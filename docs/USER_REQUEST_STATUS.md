@@ -1,13 +1,13 @@
 # 사용자 요청 전체 점검표
 
-> 상태 기준 시각: 2026-07-19 (Asia/Seoul)
+> 상태 기준 시각: 2026-07-19 08:46 (Asia/Seoul)
 >
 > 이 문서는 대화에서 요청된 작업의 **누락 확인용 인벤토리**다. 제품 계약의 정본은
 > [`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md), 현재 구현 판정의 정본은
 > [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)다. 여기서 `완료`는 현재 코드·커밋·테스트·라이브
 > 상태 중 해당 요구에 맞는 직접 근거가 있는 경우에만 사용한다.
 >
-> 현재까지 식별한 독립 요청·질문은 **113개**다. 아래 ID가 대화 요청의 추적 키이며, 커밋하지 않은 작업은
+> 현재까지 식별한 독립 요청·질문은 **114개**다. 아래 ID가 대화 요청의 추적 키이며, 커밋하지 않은 작업은
 > 테스트가 통과했더라도 `진행 중` 또는 `부분 완료`로만 기록한다.
 
 ## 상태 표기
@@ -26,9 +26,9 @@
 | ID | 요청 | 상태 | 현재 근거와 남은 일 |
 |---|---|---|---|
 | LIVE-01 | `:4400` 새로고침 후 흰 화면 수정 | 완료 | 구버전 BFF가 `workStatus`를 생략할 때 UI가 `undefined.dot`에서 죽던 문제를 fail-safe 처리했다. `96235a0`; 실제 `/#conversations` 렌더와 브라우저 오류 0건 확인. 이미 굳은 기존 renderer 탭은 닫고 새 탭을 사용해야 할 수 있다. |
-| LIVE-02 | 정상 Claude 계정에서 “organization has disabled subscription access” 오류 수정 | 부분 완료·영구 코드 승인 | live는 **정책 엔진 OFF**, 정상 계정 active, 만료 계정 paused, `fill-first`에서 Fable 5 smoke turn assistant 1개·오류 0개로 복구됐다. 영구 코드는 95/100% 자동 pause 제거, 전체 비수동-pause pool, ON/OFF epoch 직렬화, 매 tick `fill-first` 2xx ACK, OFF crash-recovery journal을 구현했다. 독립 적대적 APPROVE, 정책 계약 16/16과 전체 306/306·build 통과. 4400 재시작 후 정책 ON live 재검증이 남았다. |
+| LIVE-02 | 정상 Claude 계정에서 “organization has disabled subscription access” 오류 수정 | 부분 완료·영구 코드 및 재시작 상태 승인 | 4400을 새 코드로 재시작하고 정책 엔진 **ON**, gateway `fill-first`, 정상 계정 active 1개·수동 정지 계정 paused 1개·engine pause 0개를 live 재확인했다. 영구 코드는 95/100% 자동 pause 제거, 전체 비수동-pause pool, ON/OFF epoch 직렬화, 매 tick `fill-first` 2xx ACK, OFF crash-recovery journal을 구현했다. 독립 적대적 APPROVE, 정책 계약 16/16과 전체 306/306·build 통과. 실제 429 동일 요청 failover와 요청 단위 upstream 계정 trace는 남았다. |
 | LIVE-03 | 순차 소진을 위해 proxy를 `fill-first`로 전환 | 완료 | 설치된 CCS 계약이 `PUT {value}`임을 확인해 live gateway를 `fill-first`로 전환했다. Baton SPA의 잘못된 `POST {strategy}`와 session-affinity POST도 PUT 계약으로 수정하고 회귀 테스트를 추가했다. `ce608ee`. |
-| LIVE-04 | 라이브 수정은 구현되는 즉시 4400에서 사용 가능하게 반영 | 부분 완료 | 흰 화면 핫픽스는 서버 재시작 없이 4400에 반영했다. 이후 기능은 아직 WIP라 검증 전 4400에 올리지 않았다. |
+| LIVE-04 | 라이브 수정은 구현되는 즉시 4400에서 사용 가능하게 반영 | 부분 완료 | 최신 커밋 `b0373c0`까지 포함한 새 서버 프로세스로 4400을 재시작했다. API·정책·모델·quota 응답은 새 코드로 확인했으며, 새 대화·폴더 선택·follow-up의 브라우저 조작 E2E가 남았다. |
 
 ## 1. 프로젝트 목적·공개 저장소·개발 규율
 
@@ -38,9 +38,10 @@
 | META-02 | “Baton이 대화의 정본, provider는 현재 턴 어댑터”를 핵심 정체성으로 README에 강조 | 완료 | README 첫 설명, Why, Product invariants, Architecture에 반복 명시. `f5cd57c`. |
 | META-03 | Claude/Codex/Gemini 등 여러 계정의 usage·상태·라우팅 관리도 동등한 핵심 정체성으로 유지 | 완료 | README Why/Current status/대시보드 및 account control plane 설계에 명시. |
 | META-04 | Baton 저장소를 Agentryx-ai 조직의 public repo로 공개 | 완료 | `Agentryx-ai/Baton`, GitHub visibility=`PUBLIC`; 인증 헤더 없는 `curl`로 `https://github.com/Agentryx-ai/Baton` HTTP 200 재확인. |
-| META-05 | 작업 전·중 원자적 커밋과 push | 부분 완료 | 기능별 원자 커밋과 main push가 지속됐다. 현재 신규 브랜치 `feat/canonical-runtime-workspace`에는 검증 전 WIP가 있어 의도적으로 미커밋 상태다. |
+| META-05 | 작업 전·중 원자적 커밋과 push | 부분 완료·현재 작업 트리 정리됨 | 기능별 원자 커밋을 만들고 `feat/canonical-runtime-workspace`를 origin에 push했다. 최신 기능 커밋은 `b0373c0`; 작업 트리는 사용자 소유 untracked `.serena/`를 제외하면 깨끗하다. 아직 최종 검증과 main 통합은 남았다. |
 | META-06 | 큰 작업은 실제 DAG로 분해하고 독립 노드를 병렬 실행 | 완료·계속 적용 | follow-up backend/UI/stateless steer를 독립 노드로 병렬화해 검수·통합·커밋했고, 현재 deferred session backend/UI와 compaction 사전 검토도 파일 소유권을 분리해 병렬 진행한다. |
 | META-07 | Gemini는 환불 요청 중이므로 메시지를 보내지 말고 기존 대화만 열람 | 완료(운영 제약) | live Gemini 요청을 실행하지 않았다. 인증도 현재 차단 상태다. 이후에도 명시 해제 전 live 메시지 금지. |
+| META-08 | 지금까지 요청한 모든 작업과 완수 여부를 누락 확인용으로 문서화 | 완료·계속 갱신 | 이 문서가 114개 독립 요청·질문을 ID별로 추적한다. 완료·부분 완료·검증 필요·외부 차단을 직접 근거와 남은 일로 구분했으며, 이후 상태 변화도 같은 ID에 갱신한다. |
 
 ## 2. Claude/Codex CLI·Desktop 프록시 자동 설정
 
@@ -76,7 +77,7 @@
 | ACCOUNT-05 | quota 95%를 실제 소진으로 간주하지 않고 실제 429까지 사용 | 코드 완료·live 429 E2E 필요 | 95/98/100% 자동 소진·pause를 제거했다. 실제 429/cooling/동일 요청 failover는 CLIProxy 책임이며, Baton 정책은 `fill-first` 2xx ACK 없이는 시작·유지되지 않는다. |
 | ACCOUNT-06 | 실제 429에서 같은 요청을 다음 유효 계정으로 재시도 | 검증 필요 | CLIProxy의 `quota-exceeded.switch-project` 책임이지만 현재 설치의 실제 failover E2E가 없음. |
 | ACCOUNT-07 | 403 OAuth/구독 불가 계정을 INELIGIBLE로 제외 | 외부 계약 차단 | 현재 CCS accounts/quota API가 계정별 durable 403/INELIGIBLE 상태를 제공하지 않는다. 사용량만으로 추정 제외하면 정상 계정도 오판하므로, 지원 신호가 생길 때까지 명시적 수동 pause만 결정론적으로 안전하다. |
-| ACCOUNT-08 | Claude Fable 5 전용 usage 게이지 표시 | 완료(코드)·4400 재시작 대기 | CCS 8.1.4가 새 Claude OAuth `limits[]`를 버리는 원인을 확인했다. BFF가 local management API에서 `weekly_scoped(Fable)`만 안전 보강해 `seven_day_fable5`/`Fable 5` window로 합치며 2분 cache·single-flight·fail-open을 적용했다. 테스트와 live 원문 discovery는 통과했고 현재 4400 프로세스 재시작 후 화면 검증이 남았다. |
+| ACCOUNT-08 | Claude Fable 5 전용 usage 게이지 표시 | 완료(코드/API)·화면 검증 대기 | CCS 8.1.4가 새 Claude OAuth `limits[]`를 버리는 원인을 확인했다. BFF가 local management API에서 `weekly_scoped(Fable)`만 안전 보강해 `seven_day_fable5`/`Fable 5` window로 합치며 2분 cache·single-flight·fail-open을 적용했다. 재시작한 4400의 live quota API에서 `Fable 5` window를 확인했으며, 실제 게이지 렌더만 남았다. |
 | ACCOUNT-09 | usage freshness를 “n초 전 기준”으로 표시 | 부분 완료 | `useQuota`에는 age 계산이 있으나 현재 App의 quota fan-out에 연결되지 않음. |
 | ACCOUNT-10 | usage를 대화 응답마다 반복 표시하지 않음 | 완료 | transcript 안의 매 usage 이벤트 대신 대화 단위 최신 요약으로 표시하도록 개선. |
 
@@ -211,11 +212,12 @@
 
 아래가 현재 실제 남은 작업의 우선순위다.
 
-1. **Claude 영구 라우팅 live gate** — 95% 선제 pause 제거·전체 pool·fill-first 영구 코드는 승인·커밋됐다.
-   실제 429 same-request failover와 403 수동 격리, 정책 ON 재시작 E2E를 남겼다.
+1. **Claude 영구 라우팅 live gate** — 95% 선제 pause 제거·전체 pool·fill-first 영구 코드는 승인·커밋됐고,
+   정책 ON 재시작까지 확인했다. 실제 429 same-request failover와 요청 단위 upstream 계정 trace를 남겼다.
 2. **native folder grant + deferred conversation creation** — 폴더 선택/허용 → 임시 composer → 첫 전송에서
    session+turn 원자 생성. 이 경로로 실제 read/write tool E2E를 수행한다.
-3. **Fable 5 quota live UI** — raw schema discovery와 BFF 보강 코드는 `dc4434d`로 완료됐다. 4400 재시작 후 게이지를 검증한다.
+3. **Fable 5 quota live UI** — raw schema discovery와 BFF 보강 코드는 `dc4434d`로 완료됐고 재시작한 4400 API에서
+   Fable 전용 window를 확인했다. 브라우저 게이지만 검증한다.
 4. **Baton auto compaction** — immutable canonical history를 유지하는 derived compaction 정책을 context builder와
    SQLite/API/UI에 구현하고 exact-range/source-hash/replay/provider-switch tests를 추가한다.
 5. **cache identity** — provider가 지원하는 경우 Baton thread별 안정적인 cache key를 적용하고 A/B 교차 실행 hit/miss를 계측한다.
@@ -228,11 +230,11 @@
 
 - [ ] 실제 429 전까지 정상 Claude 계정을 유지하고 429에서 같은 요청을 failover
 - [ ] 403/만료 Claude 계정을 자동 INELIGIBLE 처리
-- [ ] Claude Fable 5 전용 usage 게이지 4400 재시작 후 시각 검증
+- [ ] Claude Fable 5 전용 usage 게이지의 4400 시각 검증(API는 확인 완료)
 - [ ] `prompt_cache_key` 또는 provider별 동등 cache identity의 Baton thread별 적용과 적대적 검수
-- [ ] 실행 중 follow-up의 durable FIFO/steer/next-turn/Goal-priority 통합
-- [ ] OS native 폴더 선택·권한 허용 UX
-- [ ] 첫 메시지를 보낼 때만 session+turn을 원자 생성하는 새 대화 UX
+- [x] 실행 중 follow-up의 durable FIFO/steer/next-turn/Goal-priority 코드 통합(브라우저 live만 남음)
+- [x] OS native 폴더 선택·권한 허용 UX 코드 통합(실제 선택 live만 남음)
+- [x] 첫 메시지를 보낼 때만 session+turn을 원자 생성하는 새 대화 UX 코드 통합(브라우저 live만 남음)
 - [ ] 선택 폴더에서 실제 Baton file tool live E2E
 - [ ] provider-neutral Baton auto compaction 구현
 - [ ] Baton-managed child execution 및 approval/user-input wait
