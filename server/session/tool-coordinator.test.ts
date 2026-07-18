@@ -256,6 +256,9 @@ test('workspace commands are absent by default and require termination-safe opt-
 test('Goal tools have exact schemas, refresh observation, and use revision CAS', async () => {
   assert.deepEqual(GOAL_TOOL_DEFINITIONS.map((tool) => tool.name), ['get_goal', 'create_goal', 'update_goal'])
   assert.equal(GOAL_TOOL_DEFINITIONS.every((tool) => tool.inputSchema.additionalProperties === false), true)
+  const updateGoalSchema = GOAL_TOOL_DEFINITIONS.find((tool) => tool.name === 'update_goal')?.inputSchema
+  assert.deepEqual(updateGoalSchema?.required, ['status', 'evidence'])
+  assert.equal('allOf' in (updateGoalSchema ?? {}), false)
   const store = new FakeStore()
   const current = goal({ revision: 3, tokenBudget: 100, tokensUsed: 40, noProgressCount: 2 })
   store.goal = current

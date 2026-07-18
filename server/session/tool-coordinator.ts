@@ -45,11 +45,7 @@ export const GOAL_TOOL_DEFINITIONS: readonly AgentToolDefinition[] = Object.free
         },
       },
     },
-  }, ['status'], {
-    allOf: [
-      { if: { properties: { status: { const: 'complete' } } }, then: { required: ['evidence'] } },
-    ],
-  }),
+  }, ['status', 'evidence']),
 ])
 
 /** The narrow durable API needed by the coordinator, intentionally easy to fake in tests. */
