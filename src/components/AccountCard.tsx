@@ -25,8 +25,9 @@ import { QuotaBar } from '@/components/QuotaBar'
  * is no per-request default lever). See docs/DESIGN.md §5 and the default-concept
  * removal note.
  *
- * - target        : engine spends this account first (engine ON only)
- * - reserve       : kept active as 429 failover reserve (engine ON only)
+ * - target        : engine's calculated first-ranked account (engine ON only;
+ *                   CLIProxy request order is still determined by its strategy)
+ * - reserve       : another account kept in the active pool (engine ON only)
  * - engine-paused : the engine removed it from rotation to preserve quota (engine ON only)
  * - user-paused   : the user manually removed it from rotation (either mode)
  * - active        : in the round-robin pool, not a distinguished role
@@ -51,8 +52,8 @@ const STATUS_BADGE: Record<
   AccountStatus,
   { label: string; icon: React.ComponentType<{ className?: string }>; className: string } | null
 > = {
-  target: { label: '타깃 · 우선 소진', icon: Target, className: 'text-ok' },
-  reserve: { label: '예비 · 429 폴백', icon: Shield, className: 'text-muted-foreground' },
+  target: { label: '정책 1순위', icon: Target, className: 'text-ok' },
+  reserve: { label: '활성 예비', icon: Shield, className: 'text-muted-foreground' },
   'engine-paused': { label: '엔진 대기 · 쿼터 보존', icon: Moon, className: 'text-muted-foreground' },
   'user-paused': { label: '수동 정지', icon: Pause, className: 'text-warn' },
   active: null,

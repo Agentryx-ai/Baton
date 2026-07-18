@@ -15,6 +15,7 @@ import { Input } from '@/components/ui/input'
 import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
+import { latestUsageSummary, transcriptItems } from './conversation-presentation'
 import type {
   CanonicalProvider,
   CanonicalSessionDto,
@@ -129,7 +130,7 @@ export function ConversationWorkspace() {
   const onStreamEvent = useCallback(() => {
     void refreshThread()
   }, [refreshThread])
-  const stream = useConversationEvents(threadId, onStreamEvent)
+  useConversationEvents(threadId, onStreamEvent)
 
   const createSession = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -178,6 +179,8 @@ export function ConversationWorkspace() {
 
   const activeTurn = snapshot ? latestActiveTurn(snapshot.turns) : null
   const latestTurn = snapshot?.turns.at(-1) ?? null
+  const latestUsage = latestUsageSummary(snapshot?.turns ?? [])
+  const visibleItems = transcriptItems(snapshot?.items ?? [])
   const latestTurnError = latestTurn?.status === 'failed' && latestTurn.error
     ? typeof latestTurn.error.message === 'string'
       ? latestTurn.error.message
@@ -205,18 +208,13 @@ export function ConversationWorkspace() {
   )
 
   return (
-    <section className="space-y-3" aria-labelledby="canonical-runtime-title">
+    <section className="space-y-4" aria-labelledby="canonical-runtime-title">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="flex items-center gap-2">
-            <h2 id="canonical-runtime-title" className="text-sm font-semibold text-foreground">
-              Canonical conversation runtime
-            </h2>
-            <Badge variant="outline">Preview</Badge>
-          </div>
-          <p className="mt-1 max-w-2xl text-xs text-muted-foreground">
-            대화의 정본은 Baton이 보관하며, 선택한 provider는 현재 턴만 실행합니다.
-          </p>
+        <div className="flex items-center gap-2">
+          <h1 id="canonical-runtime-title" className="text-xl font-semibold tracking-tight">
+            대화
+          </h1>
+          <Badge variant="outline">Preview</Badge>
         </div>
         <Button
           type="button"
@@ -245,8 +243,7 @@ export function ConversationWorkspace() {
       <div className="grid gap-4 min-[800px]:grid-cols-[15rem_minmax(0,1fr)]">
         <Card className="gap-4 py-4">
           <CardHeader className="px-4">
-            <CardTitle className="text-sm">Baton 세션</CardTitle>
-            <CardDescription>Provider와 무관한 대화 목록</CardDescription>
+            <CardTitle className="text-sm">대화 목록</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3 px-4">
             <form className="flex gap-2" onSubmit={(event) => void createSession(event)}>
@@ -283,7 +280,9 @@ export function ConversationWorkspace() {
                     <span className="block truncate font-medium">
                       {session.title || session.preview || '제목 없는 세션'}
                     </span>
-                    <span className="block truncate text-xs opacity-70">{session.id}</span>
+                    {session.title && session.preview ? (
+                      <span className="block truncate text-xs opacity-70">{session.preview}</span>
+                    ) : null}
                   </button>
                 ))
               )}
@@ -300,44 +299,39 @@ export function ConversationWorkspace() {
                 </CardTitle>
                 <CardDescription className="mt-1">
                   {snapshot
-                    ? `정본 revision ${snapshot.thread.revision} · ${snapshot.thread.status}`
-                    : '세션의 active thread를 불러옵니다.'}
+                    ? snapshot.thread.status === 'running' ? '응답 생성 중' : '준비됨'
+                    : '대화를 불러오는 중'}
                 </CardDescription>
               </div>
-              <Badge variant={stream.status === 'open' ? 'secondary' : 'outline'}>
-                SSE {stream.status} · cursor {stream.lastSequence}
-              </Badge>
+              <Badge variant="secondary">Codex</Badge>
             </div>
           </CardHeader>
 
           <CardContent className="space-y-4 px-4">
-            <div className="max-h-96 space-y-2 overflow-y-auto rounded-md border bg-muted/20 p-3">
+            {latestUsage ? (
+              <details className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                <summary className="cursor-pointer select-none font-medium text-foreground">
+                  최근 턴 사용량
+                </summary>
+                <p className="mt-2 font-mono">{latestUsage}</p>
+              </details>
+            ) : null}
+            <div className="min-h-72 max-h-[calc(100vh-23rem)] space-y-2 overflow-y-auto rounded-md border bg-muted/20 p-3">
               {loadingThread && !snapshot ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">정본 기록을 재생하는 중입니다.</p>
               ) : !snapshot ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">표시할 대화를 선택하세요.</p>
-              ) : snapshot.items.length === 0 ? (
+              ) : visibleItems.length === 0 ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">첫 메시지를 입력해 대화를 시작하세요.</p>
               ) : (
-                snapshot.items.map((item) => <ConversationItem key={item.id} item={item} />)
+                visibleItems.map((item) => <ConversationItem key={item.id} item={item} />)
               )}
             </div>
 
             <form className="space-y-3" onSubmit={(event) => void startTurn(event)}>
-              <div className="grid gap-2 sm:grid-cols-[9rem_minmax(0,1fr)]">
+              <div>
                 <label className="space-y-1 text-xs text-muted-foreground">
-                  Provider
-                  <select
-                    value={provider}
-                    disabled
-                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                  >
-                    <option value="codex">Codex</option>
-                  </select>
-                  <span className="block">Claude·Gemini adapter는 준비 중입니다.</span>
-                </label>
-                <label className="space-y-1 text-xs text-muted-foreground">
-                  Model
+                  모델
                   <select
                     value={model}
                     onChange={(event) => setModel(event.target.value)}
@@ -352,16 +346,14 @@ export function ConversationWorkspace() {
                       models.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)
                     )}
                   </select>
-                  <span className="block">
-                    {modelCatalogError
-                      ? `목록 조회 실패: ${modelCatalogError}`
-                      : '현재 CLIProxy가 제공하는 Codex 모델입니다.'}
-                  </span>
+                  {modelCatalogError ? (
+                    <span className="block text-destructive">목록 조회 실패: {modelCatalogError}</span>
+                  ) : null}
                 </label>
               </div>
 
               <label className="block space-y-1 text-xs text-muted-foreground">
-                현재 턴 입력
+                메시지
                 <textarea
                   value={prompt}
                   onChange={(event) => setPrompt(event.target.value)}
@@ -377,7 +369,7 @@ export function ConversationWorkspace() {
                     if (canSubmit) event.currentTarget.form?.requestSubmit()
                   }}
                   rows={4}
-                  placeholder="Baton 정본에 추가하고 선택한 provider로 실행할 메시지"
+                  placeholder="메시지를 입력하세요"
                   aria-keyshortcuts="Enter Shift+Enter"
                   className="w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
                 />
@@ -385,11 +377,9 @@ export function ConversationWorkspace() {
               </label>
 
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-xs text-muted-foreground">
-                  {snapshot?.thread.status === 'running'
-                    ? '현재 턴이 끝난 뒤 다음 provider를 선택할 수 있습니다.'
-                    : 'Provider 선택은 세션 소유권을 바꾸지 않습니다.'}
-                </p>
+                {snapshot?.thread.status === 'running' ? (
+                  <p className="text-xs text-muted-foreground">응답을 생성하고 있습니다.</p>
+                ) : <span />}
                 <div className="flex gap-2">
                   {activeTurn && (
                     <Button

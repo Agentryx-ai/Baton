@@ -17,6 +17,8 @@ import { usePolicy } from '@/hooks/usePolicy'
 import { useProxyStatus } from '@/hooks/useProxyStatus'
 import { usePolling } from '@/hooks/usePolling'
 import { Header } from '@/components/Header'
+import { AppNavigation, type AppView } from '@/components/AppNavigation'
+import { DashboardOverview } from '@/components/DashboardOverview'
 import { RotationPanel } from '@/components/RotationPanel'
 import { ProviderSection } from '@/components/ProviderSection'
 import { SettingsSection } from '@/components/SettingsSection'
@@ -26,12 +28,29 @@ import { ConversationWorkspace } from '@/features/conversations'
 /** Nested quota map: provider → accountId → quota (null = loading/failed). */
 type QuotaMap = Record<string, Record<string, AccountQuota | null>>
 
+function viewFromHash(): AppView {
+  const value = window.location.hash.replace(/^#\/?/, '')
+  return value === 'conversations' || value === 'settings' ? value : 'home'
+}
+
 function App() {
+  const [activeView, setActiveView] = useState<AppView>(viewFromHash)
   const { accounts, refresh: refreshAccounts } = useAccounts()
   const { state: policy, setEnabled } = usePolicy()
   const { status: proxy } = useProxyStatus()
   const [wizardOpen, setWizardOpen] = useState(false)
   const [apiKey, setApiKey] = useState<string | null>(null)
+
+  useEffect(() => {
+    const onHashChange = () => setActiveView(viewFromHash())
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
+
+  const navigate = (view: AppView) => {
+    if (view === activeView) return
+    window.location.hash = view
+  }
 
   // Proxy auth token for the connection snippet (rarely changes — fetch once).
   useEffect(() => {
@@ -174,58 +193,84 @@ function App() {
     <div className="min-h-screen bg-background text-foreground">
       <Header proxy={proxy} onRefresh={refreshAll} />
 
-      <main className="mx-auto flex max-w-5xl flex-col gap-8 px-4 py-6">
-        <ConversationWorkspace />
+      <AppNavigation active={activeView} onNavigate={navigate} variant="mobile" />
 
-        {codexTargetIsBypassed && (
-          <div className="rounded-xl border border-danger/50 bg-danger/10 px-4 py-3 text-sm" role="alert">
-            <p className="font-semibold text-danger">Codex 타깃이 실제 요청에 적용되지 않고 있습니다.</p>
-            <p className="mt-1 text-muted-foreground">
-              현재 타깃은 {codexTarget}이지만 Codex 프록시 설정은 {codexIntegration?.configuration} 상태입니다.
-              이 상태에서 Codex Desktop은 자체 로그인 계정으로 직접 요청할 수 있습니다. 모든 Codex
-              CLI/Desktop을 종료한 뒤 클라이언트 자동 설정을 적용하고 다시 실행하세요.
-            </p>
-          </div>
-        )}
+      <div className="mx-auto flex max-w-7xl gap-6 px-4 py-6">
+        <AppNavigation active={activeView} onNavigate={navigate} variant="desktop" />
 
-        <RotationPanel
-          state={policy}
-          accounts={accounts}
-          onToggle={(enabled) => void setEnabled(enabled).then(refreshAccounts)}
-        />
+        <main className="min-w-0 flex-1">
+          <section hidden={activeView !== 'home'} className="space-y-8">
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight">대시보드</h1>
+              <p className="mt-1 text-sm text-muted-foreground">계정 사용량과 라우팅 상태</p>
+            </div>
 
-        {UI_PROVIDERS.map((prov) => (
-          <ProviderSection
-            key={prov}
-            provider={prov}
-            accounts={accounts?.[prov] ?? []}
-            quotas={quotaMap?.[prov] ?? {}}
-            engineEnabled={engineEnabled}
-            providerState={providerState(prov)}
-            onPause={onPause}
-            onResume={onResume}
-            onSolo={onSolo}
-            onRemove={onRemove}
-            onAddAccount={onAddAccount}
-          />
-        ))}
+            <DashboardOverview
+              accounts={accounts}
+              quotas={quotaMap}
+              policy={policy}
+              proxy={proxy}
+            />
 
-        <SettingsSection
-          routing={routing}
-          affinity={affinity}
-          proxy={proxy}
-          connectionSnippet={connectionSnippet}
-          clientIntegration={clientIntegration}
-          clientIntegrationError={clientIntegrationError}
-          clientIntegrationLoading={clientIntegrationLoading}
-          onSetStrategy={onSetStrategy}
-          onSetAffinity={onSetAffinity}
-          onRestartProxy={onRestartProxy}
-          onRefreshClientIntegration={refreshClientIntegration}
-          onApplyClientIntegration={onApplyClientIntegration}
-          onRemoveClientIntegration={onRemoveClientIntegration}
-        />
-      </main>
+            {codexTargetIsBypassed && (
+              <div className="rounded-xl border border-danger/50 bg-danger/10 px-4 py-3 text-sm" role="alert">
+                <p className="font-semibold text-danger">Codex가 Baton 프록시를 사용하지 않습니다.</p>
+                <p className="mt-1 text-muted-foreground">
+                  Codex CLI/Desktop을 종료한 뒤 설정에서 프록시를 적용하세요.
+                </p>
+              </div>
+            )}
+
+            <RotationPanel
+              state={policy}
+              accounts={accounts}
+              onToggle={(enabled) => void setEnabled(enabled).then(refreshAccounts)}
+            />
+
+            {UI_PROVIDERS.map((prov) => (
+              <ProviderSection
+                key={prov}
+                provider={prov}
+                accounts={accounts?.[prov] ?? []}
+                quotas={quotaMap?.[prov] ?? {}}
+                engineEnabled={engineEnabled}
+                providerState={providerState(prov)}
+                onPause={onPause}
+                onResume={onResume}
+                onSolo={onSolo}
+                onRemove={onRemove}
+                onAddAccount={onAddAccount}
+              />
+            ))}
+          </section>
+
+          <section hidden={activeView !== 'conversations'}>
+            <ConversationWorkspace />
+          </section>
+
+          <section hidden={activeView !== 'settings'} className="space-y-6">
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight">설정</h1>
+              <p className="mt-1 text-sm text-muted-foreground">라우팅과 클라이언트 연결 관리</p>
+            </div>
+            <SettingsSection
+              routing={routing}
+              affinity={affinity}
+              proxy={proxy}
+              connectionSnippet={connectionSnippet}
+              clientIntegration={clientIntegration}
+              clientIntegrationError={clientIntegrationError}
+              clientIntegrationLoading={clientIntegrationLoading}
+              onSetStrategy={onSetStrategy}
+              onSetAffinity={onSetAffinity}
+              onRestartProxy={onRestartProxy}
+              onRefreshClientIntegration={refreshClientIntegration}
+              onApplyClientIntegration={onApplyClientIntegration}
+              onRemoveClientIntegration={onRemoveClientIntegration}
+            />
+          </section>
+        </main>
+      </div>
 
       <AddAccountWizard open={wizardOpen} onOpenChange={setWizardOpen} onAdded={refreshAll} />
     </div>

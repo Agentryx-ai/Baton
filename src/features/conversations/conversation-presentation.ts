@@ -1,4 +1,4 @@
-import type { CanonicalItemDto, JsonObject, JsonValue } from './types.ts'
+import type { CanonicalItemDto, CanonicalTurnDto, JsonObject, JsonValue } from './types.ts'
 
 export const PROVIDER_LABEL = {
   claude: 'Claude',
@@ -76,6 +76,20 @@ export function usageSummary(payload: JsonObject): string {
   return parts.join(' · ')
 }
 
+export function transcriptItems(items: CanonicalItemDto[]): CanonicalItemDto[] {
+  return items.filter((item) => item.kind !== 'usage')
+}
+
+export function latestUsageSummary(turns: CanonicalTurnDto[]): string | null {
+  const turn = [...turns].reverse().find((item) => item.usage !== null)
+  return turn?.usage ? usageSummary(turn.usage) : null
+}
+
 export function payloadDetail(item: CanonicalItemDto): string {
-  return JSON.stringify(item.payload, null, 2)
+  return JSON.stringify({
+    sequence: item.sequence,
+    provider: item.provider,
+    visibility: item.visibility,
+    payload: item.payload,
+  }, null, 2)
 }

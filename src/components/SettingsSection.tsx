@@ -175,14 +175,7 @@ export function SettingsSection({
   }
 
   return (
-    <section aria-labelledby="settings-heading" className="space-y-1">
-      <h2
-        id="settings-heading"
-        className="text-sm font-semibold tracking-wide text-muted-foreground uppercase"
-      >
-        설정
-      </h2>
-
+    <section aria-label="세부 설정">
       <div className="rounded-xl border bg-card px-4 text-card-foreground sm:px-6">
         {/* (a) CLIProxy strategy */}
         <Row label="CLIProxy 전략">
@@ -191,16 +184,18 @@ export function SettingsSection({
             onValueChange={(v) => onSetStrategy(v as 'round-robin' | 'fill-first')}
             className="gap-2"
           >
-            <div className="flex items-center gap-2">
-              <RadioGroupItem value="round-robin" id="strategy-round-robin" />
+            <div className="flex items-start gap-2">
+              <RadioGroupItem value="round-robin" id="strategy-round-robin" className="mt-0.5" />
               <Label htmlFor="strategy-round-robin" className="font-normal">
-                round-robin
+                <span className="block font-medium text-foreground">round-robin</span>
+                <span className="block text-xs text-muted-foreground">활성 계정에 요청을 순서대로 분산합니다.</span>
               </Label>
             </div>
-            <div className="flex items-center gap-2">
-              <RadioGroupItem value="fill-first" id="strategy-fill-first" />
+            <div className="flex items-start gap-2">
+              <RadioGroupItem value="fill-first" id="strategy-fill-first" className="mt-0.5" />
               <Label htmlFor="strategy-fill-first" className="font-normal">
-                fill-first
+                <span className="block font-medium text-foreground">fill-first</span>
+                <span className="block text-xs text-muted-foreground">한 계정을 우선 사용하고 사용할 수 없을 때 다음 계정으로 이동합니다.</span>
               </Label>
             </div>
           </RadioGroup>
@@ -249,32 +244,32 @@ export function SettingsSection({
               />
             </div>
           </div>
-          {affinity?.message ? (
-            <p className="mt-2 text-xs text-muted-foreground">
-              저장된 세션 고정 설정입니다. 로컬 CLIProxy가 설정을 핫리로드할 수 있으나
-              실시간 선택 상태는 검증되지 않습니다.
-            </p>
-          ) : null}
+          <p className="mt-2 text-xs text-muted-foreground">
+            같은 세션의 요청을 TTL 동안 동일한 계정에 고정합니다.
+          </p>
         </Row>
 
         <Separator />
 
         {/* (c) Connection info */}
         <Row label="연결 정보">
-          <div className="flex items-start gap-2">
-            <pre className="min-w-0 flex-1 overflow-x-auto rounded-md border bg-muted/50 px-3 py-2 text-xs">
-              <code>{connectionSnippet}</code>
-            </pre>
-            <Button
-              variant="outline"
-              size="icon-sm"
-              aria-label="연결 정보 복사"
-              title="복사"
-              onClick={handleCopy}
-            >
-              {copied ? <Check /> : <Copy />}
-            </Button>
-          </div>
+          <details className="rounded-md border bg-muted/20 px-3 py-2">
+            <summary className="cursor-pointer select-none text-sm font-medium">수동 연결 정보 보기</summary>
+            <div className="mt-3 flex items-start gap-2">
+              <pre className="min-w-0 flex-1 overflow-x-auto rounded-md border bg-background px-3 py-2 text-xs">
+                <code>{connectionSnippet}</code>
+              </pre>
+              <Button
+                variant="outline"
+                size="icon-sm"
+                aria-label="연결 정보 복사"
+                title="복사"
+                onClick={handleCopy}
+              >
+                {copied ? <Check /> : <Copy />}
+              </Button>
+            </div>
+          </details>
         </Row>
 
         <Separator />
@@ -421,9 +416,6 @@ export function SettingsSection({
               >
                 <RefreshCw className={cn(clientIntegrationLoading && 'animate-spin')} />
               </Button>
-              <span className="text-xs text-muted-foreground">
-                각 클라이언트에서 현재 가능한 동작만 선택할 수 있습니다.
-              </span>
             </div>
 
             {clientIntegration?.error || clientIntegrationError ? (
@@ -431,10 +423,6 @@ export function SettingsSection({
                 {clientIntegration?.error ?? clientIntegrationError?.message}
               </p>
             ) : null}
-            <p className="text-xs text-muted-foreground">
-              동작할 대상 하나만 종료 여부와 파일 잠금을 검사합니다. 다른 앱은 실행 중이어도
-              됩니다. 이미 적용된 대상은 재적용하지 않고 해제만 제공합니다.
-            </p>
           </div>
         </Row>
 

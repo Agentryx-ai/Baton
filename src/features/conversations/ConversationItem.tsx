@@ -1,6 +1,5 @@
 import { Bot, Brain, CircleAlert, Gauge, UserRound } from 'lucide-react'
 
-import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 
 import {
@@ -52,9 +51,9 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
       >
         <ItemIcon kind={item.kind} />
         <span className="font-medium text-foreground">{ITEM_LABEL[item.kind]}</span>
-        {item.provider && <span>{PROVIDER_LABEL[item.provider]}</span>}
-        <span>#{item.sequence}</span>
-        {item.visibility !== 'portable' && <Badge variant="outline">{item.visibility}</Badge>}
+        {item.provider && item.kind !== 'user_message' ? (
+          <span>{PROVIDER_LABEL[item.provider]}</span>
+        ) : null}
       </header>
 
       <div
@@ -73,7 +72,7 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
       {showRawDetail && (
         <details className="mt-2 text-xs text-muted-foreground">
           <summary className="cursor-pointer select-none rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
-            세부 정보 보기
+            세부 정보
           </summary>
           <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-background/70 p-2 font-mono text-[0.6875rem] text-foreground">
             {payloadDetail(item)}

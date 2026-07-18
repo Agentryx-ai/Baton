@@ -11,7 +11,7 @@ import {
 } from '@/components/ui/collapsible'
 
 const POLICY_NAME: Record<PolicyId, string> = {
-  'reset-imminent-first': '리셋 임박 우선 소진',
+  'reset-imminent-first': '리셋 임박 우선 순위',
 }
 
 const PROVIDER_LABEL: Record<string, string> = {
@@ -59,7 +59,7 @@ function targetLabel(
   target: string | null,
 ): string {
   if (target) return accountLabel(accounts, provider, target)
-  return state.enabled ? '타깃 없음 · 기본 라우팅' : '엔진 꺼짐 · 기본 라우팅'
+  return state.enabled ? '1순위 없음 · 기본 라우팅' : '엔진 꺼짐 · 기본 라우팅'
 }
 
 function formatTime(ts: number): string {
@@ -100,7 +100,7 @@ export function RotationPanel({ state, accounts, onToggle }: RotationPanelProps)
               </span>
             </div>
             <div className="flex gap-2">
-              <span className="shrink-0 text-muted-foreground">현재 타깃</span>
+              <span className="shrink-0 text-muted-foreground">정책 1순위</span>
               <div className="flex flex-col gap-0.5">
                 {state.providers.length === 0 ? (
                   <span className="text-muted-foreground">—</span>

@@ -85,7 +85,7 @@ export function Header({ proxy, onRefresh }: HeaderProps) {
 
   return (
     <header className="sticky top-0 z-30 border-b bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="mx-auto flex h-14 max-w-5xl items-center gap-3 px-4">
+      <div className="mx-auto flex h-14 max-w-7xl items-center gap-3 px-4">
         {/* Wordmark */}
         <div className="flex items-center gap-2 font-semibold tracking-tight">
           <GitBranch className="size-5 text-primary" aria-hidden />
