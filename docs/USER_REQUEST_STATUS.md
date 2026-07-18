@@ -23,8 +23,8 @@
 | ID | 요청 | 상태 | 현재 근거와 남은 일 |
 |---|---|---|---|
 | LIVE-01 | `:4400` 새로고침 후 흰 화면 수정 | 완료 | 구버전 BFF가 `workStatus`를 생략할 때 UI가 `undefined.dot`에서 죽던 문제를 fail-safe 처리했다. `96235a0`; 실제 `/#conversations` 렌더와 브라우저 오류 0건 확인. 이미 굳은 기존 renderer 탭은 닫고 새 탭을 사용해야 할 수 있다. |
-| LIVE-02 | 정상 Claude 계정에서 “organization has disabled subscription access” 오류 수정 | 부분 완료 | 직접 원인은 정상 Max 계정을 95%에서 선제 pause하고, Claude Code OAuth가 거부되는 만료 테스트 계정을 선택한 정책이었다. 현재 live 완화는 **정책 엔진 OFF**, 정상 계정 active, 만료 계정 paused다. 영구 코드는 아직 미수정이며 [`../issues/claude-rotation-must-switch-on-actual-429.md`](../issues/claude-rotation-must-switch-on-actual-429.md)의 완료 조건을 구현해야 한다. |
-| LIVE-03 | 순차 소진을 위해 proxy를 `fill-first`로 전환 | 미완료 | 현재 gateway는 `round-robin`이다. `POST /api/cliproxy/routing/strategy`가 gateway에서 지원되지 않아 live 변경이 실패했다. CLIProxy의 실제 지원 설정/API를 확인해 안전하게 변경해야 한다. 단, 현재 Claude active 계정은 1개라 즉시 요청은 정상 계정으로만 간다. |
+| LIVE-02 | 정상 Claude 계정에서 “organization has disabled subscription access” 오류 수정 | 부분 완료·live 복구 검증 | 직접 원인은 정상 Max 계정을 95%에서 선제 pause하고, Claude Code OAuth가 거부되는 만료 테스트 계정을 선택한 정책이었다. 현재는 **정책 엔진 OFF**, 정상 계정 active, 만료 계정 paused, `fill-first`이며 Fable 5 smoke turn이 assistant 1개·오류 0개로 완료됐다. 영구 정책 코드는 아직 미수정이며 [`../issues/claude-rotation-must-switch-on-actual-429.md`](../issues/claude-rotation-must-switch-on-actual-429.md)의 완료 조건을 구현해야 한다. |
+| LIVE-03 | 순차 소진을 위해 proxy를 `fill-first`로 전환 | 완료(live)·코드 커밋 대기 | 설치된 CCS 계약이 `PUT {value}`임을 확인해 live gateway를 `fill-first`로 전환했다. Baton SPA의 잘못된 `POST {strategy}`와 session-affinity POST도 PUT 계약으로 수정하고 회귀 테스트를 추가했다. |
 | LIVE-04 | 라이브 수정은 구현되는 즉시 4400에서 사용 가능하게 반영 | 부분 완료 | 흰 화면 핫픽스는 서버 재시작 없이 4400에 반영했다. 이후 기능은 아직 WIP라 검증 전 4400에 올리지 않았다. |
 
 ## 1. 프로젝트 목적·공개 저장소·개발 규율

@@ -21,8 +21,8 @@ import type {
   RoutingStrategy,
   RoutingStrategyName,
   SessionAffinity,
-} from '@/api/types'
-import { UI_PROVIDERS } from '@/api/types'
+} from './types.ts'
+import { UI_PROVIDERS } from './types.ts'
 
 /** Thrown on any non-2xx API response. `status` is the HTTP status code. */
 export class ApiError extends Error {
@@ -149,8 +149,8 @@ export const client = {
 
   setRoutingStrategy: async (strategy: RoutingStrategyName): Promise<void> => {
     await request('/api/cliproxy/routing/strategy', {
-      method: 'POST',
-      json: { strategy },
+      method: 'PUT',
+      json: { value: strategy },
     })
   },
 
@@ -159,7 +159,7 @@ export const client = {
     ttl?: string,
   ): Promise<void> => {
     await request('/api/cliproxy/routing/session-affinity', {
-      method: 'POST',
+      method: 'PUT',
       json: ttl === undefined ? { enabled } : { enabled, ttl },
     })
   },
