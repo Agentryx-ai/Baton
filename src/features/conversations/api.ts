@@ -6,6 +6,7 @@ import type {
   StartTurnDto,
   ThreadSnapshotDto,
   ProviderModelDescriptorDto,
+  CodexNativeScanFilter,
   NativeImportCommitDto,
   NativeImportPreviewDto,
   NativeImportSourceClient,
@@ -123,8 +124,9 @@ export const conversationApi = {
 
   previewNativeImport: (
     sources?: NativeImportSourceClient[],
+    codex?: CodexNativeScanFilter,
   ): Promise<NativeImportPreviewDto> =>
-    nativeImportPost('/native-import/preview', sources ? { sources } : {}),
+    nativeImportPost('/native-import/preview', { sources, codex }),
 
   commitNativeImport: (
     token: string,

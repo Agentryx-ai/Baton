@@ -94,7 +94,7 @@ export function groupSessions(
 }
 
 export function isSelectableNativeCandidate(candidate: NativeImportCandidateDto): boolean {
-  return candidate.status === 'new' || candidate.status === 'update_available'
+  return candidate.status === 'new' || candidate.status === 'existing' || candidate.status === 'update_available'
 }
 
 export function filterNativeImportCandidates(
@@ -108,6 +108,7 @@ export function filterNativeImportCandidates(
     candidate.projectAlias,
     candidate.provider,
     candidate.sourceClient,
+    candidate.nativeOrigin,
     candidate.status,
   ].some((value) => value?.toLocaleLowerCase().includes(normalized)))
 }

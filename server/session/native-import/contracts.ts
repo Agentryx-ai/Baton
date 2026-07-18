@@ -1,7 +1,14 @@
 import type { CanonicalProvider, NewCanonicalItem } from '../domain.ts'
 
-export type NativeSourceClient = 'codex_desktop' | 'claude_desktop' | 'claude_code'
-export type NativeImportCandidateStatus = 'new' | 'update_available' | 'duplicate'
+export type NativeSourceClient = 'codex_local' | 'claude_desktop' | 'claude_code'
+export type NativeImportCandidateStatus = 'new' | 'existing' | 'update_available' | 'duplicate'
+export type CodexNativeOrigin = 'cli' | 'ide_app' | 'exec' | 'subagent' | 'other'
+
+export interface CodexNativeScanFilter {
+  origins?: Exclude<CodexNativeOrigin, 'subagent'>[]
+  includeSubagents?: boolean
+  includeArchived?: boolean
+}
 
 export interface NativeSourceIdentity {
   sourceClient: NativeSourceClient
@@ -55,11 +62,13 @@ export interface NativeSessionCandidate extends NativeSourceIdentity {
   cwd: string | null
   createdAt: string | null
   updatedAt: string | null
+  nativeOrigin?: CodexNativeOrigin
+  nativeArchived?: boolean
   sourceHead: NativeSourceHead
   contentDigest: string
   /** Prefix digest at portableItemCount, used as the append-only record cursor. */
   prefixDigest: string
-  /** Present even for metadata-only scans; never infer this count from records. */
+  /** Zero during inventory scans and populated only after materialization. */
   portableItemCount: number
   /** Reader-private opaque locator. It must never cross the HTTP/UI boundary. */
   sourceLocator?: { path: string }
@@ -69,6 +78,8 @@ export interface NativeSessionCandidate extends NativeSourceIdentity {
   parserVersion: string
   warnings: string[]
   identityKeys: NativeIdentityKey[]
+  /** False for the lightweight inventory; true only after the transcript was parsed. */
+  materialized: boolean
 }
 
 export interface NativeImportStoredState {
@@ -87,6 +98,7 @@ export interface NativeImportPreviewCandidate extends Omit<NativeSessionCandidat
 
 export interface NativeImportPreviewRequest {
   sources?: NativeSourceClient[]
+  codex?: CodexNativeScanFilter
 }
 
 export interface NativeImportPreview {
@@ -131,6 +143,9 @@ export interface NativeSourceReader {
 
 export interface NativeSourceScanOptions {
   includeRecords?: boolean
+  codex?: CodexNativeScanFilter
+  /** Limits composite readers to source kinds requested by the preview. */
+  sources?: NativeSourceClient[]
 }
 
 export interface CommitNativeImportInput {

@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
 import { ClaudeLocalSourceReader } from './claude-source.ts'
-import { CodexDesktopSourceReader } from './codex-source.ts'
+import { CodexLocalSourceReader } from './codex-source.ts'
 import {
   mapWithConcurrency, MAX_NATIVE_CANDIDATES, MAX_NATIVE_FILE_BYTES, MAX_NATIVE_PHYSICAL_LINES,
 } from './source-utils.ts'
@@ -37,7 +37,7 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   db.close()
 
   const before = await fileHead(rollout)
-  const reader = new CodexDesktopSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET, concurrency: 2 })
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET, concurrency: 2 })
   const candidates = await reader.scan()
   assert.equal(candidates.length, 1)
   assert.equal(candidates[0]?.sourceAlias, 'Explicit title')
@@ -64,11 +64,12 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
 
   const [metadataOnly] = await reader.scan({ includeRecords: false })
   assert.equal(metadataOnly?.records.length, 0)
-  assert.equal(metadataOnly?.portableItemCount, 6)
+  assert.equal(metadataOnly?.portableItemCount, 0)
+  assert.equal(metadataOnly?.materialized, false)
   assert.ok(metadataOnly?.sourceLocator)
   const materialized = await reader.materialize(metadataOnly!)
-  assert.equal(materialized.records.length, metadataOnly?.portableItemCount)
-  assert.equal(materialized.contentDigest, metadataOnly?.contentDigest)
+  assert.equal(materialized.records.length, 6)
+  assert.equal(materialized.materialized, true)
 })
 
 test('Codex adapter never derives an alias from first_user_message', async () => {
@@ -80,7 +81,7 @@ test('Codex adapter never derives an alias from first_user_message', async () =>
   const db = createCodexDatabase(home)
   db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('x', rollout, 1, 2, 'C:\\work\\safe-project', null, 'sensitive prompt')
   db.close()
-  const [candidate] = await new CodexDesktopSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET }).scan()
+  const [candidate] = await new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET }).scan()
   assert.equal(candidate?.sourceAlias, 'safe-project')
   assert.equal(candidate?.aliasSource, 'path_fallback')
 })
@@ -141,11 +142,12 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
 
   const [metadataOnly] = await reader.scan({ includeRecords: false })
   assert.equal(metadataOnly?.records.length, 0)
-  assert.equal(metadataOnly?.portableItemCount, 6)
+  assert.equal(metadataOnly?.portableItemCount, 0)
+  assert.equal(metadataOnly?.materialized, false)
   assert.ok(metadataOnly?.sourceLocator)
   const materialized = await reader.materialize(metadataOnly!)
-  assert.equal(materialized.records.length, metadataOnly?.portableItemCount)
-  assert.equal(materialized.contentDigest, metadataOnly?.contentDigest)
+  assert.equal(materialized.records.length, 6)
+  assert.equal(materialized.materialized, true)
 
   const otherProfile = await new ClaudeLocalSourceReader({
     desktopRoot: path.join(root, 'desktop'), projectsRoot: path.join(root, 'projects'),
@@ -154,15 +156,47 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
   assert.notEqual(otherProfile[0]?.namespaceKey, candidate?.namespaceKey)
 })
 
+test('Codex local inventory defaults to active user surfaces and opts into internal or archived tasks', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-filter-'))
+  const sessions = path.join(home, 'sessions')
+  await mkdir(sessions)
+  const db = createCodexDatabase(home)
+  db.exec("ALTER TABLE threads ADD COLUMN source TEXT NOT NULL DEFAULT 'cli'; ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+  const insert = db.prepare(`
+    INSERT INTO threads(id,rollout_path,created_at,updated_at,cwd,title,first_user_message,source,archived)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `)
+  for (const [id, source, archived] of [
+    ['cli-active', 'cli', 0], ['ide-active', 'vscode', 0], ['exec-active', 'exec', 0],
+    ['subagent-active', '{"subagent":{"thread_spawn":{"parent_thread_id":"opaque"}}}', 0],
+    ['cli-archived', 'cli', 1],
+  ] as const) {
+    const rollout = path.join(sessions, `${id}.jsonl`)
+    await writeFile(rollout, JSON.stringify({ type: 'session_meta', payload: { id } }))
+    insert.run(id, rollout, 1, 2, null, id, null, source, archived)
+  }
+  db.close()
+
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
+  const defaults = await reader.scan({ includeRecords: false })
+  assert.deepEqual(defaults.map((candidate) => candidate.nativeSessionId).sort(), ['cli-active', 'ide-active'])
+  const expanded = await reader.scan({ includeRecords: false, codex: {
+    origins: ['cli', 'ide_app', 'exec', 'other'], includeSubagents: true, includeArchived: true,
+  } })
+  assert.deepEqual(expanded.map((candidate) => candidate.nativeSessionId).sort(), [
+    'cli-active', 'cli-archived', 'exec-active', 'ide-active', 'subagent-active',
+  ])
+})
+
 test('Codex adapter reports unavailable and unsupported stores instead of a silent empty inventory', async () => {
   const missing = await mkdtemp(path.join(tmpdir(), 'baton-codex-missing-'))
-  const unavailableReader = new CodexDesktopSourceReader({ codexHome: missing, namespaceSecret: NAMESPACE_SECRET })
+  const unavailableReader = new CodexLocalSourceReader({ codexHome: missing, namespaceSecret: NAMESPACE_SECRET })
   assert.deepEqual(await unavailableReader.scan(), [])
   assert.equal(unavailableReader.lastScanWarnings[0]?.status, 'unavailable')
 
   const unsupported = await mkdtemp(path.join(tmpdir(), 'baton-codex-unsupported-'))
   new DatabaseSync(path.join(unsupported, 'state_5.sqlite')).close()
-  const unsupportedReader = new CodexDesktopSourceReader({ codexHome: unsupported, namespaceSecret: NAMESPACE_SECRET })
+  const unsupportedReader = new CodexLocalSourceReader({ codexHome: unsupported, namespaceSecret: NAMESPACE_SECRET })
   assert.deepEqual(await unsupportedReader.scan(), [])
   assert.equal(unsupportedReader.lastScanWarnings[0]?.status, 'unsupported')
   assert.equal(unsupportedReader.lastScanWarnings[0]?.code, 'codex_database_schema_unsupported')
@@ -182,12 +216,13 @@ test('Codex adapter excludes candidates that exceed file or physical-line caps w
   db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('too-many-lines', tooManyLines, 1, 2, null, null, null)
   db.close()
 
-  const reader = new CodexDesktopSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET, concurrency: 2 })
-  assert.deepEqual(await reader.scan({ includeRecords: false }), [])
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET, concurrency: 2 })
+  const metadata = await reader.scan({ includeRecords: false })
+  assert.equal(metadata.length, 1)
+  assert.equal(metadata[0]?.nativeSessionId, 'too-many-lines')
   assert.equal(reader.lastScanWarnings.some((warning) => warning.status === 'unsupported'
     && warning.code === 'native_source_file_size_limit'), true)
-  assert.equal(reader.lastScanWarnings.some((warning) => warning.status === 'unsupported'
-    && warning.code === 'native_source_physical_line_limit'), true)
+  await assert.rejects(() => reader.materialize(metadata[0]!), /native_source_physical_line_limit/)
 })
 
 test('Codex adapter exposes a typed incomplete-inventory sentinel instead of silently slicing candidates', async () => {
@@ -201,7 +236,7 @@ test('Codex adapter exposes a typed incomplete-inventory sentinel instead of sil
   db.exec('COMMIT')
   db.close()
 
-  const reader = new CodexDesktopSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
   assert.deepEqual(await reader.scan({ includeRecords: false }), [])
   assert.equal(reader.inventoryOverflow, true)
   assert.equal(reader.overflowCount, 1)
@@ -227,7 +262,7 @@ test('adapters fail closed on unknown framing and a symlink escape', async (t) =
   db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('link', linkedRollout, 1, 2, null, null, null)
   db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('unknown', unknownRollout, 1, 2, null, null, null)
   db.close()
-  const reader = new CodexDesktopSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
   assert.deepEqual(await reader.scan(), [])
   assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'native_source_path_escape'), true)
   assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'codex_top_level_type_unsupported'), true)

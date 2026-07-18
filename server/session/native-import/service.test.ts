@@ -12,8 +12,8 @@ import { NativeSessionImportService } from './service.ts'
 import { contentDigest, finalizeRecords, sha256, stableJson } from './source-utils.ts'
 
 class MutableReader implements NativeSourceReader {
-  readonly sourceClient = 'codex_desktop' as const
-  readonly sourceClients = ['codex_desktop', 'claude_desktop', 'claude_code'] as const
+  readonly sourceClient = 'codex_local' as const
+  readonly sourceClients = ['codex_local', 'claude_desktop', 'claude_code'] as const
   candidate: NativeSessionCandidate
   materializeCalls = 0
   constructor(candidate: NativeSessionCandidate) { this.candidate = candidate }
@@ -28,7 +28,7 @@ class MutableReader implements NativeSourceReader {
 }
 
 class MultiReader implements NativeSourceReader {
-  readonly sourceClient = 'codex_desktop' as const
+  readonly sourceClient = 'codex_local' as const
   readonly candidates: NativeSessionCandidate[]
   constructor(candidates: NativeSessionCandidate[]) { this.candidates = candidates }
   async scan(options: NativeSourceScanOptions = {}): Promise<NativeSessionCandidate[]> {
@@ -51,8 +51,8 @@ test('preview scans only readers that can emit a selected source', async () => {
     nativeSessionId: 'claude-only', namespaceKey: 'claude-installation',
   })
   const codexReader: NativeSourceReader = {
-    sourceClient: 'codex_desktop',
-    sourceClients: ['codex_desktop'],
+    sourceClient: 'codex_local',
+    sourceClients: ['codex_local'],
     scan: async () => { codexScans += 1; return [] },
     materialize: async (candidate) => candidate,
   }
@@ -80,8 +80,8 @@ test('metadata-only inventory materializes and commits selected sessions one at 
   const second = candidate(['two'], 'candidate-2', 'native-2')
   const calls: string[] = []
   const reader: NativeSourceReader = {
-    sourceClient: 'codex_desktop',
-    sourceClients: ['codex_desktop'],
+    sourceClient: 'codex_local',
+    sourceClients: ['codex_local'],
     scan: async (options) => {
       calls.push(`scan:${String(options?.includeRecords)}`)
       assert.equal(options?.includeRecords, false)
@@ -100,15 +100,15 @@ test('metadata-only inventory materializes and commits selected sessions one at 
   }) as typeof store.commitNativeImport
   const service = new NativeSessionImportService(store, [reader])
 
-  const preview = await service.preview({ sources: ['codex_desktop'] })
+  const preview = await service.preview({ sources: ['codex_local'] })
   assert.equal(preview.candidates.every((item) => !('sourceLocator' in item) && !('records' in item)), true)
-  assert.deepEqual(preview.candidates.map((item) => item.portableItemCount), [1, 1])
+  assert.deepEqual(preview.candidates.map((item) => item.portableItemCount), [0, 0])
+  assert.equal(preview.summary.analysisPending, true)
   const tokenPayload = JSON.parse(Buffer.from(preview.token.split('.')[0]!, 'base64url').toString('utf8')) as {
     candidates: Array<Record<string, unknown>>
   }
   assert.deepEqual(Object.keys(tokenPayload.candidates[0]!).sort(), [
-    'contentDigest', 'headDigest', 'id', 'parserVersion', 'portableItemCount', 'prefixDigest',
-    'skippedItemCount', 'sourceClient', 'stateDigest',
+    'headDigest', 'id', 'parserVersion', 'sourceClient', 'stateDigest',
   ])
   const receipt = await service.commit({ token: preview.token, candidateIds: preview.candidates.map((item) => item.candidateId) })
 
@@ -128,8 +128,8 @@ test('preview rejects an inventory above the supported cap before tokenization',
   const store = await newStore()
   const base = candidate(['one'])
   const reader: NativeSourceReader = {
-    sourceClient: 'codex_desktop',
-    sourceClients: ['codex_desktop'],
+    sourceClient: 'codex_local',
+    sourceClients: ['codex_local'],
     scan: async () => Array.from({ length: 10_001 }, (_, index) => ({
       ...metadataCandidate(base), candidateId: sha256(`oversized-${index}`), nativeSessionId: `native-${index}`,
       identityKeys: [{ kind: 'native_session_id', value: `native-${index}` }],
@@ -137,7 +137,7 @@ test('preview rejects an inventory above the supported cap before tokenization',
     materialize: async () => { throw new Error('must not materialize an oversized preview') },
   }
   const service = new NativeSessionImportService(store, [reader])
-  await assert.rejects(() => service.preview({ sources: ['codex_desktop'] }), (error: unknown) =>
+  await assert.rejects(() => service.preview({ sources: ['codex_local'] }), (error: unknown) =>
     error instanceof Error && 'code' in error && error.code === 'invalid_request' && /10,000/.test(error.message))
   store.close()
 })
@@ -152,32 +152,30 @@ test('preview rejects a reader overflow sentinel before token state lookup', asy
   }) as typeof store.getNativeImportState
   const value = candidate(['one'], 'overflow-sentinel', 'overflow-native')
   const reader: NativeSourceReader = {
-    sourceClient: 'codex_desktop',
-    sourceClients: ['codex_desktop'],
+    sourceClient: 'codex_local',
+    sourceClients: ['codex_local'],
     inventoryOverflow: true,
     overflowCount: 10_001,
     scan: async () => [metadataCandidate(value)],
     materialize: async () => { throw new Error('must not materialize a truncated inventory') },
   }
   const service = new NativeSessionImportService(store, [reader])
-  await assert.rejects(() => service.preview({ sources: ['codex_desktop'] }), (error: unknown) =>
+  await assert.rejects(() => service.preview({ sources: ['codex_local'] }), (error: unknown) =>
     error instanceof Error && 'code' in error && error.code === 'invalid_request' && /10,001 reported/.test(error.message))
   assert.equal(stateLookups, 0)
   store.close()
 })
 
-test('preview token binds parser version and the complete portable record cursor', async () => {
+test('preview token binds parser version and the lightweight source head', async () => {
   const mutations: Array<[string, (value: NativeSessionCandidate) => void]> = [
     ['parser', (value) => { value.parserVersion = 'test-v2' }],
-    ['count', (value) => { value.portableItemCount += 1 }],
-    ['prefix', (value) => { value.prefixDigest = sha256('different-prefix') }],
-    ['skipped', (value) => { value.skippedItemCount += 1 }],
+    ['head', (value) => { value.sourceHead.mtimeMs += 1 }],
   ]
   for (const [name, mutate] of mutations) {
     const store = await newStore()
     const reader = new MutableReader(candidate(['one'], `binding-${name}`, `native-${name}`))
     const service = new NativeSessionImportService(store, [reader])
-    const preview = await service.preview({ sources: ['codex_desktop'] })
+    const preview = await service.preview({ sources: ['codex_local'] })
     if (name === 'parser') {
       const [encoded, signature] = preview.token.split('.')
       const payload = JSON.parse(Buffer.from(encoded!, 'base64url').toString('utf8')) as { candidates: Array<{ parserVersion: string }> }
@@ -212,13 +210,15 @@ test('preview and commit are idempotent and append only a valid native delta', a
   assert.deepEqual(replay.results, first.results)
 
   const duplicatePreview = await service.preview()
-  assert.equal(duplicatePreview.summary.duplicate, 1)
+  assert.equal(duplicatePreview.summary.existing, 1)
+  assert.equal(duplicatePreview.summary.duplicate, 0)
   const duplicate = await service.commit({ token: duplicatePreview.token, candidateIds: [duplicatePreview.candidates[0]!.candidateId] })
   assert.equal(duplicate.results[0]?.status, 'duplicate')
 
   reader.candidate = candidate(['one', 'two'])
   const deltaPreview = await service.preview()
-  assert.equal(deltaPreview.summary.updateAvailable, 1)
+  assert.equal(deltaPreview.summary.existing, 1)
+  assert.equal(deltaPreview.summary.updateAvailable, 0)
   const delta = await service.commit({ token: deltaPreview.token, candidateIds: [deltaPreview.candidates[0]!.candidateId] })
   assert.equal(delta.results[0]?.status, 'updated')
   const session = store.listSessions()[0]!
@@ -276,7 +276,7 @@ test('Claude Desktop metadata discovered later reuses an imported Claude Code id
   })
   reader.candidate = desktop
   preview = await service.preview()
-  assert.equal(preview.candidates[0]?.status, 'duplicate')
+  assert.equal(preview.candidates[0]?.status, 'existing')
   const receipt = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
   assert.equal(receipt.results[0]?.status, 'duplicate')
   assert.equal(store.listSessions().length, 1)
@@ -305,7 +305,7 @@ test('Claude Desktop metadata discovered later reuses an imported Claude Code id
   assert.equal(store.getSession(importedSessionId)?.source?.projectAlias, 'shared')
   assert.notEqual(store.getSession(otherSessionId)?.projectKey, store.getSession(importedSessionId)?.projectKey)
   reader.candidate = cli
-  assert.equal((await service.preview()).candidates[0]?.status, 'duplicate')
+  assert.equal((await service.preview()).candidates[0]?.status, 'existing')
   store.close()
 })
 
@@ -315,16 +315,16 @@ test('path fallback aliases promote generated aliases and cannot be downgraded b
   Object.assign(generated, { sourceAlias: 'Generated task', aliasSource: 'generated', titleSource: null })
   const reader = new MutableReader(generated)
   const service = new NativeSessionImportService(store, [reader])
-  let preview = await service.preview({ sources: ['codex_desktop'] })
+  let preview = await service.preview({ sources: ['codex_local'] })
   await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
 
   reader.candidate = { ...structuredClone(generated), sourceAlias: 'Project task', aliasSource: 'path_fallback' }
-  preview = await service.preview({ sources: ['codex_desktop'] })
+  preview = await service.preview({ sources: ['codex_local'] })
   await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
   assert.equal(store.listSessions()[0]?.source?.sourceAlias, 'Project task')
 
   reader.candidate = { ...structuredClone(generated), sourceAlias: 'Later generated task', aliasSource: 'generated' }
-  preview = await service.preview({ sources: ['codex_desktop'] })
+  preview = await service.preview({ sources: ['codex_local'] })
   await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
   assert.equal(store.listSessions()[0]?.source?.sourceAlias, 'Project task')
   store.close()
@@ -346,7 +346,7 @@ test('completed commit receipt and source identity survive a store restart', asy
   service = new NativeSessionImportService(store, [reader], { now: () => new Date('2026-07-18T00:20:00.000Z') })
   const replay = await service.commit(request)
   assert.deepEqual(replay.results, first.results)
-  assert.equal((await service.preview()).candidates[0]?.status, 'duplicate')
+  assert.equal((await service.preview()).candidates[0]?.status, 'existing')
   store.close()
 })
 
@@ -411,7 +411,7 @@ function candidate(texts: string[], seed = 'candidate', nativeSessionId = 'nativ
   }))
   const records = finalizeRecords(base)
   return {
-    candidateId: sha256(seed), sourceClient: 'codex_desktop', provider: 'codex', namespaceKey: 'test', nativeSessionId,
+    candidateId: sha256(seed), sourceClient: 'codex_local', provider: 'codex', namespaceKey: 'test', nativeSessionId,
     sourceAlias: 'Imported alias', aliasSource: 'native', projectAlias: 'project', projectGroupKey: 'project-key',
     cwd: 'C:\\project', createdAt: null, updatedAt: null,
     sourceHead: { size: texts.join('').length, mtimeMs: texts.length, finalRecordDigest: sha256(texts.at(-1) ?? '') },
@@ -419,9 +419,13 @@ function candidate(texts: string[], seed = 'candidate', nativeSessionId = 'nativ
     parserVersion: 'test-v1', warnings: [],
     portableItemCount: records.length, sourceLocator: { path: `C:\\native\\${nativeSessionId}.jsonl` },
     identityKeys: [{ kind: 'native_session_id', value: nativeSessionId }],
+    materialized: true,
   }
 }
 
 function metadataCandidate(value: NativeSessionCandidate): NativeSessionCandidate {
-  return { ...structuredClone(value), records: [] }
+  return {
+    ...structuredClone(value), records: [], materialized: false,
+    contentDigest: sha256(''), prefixDigest: sha256(''), portableItemCount: 0, skippedItemCount: 0, warnings: [],
+  }
 }

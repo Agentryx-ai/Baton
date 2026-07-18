@@ -23,6 +23,8 @@ import {
   withNativeCandidateSelection,
 } from './session-view-preferences'
 import type {
+  CodexNativeOrigin,
+  CodexNativeScanFilter,
   NativeImportCandidateDto,
   NativeImportCandidateStatus,
   NativeImportCommitDto,
@@ -31,13 +33,24 @@ import type {
 } from './types'
 
 const SOURCES: Array<{ value: NativeImportSourceClient; label: string }> = [
-  { value: 'codex_desktop', label: 'Codex Desktop' },
+  { value: 'codex_local', label: 'Codex 로컬' },
   { value: 'claude_desktop', label: 'Claude Desktop' },
   { value: 'claude_code', label: 'Claude Code' },
 ]
 
+const CODEX_ORIGINS: Array<{
+  value: Exclude<CodexNativeOrigin, 'subagent'>
+  label: string
+}> = [
+  { value: 'cli', label: 'CLI' },
+  { value: 'ide_app', label: 'Desktop · IDE' },
+  { value: 'exec', label: 'Exec' },
+  { value: 'other', label: '기타' },
+]
+
 const STATUS_LABEL: Record<NativeImportCandidateStatus, string> = {
   new: '새 작업',
+  existing: '가져온 기록 · 확인 필요',
   update_available: '업데이트',
   duplicate: '이미 가져옴',
   unavailable: '읽을 수 없음',
@@ -58,7 +71,10 @@ export function NativeImportDialog({
   onOpenChange: (open: boolean) => void
   onImported: () => void | Promise<void>
 }) {
-  const [sources, setSources] = useState<NativeImportSourceClient[]>(SOURCES.map((item) => item.value))
+  const [sources, setSources] = useState<NativeImportSourceClient[]>(['codex_local', 'claude_desktop'])
+  const [codexOrigins, setCodexOrigins] = useState<CodexNativeScanFilter['origins']>(['cli', 'ide_app'])
+  const [includeCodexSubagents, setIncludeCodexSubagents] = useState(false)
+  const [includeCodexArchived, setIncludeCodexArchived] = useState(false)
   const [preview, setPreview] = useState<NativeImportPreviewDto | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [acknowledged, setAcknowledged] = useState(false)
@@ -114,15 +130,20 @@ export function NativeImportDialog({
     () => new Map(preview?.candidates.map((candidate) => [candidate.id, candidate.sourceAlias]) ?? []),
     [preview],
   )
+  const codexScopeValid = !sources.includes('codex_local') || codexOrigins.length > 0
 
   const scan = async () => {
-    if (sources.length === 0) return
+    if (sources.length === 0 || !codexScopeValid) return
     setScanning(true)
     setError(null)
     setResult(null)
     setAcknowledged(false)
     try {
-      const next = await conversationApi.previewNativeImport(sources)
+      const next = await conversationApi.previewNativeImport(sources, {
+        origins: codexOrigins,
+        includeSubagents: includeCodexSubagents,
+        includeArchived: includeCodexArchived,
+      })
       setPreview(next)
       setSelected(new Set())
       setQuery('')
@@ -182,6 +203,41 @@ export function NativeImportDialog({
                   </label>
                 ))}
               </div>
+              {sources.includes('codex_local') ? (
+                <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
+                  <p className="text-xs font-medium">Codex 로컬 범위</p>
+                  <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs">
+                    {CODEX_ORIGINS.map((origin) => (
+                      <label key={origin.value} className="flex items-center gap-1.5">
+                        <input
+                          type="checkbox"
+                          checked={codexOrigins.includes(origin.value)}
+                          onChange={(event) => setCodexOrigins((current) => event.target.checked
+                            ? [...current, origin.value]
+                            : current.filter((value) => value !== origin.value))}
+                        />
+                        {origin.label}
+                      </label>
+                    ))}
+                  </div>
+                  <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs text-muted-foreground">
+                    <label className="flex items-center gap-1.5">
+                      <input type="checkbox" checked={includeCodexSubagents}
+                        onChange={(event) => setIncludeCodexSubagents(event.target.checked)} />
+                      내부 subagent 포함
+                    </label>
+                    <label className="flex items-center gap-1.5">
+                      <input type="checkbox" checked={includeCodexArchived}
+                        onChange={(event) => setIncludeCodexArchived(event.target.checked)} />
+                      아카이브 포함
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    기본값은 활성 CLI와 Desktop · IDE 작업만 표시합니다. Exec, subagent, 아카이브는 필요할 때만 포함하세요.
+                  </p>
+                  {!codexScopeValid ? <p className="text-xs text-destructive">하나 이상의 Codex 출처를 선택하세요.</p> : null}
+                </div>
+              ) : null}
               <p className="text-xs leading-relaxed text-muted-foreground">
                 검색은 원본 파일을 수정하지 않습니다. 원격 Claude 채팅처럼 로컬 transcript가 없는 세션은 가져올 수 없습니다.
               </p>
@@ -194,10 +250,13 @@ export function NativeImportDialog({
                 <div className="flex flex-wrap gap-x-4 gap-y-1">
                   <span>발견 {preview.summary.total}개</span>
                   <span>신규 {preview.summary.new}개</span>
+                  {preview.summary.existing > 0 ? <span>기존 기록 {preview.summary.existing}개</span> : null}
                   <span>업데이트 {preview.summary.updateAvailable}개</span>
                   <span>중복 {preview.summary.duplicate}개</span>
-                  <span>가져올 항목 {preview.summary.portableItems}개</span>
-                  {preview.summary.skippedItems > 0 ? (
+                  {preview.summary.analysisPending ? <span>항목 수는 선택 후 분석</span> : (
+                    <span>가져올 항목 {preview.summary.portableItems}개</span>
+                  )}
+                  {!preview.summary.analysisPending && preview.summary.skippedItems > 0 ? (
                     <span className="text-warn">제외 {preview.summary.skippedItems}개</span>
                   ) : null}
                 </div>
@@ -399,7 +458,7 @@ export function NativeImportDialog({
               </Button>
             </>
           ) : (
-            <Button type="button" disabled={sources.length === 0 || scanning} onClick={() => void scan()}>
+            <Button type="button" disabled={sources.length === 0 || !codexScopeValid || scanning} onClick={() => void scan()}>
               {scanning ? <LoaderCircle className="animate-spin" aria-hidden /> : <Database aria-hidden />}
               로컬 작업 검색
             </Button>
@@ -434,14 +493,18 @@ function CandidateRow({
           <span className="truncate text-sm font-medium">{candidate.sourceAlias || `${providerName(candidate.provider)} 작업`}</span>
           <Badge variant="outline">{STATUS_LABEL[candidate.status]}</Badge>
           <Badge variant="secondary">{sourceName(candidate.sourceClient)}</Badge>
+          {candidate.nativeOrigin ? <Badge variant="outline">{originName(candidate.nativeOrigin)}</Badge> : null}
+          {candidate.nativeArchived ? <Badge variant="outline">아카이브</Badge> : null}
         </div>
         <p className="mt-1 truncate text-xs text-muted-foreground">
           {candidate.projectAlias || '프로젝트 없음'}
           {candidate.updatedAt ? ` · ${formatDate(candidate.updatedAt)}` : ''}
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
-          메시지 {candidate.messageCount}개 · 가져올 항목 {candidate.portableItemCount}개
-          {candidate.skippedItemCount > 0 ? ` · 제외 ${candidate.skippedItemCount}개` : ''}
+          {candidate.analysisPending
+            ? '선택하면 가져오기 전에 항목을 분석합니다.'
+            : `메시지 ${candidate.messageCount}개 · 가져올 항목 ${candidate.portableItemCount}개`}
+          {!candidate.analysisPending && candidate.skippedItemCount > 0 ? ` · 제외 ${candidate.skippedItemCount}개` : ''}
           {candidate.warningCount > 0 ? ` · 경고 ${candidate.warningCount}개` : ''}
         </p>
       </div>
@@ -488,6 +551,14 @@ function Pagination({
 
 function sourceName(source: NativeImportSourceClient): string {
   return SOURCES.find((item) => item.value === source)?.label ?? source
+}
+
+function originName(origin: CodexNativeOrigin): string {
+  if (origin === 'ide_app') return 'Desktop · IDE'
+  if (origin === 'subagent') return 'Subagent'
+  if (origin === 'exec') return 'Exec'
+  if (origin === 'cli') return 'CLI'
+  return '기타'
 }
 
 function providerName(provider: string): string {

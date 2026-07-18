@@ -13,7 +13,7 @@ import { ConversationEventHub } from './event-hub.ts'
 import { TurnOrchestrator } from './orchestrator.ts'
 import { createConversationRouter } from './router.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
-import { CodexDesktopSourceReader } from './native-import/codex-source.ts'
+import { CodexLocalSourceReader } from './native-import/codex-source.ts'
 import { ClaudeLocalSourceReader } from './native-import/claude-source.ts'
 import { NativeSessionImportService } from './native-import/service.ts'
 
@@ -57,7 +57,7 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
   const service = new TurnOrchestrator(store, adapters, events)
   const nativeNamespaceSecret = store.getNativeImportNamespaceKey()
   const nativeImport = new NativeSessionImportService(store, [
-    new CodexDesktopSourceReader({ namespaceSecret: nativeNamespaceSecret }),
+    new CodexLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),
     new ClaudeLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),
   ])
   const router = createConversationRouter(service, {

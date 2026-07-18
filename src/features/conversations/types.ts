@@ -44,7 +44,13 @@ export interface CanonicalSessionDto {
   source?: NativeSessionSourceSummaryDto | null
 }
 
-export type NativeImportSourceClient = 'codex_desktop' | 'claude_desktop' | 'claude_code'
+export type NativeImportSourceClient = 'codex_local' | 'claude_desktop' | 'claude_code'
+export type CodexNativeOrigin = 'cli' | 'ide_app' | 'exec' | 'subagent' | 'other'
+export interface CodexNativeScanFilter {
+  origins: Exclude<CodexNativeOrigin, 'subagent'>[]
+  includeSubagents: boolean
+  includeArchived: boolean
+}
 
 export interface NativeSessionSourceSummaryDto {
   provider: CanonicalProvider
@@ -56,6 +62,7 @@ export interface NativeSessionSourceSummaryDto {
 
 export type NativeImportCandidateStatus =
   | 'new'
+  | 'existing'
   | 'update_available'
   | 'duplicate'
   | 'unavailable'
@@ -72,10 +79,13 @@ export interface NativeImportCandidateDto {
   projectAlias: string | null
   createdAt: string | null
   updatedAt: string | null
+  nativeOrigin?: CodexNativeOrigin | null
+  nativeArchived?: boolean
   messageCount: number
   portableItemCount: number
   skippedItemCount: number
   warningCount: number
+  analysisPending: boolean
 }
 
 export interface NativeImportPreviewDto {
@@ -84,12 +94,14 @@ export interface NativeImportPreviewDto {
   summary: {
     total: number
     new: number
+    existing: number
     updateAvailable: number
     duplicate: number
     unavailable: number
     unsupported: number
     portableItems: number
     skippedItems: number
+    analysisPending: boolean
   }
   candidates: NativeImportCandidateDto[]
   warnings: string[]

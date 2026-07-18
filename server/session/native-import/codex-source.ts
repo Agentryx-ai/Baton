@@ -3,10 +3,11 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 
 import type {
-  NativePortableRecord, NativeSessionCandidate, NativeSourceReader, NativeSourceScanOptions, NativeSourceWarning,
+  CodexNativeOrigin, NativePortableRecord, NativeSessionCandidate, NativeSourceReader, NativeSourceScanOptions,
+  NativeSourceWarning,
 } from './contracts.ts'
 import {
-  candidateId, canonicalRoot, containedRealPath, cwdAlias, mapWithConcurrency, messageText,
+  candidateId, canonicalRoot, containedRealPath, cwdAlias, inspectStableFile, mapWithConcurrency, messageText,
   MAX_NATIVE_CANDIDATES, nativePhysicalLines, NativeRecordAccumulator, PARSER_VERSION,
   pseudonymousNamespace, readStableFile, safeAlias, sanitizeToolInput, sanitizeToolResult,
   sanitizeReasoningSummary, sha256, stableJson,
@@ -34,9 +35,9 @@ const CODEX_TOP_LEVEL_TYPES = new Set([
   'world_state', 'compacted', 'inter_agent_communication_metadata',
 ])
 
-export class CodexDesktopSourceReader implements NativeSourceReader {
-  readonly sourceClient = 'codex_desktop' as const
-  readonly sourceClients = ['codex_desktop'] as const
+export class CodexLocalSourceReader implements NativeSourceReader {
+  readonly sourceClient = 'codex_local' as const
+  readonly sourceClients = ['codex_local'] as const
   readonly #home: string
   readonly #namespaceSecret: Buffer | undefined
   readonly #profileProvenance: string
@@ -49,7 +50,7 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
     this.#home = path.resolve(options.codexHome ?? path.join(homedir(), '.codex'))
     this.#namespaceSecret = options.namespaceSecret
     this.#profileProvenance = options.profileProvenance ?? ''
-    this.#concurrency = options.concurrency ?? 1
+    this.#concurrency = options.concurrency ?? 16
   }
 
   get lastScanWarnings(): readonly NativeSourceWarning[] { return this.#warnings }
@@ -58,6 +59,8 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
 
   async scan(options: NativeSourceScanOptions = {}): Promise<NativeSessionCandidate[]> {
     const includeRecords = options.includeRecords ?? true
+    const scanConcurrency = includeRecords ? 1 : this.#concurrency
+    const filter = normalizeCodexFilter(options)
     this.#warnings = []
     this.#inventoryOverflow = false
     this.#overflowCount = undefined
@@ -89,8 +92,22 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
     try {
       let rows: Array<Record<string, unknown>>
       try {
+        const columns = new Set((database.prepare('PRAGMA table_info(threads)').all() as Array<{ name: string }>)
+          .map((column) => column.name))
+        const predicates = ['rollout_path IS NOT NULL']
+        if (columns.has('archived') && !filter.includeArchived) predicates.push('archived = 0')
+        if (columns.has('source')) {
+          const origins: string[] = []
+          if (filter.origins.has('cli')) origins.push("source = 'cli'")
+          if (filter.origins.has('ide_app')) origins.push("source = 'vscode'")
+          if (filter.origins.has('exec')) origins.push("source = 'exec'")
+          if (filter.includeSubagents) origins.push("source LIKE '{\"subagent\"%'")
+          if (filter.origins.has('other')) origins.push("(source NOT IN ('cli','vscode','exec') AND source NOT LIKE '{\"subagent\"%')")
+          predicates.push(`(${origins.length > 0 ? origins.join(' OR ') : '0'})`)
+        } else if (!filter.origins.has('cli')) predicates.push('0')
+        const where = predicates.join(' AND ')
         const totalRow = database.prepare(`
-          SELECT COUNT(*) AS count FROM threads WHERE rollout_path IS NOT NULL
+          SELECT COUNT(*) AS count FROM threads WHERE ${where}
         `).get() as Record<string, unknown>
         const total = typeof totalRow.count === 'number' ? totalRow.count : Number(totalRow.count)
         if (!Number.isSafeInteger(total) || total < 0) throw new Error('codex_database_count_invalid')
@@ -101,14 +118,17 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
           return []
         }
         rows = database.prepare(`
-          SELECT id, rollout_path, created_at, updated_at, cwd, title, first_user_message
-          FROM threads WHERE rollout_path IS NOT NULL ORDER BY updated_at DESC LIMIT ?
+          SELECT id, rollout_path, created_at, updated_at, cwd, title, first_user_message,
+            ${columns.has('source') ? 'source' : "'cli'"} AS source,
+            ${columns.has('archived') ? 'archived' : '0'} AS archived
+          FROM threads WHERE ${where}
+          ORDER BY updated_at DESC LIMIT ?
         `).all(MAX_NATIVE_CANDIDATES) as Array<Record<string, unknown>>
       } catch {
         this.#warn('unsupported', 'codex_database_schema_unsupported', 'Codex state database schema is not supported')
         return []
       }
-      const candidates = await mapWithConcurrency(rows, this.#concurrency, async (row) => {
+      const candidates = await mapWithConcurrency(rows, scanConcurrency, async (row) => {
         try { return await this.#candidate(row, canonicalHomePath, namespaceKey, includeRecords) }
         catch (error) {
           this.#warn(warningStatus(error), errorCode(error, 'codex_candidate_corrupt'), 'A Codex task was skipped because its source was corrupt, unsupported, or escaped the configured home')
@@ -127,8 +147,9 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
     if (!nativeSessionId || !rolloutPath) throw new Error('codex_thread_framing_invalid')
     const requestedRolloutPath = path.isAbsolute(rolloutPath) ? rolloutPath : path.resolve(canonicalHomePath, rolloutPath)
     const canonicalRolloutPath = await containedRealPath(canonicalHomePath, requestedRolloutPath)
-    const source = await readStableFile(canonicalRolloutPath)
-    const parsed = parseCodexRecords(source.text, nativeSessionId, includeRecords)
+    const source = includeRecords ? await readStableFile(canonicalRolloutPath) : null
+    const sourceHead = source?.head ?? await inspectStableFile(canonicalRolloutPath)
+    const parsed = source ? parseCodexRecords(source.text, nativeSessionId, true) : null
     const cwd = string(row.cwd)
     const explicitTitle = string(row.title)
     const fallback = cwdAlias(cwd, 'Codex task')
@@ -149,16 +170,19 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
       cwd,
       createdAt: asIso(row.created_at),
       updatedAt: asIso(row.updated_at),
-      sourceHead: source.head,
-      contentDigest: parsed.contentDigest,
-      prefixDigest: parsed.contentDigest,
-      portableItemCount: parsed.portableItemCount,
+      nativeOrigin: codexOrigin(row.source),
+      nativeArchived: row.archived === 1 || row.archived === true,
+      sourceHead,
+      contentDigest: parsed?.contentDigest ?? sha256(''),
+      prefixDigest: parsed?.contentDigest ?? sha256(''),
+      portableItemCount: parsed?.portableItemCount ?? 0,
       sourceLocator: { path: canonicalRolloutPath },
-      records: parsed.records,
-      skippedItemCount: parsed.skipped,
+      records: parsed?.records ?? [],
+      skippedItemCount: parsed?.skipped ?? 0,
       parserVersion: PARSER_VERSION,
-      warnings: parsed.warnings,
+      warnings: parsed?.warnings ?? [],
       identityKeys: [{ kind: 'native_session_id', value: nativeSessionId, scopeNamespaceKey: namespaceKey }],
+      materialized: parsed !== null,
     }
   }
 
@@ -178,13 +202,17 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
     const source = await readStableFile(sourcePath)
     const parsed = parseCodexRecords(source.text, candidate.nativeSessionId, true)
     if (stableJson(source.head) !== stableJson(candidate.sourceHead)
-      || parsed.contentDigest !== candidate.contentDigest
-      || parsed.contentDigest !== candidate.prefixDigest
-      || parsed.portableItemCount !== candidate.portableItemCount
-      || parsed.skipped !== candidate.skippedItemCount) {
+      || (candidate.materialized && (parsed.contentDigest !== candidate.contentDigest
+        || parsed.contentDigest !== candidate.prefixDigest
+        || parsed.portableItemCount !== candidate.portableItemCount
+        || parsed.skipped !== candidate.skippedItemCount))) {
       throw new Error('source_changed_after_scan')
     }
-    return { ...candidate, sourceLocator: { path: sourcePath }, records: parsed.records }
+    return {
+      ...candidate, sourceHead: source.head, contentDigest: parsed.contentDigest, prefixDigest: parsed.contentDigest,
+      portableItemCount: parsed.portableItemCount, skippedItemCount: parsed.skipped, warnings: parsed.warnings,
+      sourceLocator: { path: sourcePath }, records: parsed.records, materialized: true,
+    }
   }
 
   #warn(status: NativeSourceWarning['status'], code: string, message: string): void {
@@ -192,6 +220,21 @@ export class CodexDesktopSourceReader implements NativeSourceReader {
     if (existing) existing.count = (existing.count ?? 1) + 1
     else this.#warnings.push({ sourceClient: this.sourceClient, status, code, message, count: 1 })
   }
+}
+
+function normalizeCodexFilter(options: NativeSourceScanOptions): {
+  origins: Set<Exclude<CodexNativeOrigin, 'subagent'>>, includeSubagents: boolean, includeArchived: boolean,
+} {
+  const origins = options.codex?.origins ?? ['cli', 'ide_app']
+  return { origins: new Set(origins), includeSubagents: options.codex?.includeSubagents === true,
+    includeArchived: options.codex?.includeArchived === true }
+}
+
+function codexOrigin(value: unknown): CodexNativeOrigin {
+  if (value === 'cli') return 'cli'
+  if (value === 'vscode') return 'ide_app'
+  if (value === 'exec') return 'exec'
+  return typeof value === 'string' && value.startsWith('{"subagent"') ? 'subagent' : 'other'
 }
 
 function parseCodexRecords(text: string, sessionId: string, includeRecords: boolean): ParsedCodexRecords {
@@ -233,7 +276,7 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       const textValue = messageText(portableContent)
       if (!textValue?.trim()) { skipped += 1; continue }
       addRecord(records, baseId, role === 'user' ? 'user_message' : 'assistant_message', {
-        text: textValue, nativeSourceClient: 'codex_desktop', nativeRecordType: payloadType, nativeTimestamp: timestamp,
+        text: textValue, nativeSourceClient: 'codex_local', nativeRecordType: payloadType, nativeTimestamp: timestamp,
       }, timestamp)
       continue
     }
@@ -245,7 +288,7 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       const sanitized = sanitizeToolInput(rawInput)
       skipped += sanitized.lossCount
       addRecord(records, `${baseId}:call`, 'tool_call', {
-        callId, name, input: sanitized.value, nativeSourceClient: 'codex_desktop', nativeTimestamp: timestamp,
+        callId, name, input: sanitized.value, nativeSourceClient: 'codex_local', nativeTimestamp: timestamp,
       }, timestamp)
       const change = fileChangeSummary(name, rawInput)
       if (change) addRecord(records, `${baseId}:change`, 'file_change', { ...change, callId }, timestamp)
@@ -257,7 +300,7 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       skipped += sanitized.lossCount
       addRecord(records, `${baseId}:result`, 'tool_result', {
         callId, toolName: toolNames.get(callId) ?? null, output: sanitized.value,
-        nativeSourceClient: 'codex_desktop', nativeTimestamp: timestamp,
+        nativeSourceClient: 'codex_local', nativeTimestamp: timestamp,
       }, timestamp)
       continue
     }

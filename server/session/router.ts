@@ -14,7 +14,7 @@ import { SessionStoreError } from './store.ts'
 import type { ProviderModelDescriptor } from './model-catalog.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 import { NativeImportError } from './native-import/service.ts'
-import type { NativeSourceClient } from './native-import/contracts.ts'
+import type { CodexNativeScanFilter, NativeSourceClient } from './native-import/contracts.ts'
 
 const PROVIDERS = new Set<CanonicalProvider>(['claude', 'codex', 'gemini'])
 const ITEM_KINDS = new Set<CanonicalItemKind>([
@@ -316,16 +316,31 @@ export function createConversationRouter(
         return
       }
       const body = bodyRecord(req.body)
-      requireOnlyKeys(body, ['sources'])
+      requireOnlyKeys(body, ['sources', 'codex'])
       let sources: NativeSourceClient[] | undefined
       if (body.sources !== undefined) {
         if (!Array.isArray(body.sources) || body.sources.length === 0 || body.sources.length > 3 || body.sources.some((source) =>
-          source !== 'codex_desktop' && source !== 'claude_desktop' && source !== 'claude_code')) {
+          source !== 'codex_local' && source !== 'claude_desktop' && source !== 'claude_code')) {
           throw new RequestValidationError('sources contains an unsupported native source')
         }
         sources = body.sources as NativeSourceClient[]
       }
-      const preview = await options.nativeImport.preview({ sources }, principal)
+      let codex: CodexNativeScanFilter | undefined
+      if (body.codex !== undefined) {
+        const value = bodyRecord(body.codex)
+        requireOnlyKeys(value, ['origins', 'includeSubagents', 'includeArchived'])
+        if (value.origins !== undefined && (!Array.isArray(value.origins) || value.origins.length === 0
+          || value.origins.length > 4 || value.origins.some((origin) =>
+            origin !== 'cli' && origin !== 'ide_app' && origin !== 'exec' && origin !== 'other'))) {
+          throw new RequestValidationError('codex.origins contains an unsupported origin')
+        }
+        if ((value.includeSubagents !== undefined && typeof value.includeSubagents !== 'boolean')
+          || (value.includeArchived !== undefined && typeof value.includeArchived !== 'boolean')) {
+          throw new RequestValidationError('codex filter flags must be boolean')
+        }
+        codex = value as CodexNativeScanFilter
+      }
+      const preview = await options.nativeImport.preview({ sources, codex }, principal)
       res.json({
         token: preview.token,
         expiresAt: preview.expiresAt,
@@ -341,11 +356,14 @@ export function createConversationRouter(
           projectAlias: safeDisplayAlias(candidate.projectAlias),
           createdAt: candidate.createdAt,
           updatedAt: candidate.updatedAt,
+          nativeOrigin: candidate.nativeOrigin ?? null,
+          nativeArchived: candidate.nativeArchived ?? false,
           portableItemCount: candidate.portableItemCount,
           skippedItemCount: candidate.skippedItemCount,
           messageCount: candidate.portableItemCount + candidate.skippedItemCount,
           status: candidate.status,
           warningCount: candidate.warnings.length,
+          analysisPending: !candidate.materialized,
         })),
       })
     }),

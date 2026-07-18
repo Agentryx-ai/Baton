@@ -328,17 +328,18 @@ test('native import routes require loopback same-origin CSRF and expose only saf
       return {
         token: 'signed-preview', expiresAt: now,
         candidates: [{
-          candidateId: 'opaque-candidate', sourceClient: 'codex_desktop', provider: 'codex',
+          candidateId: 'opaque-candidate', sourceClient: 'codex_local', provider: 'codex',
           namespaceKey: 'secret-namespace', nativeSessionId: 'secret-native-id',
           sourceAlias: 'C:\\private\\Imported task', aliasSource: 'path_fallback', titleSource: null,
           projectAlias: 'C:\\private\\repo', projectGroupKey: 'opaque-project', cwd: 'C:\\private\\repo', createdAt: now, updatedAt: now,
           sourceHead: { size: 1, mtimeMs: 2, finalRecordDigest: 'secret-head' }, contentDigest: 'secret-content',
           skippedItemCount: 1, parserVersion: 'secret-parser', warnings: ['C:\\private\\broken.jsonl'],
           identityKeys: [{ kind: 'native_session_id', value: 'secret-native-id' }], portableItemCount: 2, status: 'new',
+          materialized: false,
         }],
-        warnings: ['codex_desktop: C:\\private\\state.sqlite'],
-        summary: { total: 1, new: 1, updateAvailable: 0, duplicate: 0, unavailable: 0, unsupported: 0,
-          portableItems: 2, skippedItems: 1 },
+        warnings: ['codex_local: C:\\private\\state.sqlite'],
+        summary: { total: 1, new: 1, existing: 0, updateAvailable: 0, duplicate: 0, unavailable: 0, unsupported: 0,
+          portableItems: 2, skippedItems: 1, analysisPending: true },
       }
     },
     async commit(_request: unknown, principal: string) {
@@ -379,10 +380,12 @@ test('native import routes require loopback same-origin CSRF and expose only saf
     const encoded = JSON.stringify(preview)
     assert.doesNotMatch(encoded, /secret-native-id|secret-namespace|private|state\.sqlite|secret-head|secret-content|secret-parser|opaque-project/)
     assert.deepEqual((preview.candidates as Record<string, unknown>[])[0], {
-      id: 'opaque-candidate', sourceClient: 'codex_desktop', provider: 'codex', sourceAlias: 'Imported task',
+      id: 'opaque-candidate', sourceClient: 'codex_local', provider: 'codex', sourceAlias: 'Imported task',
       aliasSource: 'path_fallback', titleSource: null, projectAlias: 'repo',
       createdAt: now, updatedAt: now,
+      nativeOrigin: null, nativeArchived: false,
       portableItemCount: 2, skippedItemCount: 1, messageCount: 3, status: 'new', warningCount: 1,
+      analysisPending: true,
     })
 
     const committed = await fetch(`${baseUrl}/native-import/commit`, {

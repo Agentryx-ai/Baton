@@ -36,6 +36,7 @@ import type {
   NativeImportCommitState,
   NativeImportReceipt,
   NativeImportStoredState,
+  NativeSourceClient,
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
@@ -114,7 +115,19 @@ function integer(row: SqlRow, key: string): number {
 }
 
 function sourceClientRank(sourceClient: string): number {
-  return sourceClient === 'claude_desktop' || sourceClient === 'codex_desktop' ? 2 : 1
+  return sourceClient === 'claude_desktop' || sourceClient === 'codex_local' || sourceClient === 'codex_desktop' ? 2 : 1
+}
+
+// v3-v5 databases encode the former public Codex name in CHECK constraints. Keep that storage
+// value stable while exposing the accurate codex_local contract at every API boundary.
+function databaseSourceClient(sourceClient: NativeSourceClient): string {
+  return sourceClient === 'codex_local' ? 'codex_desktop' : sourceClient
+}
+
+function publicSourceClient(sourceClient: string): NativeSourceClient {
+  if (sourceClient === 'codex_desktop') return 'codex_local'
+  if (sourceClient === 'claude_desktop' || sourceClient === 'claude_code') return sourceClient
+  throw new Error('Corrupt database: source_client is unsupported')
 }
 
 function aliasSourceRank(aliasSource: string): number {
@@ -788,7 +801,7 @@ export class SqliteSessionStore implements SessionStore {
     let row = this.#optional(this.#db.prepare(`
       SELECT * FROM native_session_sources
       WHERE source_client=? AND namespace_key=? AND native_session_id=?
-    `), identity.sourceClient, identity.namespaceKey, identity.nativeSessionId)
+    `), databaseSourceClient(identity.sourceClient), identity.namespaceKey, identity.nativeSessionId)
     if (!row) {
       for (const key of identity.identityKeys ?? [{ kind: 'native_session_id' as const, value: identity.nativeSessionId }]) {
         row = this.#optional(this.#db.prepare(`
@@ -911,7 +924,7 @@ export class SqliteSessionStore implements SessionStore {
         current_content_digest,current_prefix_digest,current_last_record_ordinal,current_last_record_digest,imported_item_sequence,
         first_imported_at,last_imported_at
       ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    `).run(sourceId, sessionId, candidate.sourceClient, candidate.provider, candidate.namespaceKey,
+    `).run(sourceId, sessionId, databaseSourceClient(candidate.sourceClient), candidate.provider, candidate.namespaceKey,
       candidate.nativeSessionId, candidate.sourceAlias, candidate.aliasSource, candidate.titleSource ?? null,
       candidate.projectAlias, candidate.cwd,
       candidate.contentDigest, last?.prefixDigest ?? candidate.contentDigest, candidate.records.length,
@@ -1004,11 +1017,12 @@ export class SqliteSessionStore implements SessionStore {
     this.#insertNativeIdentityKeys(sourceId, candidate)
     this.#insertNativeProvenance(sourceId, candidate, now)
     const currentClient = text(existing, 'source_client')
+    const candidateClient = databaseSourceClient(candidate.sourceClient)
     const promoteClient = sourceClientRank(candidate.sourceClient) > sourceClientRank(currentClient)
     const promoteAlias = aliasSourceRank(candidate.aliasSource) > aliasSourceRank(text(existing, 'alias_source'))
       || (aliasSourceRank(candidate.aliasSource) === aliasSourceRank(text(existing, 'alias_source'))
         && candidate.sourceAlias !== nullableText(existing, 'source_alias'))
-    const samePrimary = candidate.sourceClient === currentClient && candidate.namespaceKey === text(existing, 'namespace_key')
+    const samePrimary = candidateClient === currentClient && candidate.namespaceKey === text(existing, 'namespace_key')
       && candidate.nativeSessionId === text(existing, 'native_session_id')
     const refreshTitleSource = samePrimary && candidate.sourceAlias === nullableText(existing, 'source_alias')
       && aliasSourceRank(candidate.aliasSource) === aliasSourceRank(text(existing, 'alias_source'))
@@ -1016,7 +1030,7 @@ export class SqliteSessionStore implements SessionStore {
     const refreshLocation = samePrimary && (candidate.cwd !== nullableText(existing, 'cwd')
       || candidate.projectAlias !== nullableText(existing, 'project_alias'))
     if (!promoteClient && !promoteAlias && !refreshLocation && !refreshTitleSource) return
-    const sourceClient = promoteClient ? candidate.sourceClient : currentClient
+    const sourceClient = promoteClient ? candidateClient : currentClient
     const namespaceKey = promoteClient ? candidate.namespaceKey : text(existing, 'namespace_key')
     const nativeSessionId = promoteClient ? candidate.nativeSessionId : text(existing, 'native_session_id')
     const alias = promoteClient || promoteAlias ? candidate.sourceAlias : nullableText(existing, 'source_alias')
@@ -1041,7 +1055,7 @@ export class SqliteSessionStore implements SessionStore {
       INSERT OR IGNORE INTO native_session_source_provenance(
         source_id,source_client,namespace_key,native_session_id_hmac,source_alias,alias_source,project_alias,discovered_at
       ) VALUES (?,?,?,?,?,?,?,?)
-    `).run(sourceId, candidate.sourceClient, candidate.namespaceKey, this.#nativeHmac(candidate.nativeSessionId),
+    `).run(sourceId, databaseSourceClient(candidate.sourceClient), candidate.namespaceKey, this.#nativeHmac(candidate.nativeSessionId),
       candidate.sourceAlias, candidate.aliasSource, candidate.projectAlias, now)
   }
 
@@ -1202,7 +1216,7 @@ export class SqliteSessionStore implements SessionStore {
       archivedAt: nullableText(row, 'archived_at'),
       source: sourceProvider ? {
         provider: sourceProvider as CanonicalProvider,
-        sourceClient: text(row, 'source_client') as NonNullable<CanonicalSession['source']>['sourceClient'],
+        sourceClient: publicSourceClient(text(row, 'source_client')),
         sourceAlias: nullableText(row, 'source_alias'),
         titleSource: nullableText(row, 'source_title_source'),
         projectAlias: nullableText(row, 'source_project_alias'),

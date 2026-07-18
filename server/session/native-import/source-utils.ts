@@ -1,5 +1,5 @@
 import { createHash, createHmac } from 'node:crypto'
-import { readFile, realpath, stat } from 'node:fs/promises'
+import { open, readFile, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 
 import type { NativePortableRecord, NativeSourceHead } from './contracts.ts'
@@ -104,6 +104,30 @@ export async function readStableFile(filePath: string): Promise<{ text: string, 
     text: content.toString('utf8'),
     head: { size: after.size, mtimeMs: after.mtimeMs, finalRecordDigest: sha256(content.subarray(Math.max(0, content.length - 4096))) },
   }
+}
+
+/**
+ * Inventories a transcript without loading it. The bounded tail digest detects replacement while
+ * keeping preview work independent of lifetime transcript size.
+ */
+export async function inspectStableFile(filePath: string): Promise<NativeSourceHead> {
+  const before = await stat(filePath)
+  if (!before.isFile()) throw new Error('native_source_not_file')
+  if (before.size > MAX_NATIVE_FILE_BYTES) throw new Error('native_source_file_size_limit')
+  const length = Math.min(4096, before.size)
+  const tail = Buffer.alloc(length)
+  const handle = await open(filePath, 'r')
+  try {
+    if (length > 0) {
+      const { bytesRead } = await handle.read(tail, 0, length, before.size - length)
+      if (bytesRead !== length) throw new Error('source_changed_during_scan')
+    }
+  } finally {
+    await handle.close()
+  }
+  const after = await stat(filePath)
+  if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw new Error('source_changed_during_scan')
+  return { size: after.size, mtimeMs: after.mtimeMs, finalRecordDigest: sha256(tail) }
 }
 
 export function finalizeRecords(records: Omit<NativePortableRecord, 'prefixDigest'>[]): NativePortableRecord[] {

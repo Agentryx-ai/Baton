@@ -35,7 +35,7 @@ function session(
 function candidate(id: string, overrides: Partial<NativeImportCandidateDto> = {}): NativeImportCandidateDto {
   return {
     id,
-    sourceClient: 'codex_desktop',
+    sourceClient: 'codex_local',
     provider: 'codex',
     status: 'new',
     sourceAlias: `Task ${id}`,
@@ -47,6 +47,7 @@ function candidate(id: string, overrides: Partial<NativeImportCandidateDto> = {}
     portableItemCount: 1,
     skippedItemCount: 0,
     warningCount: 0,
+    analysisPending: false,
     ...overrides,
   }
 }
@@ -74,7 +75,7 @@ test('provider grouping keeps sessions without source provenance visible', () =>
     session('codex', '2026-07-18T00:00:00.000Z', {
       source: {
         provider: 'codex',
-        sourceClient: 'codex_desktop',
+        sourceClient: 'codex_local',
         sourceAlias: null,
         titleSource: null,
         projectAlias: null,
@@ -189,7 +190,7 @@ test('native import API bootstraps CSRF and refreshes it once after a rejected t
   }) as typeof fetch
 
   try {
-    await conversationApi.previewNativeImport(['codex_desktop'])
+    await conversationApi.previewNativeImport(['codex_local'])
   } finally {
     globalThis.fetch = originalFetch
   }

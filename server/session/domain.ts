@@ -53,7 +53,7 @@ export interface CanonicalSession {
   archivedAt: string | null
   source?: {
     provider: CanonicalProvider
-    sourceClient: 'codex_desktop' | 'claude_desktop' | 'claude_code'
+    sourceClient: 'codex_local' | 'claude_desktop' | 'claude_code'
     sourceAlias: string | null
     titleSource: string | null
     projectAlias: string | null

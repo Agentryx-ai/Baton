@@ -1,26 +1,24 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 import type {
+  CodexNativeScanFilter,
   NativeImportCommitRequest, NativeImportPreview, NativeImportPreviewCandidate, NativeImportPreviewRequest,
   NativeImportCommitState, NativeImportReceipt, NativeImportStore, NativeSessionCandidate, NativeSourceReader,
-  NativeSourceWarning,
+  NativeSourceClient, NativeSourceWarning,
 } from './contracts.ts'
 import { sha256, stableJson } from './source-utils.ts'
 
 interface TokenPayload {
-  version: 1
+  version: 2
   nonce: string
   principalKey: string
   expiresAt: string
   sources: string[]
+  codex: Required<CodexNativeScanFilter>
   candidates: Array<{
     id: string
     sourceClient: string
     parserVersion: string
-    portableItemCount: number
-    prefixDigest: string
-    contentDigest: string
-    skippedItemCount: number
     headDigest: string
     stateDigest: string
   }>
@@ -58,12 +56,13 @@ export class NativeSessionImportService {
     if (typeof principalKey !== 'string' || principalKey.length === 0 || principalKey.length > 256) {
       throw new NativeImportError('invalid_request', 'principal is invalid')
     }
-    const sources = [...new Set(request.sources ?? ['codex_desktop', 'claude_desktop', 'claude_code'])]
-    if (sources.length === 0 || sources.some((source) => source !== 'codex_desktop'
+    const sources = [...new Set(request.sources ?? ['codex_local', 'claude_desktop', 'claude_code'])]
+    if (sources.length === 0 || sources.some((source) => source !== 'codex_local'
       && source !== 'claude_desktop' && source !== 'claude_code')) {
       throw new NativeImportError('invalid_request', 'sources contains an unsupported native source')
     }
-    const scan = await this.#scan(sources, false)
+    const codex = normalizeCodexFilter(request.codex)
+    const scan = await this.#scan(sources, { includeRecords: false, codex })
     if (scan.inventoryOverflow) {
       const detail = scan.overflowCount == null ? '' : ` (${scan.overflowCount.toLocaleString('en-US')} reported)`
       throw new NativeImportError('invalid_request',
@@ -78,19 +77,16 @@ export class NativeSessionImportService {
     const candidates = preferred.map((candidate) => this.#previewCandidate(candidate))
     const expiresAt = new Date(this.#now().getTime() + this.#ttlMs).toISOString()
     const payload: TokenPayload = {
-      version: 1,
+      version: 2,
       nonce: randomBytes(18).toString('base64url'),
       principalKey,
       expiresAt,
       sources,
+      codex,
       candidates: candidates.map((candidate) => ({
         id: candidate.candidateId,
         sourceClient: candidate.sourceClient,
         parserVersion: candidate.parserVersion,
-        portableItemCount: candidate.portableItemCount,
-        prefixDigest: candidate.prefixDigest,
-        contentDigest: candidate.contentDigest,
-        skippedItemCount: candidate.skippedItemCount,
         headDigest: headDigest(candidate.sourceHead),
         stateDigest: stateDigest(this.#store.getNativeImportState(candidate)),
       })),
@@ -136,7 +132,7 @@ export class NativeSessionImportService {
         throw new NativeImportError('invalid_request', 'durable commit progress does not match this request')
       }
       const selectedSources = [...new Set(selected.map((id) => (allowed.get(id) as TokenPayload['candidates'][number]).sourceClient))]
-      const scan = await this.#scan(selectedSources, false)
+      const scan = await this.#scan(selectedSources, { includeRecords: false, codex: token.codex })
       const rescanned = preferDesktopIdentity(scan.candidates)
       const byId = new Map(rescanned.map((candidate) => [candidate.candidateId, candidate]))
       for (let index = results.length; index < selected.length; index += 1) {
@@ -161,9 +157,10 @@ export class NativeSessionImportService {
         try {
           const materialized = await reader.materialize(candidate)
           if (!matchesTokenCandidate(materialized, expected)
-            || materialized.portableItemCount !== candidate.portableItemCount
+            || !materialized.materialized
             || materialized.records.length !== materialized.portableItemCount
-            || (materialized.records.at(-1)?.prefixDigest ?? sha256('')) !== expected.prefixDigest) {
+            || materialized.contentDigest !== materialized.prefixDigest
+            || (materialized.records.at(-1)?.prefixDigest ?? sha256('')) !== materialized.prefixDigest) {
             const result = { candidateId: id, status: 'stale' as const, error: 'source changed during materialization' }
             this.#store.recordNativeImportCommitResult(checkpoint, result)
             results.push(result)
@@ -198,12 +195,14 @@ export class NativeSessionImportService {
 
   #previewCandidate(candidate: NativeSessionCandidate): NativeImportPreviewCandidate {
     const state = this.#store.getNativeImportState(candidate)
-    const status = !state ? 'new' : state.contentDigest === candidate.contentDigest ? 'duplicate' : 'update_available'
+    const status = !state ? 'new' : candidate.materialized
+      ? state.contentDigest === candidate.contentDigest ? 'duplicate' : 'update_available'
+      : 'existing'
     const { records: _records, sourceLocator: _sourceLocator, ...metadata } = candidate
     return { ...metadata, status }
   }
 
-  async #scan(sources: string[], includeRecords: boolean): Promise<{
+  async #scan(sources: string[], options: Parameters<NativeSourceReader['scan']>[0]): Promise<{
     candidates: NativeSessionCandidate[]
     warnings: NativeSourceWarning[]
     readersByCandidateId: Map<string, NativeSourceReader>
@@ -214,7 +213,7 @@ export class NativeSessionImportService {
       (reader.sourceClients ?? [reader.sourceClient]).some((source) => sources.includes(source)))
     const settled = await Promise.all(readers.map(async (reader) => {
       try {
-        const candidates = await reader.scan({ includeRecords })
+        const candidates = await reader.scan({ ...options, sources: sources as NativeSourceClient[] })
         const overflowCount = Number.isSafeInteger(reader.overflowCount) && (reader.overflowCount as number) >= 0
           ? reader.overflowCount as number : null
         return { candidates, warnings: [...(reader.lastScanWarnings ?? [])], reader,
@@ -263,26 +262,20 @@ export class NativeSessionImportService {
 }
 
 function validTokenPayload(payload: TokenPayload): boolean {
-  return payload?.version === 1 && typeof payload.nonce === 'string' && payload.nonce.length >= 16
+  return payload?.version === 2 && typeof payload.nonce === 'string' && payload.nonce.length >= 16
     && typeof payload.principalKey === 'string' && typeof payload.expiresAt === 'string'
     && Array.isArray(payload.sources) && payload.sources.every((source) => typeof source === 'string')
     && Array.isArray(payload.candidates) && payload.candidates.every((candidate) => candidate !== null
       && typeof candidate === 'object' && typeof candidate.id === 'string' && typeof candidate.parserVersion === 'string'
-      && Number.isSafeInteger(candidate.portableItemCount) && candidate.portableItemCount >= 0
-      && typeof candidate.prefixDigest === 'string' && typeof candidate.contentDigest === 'string'
-      && Number.isSafeInteger(candidate.skippedItemCount) && candidate.skippedItemCount >= 0
-      && (candidate.sourceClient === 'codex_desktop' || candidate.sourceClient === 'claude_desktop'
+      && (candidate.sourceClient === 'codex_local' || candidate.sourceClient === 'claude_desktop'
         || candidate.sourceClient === 'claude_code')
       && typeof candidate.headDigest === 'string' && typeof candidate.stateDigest === 'string')
+    && validCodexFilter(payload.codex)
 }
 
 function matchesTokenCandidate(candidate: NativeSessionCandidate, expected: TokenPayload['candidates'][number]): boolean {
   return candidate.candidateId === expected.id && candidate.sourceClient === expected.sourceClient
     && candidate.parserVersion === expected.parserVersion
-    && candidate.portableItemCount === expected.portableItemCount
-    && candidate.prefixDigest === expected.prefixDigest
-    && candidate.contentDigest === expected.contentDigest
-    && candidate.skippedItemCount === expected.skippedItemCount
     && headDigest(candidate.sourceHead) === expected.headDigest
 }
 
@@ -300,11 +293,12 @@ function safeEqual(left: string, right: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
-export interface PreviewSummary { total: number, new: number, updateAvailable: number, duplicate: number, unavailable: number, unsupported: number, portableItems: number, skippedItems: number }
+export interface PreviewSummary { total: number, new: number, existing: number, updateAvailable: number, duplicate: number, unavailable: number, unsupported: number, portableItems: number, skippedItems: number, analysisPending: boolean }
 function previewSummary(candidates: NativeImportPreviewCandidate[], warnings: NativeSourceWarning[] = []): PreviewSummary {
   return {
     total: candidates.length,
     new: candidates.filter((item) => item.status === 'new').length,
+    existing: candidates.filter((item) => item.status === 'existing').length,
     updateAvailable: candidates.filter((item) => item.status === 'update_available').length,
     duplicate: candidates.filter((item) => item.status === 'duplicate').length,
     unavailable: warnings.filter((warning) => warning.status === 'unavailable')
@@ -313,7 +307,30 @@ function previewSummary(candidates: NativeImportPreviewCandidate[], warnings: Na
       .reduce((sum, warning) => sum + (warning.count ?? 1), 0),
     portableItems: candidates.reduce((sum, item) => sum + item.portableItemCount, 0),
     skippedItems: candidates.reduce((sum, item) => sum + item.skippedItemCount, 0),
+    analysisPending: candidates.some((item) => !item.materialized),
   }
+}
+
+const CODEX_ORIGINS = ['cli', 'ide_app', 'exec', 'other'] as const
+const CODEX_ORIGIN_SET = new Set<string>(CODEX_ORIGINS)
+function normalizeCodexFilter(filter: CodexNativeScanFilter | undefined): Required<CodexNativeScanFilter> {
+  const origins: Required<CodexNativeScanFilter>['origins'] = [...new Set<Required<CodexNativeScanFilter>['origins'][number]>(
+    filter?.origins ?? ['cli', 'ide_app'],
+  )]
+  if (origins.length === 0 || origins.some((origin) => !CODEX_ORIGIN_SET.has(origin))) {
+    throw new NativeImportError('invalid_request', 'codex.origins contains an unsupported origin')
+  }
+  if ((filter?.includeSubagents !== undefined && typeof filter.includeSubagents !== 'boolean')
+    || (filter?.includeArchived !== undefined && typeof filter.includeArchived !== 'boolean')) {
+    throw new NativeImportError('invalid_request', 'codex filter flags must be boolean')
+  }
+  return { origins, includeSubagents: filter?.includeSubagents === true, includeArchived: filter?.includeArchived === true }
+}
+
+function validCodexFilter(filter: Required<CodexNativeScanFilter>): boolean {
+  return filter !== null && typeof filter === 'object' && Array.isArray(filter.origins) && filter.origins.length > 0
+    && filter.origins.every((origin) => CODEX_ORIGIN_SET.has(origin))
+    && typeof filter.includeSubagents === 'boolean' && typeof filter.includeArchived === 'boolean'
 }
 export interface CommitSummary { total: number, imported: number, updated: number, duplicate: number, stale: number, failed: number }
 function commitSummary(results: NativeImportReceipt['results']): CommitSummary {

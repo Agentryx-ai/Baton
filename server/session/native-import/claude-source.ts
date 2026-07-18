@@ -7,7 +7,7 @@ import type {
   NativeSourceScanOptions, NativeSourceWarning,
 } from './contracts.ts'
 import {
-  candidateId, canonicalRoot, containedRealPath, cwdAlias, mapWithConcurrency,
+  candidateId, canonicalRoot, containedRealPath, cwdAlias, inspectStableFile, mapWithConcurrency,
   MAX_NATIVE_CANDIDATES, nativePhysicalLines, NativeRecordAccumulator, PARSER_VERSION,
   pseudonymousNamespace, readStableFile, safeAlias, sanitizeToolInput, sanitizeToolResult,
   sha256, stableJson,
@@ -74,7 +74,7 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
     this.#projectsRoot = path.resolve(options.projectsRoot ?? path.join(homedir(), '.claude', 'projects'))
     this.#namespaceSecret = options.namespaceSecret
     this.#profileProvenance = options.profileProvenance ?? ''
-    this.#concurrency = options.concurrency ?? 1
+    this.#concurrency = options.concurrency ?? 16
   }
 
   get lastScanWarnings(): readonly NativeSourceWarning[] { return this.#warnings }
@@ -83,6 +83,9 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
 
   async scan(options: NativeSourceScanOptions = {}): Promise<NativeSessionCandidate[]> {
     const includeRecords = options.includeRecords ?? true
+    const scanConcurrency = includeRecords ? 1 : this.#concurrency
+    const wantDesktop = options.sources?.includes('claude_desktop') ?? true
+    const wantCode = options.sources?.includes('claude_code') ?? true
     this.#warnings = []
     this.#inventoryOverflow = false
     this.#overflowCount = undefined
@@ -95,8 +98,8 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
       )
     } catch (error) {
       const code = errorCode(error, 'claude_transcript_store_unavailable')
-      this.#warn('unavailable', code, 'Claude transcript store is unavailable or its installation identity is not configured', 1, 'claude_code')
-      this.#warn('unavailable', code, 'Claude transcript store is unavailable or its installation identity is not configured', 1, 'claude_desktop')
+      if (wantCode) this.#warn('unavailable', code, 'Claude transcript store is unavailable or its installation identity is not configured', 1, 'claude_code')
+      if (wantDesktop) this.#warn('unavailable', code, 'Claude transcript store is unavailable or its installation identity is not configured', 1, 'claude_desktop')
       return []
     }
 
@@ -126,8 +129,10 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
     }
 
     let desktopRoot: string | null = null
-    try { desktopRoot = await canonicalRoot(this.#desktopRoot) }
-    catch { this.#warn('unavailable', 'claude_desktop_store_unavailable', 'Claude Desktop session metadata is unavailable; CLI transcripts remain importable') }
+    if (wantDesktop) {
+      try { desktopRoot = await canonicalRoot(this.#desktopRoot) }
+      catch { this.#warn('unavailable', 'claude_desktop_store_unavailable', 'Claude Desktop session metadata is unavailable; CLI transcripts remain importable') }
+    }
     let metadataWalk: WalkResult = { files: [], truncated: false, blockedLinks: 0 }
     if (desktopRoot) {
       try { metadataWalk = await walk(desktopRoot, '.json', MAX_NATIVE_CANDIDATES + 1) }
@@ -143,7 +148,7 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
     this.#recordWalkWarnings('claude_desktop', metadataWalk, 'claude_desktop')
 
     const claimed = new Set<string>()
-    const desktopCandidates = await mapWithConcurrency(metadataWalk.files, this.#concurrency, async (metadataPath) => {
+    const desktopCandidates = wantDesktop ? await mapWithConcurrency(metadataWalk.files, scanConcurrency, async (metadataPath) => {
       let metadata: ClaudeDesktopMetadata
       try {
         const parsed = JSON.parse(await readFile(metadataPath, 'utf8')) as unknown
@@ -183,10 +188,10 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
         this.#warn(warningStatus(error), errorCode(error, 'claude_desktop_candidate_corrupt'), 'A Claude Desktop task was skipped because its source was corrupt, unsupported, or escaped its configured store')
         return null
       }
-    })
+    }) : []
 
     const unclaimed = [...transcripts].filter(([cliSessionId]) => !claimed.has(cliSessionId))
-    const cliCandidates = await mapWithConcurrency(unclaimed, this.#concurrency, async ([cliSessionId, transcriptPath]) => {
+    const cliCandidates = wantCode ? await mapWithConcurrency(unclaimed, scanConcurrency, async ([cliSessionId, transcriptPath]) => {
       try {
         return await this.#candidate(
           'claude_code', cliSessionId, cliSessionId, transcriptPath, {}, projectsRoot,
@@ -196,7 +201,7 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
         this.#warn(warningStatus(error), errorCode(error, 'claude_cli_candidate_corrupt'), 'A Claude CLI task was skipped because its transcript was corrupt, unsupported, or escaped its configured store', 1, 'claude_code')
         return null
       }
-    })
+    }) : []
     const candidates = [...desktopCandidates, ...cliCandidates]
       .filter((candidate): candidate is NativeSessionCandidate => candidate !== null)
     if (candidates.length > MAX_NATIVE_CANDIDATES) {
@@ -221,14 +226,15 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
     includeRecords: boolean,
   ): Promise<NativeSessionCandidate> {
     const canonicalTranscript = await containedRealPath(projectsRoot, transcriptPath)
-    const source = await readStableFile(canonicalTranscript)
-    const parsed = parseClaudeRecords(source.text, cliSessionId, sourceClient, includeRecords)
-    const cwd = string(metadata.cwd) ?? parsed.cwd
+    const source = includeRecords ? await readStableFile(canonicalTranscript) : null
+    const sourceHead = source?.head ?? await inspectStableFile(canonicalTranscript)
+    const parsed = source ? parseClaudeRecords(source.text, cliSessionId, sourceClient, true) : null
+    const cwd = string(metadata.cwd) ?? parsed?.cwd ?? null
     const metadataTitle = string(metadata.title)
     const fallback = cwdAlias(cwd, 'Claude task')
     const title = metadataTitle
       ? { value: metadataTitle, source: `metadata:${provenanceToken(metadata.titleSource)}` }
-      : parsed.title
+      : parsed?.title ?? null
     const alias = title ? safeAlias(title.value, fallback) : fallback
     const nativeAlias = title !== null && alias !== fallback
     return {
@@ -245,21 +251,22 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
         ? pseudonymousNamespace(this.#namespaceSecret as Buffer, 'native-project', cwd)
         : null,
       cwd,
-      createdAt: string(metadata.createdAt) ?? parsed.createdAt,
-      updatedAt: string(metadata.lastActivityAt) ?? parsed.updatedAt,
-      sourceHead: source.head,
-      contentDigest: parsed.contentDigest,
-      prefixDigest: parsed.contentDigest,
-      portableItemCount: parsed.portableItemCount,
+      createdAt: string(metadata.createdAt) ?? parsed?.createdAt ?? null,
+      updatedAt: string(metadata.lastActivityAt) ?? parsed?.updatedAt ?? new Date(sourceHead.mtimeMs).toISOString(),
+      sourceHead,
+      contentDigest: parsed?.contentDigest ?? sha256(''),
+      prefixDigest: parsed?.contentDigest ?? sha256(''),
+      portableItemCount: parsed?.portableItemCount ?? 0,
       sourceLocator: { path: canonicalTranscript },
-      records: parsed.records,
-      skippedItemCount: parsed.skipped,
+      records: parsed?.records ?? [],
+      skippedItemCount: parsed?.skipped ?? 0,
       parserVersion: PARSER_VERSION,
-      warnings: parsed.warnings,
+      warnings: parsed?.warnings ?? [],
       identityKeys: [
         { kind: 'native_session_id', value: nativeSessionId, scopeNamespaceKey: namespaceKey },
         { kind: 'cli_session_id', value: cliSessionId, scopeNamespaceKey: transcriptNamespace },
       ],
+      materialized: parsed !== null,
     }
   }
 
@@ -284,13 +291,38 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
     const source = await readStableFile(sourcePath)
     const parsed = parseClaudeRecords(source.text, cliIdentity.value, candidate.sourceClient, true)
     if (stableJson(source.head) !== stableJson(candidate.sourceHead)
-      || parsed.contentDigest !== candidate.contentDigest
-      || parsed.contentDigest !== candidate.prefixDigest
-      || parsed.portableItemCount !== candidate.portableItemCount
-      || parsed.skipped !== candidate.skippedItemCount) {
+      || (candidate.materialized && (parsed.contentDigest !== candidate.contentDigest
+        || parsed.contentDigest !== candidate.prefixDigest
+        || parsed.portableItemCount !== candidate.portableItemCount
+        || parsed.skipped !== candidate.skippedItemCount))) {
       throw new Error('source_changed_after_scan')
     }
-    return { ...candidate, sourceLocator: { path: sourcePath }, records: parsed.records }
+    const cwd = candidate.cwd ?? parsed.cwd
+    const fallback = cwdAlias(cwd, 'Claude task')
+    const parsedAlias = parsed.title ? safeAlias(parsed.title.value, fallback) : fallback
+    const preserveAlias = candidate.aliasSource === 'native'
+    return {
+      ...candidate,
+      sourceAlias: preserveAlias ? candidate.sourceAlias : parsedAlias,
+      aliasSource: preserveAlias ? candidate.aliasSource : parsed.title ? 'native' : cwd ? 'path_fallback' : 'generated',
+      titleSource: preserveAlias ? candidate.titleSource : parsed.title?.source ?? null,
+      projectAlias: cwd ? cwdAlias(cwd, 'Claude') : null,
+      projectGroupKey: cwd
+        ? pseudonymousNamespace(this.#namespaceSecret as Buffer, 'native-project', cwd)
+        : null,
+      cwd,
+      createdAt: candidate.createdAt ?? parsed.createdAt,
+      updatedAt: candidate.updatedAt ?? parsed.updatedAt,
+      sourceHead: source.head,
+      contentDigest: parsed.contentDigest,
+      prefixDigest: parsed.contentDigest,
+      portableItemCount: parsed.portableItemCount,
+      skippedItemCount: parsed.skipped,
+      warnings: parsed.warnings,
+      sourceLocator: { path: sourcePath },
+      records: parsed.records,
+      materialized: true,
+    }
   }
 
   #recordWalkWarnings(prefix: string, result: WalkResult, sourceClient: NativeSourceClient): void {
