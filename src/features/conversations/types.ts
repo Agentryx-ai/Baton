@@ -270,6 +270,30 @@ export interface StartTurnDto {
   }>
 }
 
+export interface CreateGoalDto {
+  expected: { kind: 'none' } | { kind: 'goal'; goalId: string; revision: number }
+  objective: string
+  provider: CanonicalProvider
+  model: string
+  effort?: string | null
+  tokenBudget?: number | null
+  maxAutomaticTurns?: number
+  maxActiveSeconds?: number
+  replaceExisting?: boolean
+}
+
+export interface EditGoalDto {
+  expectedRevision: number
+  objective?: string
+  provider?: CanonicalProvider
+  model?: string
+  effort?: string | null
+  tokenBudget?: number | null
+  maxAutomaticTurns?: number
+  maxActiveSeconds?: number
+  resetLimitCounters?: boolean
+}
+
 export interface ProviderModelDescriptorDto {
   id: string
   displayName: string

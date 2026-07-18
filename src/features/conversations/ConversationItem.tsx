@@ -45,11 +45,15 @@ export function ConversationItem({
   const requestedModel = typeof item.payload.requestedModel === 'string'
     ? friendlyModel(item.payload.requestedModel)
     : null
-  const actualModel = typeof item.payload.actualModel === 'string'
-    ? friendlyModel(item.payload.actualModel)
-    : null
+  const observedModel = typeof item.payload.reportedModel === 'string'
+    ? friendlyModel(item.payload.reportedModel)
+    : typeof item.payload.resolvedModel === 'string'
+      ? friendlyModel(item.payload.resolvedModel)
+      : typeof item.payload.actualModel === 'string'
+        ? friendlyModel(item.payload.actualModel)
+        : null
   const effort = typeof item.payload.effort === 'string' ? item.payload.effort : null
-  const modelFallback = requestedModel && actualModel && requestedModel !== actualModel
+  const modelFallback = requestedModel && observedModel && requestedModel !== observedModel
   const assistantHeader = item.kind === 'assistant_message'
     ? assistantLabel(item, assistantLabelMode)
     : null
@@ -124,7 +128,7 @@ export function ConversationItem({
         ) : null}
         {requestedModel ? (
           <span className={cn(modelFallback && 'font-medium text-warn')}>
-            {modelFallback ? `${requestedModel} → ${actualModel}` : requestedModel}
+            {modelFallback ? `${requestedModel} → ${observedModel}` : requestedModel}
             {effort ? ` · ${effortLabel(effort)}` : ''}
           </span>
         ) : null}

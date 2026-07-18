@@ -1,8 +1,11 @@
 import type {
   BeginTurnResultDto,
   CanonicalItemDto,
+  CanonicalGoalDto,
   CanonicalSessionDto,
   CreateSessionDto,
+  CreateGoalDto,
+  EditGoalDto,
   StartTurnDto,
   ThreadSnapshotDto,
   ProviderModelDescriptorDto,
@@ -55,7 +58,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return parsed as T
 }
 
-function jsonRequest(method: 'POST', body: unknown, headers: Record<string, string> = {}): RequestInit {
+function jsonRequest(method: 'POST' | 'PATCH', body: unknown, headers: Record<string, string> = {}): RequestInit {
   return {
     method,
     headers: { 'Content-Type': 'application/json', ...headers },
@@ -114,6 +117,26 @@ export const conversationApi = {
 
   getThread: (threadId: string): Promise<ThreadSnapshotDto> =>
     request(`/threads/${encodeURIComponent(threadId)}`),
+
+  getGoal: async (threadId: string): Promise<CanonicalGoalDto | null> => {
+    const result = await request<{ goal: CanonicalGoalDto | null }>(`/threads/${encodeURIComponent(threadId)}/goal`)
+    return result.goal
+  },
+
+  createGoal: (threadId: string, input: CreateGoalDto): Promise<CanonicalGoalDto> =>
+    request(`/threads/${encodeURIComponent(threadId)}/goal`, jsonRequest('POST', input)),
+
+  editGoal: (goalId: string, input: EditGoalDto): Promise<CanonicalGoalDto> =>
+    request(`/goals/${encodeURIComponent(goalId)}`, jsonRequest('PATCH', input)),
+
+  setGoalStatus: (
+    goalId: string,
+    input: { expectedRevision: number; status: 'active' | 'paused'; resetLimitCounters?: boolean },
+  ): Promise<{ status: 'applied' | 'stale'; goal: CanonicalGoalDto | null }> =>
+    request(`/goals/${encodeURIComponent(goalId)}/status`, jsonRequest('POST', input)),
+
+  clearGoal: (goalId: string, expectedRevision: number): Promise<void> =>
+    request(`/goals/${encodeURIComponent(goalId)}?expectedRevision=${expectedRevision}`, { method: 'DELETE' }),
 
   listItems: async (threadId: string, after = 0): Promise<CanonicalItemDto[]> => {
     const result = await request<{ items: CanonicalItemDto[] }>(

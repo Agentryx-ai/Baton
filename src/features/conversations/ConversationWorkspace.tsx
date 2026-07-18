@@ -31,6 +31,8 @@ import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
 import { conversationEntries, latestUsageSummary } from './conversation-presentation'
+import { parseGoalComposerCommand, type GoalComposerCommand } from './goal-command'
+import { GoalControl, type GoalAction } from './GoalControl'
 import { NativeImportDialog } from './NativeImportDialog'
 import { ProviderAccountDisclosure } from './ProviderAccountDisclosure'
 import {
@@ -414,6 +416,10 @@ export function ConversationWorkspace({
   const [creating, setCreating] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [goalBusyAction, setGoalBusyAction] = useState<GoalAction | 'create' | null>(null)
+  const [goalDialog, setGoalDialog] = useState<'create' | 'edit' | 'resume' | 'clear' | null>(null)
+  const [goalDraft, setGoalDraft] = useState('')
+  const [goalPanelVersion, setGoalPanelVersion] = useState(0)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
   const [sessionScope, setSessionScope] = useState<'active' | 'trash'>('active')
@@ -541,9 +547,119 @@ export function ConversationWorkspace({
     }
   }
 
+  const saveGoalObjective = async (objective: string) => {
+    if (!snapshot || !model.trim()) return
+    const current = snapshot.goal ?? null
+    setGoalBusyAction(current ? 'edit' : 'create')
+    try {
+      if (current) {
+        await conversationApi.editGoal(current.id, {
+          expectedRevision: current.revision,
+          objective,
+        })
+      } else {
+        await conversationApi.createGoal(snapshot.thread.id, {
+          expected: { kind: 'none' },
+          objective,
+          provider,
+          model: model.trim(),
+          effort,
+        })
+      }
+      setGoalDialog(null)
+      setGoalDraft('')
+      setPrompt('')
+      setError(null)
+      await Promise.all([refreshThread(), refreshSessions()])
+    } catch (cause) {
+      setError(errorMessage(cause))
+      await refreshThread()
+    } finally {
+      setGoalBusyAction(null)
+    }
+  }
+
+  const applyGoalAction = async (action: GoalAction) => {
+    const current = snapshot?.goal ?? null
+    if (!current) {
+      if (action === 'edit') {
+        setGoalDraft('')
+        setGoalDialog('create')
+      }
+      return
+    }
+    if (action === 'edit') {
+      setGoalDraft(current.objective)
+      setGoalDialog('edit')
+      return
+    }
+    if (action === 'clear') {
+      setGoalDialog('clear')
+      return
+    }
+    if (action === 'resume' && current.status === 'budget_limited') {
+      setGoalDialog('resume')
+      return
+    }
+    setGoalBusyAction(action)
+    try {
+      await conversationApi.setGoalStatus(current.id, {
+        expectedRevision: current.revision,
+        status: action === 'pause' ? 'paused' : 'active',
+      })
+      setError(null)
+      await Promise.all([refreshThread(), refreshSessions()])
+    } catch (cause) {
+      setError(errorMessage(cause))
+      await refreshThread()
+    } finally {
+      setGoalBusyAction(null)
+    }
+  }
+
+  const handleGoalCommand = async (command: GoalComposerCommand) => {
+    const current = snapshot?.goal ?? null
+    if (command.type === 'open') {
+      if (current) setGoalPanelVersion((version) => version + 1)
+      else {
+        setGoalDraft('')
+        setGoalDialog('create')
+      }
+      return
+    }
+    if (command.type === 'set') {
+      await saveGoalObjective(command.objective)
+      return
+    }
+    if (command.type === 'edit') {
+      if (current) {
+        setGoalDraft(current.objective)
+        setGoalDialog('edit')
+      } else {
+        setGoalDraft('')
+        setGoalDialog('create')
+      }
+      return
+    }
+    if (!current) {
+      setError('현재 대화에 설정된 Goal이 없습니다.')
+      return
+    }
+    if (command.type === 'clear') {
+      setGoalDialog('clear')
+      return
+    }
+    await applyGoalAction(command.type)
+  }
+
   const startTurn = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!snapshot || !prompt.trim() || !model.trim()) return
+    const goalCommand = parseGoalComposerCommand(prompt)
+    if (goalCommand) {
+      await handleGoalCommand(goalCommand)
+      return
+    }
     setSubmitting(true)
     try {
       await conversationApi.startTurn(snapshot.thread.id, {
@@ -616,6 +732,8 @@ export function ConversationWorkspace({
 
   const selectSession = (sessionId: string) => {
     setSelectedSessionId(sessionId)
+    setGoalPanelVersion(0)
+    setGoalDialog(null)
     setMobileSidebarOpen(false)
   }
 
@@ -625,6 +743,8 @@ export function ConversationWorkspace({
     setSessions(null)
     setSelectedSessionId(null)
     setSnapshot(null)
+    setGoalPanelVersion(0)
+    setGoalDialog(null)
     lastPositionedThread.current = null
   }
 
@@ -653,6 +773,37 @@ export function ConversationWorkspace({
       setError(errorMessage(cause))
     } finally {
       setChangingSessionId(null)
+    }
+  }
+
+  const confirmGoalDialog = async () => {
+    const current = snapshot?.goal ?? null
+    if (goalDialog === 'create' || goalDialog === 'edit') {
+      const objective = goalDraft.trim()
+      if (objective) await saveGoalObjective(objective)
+      return
+    }
+    if (!current || !goalDialog) return
+    const action: GoalAction = goalDialog === 'clear' ? 'clear' : 'resume'
+    setGoalBusyAction(action)
+    try {
+      if (goalDialog === 'clear') {
+        await conversationApi.clearGoal(current.id, current.revision)
+      } else {
+        await conversationApi.setGoalStatus(current.id, {
+          expectedRevision: current.revision,
+          status: 'active',
+          resetLimitCounters: true,
+        })
+      }
+      setGoalDialog(null)
+      setError(null)
+      await Promise.all([refreshThread(), refreshSessions()])
+    } catch (cause) {
+      setError(errorMessage(cause))
+      await refreshThread()
+    } finally {
+      setGoalBusyAction(null)
     }
   }
 
@@ -730,6 +881,46 @@ export function ConversationWorkspace({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={goalDialog !== null} onOpenChange={(open) => { if (!open && !goalBusyAction) setGoalDialog(null) }}>
+        <DialogContent className="max-w-md">
+          <DialogTitle>
+            {goalDialog === 'create' ? 'Goal 만들기'
+              : goalDialog === 'edit' ? 'Goal 수정'
+                : goalDialog === 'resume' ? 'Goal 다시 시작'
+                  : 'Goal 지우기'}
+          </DialogTitle>
+          <DialogDescription>
+            {goalDialog === 'create' || goalDialog === 'edit'
+              ? 'Baton이 이 목표를 대화의 정본으로 저장하고, 완료되거나 안전 한도에 도달할 때까지 이어서 실행합니다.'
+              : goalDialog === 'resume'
+                ? '자동 실행 횟수와 활성 시간 카운터를 초기화하고 다시 진행합니다.'
+                : 'Goal 상태만 지웁니다. 지금까지의 대화와 작업 기록은 남습니다.'}
+          </DialogDescription>
+          {goalDialog === 'create' || goalDialog === 'edit' ? (
+            <textarea
+              value={goalDraft}
+              onChange={(event) => setGoalDraft(event.target.value)}
+              rows={5}
+              autoFocus
+              aria-label="Goal 내용"
+              className="w-full resize-y rounded-xl border bg-background px-3 py-2 text-sm leading-6 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              placeholder="완료할 목표를 구체적으로 적어 주세요"
+            />
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" disabled={goalBusyAction !== null} onClick={() => setGoalDialog(null)}>취소</Button>
+            <Button
+              type="button"
+              variant={goalDialog === 'clear' ? 'destructive' : 'default'}
+              disabled={goalBusyAction !== null || ((goalDialog === 'create' || goalDialog === 'edit') && !goalDraft.trim())}
+              onClick={() => void confirmGoalDialog()}
+            >
+              {goalBusyAction ? '처리 중…' : goalDialog === 'clear' ? 'Goal 지우기' : goalDialog === 'resume' ? '다시 시작' : '저장하고 시작'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center gap-3 border-b px-3 sm:px-5">
           <Button
@@ -782,6 +973,17 @@ export function ConversationWorkspace({
                 )}
               </div>
             )}
+
+            {snapshot?.goal ? (
+              <GoalControl
+                key={`${snapshot.goal.id}:${goalPanelVersion}`}
+                goal={snapshot.goal}
+                busyAction={goalBusyAction === 'create' ? null : goalBusyAction}
+                defaultExpanded={goalPanelVersion > 0}
+                className="mb-6"
+                onAction={(action) => { void applyGoalAction(action) }}
+              />
+            ) : null}
 
             {loadingThread && !snapshot ? (
               <p className="m-auto text-sm text-muted-foreground">대화를 불러오는 중…</p>
