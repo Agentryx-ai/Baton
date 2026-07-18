@@ -268,8 +268,9 @@ export function SettingsSection({
                 )
                 const isApplied = status?.configuration === 'applied'
                 const isNotApplied = status?.configuration === 'not-applied'
+                const isConflict = status?.configuration === 'conflict'
                 const actionable = Boolean(
-                  status?.certainlyStopped && (isApplied || isNotApplied),
+                  status?.certainlyStopped && (isApplied || isNotApplied || isConflict),
                 )
                 const changingThisTarget = changingIntegrationTarget === option.target
                 return (
@@ -346,6 +347,8 @@ export function SettingsSection({
                           ? status?.certainlyStopped ? '설정 해제' : '종료 후 해제'
                           : isNotApplied
                             ? status?.certainlyStopped ? '설정 적용' : '종료 후 적용'
+                            : isConflict
+                              ? status?.certainlyStopped ? '설정 복구' : '종료 후 복구'
                             : !status ? '확인 중…' : '조치 불가'}
                     </Button>
                   </div>

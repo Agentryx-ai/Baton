@@ -4,6 +4,7 @@ import { parse as parseToml } from 'smol-toml'
 
 import {
   blockedProcessesForTargets,
+  canApplyConfiguration,
   classifyProcessRecords,
   inspectClaudeCliConfig,
   inspectClaudeDesktopConfig,
@@ -15,6 +16,13 @@ import {
   selectClaudeModels,
   unpatchCodexConfig,
 } from './client-integration.ts'
+
+test('configuration conflicts are repairable but applied and unknown states are not', () => {
+  assert.equal(canApplyConfiguration('not-applied'), true)
+  assert.equal(canApplyConfiguration('conflict'), true)
+  assert.equal(canApplyConfiguration('applied'), false)
+  assert.equal(canApplyConfiguration('unknown'), false)
+})
 
 test('patchCodexConfig deterministically replaces only owned settings', () => {
   const source = [

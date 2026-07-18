@@ -251,7 +251,7 @@ export async function applyClientIntegration(
   const needsClaudeModels = targets.includes('claude-desktop')
   const needsCodexEnvironment = targets.includes('codex')
   const proxy = await loadProxyConnection(needsClaudeModels)
-  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'not-applied')
+  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'applyable')
   const models = needsClaudeModels ? selectClaudeModels(proxy.models) : []
   if (needsClaudeModels && models.length === 0) {
     throw new ClientIntegrationError(502, '프록시 모델 목록에서 Claude 모델을 찾지 못했습니다.')
@@ -482,19 +482,28 @@ type ConfigurationInspection = Pick<
   'configuration' | 'configurationDetail'
 >
 
+/** Applying is a deterministic repair for partial/stale Baton-owned fields. */
+export function canApplyConfiguration(
+  state: ClientIntegrationConfigurationState,
+): boolean {
+  return state === 'not-applied' || state === 'conflict'
+}
+
 async function requireConfigurationState(
   targets: ClientIntegrationTarget[],
   baseUrl: string,
   token: string,
-  expected: 'applied' | 'not-applied',
+  expected: 'applied' | 'applyable',
 ): Promise<void> {
   const inspections = await inspectTargetConfigurations(baseUrl, token)
   const invalid = targets
     .map((target) => ({ target, inspection: inspections.get(target)! }))
-    .filter(({ inspection }) => inspection.configuration !== expected)
+    .filter(({ inspection }) => expected === 'applied'
+      ? inspection.configuration !== 'applied'
+      : !canApplyConfiguration(inspection.configuration))
   if (invalid.length === 0) return
 
-  const expectedLabel = expected === 'applied' ? '적용된' : '미적용'
+  const expectedLabel = expected === 'applied' ? '적용된' : '미적용 또는 복구 가능한 충돌'
   const detail = invalid.map(({ target, inspection }) => {
     const label = TARGET_DEFINITIONS.find((item) => item.target === target)?.label ?? target
     return `${label}: ${inspection.configurationDetail ?? inspection.configuration}`
