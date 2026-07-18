@@ -108,6 +108,14 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/** Cardinality rule kept pure so the no-account/single-account cases stay explicit. */
+export function selectTargetAndReserve(ranked: GatewayAccount[]): {
+  target: GatewayAccount | null
+  reserve: GatewayAccount | null
+} {
+  return { target: ranked[0] ?? null, reserve: ranked[1] ?? null }
+}
+
 // ---- persisted shape -------------------------------------------------------
 
 interface PersistedState {
@@ -277,12 +285,15 @@ class PolicyEngine {
 
     const transientFailure = classified.some((c) => c.fetchFailed)
 
-    // Edge: < 2 rankable → release steering (no single-active without a reserve).
-    if (rank.length < 2) {
+    // Edge: no usable account → release steering. A single usable account is
+    // still a valid target: keeping exhausted siblings active only creates
+    // avoidable 429s and is not a real reserve.
+    const selection = selectTargetAndReserve(rank.map((item) => item.account))
+    if (!selection.target) {
       await this.releaseProvider(
         provider,
         accounts,
-        `순위 가능 계정 ${rank.length}개(<2) — 예비 없는 단일 활성 금지, 조향 해제`,
+        '순위 가능 계정 0개 — 조향 해제',
       )
       // Publish whatever the engine still has paused (releaseProvider drops ids it
       // successfully resumed; ids it failed to resume remain engine-paused).
@@ -292,15 +303,15 @@ class PolicyEngine {
       return
     }
 
-    // 4. target = rank[0], reserve = rank[1], everyone else → pause.
-    const target = rank[0].account
-    const reserve = rank[1].account
-    const keep = new Set<string>([target.id, reserve.id])
+    // 4. target = rank[0], optional reserve = rank[1], everyone else → pause.
+    const target = selection.target
+    const reserve = selection.reserve
+    const keep = new Set<string>([target.id, ...(reserve ? [reserve.id] : [])])
     const pausedIds = accounts
       .filter((a) => !keep.has(a.id))
       .map((a) => a.id)
       .sort()
-    const planKey = JSON.stringify({ t: target.id, r: reserve.id, p: pausedIds })
+    const planKey = JSON.stringify({ t: target.id, r: reserve?.id ?? null, p: pausedIds })
 
     // Edge: flap debounce. When any quota fetch failed this tick, only apply a
     // steering CHANGE if the exact same plan held last tick (2 consecutive
@@ -319,7 +330,7 @@ class PolicyEngine {
     // 5. apply idempotently: only call APIs where current ≠ desired.
     const klassOf = new Map(classified.map((c) => [c.account.id, c.klass]))
     await this.applyPlan(provider, accounts, target, reserve, keep, klassOf)
-    this.setProviderState(provider, target.id, reserve.id, [...led])
+    this.setProviderState(provider, target.id, reserve?.id ?? null, [...led])
     this.persist()
   }
 
@@ -327,7 +338,7 @@ class PolicyEngine {
     provider: string,
     accounts: GatewayAccount[],
     target: GatewayAccount,
-    reserve: GatewayAccount,
+    reserve: GatewayAccount | null,
     keep: Set<string>,
     klassOf: Map<string, Klass>,
   ): Promise<void> {
@@ -339,12 +350,13 @@ class PolicyEngine {
     // Log only on change to avoid spamming the ring buffer every tick.
     if (this.lastTarget.get(provider) !== target.id) {
       this.lastTarget.set(provider, target.id)
-      this.pushLog(provider, 'target', `타깃: ${label(target)} — 리셋 임박 우선 소진`, target.id)
+      const reserveNote = reserve ? '' : ' · 예비 없음'
+      this.pushLog(provider, 'target', `타깃: ${label(target)} — 리셋 임박 우선 소진${reserveNote}`, target.id)
     }
 
     // target & reserve must stay active. Resume ONLY if the ENGINE paused it;
     // never override a user's manual pause (§5.3).
-    for (const acc of [target, reserve]) {
+    for (const acc of [target, ...(reserve ? [reserve] : [])]) {
       if (!acc.paused) continue
       if (led.has(acc.id)) {
         await resumeAccount(provider, acc.id)

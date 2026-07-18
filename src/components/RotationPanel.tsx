@@ -52,6 +52,16 @@ function accountLabel(
   return a ? a.nickname || a.email || a.id : id
 }
 
+function targetLabel(
+  state: PolicyState,
+  accounts: Record<string, Account[]> | null | undefined,
+  provider: string,
+  target: string | null,
+): string {
+  if (target) return accountLabel(accounts, provider, target)
+  return state.enabled ? '타깃 없음 · 기본 라우팅' : '엔진 꺼짐 · 기본 라우팅'
+}
+
 function formatTime(ts: number): string {
   const d = new Date(ts)
   if (Number.isNaN(d.getTime())) return ''
@@ -97,11 +107,13 @@ export function RotationPanel({ state, accounts, onToggle }: RotationPanelProps)
                 ) : (
                   state.providers.map((p) => (
                     <span key={p.provider} className="text-foreground tabular-nums">
-                      {providerName(p.provider)} → {accountLabel(accounts, p.provider, p.target)}
-                      {p.reserve && (
+                      {providerName(p.provider)} → {targetLabel(state, accounts, p.provider, p.target)}
+                      {p.target && (
                         <span className="text-muted-foreground">
                           {' '}
-                          (예비: {accountLabel(accounts, p.provider, p.reserve)})
+                          {p.reserve
+                            ? `(예비: ${accountLabel(accounts, p.provider, p.reserve)})`
+                            : '(예비 없음)'}
                         </span>
                       )}
                     </span>
