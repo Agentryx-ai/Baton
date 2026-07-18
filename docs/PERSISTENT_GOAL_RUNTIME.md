@@ -1,7 +1,7 @@
 # Persistent Goal runtime
 
 > Status: **V1 IMPLEMENTED (2026-07-19).** SQLite projection/events, revision CAS, leases,
-> automatic continuation, limits, recovery, Goal tools, REST API, `/goal` commands, and UI controls
+> automatic continuation, limits, recovery, Goal inspection/terminal tools, REST API, `/goal` commands, and UI controls
 > are active. Claude and Codex have deterministic mock/integration coverage; Gemini live execution
 > remains unverified while its proxy authentication is unavailable.
 
@@ -70,16 +70,15 @@ All user mutations require the expected Goal revision.
 
 Every canonical turn captures its initial Goal observation before provider execution as either
 `(goalId, revision)` or the explicit sentinel `no_goal`. Every Goal-owned turn and scheduler lease
-captures `(goalId, revision)`. `create_goal` and
-`update_goal` side effects compare that pair transactionally. A stale call returns the typed
+captures `(goalId, revision)`. `update_goal` compares that pair transactionally at the terminal
+boundary. A stale call returns the typed
 `stale_goal_revision` result and MUST NOT mutate the current Goal. Reading the Goal refreshes the
 revision observed by that tool context.
 
 - Editing an idle active Goal updates the objective and schedules continuation immediately.
-- Editing during a provider round updates the Goal projection immediately. The runtime injects an
-  objective-updated steering item when the adapter supports safe steering; otherwise the new revision
-  applies at the next model-sampling boundary. A completion produced for an older revision cannot
-  complete the newer Goal.
+- Editing during a provider round first flushes accounting, revisions the Goal, interrupts the stale
+  turn, and schedules a fresh continuation for the new active revision. A completion produced for an
+  older revision cannot complete the newer Goal.
 - Pause is committed before interruption so a late terminal event cannot restart work. Cancelling or
   interrupting a Goal-owned turn MUST first compare-and-swap `active -> paused` for the captured
   revision, revoke its scheduler lease, and then interrupt the provider. It MUST NOT auto-resume.
@@ -106,39 +105,40 @@ Invalid transitions return `invalid_goal_transition` without changing revision o
 | active | pause or user cancel | paused | revision +1; active time flushed; reason set |
 | paused/blocked/usage_limited/budget_limited | resume | active | revision +1; start segment now; no-progress zero; reason cleared |
 | active | model complete | complete | captured revision CAS; completion time now |
-| active | model blocked after audit | blocked | captured revision CAS; active time flushed |
+| active | host three-turn no-progress audit | blocked | captured revision CAS; active time flushed |
 | active | host usage limit | usage_limited | captured revision CAS; active time flushed |
 | active | host budget/turn/time limit | budget_limited | captured revision CAS; active time flushed |
 | any existing | clear | none | projection removed; revisioned clear event retained |
 
 Resume from `budget_limited` requires a larger relevant limit or explicit counter reset. Pause of a
-non-active Goal, resume of an active/complete Goal, model completion/block from a stopped Goal, and
+non-active Goal, resume of an active/complete Goal, model completion from a stopped Goal, and
 create while an unfinished Goal exists are invalid.
 
 ## 5. Model tools
 
-The provider-neutral tool set includes:
+The ordinary provider-neutral tool set includes:
 
 - `get_goal`: read current status, budgets, usage, and remaining budget;
-- `create_goal`: create only when the user or higher-level instruction explicitly requested a Goal;
-- `update_goal`: the model may set only `complete` or `blocked`.
+- `update_goal`: stage only `complete`; the host commits that intent only after a normal
+  provider terminal response and final Goal accounting.
 
-The model cannot pause, resume, clear, or mark usage/budget limits. Those are user/host mutations.
+Goal creation is a user/API action (`/goal` or the Goal dialog). The reserved `create_goal` schema is
+not advertised on ordinary turns because Baton currently has no independent, validated host signal
+that a natural-language message explicitly authorized persistent Goal creation.
+
+The model cannot pause, resume, clear, block, or mark usage/budget limits. Those are user/host mutations.
 `complete` is valid only after a requirement-by-requirement evidence audit proves that no requested
-work remains. `blocked` is valid only after the same external blocker has prevented meaningful
-progress for three consecutive Goal turns. Hard work, uncertainty, or partial progress is not a
-blocker.
+work remains. Blocked state is host-owned: three consecutive turns without canonical positive
+progress produce `blocked/no_progress`. Hard work, uncertainty, or partial progress is not a blocker.
 
 Exact schemas and results are:
 
 - `get_goal` input: `{}`. Result: `{ goal: ConversationGoal|null, remainingTokens: integer|null }`.
   It refreshes the calling context's observed `(goalId, revision)`.
-- `create_goal` input: `{ objective: string, tokenBudget?: integer>=1 }`. It succeeds only when no
-  Goal exists or the current Goal is `complete`, and returns `{ goal }`. An unfinished Goal returns
-  `unfinished_goal_exists`; a turn-start or `get_goal` observation of `no_goal`/complete is the CAS
-  precondition, and a changed observation returns `stale_goal_revision`.
-- `update_goal` input: `{ status: "complete"|"blocked" }`. It compares the calling context's last
-  observed `(goalId, revision)` and returns `{ goal, finalTokensUsed }`. Missing Goal returns
+- `update_goal` input is
+  `{ status: "complete", evidence: [{requirement,proof}, ...] }`. Completion requires 1..64 bounded
+  evidence entries, compares the calling context's last observed `(goalId, revision)`, and stages a
+  terminal intent. Missing Goal returns
   `goal_not_found`; stopped Goal returns `invalid_goal_transition`; changed ID/revision returns
   `stale_goal_revision` with the current Goal projection and performs no mutation.
 
@@ -166,10 +166,15 @@ expiresAt }`. Claim is one immediate transaction that requires an active Goal re
 and no unexpired lease. Version 1 heartbeat is every 10 seconds and expiry is 30 seconds. Reclaim of
 an expired lease requires the same checks and no active canonical turn. Starting the turn verifies
 the lease tuple transactionally, stores `goalId` and `goalRevision` on the turn, then releases the
-lease; the active-turn uniqueness constraint prevents another claim. Terminal accounting and model
+lease; readiness time is charged at that boundary, and a lease-side deadline changes the Goal to
+`budget_limited/goal_time_limit` before readiness can wait past the remaining active-time budget.
+Every captured Goal turn also gets a host deadline for its remaining active-time budget; this aborts
+and cancels a silent provider, waits for accepted tools to settle, and terminates as
+`budget_limited/goal_time_limit`. The active-turn uniqueness constraint prevents another claim. Terminal accounting and model
 Goal mutations compare the turn's captured tuple, so stale completion cannot affect a newer Goal.
 
-If recovery finds a mutating tool with unknown outcome, it marks the call and turn `interrupted` and
+If live result persistence fails, or recovery finds a mutating tool with unknown outcome, Baton marks
+the call and turn `interrupted` and
 compare-and-swaps the captured active Goal to `blocked` with
 `reason=unknown_mutation_outcome`. No continuation is scheduled until the user reconciles the side
 effect and explicitly resumes.
@@ -192,10 +197,11 @@ precedence follows the canonical agent runtime; the first committed higher-prece
 wins. A user may resume a limited Goal only after explicitly accepting a reset or larger relevant
 limit, which increments the Goal revision and restarts its audit counters.
 
-The no-progress fingerprint uses canonical evidence available after a turn: repository state digest
-when available, completed tool-result digests, plan/task state, test/verification evidence, and Goal
-revision. Provider prose alone is not progress. Reaching a limit records the exact reason and stops;
-it never marks the Goal complete.
+The no-progress fingerprint uses canonical positive evidence available after a turn: successful
+workspace-mutation results plus canonical file-change, plan, and task items, together with the Goal
+revision. Read-only Goal inspection, failed tool results, changing usage metadata, and provider prose
+are not progress. Reaching a limit records the exact reason and stops; it never marks the Goal
+complete.
 
 Goal limit mapping is deterministic: automatic-turn and active-time exhaustion produce
 `budget_limited` with `goal_turn_limit` or `goal_time_limit`; token exhaustion produces
@@ -212,8 +218,11 @@ lease is running. Accounting is committed before an external Goal mutation and a
 boundary.
 
 Provider usage is flushed whenever a durable usage update is received, and elapsed/tool progress is
-flushed after every tool completion. Replayed duplicate events are idempotent. A crash may
-under-count only the interval after the last durable flush; it must never double-count a replay.
+flushed after every tool completion. Replayed duplicate events are idempotent. If a process dies
+between terminal turn storage and terminal Goal accounting, startup recovery blocks the exact active
+revision as `goal_accounting_interrupted` instead of silently continuing or deadlocking it. Recovery
+also preserves whether the interrupted execution was an automatic turn so the automatic-turn cap
+cannot be bypassed by repeated crash/resume cycles.
 
 Token budget crossing does not pretend the current work succeeded. Baton marks `budget_limited`,
 stops scheduling substantive continuation, and asks the current turn to summarize progress when a

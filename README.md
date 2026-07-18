@@ -88,7 +88,7 @@ ID는 바뀌지 않습니다.
 | 여러 provider/계정 대시보드 | 구현됨 | Claude/Codex 계정, quota, reset, 상태 관리 |
 | Smart rotation | **부분 구현** | quota 기반 target/reserve 활성 풀 조향; 실제 target 우선 라우팅은 미보장 |
 | 클라이언트 프록시 자동 설정 | 구현됨 | Claude/Codex CLI·Desktop별 결정론적 적용/해제, Codex 기존 세션 유지 모드, 종료·lock 검사 |
-| Canonical conversation runtime | **V1 부분 구현** | SQLite 정본, provider-neutral model/tool loop, durable broker, bounded cancel/recovery |
+| Canonical conversation runtime | **V1 부분 구현** | 한 요청 안에서 완료 경계까지 반복하는 provider-neutral model/tool loop, durable broker, bounded cancel/recovery |
 | Persistent Goal runtime | **V1 구현** | `/goal`, CAS/lease, 자동 후속 턴, pause/resume/edit/clear, 24턴·2시간·no-progress 안전 한도 |
 | Codex turn adapter | **V1 구현** | app-server ephemeral thread, Baton tools, web/MCP/plugin/subagent 차단, model provenance |
 | Canonical conversation UI | **Preview 구현** | 2-column 대화, 작업 상태, provider/model/effort, Goal panel, 턴 실행·취소 |
@@ -157,8 +157,11 @@ SPA (React + Vite + Tailwind + shadcn)
 - `/baton/v1` REST API, cursor replay SSE, fork, idempotent retry, cancel, crash recovery
 - provider-neutral agent loop와 Baton tool broker
   - tool call 선기록, read 병렬화, mutation 직렬화, 결과 기록 후 provider 재개
-  - workspace read/list/search/write/replace와 provider-neutral Goal tools
-  - model round/tool/retry/time/output 한도와 late completion보다 cancellation 우선
+  - 검증된 `cwd`가 있는 세션에만 workspace read/list/search/write/replace 제공
+  - 정상 최종 응답까지 같은 canonical turn 안에서 model/tool round를 반복
+  - provider readiness 30초, turn 30분, tool/retry/output 한도로 무한 대기를 차단
+  - tool/retry/time/output 한도와 late completion보다 cancellation 우선; Codex app-server가
+    공개하지 않는 정확한 sampling/retry 합계는 30분 turn timeout과 host tool limit로 보완
 - persistent Goal runtime
   - `/goal`, `/goal edit|pause|resume|clear`, Goal panel과 세션 상태
   - SQLite CAS/event, scheduler lease, 자동 continuation, token/turn/time/no-progress 한도
@@ -254,6 +257,8 @@ npm start              # http://localhost:4400
   의도적으로 비활성화합니다. 대신 provider-neutral Baton workspace/Goal tools를 사용합니다.
 - `run_command`는 현재 Windows sandbox가 작업공간 밖 읽기까지 차단할 수 있다고 검증되지 않아
   기본 도구 목록에서 fail-closed로 제외됩니다. 파일 read/write 도구는 realpath 경계를 별도로 강제합니다.
+- Goal이 없는 일반 요청도 도구 호출이 끝나고 provider가 정상 final을 낼 때까지 한 턴 안에서 계속됩니다.
+  여러 canonical turn에 걸친 장기 목표는 사용자가 명시적으로 `/goal`을 만든 경우에만 자동 계속됩니다.
 - fork는 API와 저장소에서 지원하지만 현재 preview UI에는 fork 조작 화면이 없습니다.
 - 수정하지 않은 native Desktop UI는 외부 session protocol을 보장하지 않으므로 transparent한
   공유를 약속하지 않습니다. 명시적 Baton UI/API 또는 지원되는 bridge가 정본 경로입니다.

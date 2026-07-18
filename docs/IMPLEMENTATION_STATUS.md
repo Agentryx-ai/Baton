@@ -24,17 +24,17 @@
 | Smart rotation | **부분 구현·의미 불일치** | 60초 provider별 틱, ACTIVE/FRESH/BLIND/EXHAUSTED 분류, target/reserve, debounce, 엔진 장부 복원 | target과 reserve가 모두 활성이라 `round-robin`에서는 순환됨. “리셋 임박 우선 소진”을 실제 요청 라우팅에서 보장하지 못함 |
 | Smart rotation 타깃 표시 | **구현 결함** | UI와 로그가 계산상 1순위를 `현재 타깃`으로 표시 | 실제 트래픽 타깃으로 오해되지 않도록 `정책 1순위` 등으로 표시하거나, 프록시가 우선순위를 강제하도록 구현해야 함 |
 | Quota freshness 표시 | 부분 구현 | `lastUpdated` 타입과 `useQuota`의 age 계산은 존재 | 현재 `App`의 quota 경로는 해당 hook을 사용하지 않아 설계의 “n초 전 기준” UI가 노출되지 않음 |
-| 클라이언트 프록시 통합 | **부분 구현·Codex SSOT 결함** | Claude CLI/Desktop와 Codex CLI/Desktop의 적용·해제·충돌·프로세스·lock 검사 테스트 | Codex에 `model_provider=baton`을 설치하면 기존 `openai` task가 provider-filtered Desktop 목록에서 숨겨진다. [`CODEX_NATIVE_PROXY_SSOT_DECISION.md`](CODEX_NATIVE_PROXY_SSOT_DECISION.md)의 `openai_base_url` + loopback bridge 제안을 구현하고 인증 호환성·no-fallback을 live 검증해야 하며 적용/해제 후 대상 클라이언트 완전 재시작이 필요하다. |
+| 클라이언트 프록시 통합 | **구현됨·native live 검증 대기** | Claude CLI/Desktop와 Codex CLI/Desktop의 적용·해제·충돌·프로세스·lock 검사, Codex `native-openai`와 격리 `custom-provider` 모드의 결정론적 round-trip 테스트 | 기존 OpenAI task 가시성을 유지하는 `openai_base_url` loopback bridge는 구현됐다. ChatGPT/API-key 인증별 실제 inference 경유와 proxy failure 시 no-direct-fallback은 live smoke 전 자동 배포하지 않으며, 적용/해제 후 대상 클라이언트 완전 재시작이 필요하다. |
 | Canonical domain과 SQLite | 구현됨 | session/thread/turn/item/execution/binding 스키마, WAL, transaction, idempotency, fork lineage, 재시작 recovery 테스트 | 없음 |
 | Canonical item/content 계약 | 부분 구현 | Preview enum과 자유형 `payload` JSON은 존재 | 설계의 ordered content parts, artifact digest store, command/web/compaction/diagnostic 표현은 아직 없음 |
 | Context builder와 compaction | 부분 구현 | fork lineage와 portable text replay는 구현됨 | model context budget, immutable compaction range, artifact-aware materialization은 미구현 |
-| Canonical REST/SSE | 구현됨 | session/thread/turn/item과 Goal 생성·수정·상태·삭제 API, cursor replay SSE | child execution API는 아직 없음 |
+| Canonical REST/SSE | 구현됨 | session/thread/turn/item과 Goal 생성·수정·상태·삭제, unknown-mutation 명시 reconciliation API, Goal 상태 cursor replay SSE | child execution API는 아직 없음 |
 | Codex adapter | V1 구현 | app-server ephemeral thread, Baton dynamic tools, web/MCP/plugin/subagent 차단, ID·timeout·model provenance 검증 | 공식적으로 끌 수 없는 provider-local `update_plan` metadata tool 예외가 있음 |
 | Canonical UI | 부분 구현 | 2-column 대화, 상태 표시, transcript, provider/model/effort, Goal panel과 `/goal` 명령 | fork와 cwd/project/instruction 선택 UI는 아직 없음 |
 | UI provider 선택 | 구현됨 | 서버 모델 catalog를 provider별로 조회하고 모델이 0개인 provider는 비활성화 | Gemini 인증 복구 후 live catalog 표시 검증 필요 |
 | Provider 전환 | 부분 구현 | Codex·Claude·Gemini adapter가 같은 portable history 계약을 사용; Claude Fable 5 live 검증 완료 | Gemini는 현재 proxy 인증 문제로 모델 0개이며 live 실행 미검증 |
-| Claude adapter | **V1 구현** | `/v1/messages` stateless history, Baton tool loop, effort, round별 reported model/fallback, bounded retry/timeout, Fable 5 live 응답 | streaming과 provider 고유 content part 확장 필요 |
-| Gemini adapter | **V1 구현·live 차단** | `/v1/chat/completions` 호환 history/tool loop, reasoning effort, round provenance, bounded retry/timeout | 현재 인증 버그로 live catalog/turn 검증 불가; 인증 복구 전 UI 비활성화 유지 |
+| Claude adapter | **V1 구현** | `/v1/messages` stateless history, Baton tool loop, effort, round별 reported model/fallback, structured provider-private continuation durability, bounded retry/timeout, Fable 5 live 응답 | streaming은 아직 미구현 |
+| Gemini adapter | **V1 구현·live 차단** | `/v1/chat/completions` 호환 history/tool loop, reasoning effort, round provenance와 structured provider-private continuation durability, bounded retry/timeout | 현재 인증 버그로 live catalog/turn 검증 불가; 인증 복구 전 UI 비활성화 유지 |
 | 일반 tool 실행 | 부분 구현 | provider-neutral broker가 call 선기록, read 병렬·mutation 직렬화, result 후속 기록을 강제하며 read/list/search/write/replace와 Goal tools를 제공 | 이 Windows 환경은 cwd 밖 read 제한에 elevated backend가 필요해 `run_command`를 fail-closed로 미노출. approval/user-input wait도 미구현 |
 | Persistent Goal runtime | V1 구현 | Goal projection/event, CAS, 30초 lease/10초 heartbeat, 24턴·2시간·3회 no-progress, 자동 continuation, pause/resume/edit/clear, `/goal` UI | Gemini live 검증은 인증 복구 전까지 차단 |
 | Provider opaque state | 부분 구현 | binding 스키마와 invalidation은 구현됨 | at-rest encryption이 없어 non-null opaque state 저장을 fail-closed로 거부함 |

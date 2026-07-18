@@ -28,6 +28,10 @@ A final assistant response ends the turn only when the provider has no pending c
 server continuation, approval, or required user input. A long-running Goal may enqueue another
 canonical turn after this boundary; it never changes what a turn means.
 
+Provider readiness is bounded before turn creation (30 seconds by default). Codex also bounds its
+individual app-server `initialize` and `config/read` preflight requests and terminates a stalled
+preflight process; shutdown never waits on an unresolved initialization promise.
+
 ## 2. Ownership boundaries
 
 ### Baton owns
@@ -80,13 +84,14 @@ preserves the assistant response and call order, executes according to side-effe
 returns exactly one result for every call through the original provider IDs. Protocols that require
 one user-side result message receive all results in that one message and in original call order.
 
-A call left without a result after a crash is `interrupted`. If its side effect may have happened,
+A call left without a result after a crash or result-persistence failure is `interrupted`. If its side effect may have happened,
 Baton marks the turn interrupted and blocks any owning Goal with
 `reason=unknown_mutation_outcome`; automatic continuation is forbidden until explicit user
 reconciliation and resume. Read-only or explicitly idempotent calls may be retried only under a new
 call ID and a documented replay policy.
 
-Provider-native tool IDs and structured continuation blocks are stored as provider-private data.
+Provider-native tool IDs and structured continuation blocks are stored as provider-private data when
+the adapter protocol exposes them durably.
 The UI consumes a normalized projection and never reconstructs wire history from the projection.
 Provider assistant blocks that precede a tool call, including hidden/reasoning blocks, are replayed
 without structural edits. A server-requested continuation replays the exact assistant content and
@@ -101,6 +106,7 @@ the same tool schema; it is bounded by the host's model-round limit.
 | server-requested continuation | preserve the response and continue the same turn |
 | output/context truncation | `failed` or explicit limited state; never `completed` |
 | refusal | `failed` with the refusal category |
+| provider hard account/usage limit | `failed/provider_usage_limit`; owning Goal becomes `usage_limited` |
 | user cancellation | `cancelled` |
 | process/runtime loss | `interrupted` |
 | non-retryable provider error | `failed` |
@@ -134,7 +140,7 @@ states a lower limit.
 | `search_text` | read-only | `{query: string 1..4096, path?: string=".", glob?: string, maxResults?: integer 1..500}` | `{matches: [{path,line,column,text}], truncated}` |
 | `write_file` | workspace mutation | `{path: string, content: string, expectedSha256: string|null}` | `{path, sha256, bytes, created}` |
 | `replace_text` | workspace mutation | `{path: string, oldText: string, newText: string, expectedSha256: string, expectedOccurrences?: integer 1..1000}` | `{path, sha256, bytes, replacements}` |
-| `run_command` | workspace command | `{argv: string[1..128], timeoutMs?: integer 1..120000}` | `{exitCode: integer|null, stdout: string, stderr: string, timedOut: boolean, truncated: boolean}` |
+| `run_command` | workspace command (reserved; not advertised by default) | `{argv: string[1..128], timeoutMs?: integer 1..120000}` | `{exitCode: integer|null, stdout: string, stderr: string, timedOut: boolean, truncated: boolean}` |
 
 `read_file` offsets and limits count UTF-8 bytes and never split an invalid sequence. `write_file`
 requires `expectedSha256=null` for creation and rejects an existing target; overwrite requires the
@@ -142,10 +148,11 @@ exact current digest. `replace_text` rejects a digest or occurrence-count mismat
 a same-directory temporary file, flush it, revalidate the expected digest, and replace atomically at
 the filesystem boundary.
 
-`run_command.argv` is passed directly without shell interpolation to a host sandbox runner rooted at
-`cwd`; direct network is disabled. The pre-granted `workspace_agent` capability allows the six tools
-above with approval policy `never`. Any path outside `cwd`, network request, permission expansion, or
-unregistered tool is denied rather than prompted. Other capability profiles may turn a mutation into
+The default `workspace_agent` capability allows only the five file tools above and only when the
+session has an explicit, verified `cwd`. A session without one receives no workspace tools.
+`run_command` remains unadvertised on this Windows host because termination-safe process control and
+workspace-only external reads have not both been verified. Any path outside `cwd`, network request,
+permission expansion, or unregistered tool is denied rather than prompted. Other capability profiles may turn a mutation into
 a durable `waiting_approval` request, but can never broaden the immutable execution snapshot.
 Each argv element is 1..32,768 UTF-8 bytes and the array's total is at most 128 KiB. When timeout
 occurs before a process exit is observed, `timedOut=true` and `exitCode=null`; partial output is still
@@ -166,7 +173,8 @@ per tool, `256 KiB` tool output, `30 minutes` per turn, and `3` transient provid
 - optional turn token/cost budget;
 - user cancellation at every wait boundary.
 
-Limit exhaustion is a typed failure or limited state. It is never converted to a successful final
+Limit exhaustion is a typed failure or limited state. Tool total/repetition limits are latched by the
+host and cannot be converted to a successful final
 assistant message. Default limits are versioned server policy and are copied into each execution's
 immutable policy/budget snapshot.
 
@@ -174,17 +182,18 @@ Precedence is: user cancellation; unknown mutating-tool outcome; approval/user-i
 usage limit; token/cost/wall-clock/tool/model limit; non-retryable provider error; valid completion.
 A higher-precedence result cannot be overwritten by a late lower-precedence event.
 
-Within the limit class Baton evaluates and commits in this fixed order: Goal token budget, Goal
-automatic-turn limit, Goal active-time limit, turn token/cost budget, turn wall clock, model rounds,
-total tool calls, then identical-tool repetition. One transaction evaluates this list and records only
-the first exhausted reason, so simultaneous limits cannot race to different results.
+Within the limit class Baton gives Goal token/time boundaries and the first latched host tool limit
+priority over a provider final response. Exact Codex sampling-round and combined internal retry
+counts are not exposed by the current app-server protocol; the 30-minute host turn timeout and tool
+limits remain authoritative, while exact `maxModelRoundTrips` and combined retry enforcement are a
+documented Codex protocol gap. Claude and Gemini expose their round boundaries to Baton directly.
 
 | Exhausted condition | Turn result | Owning Goal result | Reason code |
 | --- | --- | --- | --- |
 | model round trips | `failed` | `budget_limited` | `model_round_limit` |
 | total/identical tool calls | `failed` | `budget_limited` | `tool_call_limit` / `tool_repetition_limit` |
 | per-tool timeout | failed tool result; turn may recover | unchanged unless turn ultimately fails | `tool_timeout` |
-| turn wall clock | `cancelled` after interrupt | `budget_limited` | `turn_time_limit` |
+| turn wall clock | `failed` or provider `cancelled` with typed error | `budget_limited` | `turn_time_limit` |
 | turn token/cost budget | `cancelled` after safe wrap-up/interrupt | `budget_limited` | `turn_budget_limit` |
 | provider retry budget | `failed` | `blocked` | `provider_retry_exhausted` |
 | hard account usage limit | `failed` | `usage_limited` | `provider_usage_limit` |
@@ -215,6 +224,10 @@ expiry or process restart does not busy-loop or silently approve it.
 - Starting a turn and recording its user input is transactional and idempotent by client request ID.
 - Provider events and tool events are idempotent by durable event/call ID.
 - Restart recovery marks unfinished turns and calls `interrupted` before accepting new work.
+- Restart recovery fail-closes a terminal turn whose Goal accounting transaction did not finish as
+  `blocked/goal_accounting_interrupted`; explicit resume creates a fresh revision.
+- Recovery retains the durable `goalAutomatic` execution flag and charges that turn to the automatic
+  turn counter even when terminal accounting was interrupted.
 - A mutating tool result is recorded before the result is returned to the provider.
 - Cancellation wins over late provider completion.
 - Status and Goal mutations use revisions so stale completions cannot overwrite newer user intent.
