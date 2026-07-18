@@ -174,6 +174,10 @@ Baton이 선택하는 **CLIProxy 업스트림 계정**과 네이티브 클라이
   계정이 유지될 수 있습니다. 클라이언트의 프록시 URL·인증 설정을 적용하거나
   해제한 경우에는 해당 클라이언트를 재시작합니다.
 
+> Claude CLI 프록시 설정은 `ANTHROPIC_AUTH_TOKEN`을 사용하므로 claude.ai 조직
+> connectors가 비활성화된다는 경고는 정상입니다. connectors가 필요하면 해당
+> 클라이언트의 Baton 프록시 설정을 해제하고 재시작하세요.
+
 ## Run
 
 ```bash
