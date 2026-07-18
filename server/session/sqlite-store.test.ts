@@ -70,7 +70,7 @@ function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): B
   }
 }
 
-test('schema v1 migrates existing turns to nullable effort without rewriting them', (t) => {
+test('schema v1 migrates through v5 with effort and native title provenance without rewriting turns', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -93,6 +93,13 @@ test('schema v1 migrates existing turns to nullable effort without rewriting the
   const store = new SqliteSessionStore(path)
   t.after(() => store.close())
   assert.equal(store.getTurn('turn-1')?.effort, null)
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 5)
+  const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
+  const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5])
+  assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
 })
 
 test('create, append, finish, and replay are stable after reopening the database', (t) => {

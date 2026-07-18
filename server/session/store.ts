@@ -17,13 +17,14 @@ import type {
   UpsertProviderBindingInput,
   ProviderBinding,
 } from './domain.ts'
+import type { NativeImportStore } from './native-import/contracts.ts'
 
 export interface ForkThreadInput {
   threadId: ThreadId
   forkItemId: ItemId | null
 }
 
-export interface SessionStore {
+export interface SessionStore extends NativeImportStore {
   createSession(input: CreateSessionInput): CanonicalSession
   listSessions(): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null

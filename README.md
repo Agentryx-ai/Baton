@@ -229,12 +229,14 @@ npm start              # http://localhost:4400
 - `tools/native-session-handoff/` — Codex·Claude 로컬 세션의 일회성 inventory·승계 proposal·승인 기반 CLI context-ingest 패키지
 - `docs/DESIGN.md` — 현재 account control plane 설계와 정책
 - `docs/COMMON_SESSION_DESIGN.md` — canonical conversation runtime 설계
+- `docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md` — native task fork-copy import, 중복 방지와 대화 목록 그룹화 계약
 - `docs/BUILD_DAG.md` — 빌드 구조
 
 ## Known limitations
 
-- Canonical conversation runtime은 Preview입니다. 현재 실행 가능한 provider adapter는 Codex뿐이며,
-  Claude/Gemini 턴, provider 간 전환, native session import는 아직 구현되지 않았습니다.
+- Canonical conversation runtime은 Preview입니다. Claude/Gemini는 stateless adapter이고 provider 고유
+  streaming/tool 확장은 아직 제한됩니다. Native session import는 독립 `fork_copy`만 지원하며 native
+  원본의 authority 승계·동기화·`/goal` 변경은 아직 구현되지 않았습니다.
 - Preview UI가 아직 미지원인 Claude/Gemini를 선택 가능하게 노출합니다. 이는 지원 상태가 아니라
   수정해야 할 false affordance입니다.
 - Smart rotation의 `현재 타깃`은 계산상 1순위일 뿐 실제 요청 우선권을 보장하지 않습니다.
@@ -255,4 +257,5 @@ npm start              # http://localhost:4400
 
 - [Account control plane and rotation](docs/DESIGN.md)
 - [Canonical session and provider-adapter contract](docs/COMMON_SESSION_DESIGN.md)
+- [Native session import and conversation grouping](docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md)
 - [Implementation conformance and known gaps](docs/IMPLEMENTATION_STATUS.md)

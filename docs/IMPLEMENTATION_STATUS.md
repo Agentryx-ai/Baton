@@ -39,7 +39,7 @@
 | Provider opaque state | 부분 구현 | binding 스키마와 invalidation은 구현됨 | at-rest encryption이 없어 non-null opaque state 저장을 fail-closed로 거부함 |
 | Provider binding freshness | 설계 변경 | 구현은 `last_turn_id` 대신 `synced_revision`과 `context_digest`로 exact context compatibility를 판정 | 공통 설계 문서의 binding 필드를 이 결정에 맞춰 갱신 |
 | Baton-managed child execution | 부분 구현·비활성 | execution 기록과 `delegationMode: disabled`, native child capability 검증이 있음 | child API, scheduler/executor, budget/depth/join/cancel 구현 필요 |
-| Native session bridge/import | 부분 구현·실험 도구 | [`../tools/native-session-handoff/`](../tools/native-session-handoff/)에 read-only inventory, `gpt-5.6-sol/high` project-group 분석, 승인 기반 Codex/Claude CLI context-ingest와 fixture/live-analysis self-test가 있음 | one-shot operator package일 뿐 canonical import API·authority epoch store·versioned importer는 미구현. [`NATIVE_SESSION_CONTINUITY_BRIDGE.md`](NATIVE_SESSION_CONTINUITY_BRIDGE.md)의 전체 migration/recovery 경계를 계속 구현해야 함 |
+| Native session bridge/import | **fork-copy import 구현·authority migration 미구현** | Codex Desktop과 Claude Desktop/Code의 local task를 alias·project·provider provenance와 함께 read-only preview하고, 명시 승인 뒤 별도 Baton logical-work fork로 멱등 import함. project grouping, source-scoped dedupe, delta CAS/fork guard, CSRF·realpath 보호, durable receipt와 대규모 metadata-only scan이 구현됨. one-shot package도 유지 | native 원본과 Baton 사이의 SSOT 전환·동기화·`/goal` mutation은 하지 않음. 같은 logical work를 승계하는 authority epoch workflow는 [`NATIVE_SESSION_CONTINUITY_BRIDGE.md`](NATIVE_SESSION_CONTINUITY_BRIDGE.md)의 후속 범위이며 bulk import 계약은 [`NATIVE_SESSION_IMPORT_AND_GROUPING.md`](NATIVE_SESSION_IMPORT_AND_GROUPING.md)에 있음 |
 | Live Codex 검증 | 검증 공백 | 단위·통합 테스트와 `smoke:codex-adapter` handshake는 존재 | 실제 model turn → BFF 재시작 → Baton history 재개 E2E를 추가해야 Phase 1 exit를 완전히 충족 |
 
 ## 현재 구현된 canonical API
@@ -47,6 +47,9 @@
 ```text
 POST   /baton/v1/sessions
 GET    /baton/v1/sessions
+GET    /baton/v1/native-import/csrf
+POST   /baton/v1/native-import/preview
+POST   /baton/v1/native-import/commit
 GET    /baton/v1/sessions/:sessionId
 GET    /baton/v1/threads/:threadId
 POST   /baton/v1/threads/:threadId/fork
@@ -62,7 +65,6 @@ POST   /baton/v1/turns/:turnId/cancel
 POST   /baton/v1/executions/:executionId/children
 GET    /baton/v1/executions/:executionId/children
 POST   /baton/v1/executions/:executionId/cancel
-POST   /baton/v1/sessions/import
 ```
 
 ## 문서 운영 원칙

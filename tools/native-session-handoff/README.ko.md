@@ -61,6 +61,17 @@ Codex에서 Claude로 승계하려면 다음을 사용합니다.
 .\Invoke-NativeSessionHandoff.ps1 -Action Plan -Direction claude-to-codex -SinceDays 0
 ```
 
+특정 프로젝트 하나만 분석하려면 해당 세션들의 `cwd`와 정확히 일치하는 경로를 지정합니다. 이 필터는 inventory 단계에 적용되므로 다른 프로젝트는 모델에 전달되지 않습니다.
+
+```powershell
+.\Invoke-NativeSessionHandoff.ps1 `
+  -Action Plan `
+  -Direction claude-to-codex `
+  -ProjectPath C:\work\demo `
+  -CodexModel gpt-5.6-luna `
+  -CodexEffort low
+```
+
 출력된 `handoff-manifest.json`을 확인한 뒤 적용합니다.
 
 ```powershell

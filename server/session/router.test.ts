@@ -23,6 +23,7 @@ import {
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type { ForkThreadInput } from './store.ts'
+import type { NativeSessionImportService } from './native-import/service.ts'
 
 const now = '2026-07-18T00:00:00.000Z'
 
@@ -316,6 +317,83 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
       error: 'request body is not valid JSON',
     })
   })
+})
+
+test('native import routes require loopback same-origin CSRF and expose only safe display metadata', async () => {
+  const service = new TestConversationService()
+  const principals: string[] = []
+  const nativeImport = {
+    async preview(_request: unknown, principal: string) {
+      principals.push(principal)
+      return {
+        token: 'signed-preview', expiresAt: now,
+        candidates: [{
+          candidateId: 'opaque-candidate', sourceClient: 'codex_desktop', provider: 'codex',
+          namespaceKey: 'secret-namespace', nativeSessionId: 'secret-native-id',
+          sourceAlias: 'C:\\private\\Imported task', aliasSource: 'path_fallback', titleSource: null,
+          projectAlias: 'C:\\private\\repo', projectGroupKey: 'opaque-project', cwd: 'C:\\private\\repo', createdAt: now, updatedAt: now,
+          sourceHead: { size: 1, mtimeMs: 2, finalRecordDigest: 'secret-head' }, contentDigest: 'secret-content',
+          skippedItemCount: 1, parserVersion: 'secret-parser', warnings: ['C:\\private\\broken.jsonl'],
+          identityKeys: [{ kind: 'native_session_id', value: 'secret-native-id' }], portableItemCount: 2, status: 'new',
+        }],
+        warnings: ['codex_desktop: C:\\private\\state.sqlite'],
+        summary: { total: 1, new: 1, updateAvailable: 0, duplicate: 0, unavailable: 0, unsupported: 0,
+          portableItems: 2, skippedItems: 1 },
+      }
+    },
+    async commit(_request: unknown, principal: string) {
+      principals.push(principal)
+      return { results: [{ candidateId: 'opaque-candidate', status: 'imported', sessionId: 'session-safe' }],
+        summary: { total: 1, imported: 1, updated: 0, duplicate: 0, stale: 0, failed: 0 } }
+    },
+  } as unknown as NativeSessionImportService
+
+  await withServer(service, async (baseUrl) => {
+    assert.equal((await fetch(`${baseUrl}/native-import/csrf`)).status, 403)
+    const origin = new URL(baseUrl).origin
+    const sameOrigin = { origin, 'sec-fetch-site': 'same-origin' }
+    const rebound = await fetch(`${baseUrl}/native-import/csrf`, {
+      headers: { host: 'evil.test', origin: 'http://evil.test', 'sec-fetch-site': 'same-origin' },
+    })
+    assert.equal(rebound.status, 403)
+    const csrfResponse = await fetch(`${baseUrl}/native-import/csrf`, { headers: sameOrigin })
+    assert.equal(csrfResponse.status, 200)
+    assert.equal(csrfResponse.headers.get('cache-control'), 'no-store')
+    const csrf = (await json(csrfResponse)).token as string
+
+    const crossSite = await fetch(`${baseUrl}/native-import/preview`, {
+      method: 'POST', headers: { ...sameOrigin, 'sec-fetch-site': 'cross-site', 'x-baton-csrf-token': csrf,
+        'content-type': 'application/json' }, body: '{}',
+    })
+    assert.equal(crossSite.status, 403)
+    const wrongCsrf = await fetch(`${baseUrl}/native-import/preview`, {
+      method: 'POST', headers: { ...sameOrigin, 'x-baton-csrf-token': 'wrong', 'content-type': 'application/json' }, body: '{}',
+    })
+    assert.equal(wrongCsrf.status, 403)
+
+    const previewResponse = await fetch(`${baseUrl}/native-import/preview`, {
+      method: 'POST', headers: { ...sameOrigin, 'x-baton-csrf-token': csrf, 'content-type': 'application/json' }, body: '{}',
+    })
+    assert.equal(previewResponse.status, 200)
+    const preview = await json(previewResponse)
+    const encoded = JSON.stringify(preview)
+    assert.doesNotMatch(encoded, /secret-native-id|secret-namespace|private|state\.sqlite|secret-head|secret-content|secret-parser|opaque-project/)
+    assert.deepEqual((preview.candidates as Record<string, unknown>[])[0], {
+      id: 'opaque-candidate', sourceClient: 'codex_desktop', provider: 'codex', sourceAlias: 'Imported task',
+      aliasSource: 'path_fallback', titleSource: null, projectAlias: 'repo',
+      createdAt: now, updatedAt: now,
+      portableItemCount: 2, skippedItemCount: 1, messageCount: 3, status: 'new', warningCount: 1,
+    })
+
+    const committed = await fetch(`${baseUrl}/native-import/commit`, {
+      method: 'POST', headers: { ...sameOrigin, 'x-baton-csrf-token': csrf, 'content-type': 'application/json' },
+      body: JSON.stringify({ token: 'signed-preview', candidateIds: ['opaque-candidate'] }),
+    })
+    assert.equal(committed.status, 200)
+    assert.equal(principals.length, 2)
+    assert.equal(principals[0], principals[1])
+    assert.match(principals[0] ?? '', /^[a-f0-9]{64}$/)
+  }, { nativeImport })
 })
 
 test('fork, turn, item cursor, and cancellation routes pass validated contracts', async () => {

@@ -217,19 +217,28 @@ function New-HandoffInventory {
     param(
         [string]$CodexHome = (Get-DefaultCodexHome),
         [string]$ClaudeHome = (Get-DefaultClaudeHome),
-        [int]$SinceDays = 0
+        [int]$SinceDays = 0,
+        [string]$ProjectPath
     )
 
     $resolvedCodexHome = [IO.Path]::GetFullPath($CodexHome)
     $resolvedClaudeHome = [IO.Path]::GetFullPath($ClaudeHome)
+    $normalizedProjectPath = ConvertTo-NormalizedWorkPath $ProjectPath
+    $codexSessions = @(Get-CodexSessionInventory -CodexHome $resolvedCodexHome -SinceDays $SinceDays)
+    $claudeSessions = @(Get-ClaudeSessionInventory -ClaudeHome $resolvedClaudeHome -SinceDays $SinceDays)
+    if ($normalizedProjectPath) {
+        $codexSessions = @($codexSessions | Where-Object normalized_cwd -eq $normalizedProjectPath)
+        $claudeSessions = @($claudeSessions | Where-Object normalized_cwd -eq $normalizedProjectPath)
+    }
     return [pscustomobject][ordered]@{
         version = 1
         created_at = [DateTime]::UtcNow.ToString('o')
         codex_home = $resolvedCodexHome
         claude_home = $resolvedClaudeHome
+        project_path_filter = if ($normalizedProjectPath) { $normalizedProjectPath } else { $null }
         read_only = $true
-        codex_sessions = @(Get-CodexSessionInventory -CodexHome $resolvedCodexHome -SinceDays $SinceDays)
-        claude_sessions = @(Get-ClaudeSessionInventory -ClaudeHome $resolvedClaudeHome -SinceDays $SinceDays)
+        codex_sessions = $codexSessions
+        claude_sessions = $claudeSessions
     }
 }
 

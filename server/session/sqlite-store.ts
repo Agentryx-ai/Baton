@@ -1,3 +1,4 @@
+import { createHmac, randomBytes } from 'node:crypto'
 import { DatabaseSync, type StatementSync } from 'node:sqlite'
 
 import type {
@@ -28,8 +29,17 @@ import type {
 import { uuidV7 } from './domain.ts'
 import type { ForkThreadInput, SessionStore } from './store.ts'
 import { SessionStoreError } from './store.ts'
+import type {
+  CommitNativeImportInput,
+  NativeImportCommitCheckpoint,
+  NativeImportCommitResult,
+  NativeImportCommitState,
+  NativeImportReceipt,
+  NativeImportStoredState,
+  NativeSourceIdentity,
+} from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 5
 const ACTIVE_TURN_STATUSES = new Set(['queued', 'running', 'waiting_tool'])
 const TERMINAL_TURN_STATUSES = new Set(['completed', 'cancelled', 'failed', 'interrupted'])
 
@@ -103,10 +113,25 @@ function integer(row: SqlRow, key: string): number {
   return value
 }
 
+function sourceClientRank(sourceClient: string): number {
+  return sourceClient === 'claude_desktop' || sourceClient === 'codex_desktop' ? 2 : 1
+}
+
+function aliasSourceRank(aliasSource: string): number {
+  switch (aliasSource) {
+    case 'native': return 4
+    case 'first_user': return 3
+    case 'path_fallback': return 2
+    case 'generated': return 1
+    default: return 0
+  }
+}
+
 export class SqliteSessionStore implements SessionStore {
   readonly #db: DatabaseSync
   readonly #now: () => string
   readonly #idFactory: () => string
+  #nativeIdentityKey!: Buffer
 
   constructor(path: string, options: SqliteSessionStoreOptions = {}) {
     this.#now = options.now ?? (() => new Date().toISOString())
@@ -125,6 +150,7 @@ export class SqliteSessionStore implements SessionStore {
       PRAGMA busy_timeout = 5000;
     `)
     this.#migrate()
+    this.#nativeIdentityKey = this.#loadNativeIdentityKey()
   }
 
   #migrate(): void {
@@ -294,6 +320,126 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 2')
         appliedVersion = 2
       }
+      if (appliedVersion < 3) {
+        this.#db.exec(`
+          CREATE TABLE native_import_meta (
+            key TEXT PRIMARY KEY,
+            value BLOB NOT NULL
+          ) STRICT;
+          CREATE TABLE native_session_sources (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            source_client TEXT NOT NULL CHECK(source_client IN ('codex_desktop','claude_desktop','claude_code')),
+            provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+            namespace_key TEXT NOT NULL,
+            native_session_id TEXT NOT NULL,
+            source_alias TEXT,
+            alias_source TEXT NOT NULL,
+            project_alias TEXT,
+            cwd TEXT,
+            current_content_digest TEXT NOT NULL,
+            current_prefix_digest TEXT NOT NULL,
+            current_last_record_ordinal INTEGER NOT NULL CHECK(current_last_record_ordinal >= 0),
+            current_last_record_digest TEXT NOT NULL,
+            imported_item_sequence INTEGER NOT NULL CHECK(imported_item_sequence >= 0),
+            first_imported_at TEXT NOT NULL,
+            last_imported_at TEXT NOT NULL,
+            UNIQUE(source_client, namespace_key, native_session_id)
+          ) STRICT;
+          CREATE INDEX native_session_sources_session ON native_session_sources(session_id);
+          CREATE TABLE native_session_identity_keys (
+            source_id TEXT NOT NULL REFERENCES native_session_sources(id) ON DELETE RESTRICT,
+            provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+            namespace_key TEXT NOT NULL,
+            identity_kind TEXT NOT NULL CHECK(identity_kind IN ('native_session_id','cli_session_id')),
+            identity_value_hmac TEXT NOT NULL,
+            PRIMARY KEY(provider, namespace_key, identity_kind, identity_value_hmac),
+            UNIQUE(source_id, identity_kind)
+          ) WITHOUT ROWID, STRICT;
+          CREATE TABLE native_session_revisions (
+            id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL REFERENCES native_session_sources(id) ON DELETE RESTRICT,
+            content_digest TEXT NOT NULL,
+            prefix_digest TEXT NOT NULL,
+            source_head_json TEXT NOT NULL CHECK(json_valid(source_head_json)),
+            parser_version TEXT NOT NULL,
+            portable_item_count INTEGER NOT NULL CHECK(portable_item_count >= 0),
+            skipped_item_count INTEGER NOT NULL CHECK(skipped_item_count >= 0),
+            last_record_ordinal INTEGER NOT NULL CHECK(last_record_ordinal >= 0),
+            last_record_digest TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            UNIQUE(source_id, content_digest)
+          ) STRICT;
+          CREATE TABLE native_imported_records (
+            source_id TEXT NOT NULL REFERENCES native_session_sources(id) ON DELETE RESTRICT,
+            native_record_key_hmac TEXT NOT NULL,
+            item_id TEXT REFERENCES items(id) ON DELETE RESTRICT,
+            source_revision_id TEXT NOT NULL REFERENCES native_session_revisions(id) ON DELETE RESTRICT,
+            source_ordinal INTEGER NOT NULL CHECK(source_ordinal >= 1),
+            normalized_record_digest TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            PRIMARY KEY(source_id, native_record_key_hmac)
+          ) WITHOUT ROWID, STRICT;
+          CREATE TABLE native_import_commits (
+            token_nonce_hmac TEXT PRIMARY KEY,
+            principal_key TEXT NOT NULL,
+            request_digest TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('applying','completed','failed')),
+            receipt_json TEXT CHECK(receipt_json IS NULL OR json_valid(receipt_json)),
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+          ) STRICT;
+        `)
+        this.#db.prepare('INSERT INTO native_import_meta(key,value) VALUES (?,?)').run('identity_hmac_key', randomBytes(32))
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(3, 'native-session-import', this.#now())
+        this.#db.exec('PRAGMA user_version = 3')
+        appliedVersion = 3
+      }
+      if (appliedVersion < 4) {
+        this.#db.exec(`
+          ALTER TABLE native_session_identity_keys RENAME TO native_session_identity_keys_v3;
+          CREATE TABLE native_session_identity_keys (
+            source_id TEXT NOT NULL REFERENCES native_session_sources(id) ON DELETE RESTRICT,
+            provider TEXT NOT NULL CHECK(provider IN ('codex','claude')),
+            namespace_key TEXT NOT NULL,
+            identity_kind TEXT NOT NULL CHECK(identity_kind IN ('native_session_id','cli_session_id')),
+            identity_value_hmac TEXT NOT NULL,
+            PRIMARY KEY(provider, namespace_key, identity_kind, identity_value_hmac)
+          ) WITHOUT ROWID, STRICT;
+          INSERT INTO native_session_identity_keys
+            SELECT source_id,provider,namespace_key,identity_kind,identity_value_hmac
+            FROM native_session_identity_keys_v3;
+          DROP TABLE native_session_identity_keys_v3;
+          CREATE INDEX native_session_identity_keys_source ON native_session_identity_keys(source_id);
+          CREATE TABLE native_session_source_provenance (
+            source_id TEXT NOT NULL REFERENCES native_session_sources(id) ON DELETE RESTRICT,
+            source_client TEXT NOT NULL CHECK(source_client IN ('codex_desktop','claude_desktop','claude_code')),
+            namespace_key TEXT NOT NULL,
+            native_session_id_hmac TEXT NOT NULL,
+            source_alias TEXT NOT NULL,
+            alias_source TEXT NOT NULL,
+            project_alias TEXT,
+            discovered_at TEXT NOT NULL,
+            PRIMARY KEY(source_id,source_client,namespace_key,native_session_id_hmac,source_alias)
+          ) WITHOUT ROWID, STRICT;
+        `)
+        this.#db.prepare('INSERT OR IGNORE INTO native_import_meta(key,value) VALUES (?,?)')
+          .run('token_signing_key', randomBytes(32))
+        this.#db.prepare('INSERT OR IGNORE INTO native_import_meta(key,value) VALUES (?,?)')
+          .run('namespace_hmac_key', randomBytes(32))
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(4, 'native-import-recovery-and-provenance', this.#now())
+        this.#db.exec('PRAGMA user_version = 4')
+        appliedVersion = 4
+      }
+      if (appliedVersion < 5) {
+        this.#db.exec('ALTER TABLE native_session_sources ADD COLUMN title_source TEXT')
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(5, 'native-session-title-provenance', this.#now())
+        this.#db.exec('PRAGMA user_version = 5')
+        appliedVersion = 5
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
@@ -346,11 +492,11 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   listSessions(): CanonicalSession[] {
-    return this.#all(this.#db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC, id')).map((row) => this.#session(row))
+    return this.#all(this.#db.prepare(`${sessionSelect()} ORDER BY s.updated_at DESC, s.id`)).map((row) => this.#session(row))
   }
 
   getSession(sessionId: SessionId): CanonicalSession | null {
-    const row = this.#optional(this.#db.prepare('SELECT * FROM sessions WHERE id = ?'), sessionId)
+    const row = this.#optional(this.#db.prepare(`${sessionSelect()} WHERE s.id = ?`), sessionId)
     return row ? this.#session(row) : null
   }
 
@@ -638,6 +784,299 @@ export class SqliteSessionStore implements SessionStore {
     })
   }
 
+  getNativeImportState(identity: NativeSourceIdentity): NativeImportStoredState | null {
+    let row = this.#optional(this.#db.prepare(`
+      SELECT * FROM native_session_sources
+      WHERE source_client=? AND namespace_key=? AND native_session_id=?
+    `), identity.sourceClient, identity.namespaceKey, identity.nativeSessionId)
+    if (!row) {
+      for (const key of identity.identityKeys ?? [{ kind: 'native_session_id' as const, value: identity.nativeSessionId }]) {
+        row = this.#optional(this.#db.prepare(`
+          SELECT s.* FROM native_session_sources s
+          JOIN native_session_identity_keys k ON k.source_id=s.id
+          WHERE k.provider=? AND k.namespace_key=? AND k.identity_kind=? AND k.identity_value_hmac=?
+        `), identity.provider, key.scopeNamespaceKey ?? identity.namespaceKey, key.kind, this.#nativeHmac(key.value))
+        if (row) break
+      }
+    }
+    return row ? this.#nativeImportState(row) : null
+  }
+
+  getNativeImportSigningKey(): Buffer {
+    return this.#loadNativeMetaKey('token_signing_key')
+  }
+
+  getNativeImportNamespaceKey(): Buffer {
+    return this.#loadNativeMetaKey('namespace_hmac_key')
+  }
+
+  beginNativeImportCommit(tokenNonceHmac: string, principalKey: string, requestDigest: string, allowCreate = true): NativeImportCommitState {
+    const existing = this.#optional(this.#db.prepare(
+      'SELECT principal_key,request_digest,status,receipt_json FROM native_import_commits WHERE token_nonce_hmac=?',
+    ), tokenNonceHmac)
+    if (existing) {
+      if (text(existing, 'principal_key') !== principalKey || text(existing, 'request_digest') !== requestDigest) {
+        throw new Error('native import token nonce was reused with a different request')
+      }
+      const status = text(existing, 'status')
+      if (status !== 'applying' && status !== 'completed') throw new Error(`native import commit is ${status}`)
+      return { status, receipt: parseObject(existing.receipt_json) as unknown as NativeImportReceipt }
+    }
+    if (!allowCreate) throw new Error('native import token has no durable commit')
+    this.#db.prepare(`
+      INSERT INTO native_import_commits(token_nonce_hmac,principal_key,request_digest,status,receipt_json,created_at)
+      VALUES (?,?,?,'applying',?,?)
+    `).run(tokenNonceHmac, principalKey, requestDigest, canonicalJson({ results: [] }), this.#now())
+    return { status: 'applying', receipt: { results: [] } }
+  }
+
+  recordNativeImportCommitResult(checkpoint: NativeImportCommitCheckpoint, result: NativeImportCommitResult): void {
+    this.#transaction('IMMEDIATE', () => this.#recordNativeImportCommitResult(checkpoint, result))
+  }
+
+  finishNativeImportCommit(tokenNonceHmac: string, receipt: NativeImportReceipt): void {
+    const existing = this.#one(this.#db.prepare(
+      "SELECT receipt_json FROM native_import_commits WHERE token_nonce_hmac=? AND status='applying'",
+    ), tokenNonceHmac)
+    if (canonicalJson(parseObject(existing.receipt_json)) !== canonicalJson(receipt)) {
+      throw new Error('native import commit receipt does not match durable progress')
+    }
+    const result = this.#db.prepare(`
+      UPDATE native_import_commits SET status='completed',receipt_json=?,completed_at=?
+      WHERE token_nonce_hmac=? AND status='applying'
+    `).run(canonicalJson(receipt), this.#now(), tokenNonceHmac)
+    if (result.changes !== 1) throw new Error('native import commit receipt could not be finalized')
+  }
+
+  #recordNativeImportCommitResult(checkpoint: NativeImportCommitCheckpoint, result: NativeImportCommitResult): void {
+    const row = this.#one(this.#db.prepare(`
+      SELECT principal_key,request_digest,status,receipt_json FROM native_import_commits WHERE token_nonce_hmac=?
+    `), checkpoint.tokenNonceHmac)
+    if (text(row, 'principal_key') !== checkpoint.principalKey || text(row, 'request_digest') !== checkpoint.requestDigest
+      || text(row, 'status') !== 'applying') throw new Error('native import commit checkpoint is not applying')
+    const receipt = parseObject(row.receipt_json) as unknown as NativeImportReceipt
+    if (!Array.isArray(receipt.results) || receipt.results.length !== checkpoint.candidateOrdinal) {
+      throw new Error('native import commit checkpoint is out of order')
+    }
+    receipt.results.push(result)
+    const updated = this.#db.prepare(`
+      UPDATE native_import_commits SET receipt_json=? WHERE token_nonce_hmac=? AND status='applying' AND receipt_json=?
+    `).run(canonicalJson(receipt), checkpoint.tokenNonceHmac, text(row, 'receipt_json'))
+    if (updated.changes !== 1) throw new Error('native import commit checkpoint compare-and-swap failed')
+  }
+
+  commitNativeImport(input: CommitNativeImportInput): NativeImportCommitResult {
+    return this.#transaction('IMMEDIATE', () => {
+      const candidate = input.candidate
+      const existing = this.#nativeSourceRow(candidate)
+      if (existing && text(existing, 'current_content_digest') === candidate.contentDigest) {
+        this.#promoteNativeSource(existing, candidate)
+        const result = { candidateId: candidate.candidateId, status: 'duplicate' as const,
+          sessionId: text(existing, 'session_id'), importedItemCount: 0 }
+        if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
+        return result
+      }
+      if (existing) {
+        const result = this.#appendNativeImport(existing, input)
+        if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
+        return result
+      }
+      if (input.previewedState) throw new Error('native source identity disappeared after preview')
+      const result = this.#createNativeImport(input)
+      if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
+      return result
+    })
+  }
+
+  #createNativeImport(input: CommitNativeImportInput): NativeImportCommitResult {
+    const candidate = input.candidate
+    const sessionId = this.#idFactory()
+    const threadId = this.#idFactory()
+    const sourceId = this.#idFactory()
+    const revisionId = this.#idFactory()
+    const now = this.#now()
+    this.#db.prepare(`
+      INSERT INTO sessions(id,title,preview,active_thread_id,project_key,cwd,schema_version,next_item_sequence,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,1,?,?)
+    `).run(sessionId, candidate.sourceAlias, null, threadId, candidate.projectGroupKey, candidate.cwd, SCHEMA_VERSION, now, now)
+    this.#db.prepare(`
+      INSERT INTO threads(id,session_id,parent_thread_id,fork_turn_id,fork_item_id,revision,status,instruction_snapshot_json,created_at,updated_at)
+      VALUES (?,?,NULL,NULL,NULL,0,'idle',?,?,?)
+    `).run(threadId, sessionId, canonicalJson({ importMode: 'fork_copy' }), now, now)
+    const imported = this.#appendItems(sessionId, threadId, null, candidate.provider, candidate.records.map((record) => record.item), null, now)
+    const last = candidate.records.at(-1)
+    this.#db.prepare(`
+      INSERT INTO native_session_sources(
+        id,session_id,source_client,provider,namespace_key,native_session_id,source_alias,alias_source,title_source,project_alias,cwd,
+        current_content_digest,current_prefix_digest,current_last_record_ordinal,current_last_record_digest,imported_item_sequence,
+        first_imported_at,last_imported_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(sourceId, sessionId, candidate.sourceClient, candidate.provider, candidate.namespaceKey,
+      candidate.nativeSessionId, candidate.sourceAlias, candidate.aliasSource, candidate.titleSource ?? null,
+      candidate.projectAlias, candidate.cwd,
+      candidate.contentDigest, last?.prefixDigest ?? candidate.contentDigest, candidate.records.length,
+      last?.digest ?? candidate.contentDigest, imported.length, now, now)
+    this.#insertNativeIdentityKeys(sourceId, candidate)
+    this.#insertNativeProvenance(sourceId, candidate, now)
+    this.#insertNativeRevision(revisionId, sourceId, candidate, now)
+    this.#insertNativeRecords(sourceId, revisionId, candidate.records, imported, now)
+    this.#appendStreamEvent(sessionId, threadId, null, 'session_created', { sessionId, threadId, imported: true }, now)
+    if (imported.length) this.#appendStreamEvent(sessionId, threadId, null, 'items_appended', { itemIds: imported.map((item) => item.id) }, now)
+    return { candidateId: candidate.candidateId, status: 'imported', sessionId, importedItemCount: imported.length }
+  }
+
+  #appendNativeImport(existing: SqlRow, input: CommitNativeImportInput): NativeImportCommitResult {
+    const candidate = input.candidate
+    const current = this.#nativeImportState(existing)
+    if (!input.previewedState || input.previewedState.sourceId !== current.sourceId
+      || input.previewedState.contentDigest !== current.contentDigest) throw new Error('native import state changed after preview')
+    const boundary = candidate.records[current.lastRecordOrdinal - 1]
+    if (current.lastRecordOrdinal > candidate.records.length || (current.lastRecordOrdinal > 0 && (!boundary
+      || boundary.prefixDigest !== current.prefixDigest || boundary.digest !== current.lastRecordDigest))) {
+      throw new Error('source_rewritten: only append-only native deltas can be imported')
+    }
+    const sessionRow = this.#one(this.#db.prepare(`
+      SELECT s.next_item_sequence,s.active_thread_id,t.id AS root_thread_id,t.revision,
+        (SELECT COUNT(*) FROM threads child WHERE child.session_id=s.id AND child.id<>t.id) AS fork_count,
+        (SELECT COUNT(*) FROM turns turn_row WHERE turn_row.thread_id=t.id) AS turn_count,
+        (SELECT COUNT(*) FROM items item_row WHERE item_row.session_id=s.id) AS item_count
+      FROM sessions s JOIN threads t ON t.session_id=s.id AND t.parent_thread_id IS NULL WHERE s.id=?
+    `), current.sessionId)
+    if (text(sessionRow, 'active_thread_id') !== text(sessionRow, 'root_thread_id')
+      || integer(sessionRow, 'revision') !== 0 || integer(sessionRow, 'fork_count') !== 0
+      || integer(sessionRow, 'turn_count') !== 0 || integer(sessionRow, 'item_count') !== current.importedItemSequence
+      || integer(sessionRow, 'next_item_sequence') !== current.importedItemSequence + 1) {
+      throw new Error('update_conflict_after_fork: imported session is no longer an untouched root thread')
+    }
+    const delta = candidate.records.slice(current.lastRecordOrdinal)
+    const now = this.#now()
+    const threadId = text(sessionRow, 'active_thread_id')
+    const imported = this.#appendItems(current.sessionId, threadId, null, candidate.provider, delta.map((record) => record.item), null, now)
+    const revisionId = this.#idFactory()
+    const last = candidate.records.at(-1)
+    const updated = this.#db.prepare(`
+      UPDATE native_session_sources SET current_content_digest=?,current_prefix_digest=?,
+        current_last_record_ordinal=?,current_last_record_digest=?,imported_item_sequence=?,last_imported_at=?
+      WHERE id=? AND current_content_digest=? AND imported_item_sequence=?
+    `).run(candidate.contentDigest,
+      last?.prefixDigest ?? candidate.contentDigest, candidate.records.length, last?.digest ?? candidate.contentDigest,
+      current.importedItemSequence + imported.length, now, current.sourceId, current.contentDigest, current.importedItemSequence)
+    if (updated.changes !== 1) throw new Error('native import compare-and-swap failed')
+    this.#insertNativeRevision(revisionId, current.sourceId, candidate, now)
+    this.#insertNativeRecords(current.sourceId, revisionId, delta, imported, now)
+    this.#promoteNativeSource(existing, candidate)
+    this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, current.sessionId)
+    if (imported.length) this.#appendStreamEvent(current.sessionId, threadId, null, 'items_appended', { itemIds: imported.map((item) => item.id), nativeDelta: true }, now)
+    return { candidateId: candidate.candidateId, status: 'updated', sessionId: current.sessionId, importedItemCount: imported.length }
+  }
+
+  #nativeSourceRow(identity: NativeSourceIdentity): SqlRow | null {
+    const state = this.getNativeImportState(identity)
+    return state ? this.#optional(this.#db.prepare('SELECT * FROM native_session_sources WHERE id=?'), state.sourceId) : null
+  }
+
+  #nativeImportState(row: SqlRow): NativeImportStoredState {
+    return {
+      sourceId: text(row, 'id'), sessionId: text(row, 'session_id'),
+      contentDigest: text(row, 'current_content_digest'), prefixDigest: text(row, 'current_prefix_digest'),
+      lastRecordOrdinal: integer(row, 'current_last_record_ordinal'), lastRecordDigest: text(row, 'current_last_record_digest'),
+      importedItemSequence: integer(row, 'imported_item_sequence'),
+    }
+  }
+
+  #insertNativeIdentityKeys(sourceId: string, candidate: CommitNativeImportInput['candidate']): void {
+    const insert = this.#db.prepare(`
+      INSERT OR IGNORE INTO native_session_identity_keys(source_id,provider,namespace_key,identity_kind,identity_value_hmac)
+      VALUES (?,?,?,?,?)
+    `)
+    for (const key of candidate.identityKeys) insert.run(sourceId, candidate.provider,
+      key.scopeNamespaceKey ?? candidate.namespaceKey, key.kind, this.#nativeHmac(key.value))
+  }
+
+  #promoteNativeSource(existing: SqlRow, candidate: CommitNativeImportInput['candidate']): void {
+    const sourceId = text(existing, 'id')
+    const now = this.#now()
+    this.#db.prepare(`
+      INSERT OR IGNORE INTO native_session_identity_keys(source_id,provider,namespace_key,identity_kind,identity_value_hmac)
+      VALUES (?,?,?,?,?)
+    `).run(sourceId, text(existing, 'provider'), text(existing, 'namespace_key'), 'native_session_id',
+      this.#nativeHmac(text(existing, 'native_session_id')))
+    this.#insertNativeIdentityKeys(sourceId, candidate)
+    this.#insertNativeProvenance(sourceId, candidate, now)
+    const currentClient = text(existing, 'source_client')
+    const promoteClient = sourceClientRank(candidate.sourceClient) > sourceClientRank(currentClient)
+    const promoteAlias = aliasSourceRank(candidate.aliasSource) > aliasSourceRank(text(existing, 'alias_source'))
+      || (aliasSourceRank(candidate.aliasSource) === aliasSourceRank(text(existing, 'alias_source'))
+        && candidate.sourceAlias !== nullableText(existing, 'source_alias'))
+    const samePrimary = candidate.sourceClient === currentClient && candidate.namespaceKey === text(existing, 'namespace_key')
+      && candidate.nativeSessionId === text(existing, 'native_session_id')
+    const refreshTitleSource = samePrimary && candidate.sourceAlias === nullableText(existing, 'source_alias')
+      && aliasSourceRank(candidate.aliasSource) === aliasSourceRank(text(existing, 'alias_source'))
+      && candidate.titleSource != null && candidate.titleSource !== nullableText(existing, 'title_source')
+    const refreshLocation = samePrimary && (candidate.cwd !== nullableText(existing, 'cwd')
+      || candidate.projectAlias !== nullableText(existing, 'project_alias'))
+    if (!promoteClient && !promoteAlias && !refreshLocation && !refreshTitleSource) return
+    const sourceClient = promoteClient ? candidate.sourceClient : currentClient
+    const namespaceKey = promoteClient ? candidate.namespaceKey : text(existing, 'namespace_key')
+    const nativeSessionId = promoteClient ? candidate.nativeSessionId : text(existing, 'native_session_id')
+    const alias = promoteClient || promoteAlias ? candidate.sourceAlias : nullableText(existing, 'source_alias')
+    const aliasSource = promoteClient || promoteAlias ? candidate.aliasSource : text(existing, 'alias_source')
+    const titleSource = promoteClient || promoteAlias ? candidate.titleSource ?? null
+      : refreshTitleSource ? candidate.titleSource ?? null : nullableText(existing, 'title_source')
+    const projectAlias = promoteClient || promoteAlias || refreshLocation
+      ? candidate.projectAlias : nullableText(existing, 'project_alias')
+    const cwd = promoteClient || refreshLocation ? candidate.cwd : nullableText(existing, 'cwd')
+    this.#db.prepare(`
+      UPDATE native_session_sources SET source_client=?,namespace_key=?,native_session_id=?,source_alias=?,alias_source=?,
+        title_source=?,project_alias=?,cwd=?,last_imported_at=? WHERE id=?
+    `).run(sourceClient, namespaceKey, nativeSessionId, alias, aliasSource, titleSource, projectAlias, cwd, now, sourceId)
+    this.#db.prepare(`
+      UPDATE sessions SET title=CASE WHEN title=? OR title IS NULL THEN ? ELSE title END,
+        project_key=COALESCE(?,project_key),updated_at=? WHERE id=?
+    `).run(nullableText(existing, 'source_alias'), alias, candidate.projectGroupKey, now, text(existing, 'session_id'))
+  }
+
+  #insertNativeProvenance(sourceId: string, candidate: CommitNativeImportInput['candidate'], now: string): void {
+    this.#db.prepare(`
+      INSERT OR IGNORE INTO native_session_source_provenance(
+        source_id,source_client,namespace_key,native_session_id_hmac,source_alias,alias_source,project_alias,discovered_at
+      ) VALUES (?,?,?,?,?,?,?,?)
+    `).run(sourceId, candidate.sourceClient, candidate.namespaceKey, this.#nativeHmac(candidate.nativeSessionId),
+      candidate.sourceAlias, candidate.aliasSource, candidate.projectAlias, now)
+  }
+
+  #insertNativeRevision(revisionId: string, sourceId: string, candidate: CommitNativeImportInput['candidate'], now: string): void {
+    const last = candidate.records.at(-1)
+    this.#db.prepare(`
+      INSERT INTO native_session_revisions(id,source_id,content_digest,prefix_digest,source_head_json,parser_version,
+        portable_item_count,skipped_item_count,last_record_ordinal,last_record_digest,imported_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    `).run(revisionId, sourceId, candidate.contentDigest, last?.prefixDigest ?? candidate.contentDigest,
+      canonicalJson(candidate.sourceHead), candidate.parserVersion, candidate.records.length, candidate.skippedItemCount,
+      candidate.records.length, last?.digest ?? candidate.contentDigest, now)
+  }
+
+  #insertNativeRecords(sourceId: string, revisionId: string, records: CommitNativeImportInput['candidate']['records'], items: CanonicalItem[], now: string): void {
+    const insert = this.#db.prepare(`
+      INSERT INTO native_imported_records(source_id,native_record_key_hmac,item_id,source_revision_id,source_ordinal,normalized_record_digest,imported_at)
+      VALUES (?,?,?,?,?,?,?)
+    `)
+    records.forEach((record, index) => insert.run(sourceId, this.#nativeHmac(record.key), items[index]?.id ?? null,
+      revisionId, record.ordinal, record.digest, now))
+  }
+
+  #loadNativeIdentityKey(): Buffer {
+    return this.#loadNativeMetaKey('identity_hmac_key')
+  }
+
+  #loadNativeMetaKey(key: string): Buffer {
+    const row = this.#one(this.#db.prepare('SELECT value FROM native_import_meta WHERE key=?'), key)
+    if (!(row.value instanceof Uint8Array)) throw new Error('Corrupt database: native import HMAC key is missing')
+    return Buffer.from(row.value)
+  }
+
+  #nativeHmac(value: string): string { return createHmac('sha256', this.#nativeIdentityKey).update(value).digest('hex') }
+
   close(): void {
     this.#db.close()
   }
@@ -687,7 +1126,7 @@ export class SqliteSessionStore implements SessionStore {
   #appendItems(
     sessionId: string,
     threadId: string,
-    turnId: string,
+    turnId: string | null,
     defaultProvider: CanonicalProvider | null,
     values: NewCanonicalItem[],
     originEventId: string | null,
@@ -749,17 +1188,25 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   #session(row: SqlRow): CanonicalSession {
+    const sourceProvider = nullableText(row, 'source_provider')
     return {
       id: text(row, 'id'),
       title: nullableText(row, 'title'),
       preview: nullableText(row, 'preview'),
       activeThreadId: text(row, 'active_thread_id'),
       projectKey: nullableText(row, 'project_key'),
-      cwd: nullableText(row, 'cwd'),
+      cwd: sourceProvider ? null : nullableText(row, 'cwd'),
       schemaVersion: integer(row, 'schema_version'),
       createdAt: text(row, 'created_at'),
       updatedAt: text(row, 'updated_at'),
       archivedAt: nullableText(row, 'archived_at'),
+      source: sourceProvider ? {
+        provider: sourceProvider as CanonicalProvider,
+        sourceClient: text(row, 'source_client') as NonNullable<CanonicalSession['source']>['sourceClient'],
+        sourceAlias: nullableText(row, 'source_alias'),
+        titleSource: nullableText(row, 'source_title_source'),
+        projectAlias: nullableText(row, 'source_project_alias'),
+      } : null,
     }
   }
 
@@ -861,4 +1308,16 @@ export class SqliteSessionStore implements SessionStore {
       createdAt: text(row, 'created_at'),
     }
   }
+}
+
+function sessionSelect(): string {
+  return `
+    SELECT s.*,
+      (SELECT ns.provider FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_provider,
+      (SELECT ns.source_client FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_client,
+      (SELECT ns.source_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_alias,
+      (SELECT ns.title_source FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_title_source,
+      (SELECT ns.project_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_project_alias
+    FROM sessions s
+  `
 }

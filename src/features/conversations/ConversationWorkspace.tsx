@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  ChevronDown,
+  ChevronRight,
+  Download,
+  ListFilter,
   Menu,
   MessageSquarePlus,
   RefreshCw,
@@ -23,7 +27,16 @@ import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
 import { latestUsageSummary, transcriptItems } from './conversation-presentation'
+import { NativeImportDialog } from './NativeImportDialog'
 import { ProviderAccountDisclosure } from './ProviderAccountDisclosure'
+import {
+  groupSessions,
+  loadSessionViewPreferences,
+  saveSessionViewPreferences,
+  type AssistantLabelMode,
+  type SessionGroupMode,
+  type SessionViewPreferences,
+} from './session-view-preferences'
 import type {
   CanonicalProvider,
   CanonicalSessionDto,
@@ -68,20 +81,40 @@ function SessionSidebar({
   selectedSessionId,
   loading,
   creating,
+  preferences,
   onSelect,
   onCreate,
   onRefresh,
+  onPreferencesChange,
+  onOpenImport,
   onNavigate,
 }: {
   sessions: CanonicalSessionDto[] | null
   selectedSessionId: string | null
   loading: boolean
   creating: boolean
+  preferences: SessionViewPreferences
   onSelect: (sessionId: string) => void
   onCreate: () => void
   onRefresh: () => void
+  onPreferencesChange: (preferences: SessionViewPreferences) => void
+  onOpenImport: () => void
   onNavigate: (view: AppView) => void
 }) {
+  const groups = sessions ? groupSessions(sessions, preferences.groupBy) : []
+  const collapsed = new Set(preferences.collapsedGroups)
+  const setGroupBy = (groupBy: SessionGroupMode) => onPreferencesChange({ ...preferences, groupBy })
+  const setAssistantLabel = (assistantLabel: AssistantLabelMode) => onPreferencesChange({
+    ...preferences,
+    assistantLabel,
+  })
+  const toggleGroup = (groupId: string) => onPreferencesChange({
+    ...preferences,
+    collapsedGroups: collapsed.has(groupId)
+      ? preferences.collapsedGroups.filter((id) => id !== groupId)
+      : [...preferences.collapsedGroups, groupId],
+  })
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
       <div className="shrink-0 border-b border-sidebar-border">
@@ -104,16 +137,64 @@ function SessionSidebar({
       <div className="flex min-h-0 flex-1 flex-col px-2 pb-2">
         <div className="flex shrink-0 items-center justify-between px-2 py-2">
           <span className="text-xs font-medium text-muted-foreground">최근 대화</span>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon-xs"
-            disabled={loading}
-            onClick={onRefresh}
-            aria-label="대화 목록 새로고침"
-          >
-            <RefreshCw className={cn(loading && 'animate-spin')} aria-hidden />
-          </Button>
+          <div className="flex items-center">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              disabled={loading}
+              onClick={onRefresh}
+              aria-label="대화 목록 새로고침"
+            >
+              <RefreshCw className={cn(loading && 'animate-spin')} aria-hidden />
+            </Button>
+            <details className="group relative">
+              <summary className="flex size-7 cursor-pointer list-none items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden" aria-label="대화 목록 보기 설정">
+                <ListFilter className="size-3.5" aria-hidden />
+              </summary>
+              <div className="absolute right-0 z-30 mt-1 w-56 rounded-lg border bg-popover p-2 text-popover-foreground shadow-lg">
+                <fieldset className="space-y-1">
+                  <legend className="px-2 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">그룹화</legend>
+                  {([
+                    ['project', '프로젝트'],
+                    ['provider', 'Provider'],
+                    ['none', '없음'],
+                  ] as Array<[SessionGroupMode, string]>).map(([value, label]) => (
+                    <label key={value} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent">
+                      <input type="radio" name="session-group-mode" checked={preferences.groupBy === value} onChange={() => setGroupBy(value)} />
+                      {label}
+                    </label>
+                  ))}
+                </fieldset>
+                <div className="my-2 border-t" />
+                <fieldset className="space-y-1">
+                  <legend className="px-2 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">응답 이름</legend>
+                  {([
+                    ['provider', 'Provider 이름'],
+                    ['assistant', 'Assistant'],
+                    ['both', '둘 다'],
+                  ] as Array<[AssistantLabelMode, string]>).map(([value, label]) => (
+                    <label key={value} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent">
+                      <input type="radio" name="assistant-label-mode" checked={preferences.assistantLabel === value} onChange={() => setAssistantLabel(value)} />
+                      {label}
+                    </label>
+                  ))}
+                </fieldset>
+                <div className="my-2 border-t" />
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent"
+                  onClick={(event) => {
+                    event.currentTarget.closest('details')?.removeAttribute('open')
+                    onOpenImport()
+                  }}
+                >
+                  <Download className="size-3.5" aria-hidden />
+                  Native 작업 가져오기
+                </button>
+              </div>
+            </details>
+          </div>
         </div>
 
         <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
@@ -124,30 +205,61 @@ function SessionSidebar({
               아직 대화가 없습니다.
             </p>
           ) : (
-            sessions.map((session) => (
-              <button
-                key={session.id}
-                type="button"
-                onClick={() => onSelect(session.id)}
-                className={cn(
-                  'w-full rounded-lg px-3 py-2.5 text-left text-sm transition-colors',
-                  session.id === selectedSessionId
-                    ? 'bg-sidebar-accent text-sidebar-accent-foreground'
-                    : 'text-muted-foreground hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground',
-                )}
-              >
-                <span className="block truncate font-medium">
-                  {session.title || session.preview || '새 대화'}
-                </span>
-                {session.title && session.preview ? (
-                  <span className="mt-0.5 block truncate text-xs opacity-70">{session.preview}</span>
-                ) : null}
-              </button>
+            groups.map((group) => preferences.groupBy === 'none' ? (
+              group.sessions.map((session) => (
+                <SessionButton key={session.id} session={session} selected={session.id === selectedSessionId} onSelect={onSelect} />
+              ))
+            ) : (
+              <section key={group.id} className="pb-1">
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-1 rounded-md px-2 py-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
+                  aria-expanded={!collapsed.has(group.id)}
+                  onClick={() => toggleGroup(group.id)}
+                >
+                  {collapsed.has(group.id) ? <ChevronRight className="size-3" aria-hidden /> : <ChevronDown className="size-3" aria-hidden />}
+                  <span className="min-w-0 flex-1 truncate">{group.label}</span>
+                  <span className="font-normal tabular-nums opacity-70">{group.sessions.length}</span>
+                </button>
+                {!collapsed.has(group.id) ? group.sessions.map((session) => (
+                  <SessionButton key={session.id} session={session} selected={session.id === selectedSessionId} onSelect={onSelect} />
+                )) : null}
+              </section>
             ))
           )}
         </div>
       </div>
     </div>
+  )
+}
+
+function SessionButton({
+  session,
+  selected,
+  onSelect,
+}: {
+  session: CanonicalSessionDto
+  selected: boolean
+  onSelect: (sessionId: string) => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(session.id)}
+      className={cn(
+        'w-full rounded-lg px-3 py-2.5 text-left text-sm transition-colors',
+        selected
+          ? 'bg-sidebar-accent text-sidebar-accent-foreground'
+          : 'text-muted-foreground hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground',
+      )}
+    >
+      <span className="block truncate font-medium">
+        {session.title || session.source?.sourceAlias || session.preview || '새 대화'}
+      </span>
+      {session.title && session.preview ? (
+        <span className="mt-0.5 block truncate text-xs opacity-70">{session.preview}</span>
+      ) : null}
+    </button>
   )
 }
 
@@ -184,6 +296,8 @@ export function ConversationWorkspace({
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
+  const [nativeImportOpen, setNativeImportOpen] = useState(false)
+  const [viewPreferences, setViewPreferences] = useState(loadSessionViewPreferences)
   const threadRequest = useRef(0)
 
   const selectedSession = useMemo(
@@ -271,6 +385,10 @@ export function ConversationWorkspace({
   useEffect(() => {
     void refreshSessions()
   }, [refreshSessions])
+
+  useEffect(() => {
+    saveSessionViewPreferences(viewPreferences)
+  }, [viewPreferences])
 
   useEffect(() => {
     void refreshModels()
@@ -375,9 +493,15 @@ export function ConversationWorkspace({
       selectedSessionId={selectedSessionId}
       loading={loadingSessions}
       creating={creating}
+      preferences={viewPreferences}
       onSelect={selectSession}
       onCreate={() => void createSession()}
       onRefresh={() => void refreshSessions()}
+      onPreferencesChange={setViewPreferences}
+      onOpenImport={() => {
+        setMobileSidebarOpen(false)
+        setNativeImportOpen(true)
+      }}
       onNavigate={(view) => {
         setMobileSidebarOpen(false)
         if (view === 'home') onNavigateHome()
@@ -405,6 +529,12 @@ export function ConversationWorkspace({
           {sidebar}
         </DialogContent>
       </Dialog>
+
+      <NativeImportDialog
+        open={nativeImportOpen}
+        onOpenChange={setNativeImportOpen}
+        onImported={refreshSessions}
+      />
 
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center gap-3 border-b px-3 sm:px-5">
@@ -469,7 +599,9 @@ export function ConversationWorkspace({
               </div>
             ) : (
               <div className="space-y-7">
-                {visibleItems.map((item) => <ConversationItem key={item.id} item={item} />)}
+                {visibleItems.map((item) => (
+                  <ConversationItem key={item.id} item={item} assistantLabelMode={viewPreferences.assistantLabel} />
+                ))}
               </div>
             )}
 
@@ -523,11 +655,10 @@ export function ConversationWorkspace({
                   if (!next) return
                   setProvider(nextProvider)
                   setModel(next.id)
-                  setEffort(next.defaultEffort)
+                  setEffort(next?.defaultEffort ?? null)
                 }}
                 disabled={PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
                 aria-label="모델"
-                title={selectedModel ? `${selectedModel.id} · ${selectedModel.description}` : undefined}
                 className="min-w-0 max-w-64 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs font-medium text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
               >
                 {!model ? <option value="">모델 불러오는 중…</option> : null}
@@ -542,7 +673,7 @@ export function ConversationWorkspace({
                     >
                       {(catalog?.models ?? []).map((option) => (
                         <option key={option.id} value={`${candidate}:${option.id}`}>
-                          {option.displayName} · {option.description}
+                          {option.displayName}
                         </option>
                       ))}
                     </optgroup>

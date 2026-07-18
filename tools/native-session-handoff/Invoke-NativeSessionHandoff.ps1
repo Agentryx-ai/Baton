@@ -9,6 +9,7 @@ param(
 
     [string]$CodexHome,
     [string]$ClaudeHome,
+    [string]$ProjectPath,
     [string]$OutputRoot,
     [string]$ManifestPath,
     [ValidateRange(0, 36500)][int]$SinceDays = 365,
@@ -62,7 +63,8 @@ if ($Action -eq 'Apply') {
 }
 
 $runDirectory = New-RunDirectory
-$inventory = New-HandoffInventory -CodexHome $CodexHome -ClaudeHome $ClaudeHome -SinceDays $SinceDays
+$inventory = New-HandoffInventory -CodexHome $CodexHome -ClaudeHome $ClaudeHome -SinceDays $SinceDays `
+    -ProjectPath $ProjectPath
 $inventoryPath = Join-Path $runDirectory 'inventory.json'
 Write-JsonFile -Value $inventory -Path $inventoryPath
 Write-Host "Codex sessions: $(@($inventory.codex_sessions).Count)"

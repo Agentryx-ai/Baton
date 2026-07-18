@@ -1,3 +1,4 @@
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import express, { Router } from 'express'
 import type { NextFunction, Request, Response } from 'express'
 
@@ -11,6 +12,9 @@ import type {
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type { ProviderModelDescriptor } from './model-catalog.ts'
+import type { NativeSessionImportService } from './native-import/service.ts'
+import { NativeImportError } from './native-import/service.ts'
+import type { NativeSourceClient } from './native-import/contracts.ts'
 
 const PROVIDERS = new Set<CanonicalProvider>(['claude', 'codex', 'gemini'])
 const ITEM_KINDS = new Set<CanonicalItemKind>([
@@ -40,12 +44,20 @@ export interface ConversationRouterOptions {
     models: ProviderModelDescriptor[]
     defaultModel: string | null
   }>
+  nativeImport?: NativeSessionImportService
 }
 
 class RequestValidationError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'RequestValidationError'
+  }
+}
+
+class NativeImportSecurityError extends Error {
+  constructor(message = 'native import request was rejected') {
+    super(message)
+    this.name = 'NativeImportSecurityError'
   }
 }
 
@@ -56,6 +68,50 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function bodyRecord(value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new RequestValidationError('request body must be a JSON object')
   return value
+}
+
+function requireOnlyKeys(body: Record<string, unknown>, keys: readonly string[]): void {
+  const allowed = new Set(keys)
+  if (Object.keys(body).some((key) => !allowed.has(key))) throw new RequestValidationError('request contains unsupported fields')
+}
+
+function nativeImportPrincipal(req: Request, requireOrigin: boolean): string {
+  const remoteAddress = req.socket.remoteAddress ?? ''
+  if (remoteAddress !== '127.0.0.1' && remoteAddress !== '::1' && remoteAddress !== '::ffff:127.0.0.1') {
+    throw new NativeImportSecurityError()
+  }
+  const host = req.get('host') ?? ''
+  if (!/^(?:127\.0\.0\.1|localhost|\[::1\])(?::(?:[1-9]\d{0,4}))?$/.test(host)) {
+    throw new NativeImportSecurityError()
+  }
+  try { new URL(`http://${host}`) } catch { throw new NativeImportSecurityError() }
+  if (req.get('sec-fetch-site') !== 'same-origin') throw new NativeImportSecurityError()
+  const origin = req.get('origin')
+  if (requireOrigin && !origin) throw new NativeImportSecurityError()
+  if (origin) {
+    let parsed: URL
+    try { parsed = new URL(origin) } catch { throw new NativeImportSecurityError() }
+    if (parsed.protocol !== 'http:' || parsed.host !== host || parsed.origin !== origin) throw new NativeImportSecurityError()
+  }
+  return createHash('sha256').update(`${host}\0${origin ?? `http://${host}`}`).digest('hex')
+}
+
+function requireCsrf(req: Request, expected: string): string {
+  const principal = nativeImportPrincipal(req, true)
+  const supplied = req.get('x-baton-csrf-token') ?? ''
+  const left = Buffer.from(supplied); const right = Buffer.from(expected)
+  if (left.length !== right.length || !timingSafeEqual(left, right)) throw new NativeImportSecurityError()
+  return principal
+}
+
+function safeDisplayAlias(value: string | null): string | null {
+  if (!value) return null
+  const trimmed = value.trim().slice(0, 240)
+  if (!trimmed) return null
+  if (/^(?:[a-zA-Z]:[\\/]|\\\\|\/)/.test(trimmed)) {
+    return trimmed.split(/[\\/]+/).filter(Boolean).at(-1) ?? null
+  }
+  return trimmed
 }
 
 function optionalNullableString(
@@ -153,8 +209,8 @@ function parseStartTurnInput(threadId: string, value: unknown): StartTurnInput {
     threadId,
     provider: provider as CanonicalProvider,
     model: requiredNonEmptyString(body, 'model'),
-    clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
     effort,
+    clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
     expectedRevision: body.expectedRevision as number,
     input: body.input.map(parseNewItem),
   }
@@ -207,6 +263,7 @@ export function createConversationRouter(
 ): ConversationRouter {
   const router = Router() as ConversationRouter
   const streams = new Map<Response, () => void>()
+  const nativeImportCsrfToken = randomBytes(32).toString('base64url')
 
   router.closeStreams = () => {
     for (const [response, cleanup] of [...streams]) {
@@ -215,6 +272,14 @@ export function createConversationRouter(
     }
   }
 
+  router.use('/native-import', (req, _res, next) => {
+    try {
+      if (req.method === 'GET') nativeImportPrincipal(req, false)
+      else requireCsrf(req, nativeImportCsrfToken)
+      next()
+    } catch (error) { next(error) }
+  })
+  router.use('/native-import', express.json({ limit: '8mb' }))
   router.use(express.json({ limit: '2mb' }))
 
   router.post(
@@ -228,6 +293,87 @@ export function createConversationRouter(
   router.get('/sessions', (_req, res) => {
     res.json({ sessions: service.listSessions() })
   })
+
+  router.get(
+    '/native-import/csrf',
+    route((req, res) => {
+      nativeImportPrincipal(req, false)
+      if (!options.nativeImport) {
+        res.status(503).json({ code: 'native_import_unavailable', error: 'native import is unavailable' })
+        return
+      }
+      res.setHeader('cache-control', 'no-store')
+      res.json({ token: nativeImportCsrfToken })
+    }),
+  )
+
+  router.post(
+    '/native-import/preview',
+    route(async (req, res) => {
+      const principal = requireCsrf(req, nativeImportCsrfToken)
+      if (!options.nativeImport) {
+        res.status(503).json({ code: 'native_import_unavailable', error: 'native import is unavailable' })
+        return
+      }
+      const body = bodyRecord(req.body)
+      requireOnlyKeys(body, ['sources'])
+      let sources: NativeSourceClient[] | undefined
+      if (body.sources !== undefined) {
+        if (!Array.isArray(body.sources) || body.sources.length === 0 || body.sources.length > 3 || body.sources.some((source) =>
+          source !== 'codex_desktop' && source !== 'claude_desktop' && source !== 'claude_code')) {
+          throw new RequestValidationError('sources contains an unsupported native source')
+        }
+        sources = body.sources as NativeSourceClient[]
+      }
+      const preview = await options.nativeImport.preview({ sources }, principal)
+      res.json({
+        token: preview.token,
+        expiresAt: preview.expiresAt,
+        summary: preview.summary,
+        warnings: preview.warnings.length > 0 ? ['일부 원본을 읽지 못했습니다. 세부 정보는 서버 로그를 확인하세요.'] : [],
+        candidates: preview.candidates.map((candidate) => ({
+          id: candidate.candidateId,
+          sourceClient: candidate.sourceClient,
+          provider: candidate.provider,
+          sourceAlias: safeDisplayAlias(candidate.sourceAlias),
+          aliasSource: candidate.aliasSource,
+          titleSource: candidate.titleSource ?? null,
+          projectAlias: safeDisplayAlias(candidate.projectAlias),
+          createdAt: candidate.createdAt,
+          updatedAt: candidate.updatedAt,
+          portableItemCount: candidate.portableItemCount,
+          skippedItemCount: candidate.skippedItemCount,
+          messageCount: candidate.portableItemCount + candidate.skippedItemCount,
+          status: candidate.status,
+          warningCount: candidate.warnings.length,
+        })),
+      })
+    }),
+  )
+
+  router.post(
+    '/native-import/commit',
+    route(async (req, res) => {
+      const principal = requireCsrf(req, nativeImportCsrfToken)
+      if (!options.nativeImport) {
+        res.status(503).json({ code: 'native_import_unavailable', error: 'native import is unavailable' })
+        return
+      }
+      const body = bodyRecord(req.body)
+      requireOnlyKeys(body, ['token', 'candidateIds'])
+      if (!Array.isArray(body.candidateIds) || body.candidateIds.length === 0 || body.candidateIds.length > 10_000
+        || body.candidateIds.some((id) => typeof id !== 'string' || !id || id.length > 256)) {
+        throw new RequestValidationError('candidateIds must be a non-empty string array')
+      }
+      const token = requiredNonEmptyString(body, 'token')
+      if (token.length > 7_000_000) throw new RequestValidationError('token is too large')
+      const receipt = await options.nativeImport.commit({
+        token,
+        candidateIds: body.candidateIds as string[],
+      }, principal)
+      res.json(receipt)
+    }),
+  )
 
   router.get(
     '/providers/:provider/models',
@@ -389,8 +535,21 @@ export function createConversationRouter(
       res.status(400).json({ code: 'invalid_request', error: error.message })
       return
     }
+    if (error instanceof NativeImportSecurityError) {
+      res.status(403).json({ code: 'native_import_forbidden', error: error.message })
+      return
+    }
+    if (error instanceof NativeImportError) {
+      const status = error.code === 'stale_preview' || error.code === 'commit_in_progress' ? 409 : 400
+      res.status(status).json({ code: error.code, error: error.message })
+      return
+    }
     if (error instanceof SyntaxError && 'body' in error) {
       res.status(400).json({ code: 'invalid_json', error: 'request body is not valid JSON' })
+      return
+    }
+    if (isRecord(error) && error.type === 'entity.too.large') {
+      res.status(413).json({ code: 'request_too_large', error: 'request body is too large' })
       return
     }
     if (error instanceof SessionStoreError) {

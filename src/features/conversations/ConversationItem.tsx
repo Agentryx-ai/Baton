@@ -10,6 +10,7 @@ import {
   usageSummary,
 } from './conversation-presentation'
 import type { CanonicalItemDto } from './types'
+import type { AssistantLabelMode } from './session-view-preferences'
 
 const ICON = {
   user_message: UserRound,
@@ -24,7 +25,13 @@ function ItemIcon({ kind }: { kind: CanonicalItemDto['kind'] }) {
   return Icon ? <Icon className="size-3.5" aria-hidden /> : null
 }
 
-export function ConversationItem({ item }: { item: CanonicalItemDto }) {
+export function ConversationItem({
+  item,
+  assistantLabelMode = 'provider',
+}: {
+  item: CanonicalItemDto
+  assistantLabelMode?: AssistantLabelMode
+}) {
   const isError = item.kind === 'error'
   const isReasoning = item.kind === 'reasoning_summary'
   const isUsage = item.kind === 'usage'
@@ -38,7 +45,9 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
     : null
   const effort = typeof item.payload.effort === 'string' ? item.payload.effort : null
   const modelFallback = requestedModel && actualModel && requestedModel !== actualModel
-
+  const assistantHeader = item.kind === 'assistant_message'
+    ? assistantLabel(item, assistantLabelMode)
+    : null
 
   if (item.kind === 'user_message') {
     return (
@@ -84,8 +93,8 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
         )}
       >
         <ItemIcon kind={item.kind} />
-        <span className="font-medium text-foreground">{ITEM_LABEL[item.kind]}</span>
-        {item.provider ? (
+        <span className="font-medium text-foreground">{assistantHeader ?? ITEM_LABEL[item.kind]}</span>
+        {item.provider && item.kind !== 'assistant_message' ? (
           <span>{PROVIDER_LABEL[item.provider]}</span>
         ) : null}
         {requestedModel ? (
@@ -119,6 +128,13 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
       )}
     </article>
   )
+}
+
+function assistantLabel(item: CanonicalItemDto, mode: AssistantLabelMode): string {
+  const provider = item.provider ? PROVIDER_LABEL[item.provider] : null
+  if (mode === 'assistant' || !provider) return 'Assistant'
+  if (mode === 'both') return `Assistant · ${provider}`
+  return provider
 }
 
 function friendlyModel(model: string): string {

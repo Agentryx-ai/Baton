@@ -42,6 +42,14 @@ try {
     if ($inventory.claude_sessions[0].first_user_preview -ne 'Continue the demo from Codex') {
         throw "Claude preview mismatch: '$($inventory.claude_sessions[0].first_user_preview)'"
     }
+    $filteredInventory = New-HandoffInventory -CodexHome $codexRoot -ClaudeHome $claudeRoot -ProjectPath 'C:\work\demo'
+    if (@($filteredInventory.codex_sessions).Count -ne 1 -or @($filteredInventory.claude_sessions).Count -ne 1) {
+        throw 'Project path filter omitted the matching fixture sessions.'
+    }
+    $emptyInventory = New-HandoffInventory -CodexHome $codexRoot -ClaudeHome $claudeRoot -ProjectPath 'C:\work\other'
+    if (@($emptyInventory.codex_sessions).Count -ne 0 -or @($emptyInventory.claude_sessions).Count -ne 0) {
+        throw 'Project path filter included sessions from another project.'
+    }
     $groups = @(New-AnalysisGroups -Inventory $inventory)
     if ($groups.Count -ne 1) { throw 'Expected one project group.' }
     if (@($groups[0].codex_sessions).Count -ne 1 -or @($groups[0].claude_sessions).Count -ne 1) {

@@ -51,6 +51,13 @@ export interface CanonicalSession {
   createdAt: string
   updatedAt: string
   archivedAt: string | null
+  source?: {
+    provider: CanonicalProvider
+    sourceClient: 'codex_desktop' | 'claude_desktop' | 'claude_code'
+    sourceAlias: string | null
+    titleSource: string | null
+    projectAlias: string | null
+  } | null
 }
 
 export interface CanonicalThread {

@@ -41,6 +41,79 @@ export interface CanonicalSessionDto {
   createdAt: string
   updatedAt: string
   archivedAt: string | null
+  source?: NativeSessionSourceSummaryDto | null
+}
+
+export type NativeImportSourceClient = 'codex_desktop' | 'claude_desktop' | 'claude_code'
+
+export interface NativeSessionSourceSummaryDto {
+  provider: CanonicalProvider
+  sourceClient: NativeImportSourceClient
+  sourceAlias: string | null
+  titleSource?: string | null
+  projectAlias: string | null
+}
+
+export type NativeImportCandidateStatus =
+  | 'new'
+  | 'update_available'
+  | 'duplicate'
+  | 'unavailable'
+  | 'unsupported'
+
+export interface NativeImportCandidateDto {
+  id: string
+  sourceClient: NativeImportSourceClient
+  provider: CanonicalProvider
+  status: NativeImportCandidateStatus
+  sourceAlias: string | null
+  aliasSource: 'native' | 'generated' | 'first_user' | 'path_fallback'
+  titleSource?: string | null
+  projectAlias: string | null
+  createdAt: string | null
+  updatedAt: string | null
+  messageCount: number
+  portableItemCount: number
+  skippedItemCount: number
+  warningCount: number
+}
+
+export interface NativeImportPreviewDto {
+  token: string
+  expiresAt: string
+  summary: {
+    total: number
+    new: number
+    updateAvailable: number
+    duplicate: number
+    unavailable: number
+    unsupported: number
+    portableItems: number
+    skippedItems: number
+  }
+  candidates: NativeImportCandidateDto[]
+  warnings: string[]
+}
+
+export type NativeImportCommitStatus = 'imported' | 'updated' | 'duplicate' | 'stale' | 'failed'
+
+export interface NativeImportCommitResultDto {
+  candidateId: string
+  status: NativeImportCommitStatus
+  sessionId?: string
+  error?: string
+}
+
+export interface NativeImportCommitDto {
+  summary: {
+    total: number
+    imported: number
+    updated: number
+    duplicate: number
+    stale: number
+    failed: number
+  }
+  results: NativeImportCommitResultDto[]
 }
 
 export interface CanonicalThreadDto {
