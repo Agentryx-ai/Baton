@@ -21,7 +21,7 @@ export function AppNavigation({
 }: {
   active: AppView
   onNavigate: (view: AppView) => void
-  variant: 'mobile' | 'desktop'
+  variant: 'mobile' | 'desktop' | 'embedded'
 }) {
   const items = ITEMS.map((item) => {
     const selected = item.view === active
@@ -32,7 +32,8 @@ export function AppNavigation({
         aria-current={selected ? 'page' : undefined}
         onClick={() => onNavigate(item.view)}
         className={cn(
-          'flex min-w-0 items-center justify-center gap-2 rounded-lg px-2 py-2 text-sm font-medium transition-colors md:w-full md:justify-start md:px-3',
+          'flex min-w-0 items-center gap-2 rounded-lg py-2 text-sm font-medium transition-colors',
+          variant === 'mobile' ? 'justify-center px-2' : 'w-full justify-start px-3',
           selected
             ? 'bg-sidebar-accent text-sidebar-accent-foreground'
             : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
@@ -55,14 +56,17 @@ export function AppNavigation({
     )
   }
 
+  const navigation = (
+    <nav aria-label="주요 화면" className="space-y-1 p-3">
+      {items}
+    </nav>
+  )
+
+  if (variant === 'embedded') return navigation
+
   return (
-    <aside className="hidden w-44 shrink-0 md:block">
-      <nav
-        aria-label="주요 화면"
-        className="sticky top-20 space-y-1 rounded-xl border bg-sidebar p-2 text-sidebar-foreground"
-      >
-        {items}
-      </nav>
+    <aside className="hidden w-72 shrink-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:block">
+      {navigation}
     </aside>
   )
 }

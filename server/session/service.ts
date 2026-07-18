@@ -18,6 +18,7 @@ export interface StartTurnInput {
   threadId: ThreadId
   provider: CanonicalProvider
   model: string
+  effort?: string | null
   clientRequestId: string
   expectedRevision: number
   input: NewCanonicalItem[]

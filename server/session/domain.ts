@@ -72,6 +72,7 @@ export interface CanonicalTurn {
   sequence: number
   provider: CanonicalProvider
   model: string
+  effort: string | null
   status: TurnStatus
   clientRequestId: string
   startedAt: string | null
@@ -199,6 +200,7 @@ export interface BeginTurnInput {
   threadId: ThreadId
   provider: CanonicalProvider
   model: string
+  effort?: string | null
   clientRequestId: string
   requestHash: string
   expectedRevision: number

@@ -62,6 +62,7 @@ export interface CanonicalTurnDto {
   sequence: number
   provider: CanonicalProvider
   model: string
+  effort: string | null
   status: TurnStatus
   clientRequestId: string
   startedAt: string | null
@@ -122,6 +123,7 @@ export interface CreateSessionDto {
 export interface StartTurnDto {
   provider: CanonicalProvider
   model: string
+  effort?: string | null
   clientRequestId: string
   expectedRevision: number
   input: Array<{
@@ -129,6 +131,14 @@ export interface StartTurnDto {
     visibility: 'portable'
     payload: JsonObject
   }>
+}
+
+export interface ProviderModelDescriptorDto {
+  id: string
+  displayName: string
+  description: string
+  effortLevels: string[]
+  defaultEffort: string | null
 }
 
 export interface BeginTurnResultDto {

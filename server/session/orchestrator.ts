@@ -81,6 +81,7 @@ export class TurnOrchestrator implements ConversationService {
       threadId: input.threadId,
       provider: input.provider,
       model: input.model,
+      effort: input.effort ?? null,
       clientRequestId: input.clientRequestId,
       requestHash: hashTurnRequest(input),
       expectedRevision: input.expectedRevision,
@@ -94,7 +95,7 @@ export class TurnOrchestrator implements ConversationService {
         maxDepth: 0,
         capabilityGrant: null,
       },
-      budget: {},
+      budget: input.effort ? { effort: input.effort } : {},
       leaseExpiresAt: null,
     })
     this.events.publish(input.threadId)
@@ -161,7 +162,12 @@ export class TurnOrchestrator implements ConversationService {
       if (!persisted) throw new Error(`Thread disappeared after turn start: ${input.threadId}`)
       const snapshot = adapterSnapshot(persisted, input.provider, turn.id)
       assertNoUnresolvedToolCalls(snapshot)
-      const request = { turnId: turn.id, model: input.model, input: input.input }
+      const request = {
+        turnId: turn.id,
+        model: input.model,
+        effort: input.effort ?? null,
+        input: input.input,
+      }
       adapter.validate(request, snapshot)
       const nativeRequest = adapter.materialize(request, snapshot)
 
@@ -236,6 +242,7 @@ export function hashTurnRequest(input: StartTurnInput): string {
     threadId: input.threadId,
     provider: input.provider,
     model: input.model,
+    effort: input.effort ?? null,
     clientRequestId: input.clientRequestId,
     input: input.input,
   })).digest('hex')
@@ -279,6 +286,9 @@ function instructionCwd(snapshot: Record<string, unknown> | undefined): string |
 
 function validateTurnInput(input: StartTurnInput): void {
   if (!input.model.trim()) throw new Error('model is required')
+  if (input.effort !== undefined && input.effort !== null && !input.effort.trim()) {
+    throw new Error('effort must be null or a non-empty string')
+  }
   if (!input.clientRequestId.trim()) throw new Error('clientRequestId is required')
   if (input.input.length === 0) throw new Error('at least one input item is required')
   for (const item of input.input) {

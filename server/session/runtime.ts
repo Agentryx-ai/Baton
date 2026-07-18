@@ -7,6 +7,8 @@ import { parse as parseToml } from 'smol-toml'
 import { loadProxyConnection } from '../client-integration.ts'
 import { AdapterRegistry } from './adapter-registry.ts'
 import { CodexCanonicalAdapter } from './codex-adapter.ts'
+import { StatelessHttpCanonicalAdapter } from './stateless-http-adapter.ts'
+import { buildProviderModelCatalog } from './model-catalog.ts'
 import { ConversationEventHub } from './event-hub.ts'
 import { TurnOrchestrator } from './orchestrator.ts'
 import { createConversationRouter } from './router.ts'
@@ -36,16 +38,28 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
       return { baseUrl: connection.baseUrl, token: connection.token }
     },
   }))
+  const statelessProxyConnection = async () => {
+    const connection = await loadProxyConnection(false)
+    return { baseUrl: connection.baseUrl, token: connection.token }
+  }
+  adapters.register(new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: statelessProxyConnection,
+  }))
+  adapters.register(new StatelessHttpCanonicalAdapter({
+    provider: 'gemini',
+    proxyConnection: statelessProxyConnection,
+  }))
   const events = new ConversationEventHub()
   const service = new TurnOrchestrator(store, adapters, events)
   const router = createConversationRouter(service, {
     listModels: async (provider) => {
-      if (provider !== 'codex') return { models: [], defaultModel: null }
       const connection = await loadProxyConnection(true)
-      const models = connection.models.filter(
-        (id) => id.startsWith('gpt-') && !id.startsWith('gpt-image-'),
-      )
-      return { models, defaultModel: await configuredDefaultModel(models) }
+      const configuredDefault = provider === 'codex'
+        ? await configuredDefaultModel(connection.models)
+        : null
+      const catalog = buildProviderModelCatalog(provider, connection.models, configuredDefault)
+      return { models: catalog.models, defaultModel: catalog.defaultModel }
     },
   })
 

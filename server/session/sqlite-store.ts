@@ -29,7 +29,7 @@ import { uuidV7 } from './domain.ts'
 import type { ForkThreadInput, SessionStore } from './store.ts'
 import { SessionStoreError } from './store.ts'
 
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 const ACTIVE_TURN_STATUSES = new Set(['queued', 'running', 'waiting_tool'])
 const TERMINAL_TURN_STATUSES = new Set(['completed', 'cancelled', 'failed', 'interrupted'])
 
@@ -282,8 +282,17 @@ export class SqliteSessionStore implements SessionStore {
         `)
         this.#db
           .prepare('INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)')
-          .run(SCHEMA_VERSION, 'canonical-session-v1', this.#now())
-        this.#db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+          .run(1, 'canonical-session-v1', this.#now())
+        this.#db.exec('PRAGMA user_version = 1')
+      }
+      let appliedVersion = versions.length === 0 ? 1 : versions.at(-1) ?? 0
+      if (appliedVersion < 2) {
+        this.#db.exec('ALTER TABLE turns ADD COLUMN effort TEXT')
+        this.#db
+          .prepare('INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)')
+          .run(2, 'turn-reasoning-effort', this.#now())
+        this.#db.exec('PRAGMA user_version = 2')
+        appliedVersion = 2
       }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
@@ -434,9 +443,10 @@ export class SqliteSessionStore implements SessionStore {
       ), thread.id)
       const turnSequence = integer(sequenceRow, 'next_sequence')
       this.#db.prepare(`
-        INSERT INTO turns(id,thread_id,sequence,provider,model,status,client_request_id,request_hash,started_at)
-        VALUES (?,?,?,?,?,'running',?,?,?)
-      `).run(turnId, thread.id, turnSequence, input.provider, input.model, input.clientRequestId, input.requestHash, now)
+        INSERT INTO turns(id,thread_id,sequence,provider,model,effort,status,client_request_id,request_hash,started_at)
+        VALUES (?,?,?,?,?,?,'running',?,?,?)
+      `).run(turnId, thread.id, turnSequence, input.provider, input.model, input.effort ?? null,
+        input.clientRequestId, input.requestHash, now)
       this.#db.prepare(`
         INSERT INTO executions(id,session_id,thread_id,turn_id,parent_execution_id,spawn_item_id,kind,provider,model,adapter_version,status,policy_snapshot_json,budget_json,usage_json,lease_expires_at,started_at)
         VALUES (?,?,?,?,NULL,NULL,'root_turn',?,?,?,'running',?,?,?,?,?)
@@ -450,6 +460,7 @@ export class SqliteSessionStore implements SessionStore {
         executionId,
         provider: input.provider,
         model: input.model,
+        effort: input.effort ?? null,
         itemIds: initialItems.map((item) => item.id),
       }, now)
       return {
@@ -774,6 +785,7 @@ export class SqliteSessionStore implements SessionStore {
       sequence: integer(row, 'sequence'),
       provider: text(row, 'provider') as CanonicalProvider,
       model: text(row, 'model'),
+      effort: nullableText(row, 'effort'),
       status: text(row, 'status') as CanonicalTurn['status'],
       clientRequestId: text(row, 'client_request_id'),
       startedAt: nullableText(row, 'started_at'),

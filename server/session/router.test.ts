@@ -58,6 +58,7 @@ const turn: CanonicalTurn = {
   sequence: 1,
   provider: 'codex',
   model: 'gpt-5',
+  effort: null,
   status: 'queued',
   clientRequestId: 'request-1',
   startedAt: null,
@@ -226,7 +227,15 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
     assert.equal(response.status, 200)
     assert.deepEqual(await json(response), {
       provider: 'codex',
-      models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+      models: [
+        {
+          id: 'gpt-5.6-sol',
+          displayName: 'GPT-5.6 Sol',
+          description: '기본 모델',
+          effortLevels: ['low', 'high'],
+          defaultEffort: 'high',
+        },
+      ],
       defaultModel: 'gpt-5.6-sol',
     })
     assert.deepEqual(requested, ['codex'])
@@ -238,7 +247,13 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
     listModels: async (provider) => {
       requested.push(provider)
       return {
-        models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+        models: [{
+          id: 'gpt-5.6-sol',
+          displayName: 'GPT-5.6 Sol',
+          description: '기본 모델',
+          effortLevels: ['low', 'high'],
+          defaultEffort: 'high',
+        }],
         defaultModel: 'gpt-5.6-sol',
       }
     },
@@ -320,6 +335,7 @@ test('fork, turn, item cursor, and cancellation routes pass validated contracts'
       body: JSON.stringify({
         provider: 'codex',
         model: 'gpt-5',
+        effort: 'high',
         clientRequestId: 'request-1',
         expectedRevision: 0,
         input: [
@@ -337,6 +353,7 @@ test('fork, turn, item cursor, and cancellation routes pass validated contracts'
       threadId: thread.id,
       provider: 'codex',
       model: 'gpt-5',
+      effort: 'high',
       clientRequestId: 'request-1',
       expectedRevision: 0,
       input: [

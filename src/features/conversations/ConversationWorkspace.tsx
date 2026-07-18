@@ -1,14 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Home,
   Menu,
   MessageSquarePlus,
   RefreshCw,
   Send,
-  Settings,
   Square,
 } from 'lucide-react'
 
+import { AppNavigation, type AppView } from '@/components/AppNavigation'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -27,6 +26,7 @@ import type {
   CanonicalProvider,
   CanonicalSessionDto,
   CanonicalTurnDto,
+  ProviderModelDescriptorDto,
   ThreadSnapshotDto,
 } from './types'
 import { useConversationEvents } from './useConversationEvents'
@@ -42,6 +42,25 @@ function latestActiveTurn(turns: CanonicalTurnDto[]): CanonicalTurnDto | null {
     .find((turn) => ['queued', 'running', 'waiting_tool'].includes(turn.status)) ?? null
 }
 
+const PROVIDERS: CanonicalProvider[] = ['codex', 'claude', 'gemini']
+const PROVIDER_NAME: Record<CanonicalProvider, string> = {
+  codex: 'Codex',
+  claude: 'Claude',
+  gemini: 'Gemini',
+}
+const EFFORT_NAME: Record<string, string> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra High',
+  max: 'Max',
+}
+
+interface ModelCatalogState {
+  models: ProviderModelDescriptorDto[]
+  defaultModel: string | null
+}
+
 function SessionSidebar({
   sessions,
   selectedSessionId,
@@ -50,8 +69,7 @@ function SessionSidebar({
   onSelect,
   onCreate,
   onRefresh,
-  onNavigateHome,
-  onNavigateSettings,
+  onNavigate,
 }: {
   sessions: CanonicalSessionDto[] | null
   selectedSessionId: string | null
@@ -60,19 +78,12 @@ function SessionSidebar({
   onSelect: (sessionId: string) => void
   onCreate: () => void
   onRefresh: () => void
-  onNavigateHome: () => void
-  onNavigateSettings: () => void
+  onNavigate: (view: AppView) => void
 }) {
   return (
     <div className="flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
-      <div className="flex h-14 shrink-0 items-center gap-1 border-b border-sidebar-border px-3">
-        <Button type="button" variant="ghost" size="icon-sm" onClick={onNavigateHome} aria-label="대시보드">
-          <Home aria-hidden />
-        </Button>
-        <span className="ml-1 min-w-0 flex-1 truncate text-sm font-semibold">대화</span>
-        <Button type="button" variant="ghost" size="icon-sm" onClick={onNavigateSettings} aria-label="설정">
-          <Settings aria-hidden />
-        </Button>
+      <div className="shrink-0 border-b border-sidebar-border">
+        <AppNavigation active="conversations" onNavigate={onNavigate} variant="embedded" />
       </div>
 
       <div className="shrink-0 p-3 pb-2">
@@ -148,10 +159,15 @@ export function ConversationWorkspace({
   const [sessions, setSessions] = useState<CanonicalSessionDto[] | null>(null)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const [snapshot, setSnapshot] = useState<ThreadSnapshotDto | null>(null)
-  const provider: CanonicalProvider = 'codex'
+  const [provider, setProvider] = useState<CanonicalProvider>('codex')
   const [model, setModel] = useState('')
-  const [models, setModels] = useState<string[] | null>(null)
-  const [modelCatalogError, setModelCatalogError] = useState<string | null>(null)
+  const [effort, setEffort] = useState<string | null>('high')
+  const [catalogs, setCatalogs] = useState<Record<CanonicalProvider, ModelCatalogState | null>>({
+    codex: null,
+    claude: null,
+    gemini: null,
+  })
+  const [modelCatalogErrors, setModelCatalogErrors] = useState<Partial<Record<CanonicalProvider, string>>>({})
   const [prompt, setPrompt] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [loadingSessions, setLoadingSessions] = useState(false)
@@ -167,6 +183,9 @@ export function ConversationWorkspace({
     [selectedSessionId, sessions],
   )
   const threadId = selectedSession?.activeThreadId ?? null
+  const currentCatalog = catalogs[provider]
+  const models = currentCatalog?.models ?? null
+  const selectedModel = models?.find((option) => option.id === model) ?? null
 
   const refreshSessions = useCallback(async () => {
     setLoadingSessions(true)
@@ -186,19 +205,39 @@ export function ConversationWorkspace({
   }, [])
 
   const refreshModels = useCallback(async () => {
-    try {
-      const catalog = await conversationApi.listModels(provider)
-      setModels(catalog.models)
-      setModel((current) => {
-        if (catalog.models.includes(current)) return current
-        return catalog.defaultModel ?? catalog.models[0] ?? ''
-      })
-      setModelCatalogError(null)
-    } catch (cause) {
-      setModels([])
-      setModelCatalogError(errorMessage(cause))
+    const results = await Promise.all(PROVIDERS.map(async (candidate) => {
+      try {
+        const catalog = await conversationApi.listModels(candidate)
+        return { provider: candidate, catalog, error: null }
+      } catch (cause) {
+        return { provider: candidate, catalog: null, error: errorMessage(cause) }
+      }
+    }))
+    const nextCatalogs: Record<CanonicalProvider, ModelCatalogState | null> = {
+      codex: null,
+      claude: null,
+      gemini: null,
     }
-  }, [provider])
+    const nextErrors: Partial<Record<CanonicalProvider, string>> = {}
+    for (const result of results) {
+      nextCatalogs[result.provider] = result.catalog
+        ? { models: result.catalog.models, defaultModel: result.catalog.defaultModel }
+        : { models: [], defaultModel: null }
+      if (result.error) nextErrors[result.provider] = result.error
+    }
+    setCatalogs(nextCatalogs)
+    setModelCatalogErrors(nextErrors)
+  }, [])
+
+  useEffect(() => {
+    if (!currentCatalog) return
+    const option = currentCatalog.models.find((candidate) => candidate.id === model)
+      ?? currentCatalog.models.find((candidate) => candidate.id === currentCatalog.defaultModel)
+      ?? currentCatalog.models[0]
+      ?? null
+    setModel(option?.id ?? '')
+    setEffort(option?.defaultEffort ?? null)
+  }, [currentCatalog, model, provider])
 
   const refreshThread = useCallback(async () => {
     const requestId = ++threadRequest.current
@@ -264,6 +303,7 @@ export function ConversationWorkspace({
       await conversationApi.startTurn(snapshot.thread.id, {
         provider,
         model: model.trim(),
+        effort,
         clientRequestId: crypto.randomUUID(),
         expectedRevision: snapshot.thread.revision,
         input: [
@@ -330,8 +370,11 @@ export function ConversationWorkspace({
       onSelect={selectSession}
       onCreate={() => void createSession()}
       onRefresh={() => void refreshSessions()}
-      onNavigateHome={onNavigateHome}
-      onNavigateSettings={onNavigateSettings}
+      onNavigate={(view) => {
+        setMobileSidebarOpen(false)
+        if (view === 'home') onNavigateHome()
+        if (view === 'settings') onNavigateSettings()
+      }}
     />
   )
 
@@ -381,7 +424,7 @@ export function ConversationWorkspace({
               aria-hidden
             />
             <span>{snapshot?.thread.status === 'running' ? '응답 중' : '준비됨'}</span>
-            <Badge variant="secondary" className="hidden sm:inline-flex">Codex</Badge>
+            <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge>
           </div>
         </header>
 
@@ -459,22 +502,61 @@ export function ConversationWorkspace({
               className="max-h-48 min-h-14 w-full resize-none bg-transparent px-2 py-2 text-[0.9375rem] leading-6 text-foreground outline-none placeholder:text-muted-foreground"
             />
 
-            <div className="flex items-center gap-2 px-1 pb-1">
+            <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
+              <select
+                value={provider}
+                onChange={(event) => setProvider(event.target.value as CanonicalProvider)}
+                aria-label="Provider"
+                className="rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs font-medium text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {PROVIDERS.map((candidate) => {
+                  const catalog = catalogs[candidate]
+                  const unavailable = catalog !== null && catalog.models.length === 0
+                  return (
+                    <option key={candidate} value={candidate} disabled={unavailable}>
+                      {PROVIDER_NAME[candidate]}{unavailable ? ' · 사용 불가' : ''}
+                    </option>
+                  )
+                })}
+              </select>
+
               <select
                 value={model}
-                onChange={(event) => setModel(event.target.value)}
+                onChange={(event) => {
+                  const next = models?.find((option) => option.id === event.target.value) ?? null
+                  setModel(event.target.value)
+                  setEffort(next?.defaultEffort ?? null)
+                }}
                 disabled={models === null || models.length === 0}
-                aria-label="Codex 모델"
-                className="min-w-0 max-w-56 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label={`${PROVIDER_NAME[provider]} 모델`}
+                title={selectedModel ? `${selectedModel.id} · ${selectedModel.description}` : undefined}
+                className="min-w-0 max-w-52 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
               >
                 {models === null ? (
                   <option value="">모델 불러오는 중…</option>
                 ) : models.length === 0 ? (
                   <option value="">사용 가능한 모델 없음</option>
                 ) : (
-                  models.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)
+                  models.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.displayName} · {option.description}
+                    </option>
+                  ))
                 )}
               </select>
+
+              {selectedModel && selectedModel.effortLevels.length > 0 ? (
+                <select
+                  value={effort ?? ''}
+                  onChange={(event) => setEffort(event.target.value || null)}
+                  aria-label="Reasoning effort"
+                  className="rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {selectedModel.effortLevels.map((level) => (
+                    <option key={level} value={level}>{EFFORT_NAME[level] ?? level}</option>
+                  ))}
+                </select>
+              ) : null}
 
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                 {snapshot?.thread.status === 'running' ? '응답을 생성하고 있습니다' : ''}
@@ -498,9 +580,9 @@ export function ConversationWorkspace({
               )}
             </div>
           </form>
-          {modelCatalogError ? (
+          {modelCatalogErrors[provider] ? (
             <p className="mx-auto mt-2 max-w-3xl px-2 text-xs text-destructive">
-              모델 목록을 불러오지 못했습니다: {modelCatalogError}
+              모델 목록을 불러오지 못했습니다: {modelCatalogErrors[provider]}
             </p>
           ) : null}
         </div>

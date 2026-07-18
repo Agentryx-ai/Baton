@@ -197,19 +197,13 @@ function App() {
         <AppNavigation active={activeView} onNavigate={navigate} variant="mobile" />
       )}
 
-      <div
-        className={
-          activeView === 'conversations'
-            ? 'w-full'
-            : 'mx-auto flex max-w-7xl gap-6 px-4 py-6'
-        }
-      >
+      <div className="flex min-h-[calc(100vh-3.5rem-1px)] w-full">
         {activeView !== 'conversations' && (
           <AppNavigation active={activeView} onNavigate={navigate} variant="desktop" />
         )}
 
         <main className="min-w-0 flex-1">
-          <section hidden={activeView !== 'home'} className="space-y-8">
+          <section hidden={activeView !== 'home'} className="mx-auto max-w-5xl space-y-8 px-4 py-6">
             <div>
               <h1 className="text-xl font-semibold tracking-tight">대시보드</h1>
               <p className="mt-1 text-sm text-muted-foreground">계정 사용량과 라우팅 상태</p>
@@ -261,7 +255,7 @@ function App() {
             />
           </section>
 
-          <section hidden={activeView !== 'settings'} className="space-y-6">
+          <section hidden={activeView !== 'settings'} className="mx-auto max-w-5xl space-y-6 px-4 py-6">
             <div>
               <h1 className="text-xl font-semibold tracking-tight">설정</h1>
               <p className="mt-1 text-sm text-muted-foreground">라우팅과 클라이언트 연결 관리</p>

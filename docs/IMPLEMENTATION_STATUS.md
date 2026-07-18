@@ -30,9 +30,11 @@
 | Context builder와 compaction | 부분 구현 | fork lineage와 portable text replay는 구현됨 | model context budget, immutable compaction range, artifact-aware materialization은 미구현 |
 | Canonical REST/SSE | 구현됨 | `/baton/v1` session 조회·생성, thread snapshot/fork, turn 시작·취소, item cursor, SSE replay | child execution/import API는 아직 없음 |
 | Codex adapter | 부분 구현 | app-server handshake, ephemeral `thread/start`, `thread/inject_items`, `turn/start`, interrupt, durable text/plan/reasoning/usage/error 정규화 | 현재 text 중심 Preview. 일반 tool/file-change 실행 계약은 아직 충족하지 않음 |
-| Canonical UI | 부분 구현 | 세션 생성·선택, transcript, SSE 상태, model 입력, 턴 실행·취소가 `App`에 마운트됨 | fork UI, cwd/project/instruction 설정, capability 기반 provider 선택 필요 |
-| UI provider 선택 | **구현 결함** | UI는 Claude/Codex/Gemini를 모두 선택 가능하게 표시하지만 runtime에는 Codex adapter만 등록됨 | capability를 서버에서 조회해 미지원 provider를 숨기거나 비활성화해야 함 |
-| Provider 전환 | 미구현 | 공통 enum·domain 계약만 존재 | Claude와 Gemini adapter 구현 후 portable history 전환 E2E 필요 |
+| Canonical UI | 부분 구현 | 홈·대화·설정이 동일한 앱 셸을 사용하며 세션, transcript, SSE, provider/model/effort, 턴 실행·취소를 제공 | fork UI와 cwd/project/instruction 설정은 아직 없음 |
+| UI provider 선택 | 구현됨 | 서버 모델 catalog를 provider별로 조회하고 모델이 0개인 provider는 비활성화 | Gemini 인증 복구 후 live catalog 표시 검증 필요 |
+| Provider 전환 | 부분 구현 | Codex·Claude·Gemini adapter가 같은 portable history 계약을 사용; Claude Fable 5 live 검증 완료 | Gemini는 현재 proxy 인증 문제로 모델 0개이며 live 실행 미검증 |
+| Claude adapter | **Preview 구현** | `/v1/messages` stateless history, effort 전달, 요청/실제 model 및 fallback 기록, mock 통합 테스트와 Fable 5 live 응답 확인 | streaming과 provider 고유 content part 확장 필요 |
+| Gemini adapter | **Preview 구현·live 차단** | `/v1/chat/completions` 호환 경로, reasoning effort, usage 정규화와 mock 통합 테스트 | 현재 인증 버그로 live catalog/turn 검증 불가; 인증 복구 전 UI 비활성화 유지 |
 | 일반 tool 실행 | 부분 구현 | item/domain 계약은 있으나 현재 turn policy는 `allowedTools: []`; Codex adapter는 shell, MCP, plugin과 approval/tool 요청을 차단 | Baton 소유 tool 실행과 approval 정책을 설계대로 구현하기 전까지 text-only 제약 유지 |
 | Provider opaque state | 부분 구현 | binding 스키마와 invalidation은 구현됨 | at-rest encryption이 없어 non-null opaque state 저장을 fail-closed로 거부함 |
 | Provider binding freshness | 설계 변경 | 구현은 `last_turn_id` 대신 `synced_revision`과 `context_digest`로 exact context compatibility를 판정 | 공통 설계 문서의 binding 필드를 이 결정에 맞춰 갱신 |

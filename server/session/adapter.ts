@@ -9,6 +9,7 @@ import type {
 export interface CanonicalTurnRequest {
   turnId: TurnId
   model: string
+  effort?: string | null
   input: NewCanonicalItem[]
 }
 

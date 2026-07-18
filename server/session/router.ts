@@ -10,6 +10,7 @@ import type {
 } from './domain.ts'
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
+import type { ProviderModelDescriptor } from './model-catalog.ts'
 
 const PROVIDERS = new Set<CanonicalProvider>(['claude', 'codex', 'gemini'])
 const ITEM_KINDS = new Set<CanonicalItemKind>([
@@ -36,7 +37,7 @@ export interface ConversationRouter extends Router {
 
 export interface ConversationRouterOptions {
   listModels?: (provider: CanonicalProvider) => Promise<{
-    models: string[]
+    models: ProviderModelDescriptor[]
     defaultModel: string | null
   }>
 }
@@ -135,6 +136,7 @@ function parseNewItem(value: unknown, index: number): NewCanonicalItem {
 function parseStartTurnInput(threadId: string, value: unknown): StartTurnInput {
   const body = bodyRecord(value)
   const provider = requiredNonEmptyString(body, 'provider')
+  const effort = optionalNullableString(body, 'effort')
   if (!PROVIDERS.has(provider as CanonicalProvider)) {
     throw new RequestValidationError('provider must be claude, codex, or gemini')
   }
@@ -144,11 +146,15 @@ function parseStartTurnInput(threadId: string, value: unknown): StartTurnInput {
   if (!Array.isArray(body.input) || body.input.length === 0) {
     throw new RequestValidationError('input must be a non-empty array')
   }
+  if (effort !== undefined && effort !== null && effort.trim().length === 0) {
+    throw new RequestValidationError('effort must be null or a non-empty string')
+  }
   return {
     threadId,
     provider: provider as CanonicalProvider,
     model: requiredNonEmptyString(body, 'model'),
     clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
+    effort,
     expectedRevision: body.expectedRevision as number,
     input: body.input.map(parseNewItem),
   }

@@ -66,6 +66,7 @@ export interface CodexAdapterOptions {
 interface MaterializedCodexTurn {
   turnId: string
   model: string
+  effort: string | null
   cwd: string | null
   history: JsonObject[]
   input: Array<{ type: 'text'; text: string }>
@@ -276,6 +277,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     const body: MaterializedCodexTurn = {
       turnId: request.turnId,
       model: request.model,
+      effort: request.effort ?? null,
       cwd: snapshot.session.cwd,
       history,
       input: request.input.map((item) => ({
@@ -412,6 +414,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       const start = asObject(
         await client.request('thread/start', {
           model: body.model,
+          effort: body.effort,
           cwd: body.cwd,
           environments: [],
           runtimeWorkspaceRoots: [],
@@ -448,6 +451,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           clientUserMessageId: body.turnId,
           input: body.input,
           model: body.model,
+          effort: body.effort,
           environments: [],
           runtimeWorkspaceRoots: [],
           approvalsReviewer: 'user',
@@ -728,6 +732,7 @@ function parseMaterializedRequest(value: unknown): MaterializedCodexTurn {
   return {
     turnId: requiredString(body.turnId, 'canonical turn id'),
     model: requiredString(body.model, 'Codex model'),
+    effort: typeof body.effort === 'string' ? body.effort : null,
     cwd: typeof body.cwd === 'string' ? body.cwd : null,
     history: body.history.map((item) => asObject(item, 'Codex history item')),
     input: body.input.map((item) => {

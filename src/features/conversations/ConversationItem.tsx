@@ -30,6 +30,15 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
   const isUsage = item.kind === 'usage'
   const body = isUsage ? usageSummary(item.payload) : payloadText(item)
   const showRawDetail = isError || isReasoning || isUsage || item.kind === 'provider_event'
+  const requestedModel = typeof item.payload.requestedModel === 'string'
+    ? friendlyModel(item.payload.requestedModel)
+    : null
+  const actualModel = typeof item.payload.actualModel === 'string'
+    ? friendlyModel(item.payload.actualModel)
+    : null
+  const effort = typeof item.payload.effort === 'string' ? item.payload.effort : null
+  const modelFallback = requestedModel && actualModel && requestedModel !== actualModel
+
 
   if (item.kind === 'user_message') {
     return (
@@ -79,6 +88,12 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
         {item.provider ? (
           <span>{PROVIDER_LABEL[item.provider]}</span>
         ) : null}
+        {requestedModel ? (
+          <span className={cn(modelFallback && 'font-medium text-warn')}>
+            {modelFallback ? `${requestedModel} → ${actualModel}` : requestedModel}
+            {effort ? ` · ${effortLabel(effort)}` : ''}
+          </span>
+        ) : null}
       </header>
 
       <div
@@ -104,4 +119,18 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
       )}
     </article>
   )
+}
+
+function friendlyModel(model: string): string {
+  return model
+    .replace(/^claude-/, '')
+    .replace(/-\d{8}$/, '')
+    .split('-')
+    .map((part) => /^\d+$/.test(part) ? part : part[0]?.toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function effortLabel(effort: string): string {
+  if (effort === 'xhigh') return 'Extra High'
+  return effort[0]?.toUpperCase() + effort.slice(1)
 }

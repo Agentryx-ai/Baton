@@ -54,6 +54,7 @@ test('usage stays canonical but is summarized once outside the transcript', () =
     sequence: 1,
     provider: 'codex',
     model: 'gpt-test',
+    effort: null,
     status: 'completed',
     clientRequestId: 'request-1',
     startedAt: '2026-07-18T00:00:00.000Z',

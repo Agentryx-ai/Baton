@@ -5,6 +5,7 @@ import type {
   CreateSessionDto,
   StartTurnDto,
   ThreadSnapshotDto,
+  ProviderModelDescriptorDto,
 } from './types'
 
 const BASE_PATH = '/baton/v1'
@@ -61,7 +62,7 @@ function jsonRequest(method: 'POST', body: unknown): RequestInit {
 export const conversationApi = {
   listModels: (provider: string): Promise<{
     provider: string
-    models: string[]
+    models: ProviderModelDescriptorDto[]
     defaultModel: string | null
   }> => request(`/providers/${encodeURIComponent(provider)}/models`),
 

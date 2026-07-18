@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test, { after, type TestContext } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
 
 import type {
   BeginTurnInput,
@@ -59,6 +60,7 @@ function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): B
     threadId,
     provider: 'codex',
     model: 'gpt-test',
+    effort: 'high',
     clientRequestId: request,
     requestHash: hash,
     expectedRevision: 0,
@@ -68,12 +70,38 @@ function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): B
   }
 }
 
+test('schema v1 migrates existing turns to nullable effort without rewriting them', (t) => {
+  const path = databasePath(t)
+  const legacy = new DatabaseSync(path)
+  legacy.exec(`
+    CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, applied_at TEXT NOT NULL) STRICT;
+    INSERT INTO schema_migrations VALUES(1, 'canonical-session-v1', '2026-07-18T00:00:00.000Z');
+    PRAGMA user_version = 1;
+    CREATE TABLE turns(
+      id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+      provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+      client_request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+      started_at TEXT, completed_at TEXT, usage_json TEXT, error_json TEXT
+    ) STRICT;
+    INSERT INTO turns VALUES(
+      'turn-1','thread-1',1,'claude','claude-fable-5','completed','request-1','hash-1',
+      '2026-07-18T00:00:00.000Z','2026-07-18T00:00:01.000Z',NULL,NULL
+    );
+  `)
+  legacy.close()
+
+  const store = new SqliteSessionStore(path)
+  t.after(() => store.close())
+  assert.equal(store.getTurn('turn-1')?.effort, null)
+})
+
 test('create, append, finish, and replay are stable after reopening the database', (t) => {
   const path = databasePath(t)
   const options = deterministicOptions()
   const store = new SqliteSessionStore(path, options)
   const session = store.createSession({ title: 'Canonical session', instructionSnapshot: { z: 1, a: true } })
   const started = store.beginTurn(beginInput(session.activeThreadId))
+  assert.equal(started.turn.effort, 'high')
   const appended = store.appendProviderEvent({
     turnId: started.turn.id,
     eventId: 'native-event-1',
