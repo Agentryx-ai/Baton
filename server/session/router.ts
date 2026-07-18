@@ -7,10 +7,12 @@ import type {
   CanonicalProvider,
   CanonicalStreamEvent,
   CreateSessionInput,
+  GoalObservation,
   NewCanonicalItem,
 } from './domain.ts'
 import type { ConversationService, StartTurnInput } from './service.ts'
-import { SessionStoreError } from './store.ts'
+import { GoalStoreError, SessionStoreError } from './store.ts'
+import type { CreateGoalInput, EditGoalInput } from './store.ts'
 import type { ProviderModelDescriptor } from './model-catalog.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 import { NativeImportError } from './native-import/service.ts'
@@ -132,6 +134,98 @@ function requiredNonEmptyString(body: Record<string, unknown>, key: string): str
   return value
 }
 
+function requiredPositiveInteger(body: Record<string, unknown>, key: string): number {
+  const value = body[key]
+  if (!Number.isSafeInteger(value) || Number(value) < 1) {
+    throw new RequestValidationError(`${key} must be a positive integer`)
+  }
+  return Number(value)
+}
+
+function optionalPositiveInteger(body: Record<string, unknown>, key: string): number | undefined {
+  if (body[key] === undefined) return undefined
+  return requiredPositiveInteger(body, key)
+}
+
+function requiredProvider(body: Record<string, unknown>, key = 'provider'): CanonicalProvider {
+  const value = body[key]
+  if (typeof value !== 'string' || !PROVIDERS.has(value as CanonicalProvider)) {
+    throw new RequestValidationError(`${key} must be claude, codex, or gemini`)
+  }
+  return value as CanonicalProvider
+}
+
+function parseGoalObservation(value: unknown): GoalObservation {
+  const expected = bodyRecord(value)
+  if (expected.kind === 'none') {
+    requireOnlyKeys(expected, ['kind'])
+    return { kind: 'none' }
+  }
+  if (expected.kind === 'goal') {
+    requireOnlyKeys(expected, ['kind', 'goalId', 'revision'])
+    return {
+      kind: 'goal',
+      goalId: requiredNonEmptyString(expected, 'goalId'),
+      revision: requiredPositiveInteger(expected, 'revision'),
+    }
+  }
+  throw new RequestValidationError('expected.kind must be none or goal')
+}
+
+function parseCreateGoalInput(threadId: string, value: unknown): CreateGoalInput {
+  const body = bodyRecord(value)
+  requireOnlyKeys(body, [
+    'expected', 'objective', 'provider', 'model', 'effort', 'tokenBudget',
+    'maxAutomaticTurns', 'maxActiveSeconds', 'replaceExisting',
+  ])
+  if (body.tokenBudget !== undefined && body.tokenBudget !== null) requiredPositiveInteger(body, 'tokenBudget')
+  if (body.replaceExisting !== undefined && typeof body.replaceExisting !== 'boolean') {
+    throw new RequestValidationError('replaceExisting must be a boolean')
+  }
+  return {
+    threadId,
+    expected: parseGoalObservation(body.expected),
+    objective: requiredNonEmptyString(body, 'objective'),
+    provider: requiredProvider(body),
+    model: requiredNonEmptyString(body, 'model'),
+    effort: optionalNullableString(body, 'effort'),
+    tokenBudget: body.tokenBudget === null ? null : optionalPositiveInteger(body, 'tokenBudget'),
+    maxAutomaticTurns: optionalPositiveInteger(body, 'maxAutomaticTurns'),
+    maxActiveSeconds: optionalPositiveInteger(body, 'maxActiveSeconds'),
+    replaceExisting: body.replaceExisting as boolean | undefined,
+  }
+}
+
+function parseEditGoalInput(goalId: string, value: unknown): EditGoalInput {
+  const body = bodyRecord(value)
+  requireOnlyKeys(body, [
+    'expectedRevision', 'objective', 'provider', 'model', 'effort', 'tokenBudget',
+    'maxAutomaticTurns', 'maxActiveSeconds', 'resetLimitCounters',
+  ])
+  if (body.tokenBudget !== undefined && body.tokenBudget !== null) requiredPositiveInteger(body, 'tokenBudget')
+  if (body.resetLimitCounters !== undefined && typeof body.resetLimitCounters !== 'boolean') {
+    throw new RequestValidationError('resetLimitCounters must be a boolean')
+  }
+  return {
+    goalId,
+    expectedRevision: requiredPositiveInteger(body, 'expectedRevision'),
+    ...(body.objective === undefined ? {} : { objective: requiredNonEmptyString(body, 'objective') }),
+    ...(body.provider === undefined ? {} : { provider: requiredProvider(body) }),
+    ...(body.model === undefined ? {} : { model: requiredNonEmptyString(body, 'model') }),
+    ...(body.effort === undefined ? {} : { effort: optionalNullableString(body, 'effort') }),
+    ...(body.tokenBudget === undefined ? {} : {
+      tokenBudget: body.tokenBudget === null ? null : requiredPositiveInteger(body, 'tokenBudget'),
+    }),
+    ...(body.maxAutomaticTurns === undefined ? {} : {
+      maxAutomaticTurns: requiredPositiveInteger(body, 'maxAutomaticTurns'),
+    }),
+    ...(body.maxActiveSeconds === undefined ? {} : {
+      maxActiveSeconds: requiredPositiveInteger(body, 'maxActiveSeconds'),
+    }),
+    ...(body.resetLimitCounters === undefined ? {} : { resetLimitCounters: body.resetLimitCounters }),
+  }
+}
+
 function optionalRecord(
   body: Record<string, unknown>,
   key: string,
@@ -226,6 +320,15 @@ function parseOptionalCursor(value: unknown, label: string): number | undefined 
     throw new RequestValidationError(`${label} must be a safe non-negative integer`)
   }
   return cursor
+}
+
+function parseRequiredQueryInteger(value: unknown, label: string): number {
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
+    throw new RequestValidationError(`${label} must be a positive integer`)
+  }
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed)) throw new RequestValidationError(`${label} must be a safe positive integer`)
+  return parsed
 }
 
 function requestCursor(req: Request): number {
@@ -440,6 +543,42 @@ export function createConversationRouter(
     res.json(snapshot)
   })
 
+  router.get('/threads/:threadId/goal', (req, res) => {
+    res.json({ goal: service.getGoal(pathParam(req, 'threadId')) })
+  })
+
+  router.post('/threads/:threadId/goal', route(async (req, res) => {
+    const goal = await service.createGoal(parseCreateGoalInput(pathParam(req, 'threadId'), req.body))
+    res.status(201).json(goal)
+  }))
+
+  router.patch('/goals/:goalId', route(async (req, res) => {
+    res.json(await service.editGoal(parseEditGoalInput(pathParam(req, 'goalId'), req.body)))
+  }))
+
+  router.post('/goals/:goalId/status', route(async (req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['expectedRevision', 'status', 'resetLimitCounters'])
+    if (body.status !== 'active' && body.status !== 'paused') {
+      throw new RequestValidationError('status must be active or paused')
+    }
+    if (body.resetLimitCounters !== undefined && typeof body.resetLimitCounters !== 'boolean') {
+      throw new RequestValidationError('resetLimitCounters must be a boolean')
+    }
+    res.json(await service.updateGoalStatus({
+      goalId: pathParam(req, 'goalId'),
+      expectedRevision: requiredPositiveInteger(body, 'expectedRevision'),
+      status: body.status,
+      ...(body.resetLimitCounters === undefined ? {} : { resetLimitCounters: body.resetLimitCounters }),
+    }))
+  }))
+
+  router.delete('/goals/:goalId', route(async (req, res) => {
+    const expectedRevision = parseRequiredQueryInteger(req.query.expectedRevision, 'expectedRevision')
+    await service.clearGoal({ goalId: pathParam(req, 'goalId'), expectedRevision })
+    res.status(204).end()
+  }))
+
   router.post(
     '/threads/:threadId/fork',
     route((req, res) => {
@@ -594,6 +733,14 @@ export function createConversationRouter(
         session_archived: 409,
       } as const
       res.status(statusByCode[error.code]).json({ code: error.code, error: error.message })
+      return
+    }
+    if (error instanceof GoalStoreError) {
+      const conflict = error.code === 'stale_goal_revision'
+        || error.code === 'invalid_goal_transition'
+        || error.code === 'goal_lease_lost'
+      const status = error.code === 'goal_not_found' ? 404 : conflict ? 409 : 400
+      res.status(status).json({ code: error.code, error: error.message })
       return
     }
     res.status(500).json({ code: 'internal_error', error: 'internal server error' })

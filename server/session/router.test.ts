@@ -7,6 +7,7 @@ import express from 'express'
 import type {
   BeginTurnResult,
   CanonicalExecution,
+  CanonicalGoal,
   CanonicalItem,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -20,9 +21,9 @@ import {
   type ConversationRouter,
   type ConversationRouterOptions,
 } from './router.ts'
-import type { ConversationService, StartTurnInput } from './service.ts'
+import type { ConversationService, StartTurnInput, UserGoalStatusInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
-import type { ForkThreadInput } from './store.ts'
+import type { ClearGoalInput, CreateGoalInput, EditGoalInput, ForkThreadInput, GoalCasResult } from './store.ts'
 import type { SessionListScope } from './store.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 
@@ -143,6 +144,7 @@ class TestConversationService implements ConversationService {
   startInput: StartTurnInput | null = null
   cancelledTurnId: string | null = null
   listedScope: SessionListScope | null = null
+  goal: CanonicalGoal | null = null
 
   createSession(input: CreateSessionInput): CanonicalSession {
     this.createdInput = input
@@ -195,6 +197,27 @@ class TestConversationService implements ConversationService {
     return this.events.filter((candidate) => candidate.sequence > afterSequence)
   }
 
+  getGoal(threadId: string): CanonicalGoal | null { return threadId === thread.id ? this.goal : null }
+
+  async createGoal(input: CreateGoalInput): Promise<CanonicalGoal> {
+    this.goal = testGoal({ objective: input.objective, provider: input.provider, model: input.model })
+    return this.goal
+  }
+
+  async editGoal(input: EditGoalInput): Promise<CanonicalGoal> {
+    if (!this.goal) throw new Error('goal missing')
+    this.goal = { ...this.goal, objective: input.objective ?? this.goal.objective, revision: this.goal.revision + 1 }
+    return this.goal
+  }
+
+  async updateGoalStatus(input: UserGoalStatusInput): Promise<GoalCasResult> {
+    if (!this.goal || this.goal.revision !== input.expectedRevision) return { status: 'stale', goal: this.goal }
+    this.goal = { ...this.goal, status: input.status, revision: this.goal.revision + 1 }
+    return { status: 'applied', goal: this.goal }
+  }
+
+  async clearGoal(_input: ClearGoalInput): Promise<void> { this.goal = null }
+
   async startTurn(input: StartTurnInput): Promise<BeginTurnResult> {
     this.startInput = input
     return beginResult
@@ -215,6 +238,17 @@ class TestConversationService implements ConversationService {
 
   notify(): void {
     for (const listener of this.listeners) listener()
+  }
+}
+
+function testGoal(overrides: Partial<CanonicalGoal> = {}): CanonicalGoal {
+  return {
+    id: 'goal-1', threadId: thread.id, objective: 'finish', status: 'active', statusReason: null,
+    revision: 1, provider: 'codex', model: 'gpt-test', effort: null, tokenBudget: null,
+    tokensUsed: 0, timeUsedSeconds: 0, maxAutomaticTurns: 24, automaticTurnsUsed: 0,
+    maxActiveSeconds: 7_200, noProgressCount: 0, lastProgressDigest: null,
+    createdAt: now, updatedAt: now, startedAt: now, completedAt: null,
+    ...overrides,
   }
 }
 
@@ -353,6 +387,52 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
       code: 'invalid_json',
       error: 'request body is not valid JSON',
     })
+  })
+})
+
+test('Goal routes validate revisions and expose create, edit, pause, resume, and clear', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl) => {
+    const empty = await fetch(`${baseUrl}/threads/${thread.id}/goal`)
+    assert.deepEqual(await empty.json(), { goal: null })
+
+    const createdResponse = await fetch(`${baseUrl}/threads/${thread.id}/goal`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expected: { kind: 'none' }, objective: 'ship the work', provider: 'codex', model: 'gpt-test', effort: 'high',
+      }),
+    })
+    assert.equal(createdResponse.status, 201)
+    const created = await createdResponse.json() as CanonicalGoal
+    assert.equal(created.objective, 'ship the work')
+
+    const editedResponse = await fetch(`${baseUrl}/goals/${created.id}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: created.revision, objective: 'ship verified work' }),
+    })
+    assert.equal(editedResponse.status, 200)
+    const edited = await editedResponse.json() as CanonicalGoal
+    assert.equal(edited.objective, 'ship verified work')
+
+    const paused = await fetch(`${baseUrl}/goals/${created.id}/status`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: edited.revision, status: 'paused' }),
+    })
+    assert.equal(paused.status, 200)
+    const pausedResult = await paused.json() as GoalCasResult
+    assert.equal(pausedResult.goal?.status, 'paused')
+
+    const cleared = await fetch(`${baseUrl}/goals/${created.id}?expectedRevision=${pausedResult.goal?.revision}`, {
+      method: 'DELETE',
+    })
+    assert.equal(cleared.status, 204)
+    assert.equal(service.goal, null)
+
+    const invalid = await fetch(`${baseUrl}/threads/${thread.id}/goal`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expected: { kind: 'none' }, objective: 'x', provider: 'unknown', model: 'm' }),
+    })
+    assert.equal(invalid.status, 400)
   })
 })
 

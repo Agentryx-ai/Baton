@@ -889,6 +889,39 @@ test('startup recovery blocks the exact active Goal revision owned by an interru
   assert.equal(recovered.listGoalEvents(session.activeThreadId).filter((event) => event.type === 'goal_blocked').length, 1)
 })
 
+test('startup recovery reports an unresolved mutating tool as an unknown outcome', (t) => {
+  const path = databasePath(t)
+  const options = deterministicOptions()
+  const first = new SqliteSessionStore(path, options)
+  const session = first.createSession({})
+  const goal = first.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'recover a mutation safely',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = first.beginTurn(beginInput(session.activeThreadId))
+  first.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'unresolved-mutation-call',
+    items: [{
+      kind: 'tool_call',
+      payload: {
+        callId: 'mutation-1', providerCallId: 'provider-mutation-1', name: 'write_file',
+        input: { path: 'x' }, sideEffect: 'workspace_mutation',
+      },
+    }],
+  })
+  first.close()
+
+  const recovered = new SqliteSessionStore(path, options)
+  t.after(() => recovered.close())
+  assert.equal(recovered.recoverInterruptedTurns(), 1)
+  assert.equal(recovered.getTurn(started.turn.id)?.error?.code, 'unknown_mutation_outcome')
+  assert.equal(recovered.getGoalById(goal.id)?.statusReason?.code, 'unknown_mutation_outcome')
+})
+
 test('provider bindings reject plaintext opaque state and invalidate incompatible context', (t) => {
   const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
   t.after(() => store.close())

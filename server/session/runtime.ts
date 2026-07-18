@@ -88,6 +88,9 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
     service,
     start: () => {
       const recovered = service.recoverInterruptedTurns()
+      void service.startGoalRuntime().catch((error) => {
+        console.error(`[baton] Goal runtime failed to start: ${error instanceof Error ? error.message : String(error)}`)
+      })
       sweepTrash()
       if (!retentionTimer) {
         retentionTimer = setInterval(sweepTrash, SESSION_RETENTION_INTERVAL_MS)

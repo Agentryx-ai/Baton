@@ -18,6 +18,7 @@ import type {
   ExecutionPolicySnapshot,
   FinishTurnInput,
   GoalSchedulerLease,
+  GoalId,
   GoalStatus,
   GoalStatusReason,
   NewCanonicalItem,
@@ -1090,6 +1091,11 @@ export class SqliteSessionStore implements SessionStore {
     return row ? this.#goal(row) : null
   }
 
+  getGoalById(goalId: GoalId): CanonicalGoal | null {
+    const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), goalId)
+    return row ? this.#goal(row) : null
+  }
+
   listActiveGoals(): CanonicalGoal[] {
     return this.#all(this.#db.prepare(`
       SELECT g.* FROM goals g
@@ -1527,16 +1533,19 @@ export class SqliteSessionStore implements SessionStore {
       const now = this.#now()
       for (const row of rows) {
         const turnId = text(row, 'id')
+        const unknownMutation = this.#hasUnresolvedMutatingToolCall(turnId)
+        const recoveryCode = unknownMutation ? 'unknown_mutation_outcome' : 'runtime_interrupted'
         const goalId = nullableText(row, 'goal_id')
         const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
-        this.#db.prepare("UPDATE turns SET status='interrupted',completed_at=? WHERE id=?").run(now, turnId)
+        this.#db.prepare("UPDATE turns SET status='interrupted',completed_at=?,error_json=? WHERE id=?")
+          .run(now, canonicalJson({ code: recoveryCode }), turnId)
         this.#db.prepare("UPDATE executions SET status='interrupted',completed_at=? WHERE turn_id=?").run(now, turnId)
         this.#db.prepare("UPDATE threads SET status='idle',revision=revision+1,updated_at=? WHERE id=?")
           .run(now, text(row, 'thread_id'))
         this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, text(row, 'session_id'))
         this.#appendStreamEvent(text(row, 'session_id'), text(row, 'thread_id'), turnId, 'turn_interrupted', {
           status: 'interrupted',
-          reason: 'process_restart',
+          reason: recoveryCode,
         }, now)
         if (goalId !== null && goalRevision !== null) {
           const goalRow = this.#optional(this.#db.prepare(`
@@ -1545,7 +1554,7 @@ export class SqliteSessionStore implements SessionStore {
           if (goalRow) {
             const previous = this.#goal(goalRow)
             const reason: GoalStatusReason = {
-              code: 'runtime_interrupted',
+              code: recoveryCode,
               source: 'host',
               message: null,
               at: now,
@@ -1566,6 +1575,25 @@ export class SqliteSessionStore implements SessionStore {
       }
       return rows.length
     })
+  }
+
+  #hasUnresolvedMutatingToolCall(turnId: TurnId): boolean {
+    const rows = this.#all(this.#db.prepare(`
+      SELECT kind,payload_json FROM items
+      WHERE turn_id=? AND kind IN ('tool_call','tool_result')
+      ORDER BY sequence
+    `), turnId)
+    const completed = new Set<string>()
+    const calls: Array<{ callId: string; sideEffect: string | null }> = []
+    for (const row of rows) {
+      const payload = parseObject(row.payload_json)
+      const callId = typeof payload.callId === 'string' ? payload.callId : null
+      if (!callId) continue
+      if (text(row, 'kind') === 'tool_result') completed.add(callId)
+      else calls.push({ callId, sideEffect: typeof payload.sideEffect === 'string' ? payload.sideEffect : null })
+    }
+    return calls.some((call) => !completed.has(call.callId)
+      && (call.sideEffect === 'workspace_mutation' || call.sideEffect === 'workspace_command'))
   }
 
   getNativeImportState(identity: NativeSourceIdentity): NativeImportStoredState | null {

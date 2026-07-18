@@ -158,6 +158,7 @@ export interface SessionStore extends NativeImportStore {
   recoverInterruptedTurns(): number
 
   getGoal(threadId: ThreadId): CanonicalGoal | null
+  getGoalById(goalId: GoalId): CanonicalGoal | null
   listActiveGoals(): CanonicalGoal[]
   listGoalEvents(threadId: ThreadId, afterSequence?: number): GoalEvent[]
   createGoal(input: CreateGoalInput): CanonicalGoal

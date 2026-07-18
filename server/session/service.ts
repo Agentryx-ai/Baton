@@ -1,6 +1,7 @@
 import type {
   BeginTurnResult,
   CanonicalItem,
+  CanonicalGoal,
   CanonicalProvider,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -12,7 +13,14 @@ import type {
   ThreadSnapshot,
   TurnId,
 } from './domain.ts'
-import type { ForkThreadInput, SessionListScope } from './store.ts'
+import type {
+  ClearGoalInput,
+  CreateGoalInput,
+  EditGoalInput,
+  ForkThreadInput,
+  GoalCasResult,
+  SessionListScope,
+} from './store.ts'
 
 export interface StartTurnInput {
   threadId: ThreadId
@@ -22,6 +30,13 @@ export interface StartTurnInput {
   clientRequestId: string
   expectedRevision: number
   input: NewCanonicalItem[]
+}
+
+export interface UserGoalStatusInput {
+  goalId: string
+  expectedRevision: number
+  status: 'active' | 'paused'
+  resetLimitCounters?: boolean
 }
 
 export interface ConversationService {
@@ -34,6 +49,12 @@ export interface ConversationService {
   forkThread(input: ForkThreadInput): CanonicalThread
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]
   listEvents(threadId: ThreadId, afterSequence?: number): CanonicalStreamEvent[]
+
+  getGoal(threadId: ThreadId): CanonicalGoal | null
+  createGoal(input: CreateGoalInput): Promise<CanonicalGoal>
+  editGoal(input: EditGoalInput): Promise<CanonicalGoal>
+  updateGoalStatus(input: UserGoalStatusInput): Promise<GoalCasResult>
+  clearGoal(input: ClearGoalInput): Promise<void>
 
   startTurn(input: StartTurnInput): Promise<BeginTurnResult>
   cancelTurn(turnId: TurnId): Promise<void>

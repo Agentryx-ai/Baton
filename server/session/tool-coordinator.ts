@@ -155,7 +155,7 @@ export class ToolCoordinator {
       ))
     }
 
-    const promise = this.#executeOnce(invocation, fingerprint, signal)
+    const promise = this.#executeOnce(invocation, signal)
       .finally(() => this.#inFlight.delete(invocation.callId))
     this.#inFlight.set(invocation.callId, { fingerprint, promise })
     return promise
@@ -163,7 +163,6 @@ export class ToolCoordinator {
 
   async #executeOnce(
     invocation: AgentToolInvocation,
-    fingerprint: string,
     signal?: AbortSignal,
   ): Promise<AgentToolResult> {
     const definition = this.#definitionsByName.get(invocation.name)
