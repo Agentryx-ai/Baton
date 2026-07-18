@@ -13,6 +13,7 @@ import {
 import { Input } from '@/components/ui/input'
 
 import { ConversationApiError, conversationApi } from './api'
+import { composerKeyAction } from './composer-keyboard'
 import type {
   CanonicalItemDto,
   CanonicalProvider,
@@ -415,10 +416,23 @@ export function ConversationWorkspace() {
                 <textarea
                   value={prompt}
                   onChange={(event) => setPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    const action = composerKeyAction({
+                      key: event.key,
+                      shiftKey: event.shiftKey,
+                      isComposing: event.nativeEvent.isComposing,
+                      keyCode: event.keyCode,
+                    })
+                    if (action !== 'submit') return
+                    event.preventDefault()
+                    if (canSubmit) event.currentTarget.form?.requestSubmit()
+                  }}
                   rows={4}
                   placeholder="Baton 정본에 추가하고 선택한 provider로 실행할 메시지"
+                  aria-keyshortcuts="Enter Shift+Enter"
                   className="w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
                 />
+                <span className="block">Enter 전송 · Shift+Enter 줄바꿈</span>
               </label>
 
               <div className="flex flex-wrap items-center justify-between gap-2">
