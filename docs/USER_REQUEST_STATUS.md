@@ -6,6 +6,9 @@
 > [`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md), 현재 구현 판정의 정본은
 > [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)다. 여기서 `완료`는 현재 코드·커밋·테스트·라이브
 > 상태 중 해당 요구에 맞는 직접 근거가 있는 경우에만 사용한다.
+>
+> 현재까지 식별한 독립 요청·질문은 **111개**다. 아래 ID가 대화 요청의 추적 키이며, 커밋하지 않은 작업은
+> 테스트가 통과했더라도 `진행 중` 또는 `부분 완료`로만 기록한다.
 
 ## 상태 표기
 
@@ -23,8 +26,8 @@
 | ID | 요청 | 상태 | 현재 근거와 남은 일 |
 |---|---|---|---|
 | LIVE-01 | `:4400` 새로고침 후 흰 화면 수정 | 완료 | 구버전 BFF가 `workStatus`를 생략할 때 UI가 `undefined.dot`에서 죽던 문제를 fail-safe 처리했다. `96235a0`; 실제 `/#conversations` 렌더와 브라우저 오류 0건 확인. 이미 굳은 기존 renderer 탭은 닫고 새 탭을 사용해야 할 수 있다. |
-| LIVE-02 | 정상 Claude 계정에서 “organization has disabled subscription access” 오류 수정 | 부분 완료·live 복구 검증 | 직접 원인은 정상 Max 계정을 95%에서 선제 pause하고, Claude Code OAuth가 거부되는 만료 테스트 계정을 선택한 정책이었다. 현재는 **정책 엔진 OFF**, 정상 계정 active, 만료 계정 paused, `fill-first`이며 Fable 5 smoke turn이 assistant 1개·오류 0개로 완료됐다. 영구 정책 코드는 아직 미수정이며 [`../issues/claude-rotation-must-switch-on-actual-429.md`](../issues/claude-rotation-must-switch-on-actual-429.md)의 완료 조건을 구현해야 한다. |
-| LIVE-03 | 순차 소진을 위해 proxy를 `fill-first`로 전환 | 완료(live)·코드 커밋 대기 | 설치된 CCS 계약이 `PUT {value}`임을 확인해 live gateway를 `fill-first`로 전환했다. Baton SPA의 잘못된 `POST {strategy}`와 session-affinity POST도 PUT 계약으로 수정하고 회귀 테스트를 추가했다. |
+| LIVE-02 | 정상 Claude 계정에서 “organization has disabled subscription access” 오류 수정 | 부분 완료·영구 수정 검증 중 | 직접 원인은 정상 Max 계정을 95%에서 선제 pause하고, Claude Code OAuth가 거부되는 만료 테스트 계정을 선택한 정책이었다. live는 **정책 엔진 OFF**, 정상 계정 active, 만료 계정 paused, `fill-first`에서 Fable 5 smoke turn assistant 1개·오류 0개로 복구됐다. 영구 수정 WIP는 95/100% 자동 pause 제거, 전체 비수동-pause pool 보존, `fill-first` ACK 전 정책 시작 금지를 구현했고 정책 테스트 6/6·typecheck를 통과했다. 아직 원자적 커밋·전체 회귀·live 재검증 전이다. |
+| LIVE-03 | 순차 소진을 위해 proxy를 `fill-first`로 전환 | 완료 | 설치된 CCS 계약이 `PUT {value}`임을 확인해 live gateway를 `fill-first`로 전환했다. Baton SPA의 잘못된 `POST {strategy}`와 session-affinity POST도 PUT 계약으로 수정하고 회귀 테스트를 추가했다. `ce608ee`. |
 | LIVE-04 | 라이브 수정은 구현되는 즉시 4400에서 사용 가능하게 반영 | 부분 완료 | 흰 화면 핫픽스는 서버 재시작 없이 4400에 반영했다. 이후 기능은 아직 WIP라 검증 전 4400에 올리지 않았다. |
 
 ## 1. 프로젝트 목적·공개 저장소·개발 규율
@@ -66,12 +69,12 @@
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
 | ACCOUNT-01 | provider별 Claude/Codex target을 독립 평가 | 완료 | 정책 엔진이 provider별로 독립 tick을 수행한다. |
-| ACCOUNT-02 | usable 계정이 정확히 1개면 그 계정을 target으로 하고 소진 계정 pause | 완료(기존 정책) | `876f76a`로 단일 usable 계정 조향을 구현. 다만 “소진”을 95%로 판단하는 정책 자체는 LIVE-02 때문에 교체 필요. |
-| ACCOUNT-03 | 수동 정지 계정은 어떤 경우에도 사용하지 않음 | 구현됨·live 재검증 필요 | 수동 paused는 engine-owned pause와 구분되고 자동 resume 대상이 아니다. proxy 요청 단위 trace로 한 번 더 검증 필요. |
+| ACCOUNT-02 | usable 계정이 정확히 1개면 그 계정을 target으로 하고 소진 계정 pause | 정책 교체 진행 중 | 기존 `876f76a`의 “두 계정만 active/95% 소진” 모델은 실제 CLIProxy failover를 약화했다. 새 WIP는 사용량으로 계정을 pause하지 않고 모든 비수동-pause 계정을 proxy pool에 남겨 `fill-first`가 순차 소진·3번째 이상 failover를 담당하게 한다. |
+| ACCOUNT-03 | 수동 정지 계정은 어떤 경우에도 사용하지 않음 | 구현됨·live 재검증 필요 | 새 정책 테스트는 수동 paused 계정을 선택·resume하지 않음을 확인했다. proxy 요청 단위 trace로 한 번 더 검증하고 원자적 커밋해야 한다. |
 | ACCOUNT-04 | round-robin/fill-first 의미를 UI에서 설명 | 완료 | 홈/설정에 전략 설명과 상태가 존재. |
-| ACCOUNT-05 | quota 95%를 실제 소진으로 간주하지 않고 실제 429까지 사용 | 미착수(영구 수정) | 현재 라이브 완화로 엔진만 OFF. 95%는 경고 전용으로 낮추고 429 cooldown/403 ineligible을 분리해야 한다. |
+| ACCOUNT-05 | quota 95%를 실제 소진으로 간주하지 않고 실제 429까지 사용 | 진행 중 (NO-GO) | 영구 수정 WIP에서 95/98/100% 자동 소진·pause를 제거했다. 실제 429/cooling/동일 요청 failover는 CLIProxy 책임으로 유지하며, Baton 정책은 `fill-first` 설정 ACK 없이는 시작하지 않는다. 전체 회귀·live 429 E2E가 남았다. |
 | ACCOUNT-06 | 실제 429에서 같은 요청을 다음 유효 계정으로 재시도 | 검증 필요 | CLIProxy의 `quota-exceeded.switch-project` 책임이지만 현재 설치의 실제 failover E2E가 없음. |
-| ACCOUNT-07 | 403 OAuth/구독 불가 계정을 INELIGIBLE로 제외 | 미착수 | 현재는 수동 pause로만 격리. 자격 상태와 UI/로그 모델 필요. |
+| ACCOUNT-07 | 403 OAuth/구독 불가 계정을 INELIGIBLE로 제외 | 외부 계약 차단 | 현재 CCS accounts/quota API가 계정별 durable 403/INELIGIBLE 상태를 제공하지 않는다. 사용량만으로 추정 제외하면 정상 계정도 오판하므로, 지원 신호가 생길 때까지 명시적 수동 pause만 결정론적으로 안전하다. |
 | ACCOUNT-08 | Claude Fable 5 전용 usage 게이지 표시 | 완료(코드)·4400 재시작 대기 | CCS 8.1.4가 새 Claude OAuth `limits[]`를 버리는 원인을 확인했다. BFF가 local management API에서 `weekly_scoped(Fable)`만 안전 보강해 `seven_day_fable5`/`Fable 5` window로 합치며 2분 cache·single-flight·fail-open을 적용했다. 테스트와 live 원문 discovery는 통과했고 현재 4400 프로세스 재시작 후 화면 검증이 남았다. |
 | ACCOUNT-09 | usage freshness를 “n초 전 기준”으로 표시 | 부분 완료 | `useQuota`에는 age 계산이 있으나 현재 App의 quota fan-out에 연결되지 않음. |
 | ACCOUNT-10 | usage를 대화 응답마다 반복 표시하지 않음 | 완료 | transcript 안의 매 usage 이벤트 대신 대화 단위 최신 요약으로 표시하도록 개선. |
@@ -133,8 +136,8 @@
 
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
-| WORKSPACE-01 | 사용자 허용 후 Baton이 로컬 폴더 파일에 접근 | 부분 완료 | 사용자가 입력한 절대 `cwd`를 realpath 검증·CAS 연결하면 read/list/search/write/replace 도구가 그 root에서만 활성화된다. `405d6bd`. **OS native folder picker와 권한 grant UX는 아직 없다.** |
-| WORKSPACE-02 | 폴더별로 접근을 요청·허용 | 미착수(UI grant) | 현재는 경로 문자열 입력 방식이다. BFF가 사용할 실제 절대 경로를 안전하게 받는 native folder picker/host grant가 필요하다. |
+| WORKSPACE-01 | 사용자 허용 후 Baton이 로컬 폴더 파일에 접근 | 부분 완료 | 절대 `cwd`의 realpath 검증·CAS와 root 한정 read/list/search/write/replace 도구가 있다(`405d6bd`). Windows native folder picker host API도 명시적 interaction header, UTF-8 Base64 JSON, timeout·크기 제한·typed failure로 구현·커밋했다(`006a7d6`). 대화 UI 연결과 실제 폴더 live E2E가 남았다. |
+| WORKSPACE-02 | 폴더별로 접근을 요청·허용 | 부분 완료 | BFF native picker 기반은 완료됐지만 UI의 폴더 선택·grant 흐름과 세션별 권한 표시가 아직 연결되지 않았다. |
 | WORKSPACE-03 | 폴더(프로젝트)별 작업/세션 생성 | 부분 완료 | session에 verified `cwd`/project grouping은 있지만, 새 대화 시작 UX가 요구와 다르다. |
 | WORKSPACE-04 | “새 대화” 클릭만으로 DB 세션을 만들지 않고 임시 composer에서 폴더/model/message를 고른 뒤 첫 전송 때 원자 생성 | 미착수 | 현재 dialog의 `대화 시작`이 즉시 `POST /sessions`를 호출한다. deferred draft + create-and-start atomic API/UX가 필요하다. |
 | WORKSPACE-05 | 가져온 세션의 source cwd는 제안일 뿐, 명시 연결 전 권한 없음 | 완료 | source cwd와 authorized cwd를 분리하고 drift/junction 교체를 fail-closed 처리. |
@@ -149,20 +152,19 @@
 | AGENT-01 | 한 번 응답하고 끝내지 않고 요청 완수까지 model/tool round를 반복 | 완료(V1) | provider-neutral broker와 Claude/Gemini/Codex bounded loop 구현. |
 | AGENT-02 | 무한 루프 방지와 명확한 종료 조건 | 완료(V1) | turn timeout, provider readiness, tool/retry/output bounds, Goal 24턴/2시간/3회 no-progress. |
 | AGENT-03 | persistent `/goal`을 provider-neutral하게 구현하고 Claude 호환 | 완료(V1) | durable CAS/event/lease/scheduler, UI 명령·panel, Claude/Codex adapter 연동. Gemini live만 외부 차단. |
-| AGENT-04 | 실행 중 사용자 follow-up을 Codex `turn/steer` 또는 stateless safe boundary로 전달 | 진행 중 (NO-GO) | Codex live steer 기반은 `fc70699`. 공통 queue/backend/UI 통합 초안은 현재 미완료·미검증. |
-| AGENT-05 | pending 사용자 입력을 자동 Goal continuation보다 우선 | 진행 중 (NO-GO) | 설계/초안은 있으나 startup failure 경로에서 Goal이 앞설 수 있는 correctness bug가 확인됨. |
-| AGENT-06 | accepted/unknown/requeue가 중복 실행 없이 durable | 진행 중 (NO-GO) | backend 초안에 accepted consume 검증 누락, stale Goal rollback, v11 migration 미검증 문제가 있어 커밋 금지 상태. |
-| AGENT-07 | Claude/Gemini follow-up을 tool-result 뒤 안전 경계에서 FIFO 삽입 | 진행 중 (NO-GO) | `LiveSteerQueue` 초안은 있으나 end/tool/final/cancel race 테스트가 전혀 없어 배포 금지. |
+| AGENT-04 | 실행 중 사용자 follow-up을 Codex `turn/steer` 또는 stateless safe boundary로 전달 | 진행 중 (NO-GO) | Codex live steer 기반(`fc70699`) 위에 durable API/store/orchestrator/UI와 Claude/Gemini safe-boundary steer를 통합했다. 마지막 shutdown/drain race 수정 후 orchestrator 26/26·typecheck가 통과했으나 최종 적대적 재검수·전체 회귀·커밋 전이다. |
+| AGENT-05 | pending 사용자 입력을 자동 Goal continuation보다 우선 | 진행 중 (NO-GO) | queued user follow-up 우선, Goal scope capture/tuple 검증, targetless next-turn, bounded retry가 구현됐다. crash/startup/close 경계의 최종 적대적 재검수가 남았다. |
+| AGENT-06 | accepted/unknown/requeue가 중복 실행 없이 durable | 진행 중 (NO-GO) | schema v12의 `steer|next_turn`, `delivery_unknown`, CAS/idempotency, accepted crash fail-close와 close-time drain 대기를 구현했다. 중복 실행 방지 최종 리뷰와 DB reopen 포함 전체 회귀 후에만 커밋한다. |
+| AGENT-07 | Claude/Gemini follow-up을 tool-result 뒤 안전 경계에서 FIFO 삽입 | 진행 중 (NO-GO) | stateless adapter에 end/tool boundary FIFO, pause/max_tokens 순서, final/cancel/dispose race 처리를 구현하고 mock 검증했다. Gemini는 사용자 지시대로 live 호출하지 않았으며 전체 통합 검증이 남았다. |
 | AGENT-08 | approval/user-input wait | 미구현 | 현재 blocker/approval lifecycle은 완성되지 않았다. |
 
 ### 현재 중단된 병렬 작업의 정확한 상태
 
-1. **UI/API 노드** — 구현 초안 완료, app typecheck 통과, UI behavior 10/10 통과. backend 계약 정착 후 전체 검증 필요.
-2. **Backend/store/orchestrator 노드** — 미완료 NO-GO. stale Goal rollback, accepted consume race, startup 우선순위,
-   v11 migration/API/race test가 남았다.
-3. **Claude/Gemini stateless steer 노드** — 미완료 NO-GO. queue 초안만 있고 새 테스트·최종 typecheck가 없다.
-4. 마지막 통합 전 안정 기준은 `96235a0` 이전 합본의 전체 테스트 254/254와 typecheck 통과다. 현재 WIP 전체는
-   build 가능한 상태로 간주하지 않는다.
+1. **UI/API 노드** — Send/Stop 분리, 모델 잠금, pending FIFO 상태·취소까지 구현했다.
+2. **Backend/store/orchestrator 노드** — schema v12, CAS/idempotency, Goal 우선순위, crash fail-close, shutdown drain까지
+   구현했다. 마지막 수정 기준 orchestrator 26/26와 typecheck가 통과했다.
+3. **Claude/Gemini stateless steer 노드** — safe-boundary FIFO와 final/cancel/dispose race를 mock 검증했다. Gemini live는 금지다.
+4. **현재 판정은 여전히 NO-GO** — 최종 독립 적대적 재검수, 전체 test/lint/build, 원자적 커밋 전에는 완료로 올리지 않는다.
 
 ## 9. Context caching과 compaction
 
