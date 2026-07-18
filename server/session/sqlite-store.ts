@@ -367,8 +367,10 @@ export class SqliteSessionStore implements SessionStore {
       }
     }
     const bindingRows = this.#all(this.#db.prepare(
-      'SELECT * FROM provider_bindings WHERE thread_id = ? AND invalidated_at IS NULL ORDER BY provider',
-    ), threadId)
+      `SELECT * FROM provider_bindings
+       WHERE thread_id = ? AND invalidated_at IS NULL AND synced_revision = ?
+       ORDER BY provider`,
+    ), threadId, thread.revision)
     return { session, thread, turns, items, bindings: bindingRows.map((row) => this.#binding(row)) }
   }
 
@@ -523,6 +525,10 @@ export class SqliteSessionStore implements SessionStore {
         .run(input.status, now, canonicalJson(desiredUsage ?? {}), input.turnId)
       this.#db.prepare("UPDATE threads SET status='idle',revision=revision+1,updated_at=? WHERE id=?")
         .run(now, text(row, 'thread_id'))
+      this.#db.prepare(`
+        UPDATE provider_bindings SET invalidated_at=?,updated_at=?
+        WHERE thread_id=? AND invalidated_at IS NULL
+      `).run(now, now, text(row, 'thread_id'))
       this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, text(row, 'session_id'))
       const eventType: CanonicalStreamEventType = input.status === 'completed'
         ? 'turn_completed'

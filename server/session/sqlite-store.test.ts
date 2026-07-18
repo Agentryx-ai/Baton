@@ -243,4 +243,9 @@ test('provider bindings reject plaintext opaque state and invalidate incompatibl
   const replacement = store.upsertProviderBinding({ ...base, contextDigest: 'digest-b' })
   assert.notEqual(replacement.id, first.id)
   assert.deepEqual(store.getSnapshot(thread.id)?.bindings.map((binding) => binding.id), [replacement.id])
+
+  const turn = store.beginTurn(beginInput(thread.id))
+  assert.deepEqual(store.getSnapshot(thread.id)?.bindings, [], 'running revisions must not expose stale bindings')
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  assert.deepEqual(store.getSnapshot(thread.id)?.bindings, [], 'finished turns invalidate prior bindings')
 })
