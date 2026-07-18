@@ -224,3 +224,34 @@ test('an active Goal launches a continuation and can complete through the provid
   assert.equal(store.getSnapshot(session.activeThreadId)?.turns.length, 1)
   assert.equal(store.listItems(session.activeThreadId).some((item) => item.kind === 'tool_result'), true)
 })
+
+test('a Goal with no canonical progress stops after exactly three automatic turns', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-no-progress-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  registry.register(safeAdapter([]))
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const session = orchestrator.createSession({ cwd: directory })
+  await orchestrator.startGoalRuntime()
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'stop if no durable progress exists',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (store.getGoalById(goal.id)?.status === 'blocked') break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const blocked = store.getGoalById(goal.id)
+  assert.equal(blocked?.status, 'blocked')
+  assert.equal(blocked?.statusReason?.code, 'no_progress')
+  assert.equal(blocked?.automaticTurnsUsed, 3)
+  assert.equal(store.getSnapshot(session.activeThreadId)?.turns.length, 3)
+})

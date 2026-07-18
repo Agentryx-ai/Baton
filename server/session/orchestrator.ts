@@ -394,7 +394,7 @@ export class TurnOrchestrator implements ConversationService {
       tokensUsed,
       timeUsedSeconds: elapsedTurnSeconds(turn, new Date().toISOString()),
       ...(includeProgress ? {
-        progressDigest: goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision),
+        progressDigest: goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision, turn.id),
       } : {}),
     })
   }
@@ -406,7 +406,7 @@ export class TurnOrchestrator implements ConversationService {
     automatic: boolean,
   ): Promise<void> {
     if (turn.goalId === null || turn.goalRevision === null) return
-    const progressDigest = goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision)
+    const progressDigest = goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision, turn.id)
     const accounted = this.store.recordGoalTurn({
       turnId: turn.id,
       goalId: turn.goalId,
@@ -612,11 +612,12 @@ function elapsedTurnSeconds(turn: CanonicalTurn, endIso: string): number {
   return Math.max(0, Math.floor((Date.parse(endIso) - Date.parse(turn.startedAt)) / 1_000))
 }
 
-function goalProgressDigest(snapshot: ThreadSnapshot | null, goalRevision: number): string {
+function goalProgressDigest(snapshot: ThreadSnapshot | null, goalRevision: number, turnId: TurnId): string | null {
   const evidence = snapshot?.items
-    .filter((item) => item.kind === 'tool_result' || item.kind === 'file_change'
-      || item.kind === 'plan' || item.kind === 'task')
+    .filter((item) => item.turnId === turnId && (item.kind === 'tool_result' || item.kind === 'file_change'
+      || item.kind === 'plan' || item.kind === 'task'))
     .map((item) => stableProgressEvidence(item.kind, item.payload)) ?? []
+  if (evidence.length === 0) return null
   return createHash('sha256').update(stableJson({
     goalRevision,
     evidence: [...new Set(evidence)].sort(),

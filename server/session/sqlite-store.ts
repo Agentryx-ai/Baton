@@ -1430,7 +1430,7 @@ export class SqliteSessionStore implements SessionStore {
       const now = this.#now()
       const sameProgress = input.progressDigest !== null && current.lastProgressDigest === input.progressDigest
       const noProgressCount = input.progressDigest === null
-        ? current.noProgressCount
+        ? current.noProgressCount + 1
         : sameProgress ? current.noProgressCount + 1 : 0
       this.#db.prepare(`
         UPDATE goal_turn_accounting

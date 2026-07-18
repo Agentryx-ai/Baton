@@ -118,7 +118,7 @@ class FakeGoalStore implements GoalRuntimeStore {
       timeUsedSeconds: this.current.timeUsedSeconds + input.timeUsedSeconds,
       automaticTurnsUsed: this.current.automaticTurnsUsed + (input.automatic ? 1 : 0),
       noProgressCount: input.progressDigest === null
-        ? this.current.noProgressCount
+        ? this.current.noProgressCount + 1
         : same ? this.current.noProgressCount + 1 : 0,
       lastProgressDigest: input.progressDigest ?? this.current.lastProgressDigest,
     }
