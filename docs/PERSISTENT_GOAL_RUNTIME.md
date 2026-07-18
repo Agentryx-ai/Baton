@@ -2,7 +2,8 @@
 
 > Status: **V1 IMPLEMENTED (2026-07-19).** SQLite projection/events, revision CAS, leases,
 > automatic continuation, limits, recovery, Goal inspection/terminal tools, REST API, `/goal` commands, and UI controls
-> are active. Claude and Codex have deterministic mock/integration coverage; Gemini live execution
+> are active. Provider adapters and the Goal runtime have separate deterministic coverage; cross-layer
+> Goal lifecycle conformance through every real adapter remains incomplete, and Gemini live execution
 > remains unverified while its proxy authentication is unavailable.
 
 ## 1. Purpose and separation
@@ -49,7 +50,7 @@ events and turns are never rewritten.
 
 The composer recognizes commands only at the beginning of the submitted text:
 
-- exact `/goal`: open Goal entry/status UI and do not send a chat message;
+- exact `/goal`: switch the composer into removable Goal-entry mode and do not send a chat message;
 - `/goal` followed by Unicode whitespace and an objective: create or replace a Goal;
 - `/goal edit`: open the editor;
 - `/goal pause`: pause;
@@ -60,8 +61,8 @@ The composer recognizes commands only at the beginning of the submitted text:
 an unfinished Goal exists requires explicit replacement confirmation and creates a new Goal ID with
 fresh counters. Editing keeps the Goal ID and counters.
 
-The Goal chip/panel shows objective, status, active duration, automatic turns, tokens, remaining
-budget, and the latest reason. It offers edit, pause, resume, and clear actions. A completed Goal stays
+The persistent Goal tray immediately above the composer shows objective, status, active duration,
+automatic turns, tokens, remaining budget, and the latest reason. It offers edit, pause, resume, and clear actions. A completed Goal stays
 visible in the transcript/status history until a new Goal replaces the current projection.
 
 ## 4. Mutation semantics
