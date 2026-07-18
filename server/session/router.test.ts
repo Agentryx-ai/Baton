@@ -57,6 +57,8 @@ const session: CanonicalSession = {
 const turn: CanonicalTurn = {
   id: 'turn-1',
   threadId: thread.id,
+  goalId: null,
+  goalRevision: null,
   sequence: 1,
   provider: 'codex',
   model: 'gpt-5',

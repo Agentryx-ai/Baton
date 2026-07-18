@@ -3,9 +3,9 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite'
 
 import type {
   AppendEventInput,
-  BeginTurnInput,
   BeginTurnResult,
   CanonicalExecution,
+  CanonicalGoal,
   CanonicalItem,
   CanonicalItemKind,
   CanonicalProvider,
@@ -17,6 +17,9 @@ import type {
   CreateSessionInput,
   ExecutionPolicySnapshot,
   FinishTurnInput,
+  GoalSchedulerLease,
+  GoalStatus,
+  GoalStatusReason,
   NewCanonicalItem,
   ProviderBinding,
   ProviderCapabilities,
@@ -27,8 +30,24 @@ import type {
   UpsertProviderBindingInput,
 } from './domain.ts'
 import { uuidV7 } from './domain.ts'
-import type { ForkThreadInput, SessionListScope, SessionStore } from './store.ts'
-import { SessionStoreError } from './store.ts'
+import type {
+  ClaimGoalLeaseInput,
+  CheckpointGoalTurnInput,
+  ClearGoalInput,
+  CreateGoalInput,
+  EditGoalInput,
+  ForkThreadInput,
+  GoalCasResult,
+  GoalAwareBeginTurnInput,
+  GoalEvent,
+  HeartbeatGoalLeaseInput,
+  RecordGoalTurnInput,
+  ReleaseGoalLeaseInput,
+  SessionListScope,
+  SessionStore,
+  UpdateGoalStatusInput,
+} from './store.ts'
+import { GoalStoreError, SessionStoreError } from './store.ts'
 import type {
   CommitNativeImportInput,
   NativeImportCommitCheckpoint,
@@ -40,7 +59,10 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 6
+const SCHEMA_VERSION = 7
+const DEFAULT_GOAL_TURNS = 24
+const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
+const DEFAULT_GOAL_LEASE_MS = 30_000
 const ACTIVE_TURN_STATUSES = new Set(['queued', 'running', 'waiting_tool'])
 const TERMINAL_TURN_STATUSES = new Set(['completed', 'cancelled', 'failed', 'interrupted'])
 
@@ -480,6 +502,97 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 6')
         appliedVersion = 6
       }
+      if (appliedVersion < 7) {
+        this.#db.exec(`
+          ALTER TABLE turns ADD COLUMN goal_id TEXT;
+          ALTER TABLE turns ADD COLUMN goal_revision INTEGER;
+          CREATE TRIGGER turns_goal_context_insert BEFORE INSERT ON turns
+          WHEN (NEW.goal_id IS NULL) != (NEW.goal_revision IS NULL)
+            OR NEW.goal_revision < 1
+          BEGIN
+            SELECT RAISE(ABORT, 'turn goal context must be a complete positive tuple');
+          END;
+          CREATE TRIGGER turns_goal_context_update BEFORE UPDATE OF goal_id,goal_revision ON turns
+          WHEN (NEW.goal_id IS NULL) != (NEW.goal_revision IS NULL)
+            OR NEW.goal_revision < 1
+          BEGIN
+            SELECT RAISE(ABORT, 'turn goal context must be a complete positive tuple');
+          END;
+
+          CREATE TABLE goals (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL UNIQUE REFERENCES threads(id) ON DELETE RESTRICT,
+            objective TEXT NOT NULL CHECK(length(objective) BETWEEN 1 AND 4000),
+            status TEXT NOT NULL CHECK(status IN ('active','paused','blocked','usage_limited','budget_limited','complete')),
+            status_reason_json TEXT CHECK(status_reason_json IS NULL OR json_valid(status_reason_json)),
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            provider TEXT NOT NULL CHECK(provider IN ('claude','codex','gemini')),
+            model TEXT NOT NULL CHECK(length(model) >= 1),
+            effort TEXT,
+            token_budget INTEGER CHECK(token_budget IS NULL OR token_budget >= 1),
+            tokens_used INTEGER NOT NULL DEFAULT 0 CHECK(tokens_used >= 0),
+            time_used_seconds INTEGER NOT NULL DEFAULT 0 CHECK(time_used_seconds >= 0),
+            max_automatic_turns INTEGER NOT NULL CHECK(max_automatic_turns >= 1),
+            automatic_turns_used INTEGER NOT NULL DEFAULT 0 CHECK(automatic_turns_used >= 0),
+            max_active_seconds INTEGER NOT NULL CHECK(max_active_seconds >= 1),
+            no_progress_count INTEGER NOT NULL DEFAULT 0 CHECK(no_progress_count >= 0),
+            last_progress_digest TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT
+          ) STRICT;
+          CREATE INDEX goals_active_scheduler ON goals(status, updated_at, id) WHERE status='active';
+
+          CREATE TABLE goal_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal_id TEXT NOT NULL,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            type TEXT NOT NULL,
+            payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX goal_events_thread_sequence ON goal_events(thread_id, sequence);
+          CREATE TRIGGER goal_events_no_update BEFORE UPDATE ON goal_events BEGIN
+            SELECT RAISE(ABORT, 'goal events are append-only');
+          END;
+          CREATE TRIGGER goal_events_no_delete BEFORE DELETE ON goal_events
+          WHEN NOT EXISTS (
+            SELECT 1 FROM session_purge_context WHERE session_id = OLD.session_id
+          ) BEGIN
+            SELECT RAISE(ABORT, 'goal events are append-only');
+          END;
+
+          CREATE TABLE goal_scheduler_leases (
+            goal_id TEXT PRIMARY KEY REFERENCES goals(id) ON DELETE CASCADE,
+            lease_id TEXT NOT NULL UNIQUE,
+            goal_revision INTEGER NOT NULL CHECK(goal_revision >= 1),
+            owner_id TEXT NOT NULL CHECK(length(owner_id) >= 1),
+            acquired_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE goal_turn_accounting (
+            turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE RESTRICT,
+            goal_id TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL CHECK(goal_revision >= 1),
+            tokens_used INTEGER NOT NULL CHECK(tokens_used >= 0),
+            time_used_seconds INTEGER NOT NULL CHECK(time_used_seconds >= 0),
+            automatic INTEGER NOT NULL DEFAULT 0 CHECK(automatic IN (0,1)),
+            terminal INTEGER NOT NULL DEFAULT 0 CHECK(terminal IN (0,1)),
+            progress_digest TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          ) WITHOUT ROWID, STRICT;
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(7, 'persistent-goal-runtime', this.#now())
+        this.#db.exec('PRAGMA user_version = 7')
+        appliedVersion = 7
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
@@ -561,6 +674,11 @@ export class SqliteSessionStore implements SessionStore {
       if (activeTurn) {
         throw new SessionStoreError('session_busy', '실행 중인 응답이 끝난 뒤 대화를 삭제하세요.')
       }
+      this.#db.prepare(`
+        DELETE FROM goal_scheduler_leases WHERE goal_id IN (
+          SELECT g.id FROM goals g JOIN threads t ON t.id=g.thread_id WHERE t.session_id=?
+        )
+      `).run(sessionId)
       this.#db.prepare('UPDATE sessions SET archived_at = ? WHERE id = ?').run(this.#now(), sessionId)
       return this.getSession(sessionId) as CanonicalSession
     })
@@ -608,6 +726,17 @@ export class SqliteSessionStore implements SessionStore {
         DELETE FROM provider_events WHERE turn_id IN (
           SELECT t.id FROM turns t
           JOIN threads th ON th.id = t.thread_id
+          JOIN session_purge_context pc ON pc.session_id = th.session_id
+        );
+        DELETE FROM goal_turn_accounting WHERE turn_id IN (
+          SELECT t.id FROM turns t
+          JOIN threads th ON th.id = t.thread_id
+          JOIN session_purge_context pc ON pc.session_id = th.session_id
+        );
+        DELETE FROM goal_events
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM goals WHERE thread_id IN (
+          SELECT th.id FROM threads th
           JOIN session_purge_context pc ON pc.session_id = th.session_id
         );
         DELETE FROM provider_bindings WHERE thread_id IN (
@@ -694,7 +823,7 @@ export class SqliteSessionStore implements SessionStore {
     })
   }
 
-  beginTurn(input: BeginTurnInput): BeginTurnResult {
+  beginTurn(input: GoalAwareBeginTurnInput): BeginTurnResult {
     return this.#transaction('IMMEDIATE', () => {
       const existingRow = this.#optional(
         this.#db.prepare('SELECT * FROM turns WHERE thread_id = ? AND client_request_id = ?'),
@@ -724,6 +853,27 @@ export class SqliteSessionStore implements SessionStore {
       if (thread.status !== 'idle') throw new SessionStoreError('turn_not_running', 'Thread already has an active turn')
 
       const now = this.#now()
+      const goalContext = input.goalContext ?? null
+      const currentGoalRow = this.#optional(
+        this.#db.prepare("SELECT * FROM goals WHERE thread_id=? AND status='active'"),
+        thread.id,
+      )
+      let capturedGoalId = currentGoalRow ? text(currentGoalRow, 'id') : null
+      let capturedGoalRevision = currentGoalRow ? integer(currentGoalRow, 'revision') : null
+      if (goalContext) {
+        const lease = this.#optional(this.#db.prepare(`
+          SELECT l.* FROM goal_scheduler_leases l
+          JOIN goals g ON g.id=l.goal_id
+          WHERE l.lease_id=? AND l.goal_id=? AND l.goal_revision=?
+            AND g.thread_id=? AND g.status='active' AND g.revision=l.goal_revision
+        `), goalContext.leaseId, goalContext.goalId, goalContext.goalRevision, thread.id)
+        if (!lease || text(lease, 'expires_at') <= now) {
+          throw new GoalStoreError('goal_lease_lost', 'Goal scheduler lease is missing, expired, or stale')
+        }
+        capturedGoalId = goalContext.goalId
+        capturedGoalRevision = goalContext.goalRevision
+      }
+
       const turnId = this.#idFactory()
       const executionId = this.#idFactory()
       const sequenceRow = this.#one(this.#db.prepare(
@@ -731,10 +881,10 @@ export class SqliteSessionStore implements SessionStore {
       ), thread.id)
       const turnSequence = integer(sequenceRow, 'next_sequence')
       this.#db.prepare(`
-        INSERT INTO turns(id,thread_id,sequence,provider,model,effort,status,client_request_id,request_hash,started_at)
-        VALUES (?,?,?,?,?,?,'running',?,?,?)
+        INSERT INTO turns(id,thread_id,sequence,provider,model,effort,status,client_request_id,request_hash,started_at,goal_id,goal_revision)
+        VALUES (?,?,?,?,?,?,'running',?,?,?,?,?)
       `).run(turnId, thread.id, turnSequence, input.provider, input.model, input.effort ?? null,
-        input.clientRequestId, input.requestHash, now)
+        input.clientRequestId, input.requestHash, now, capturedGoalId, capturedGoalRevision)
       this.#db.prepare(`
         INSERT INTO executions(id,session_id,thread_id,turn_id,parent_execution_id,spawn_item_id,kind,provider,model,adapter_version,status,policy_snapshot_json,budget_json,usage_json,lease_expires_at,started_at)
         VALUES (?,?,?,?,NULL,NULL,'root_turn',?,?,?,'running',?,?,?,?,?)
@@ -751,6 +901,14 @@ export class SqliteSessionStore implements SessionStore {
         effort: input.effort ?? null,
         itemIds: initialItems.map((item) => item.id),
       }, now)
+      if (goalContext) {
+        this.#db.prepare(`
+          DELETE FROM goal_scheduler_leases
+          WHERE lease_id=? AND goal_id=? AND goal_revision=?
+        `).run(goalContext.leaseId, goalContext.goalId, goalContext.goalRevision)
+      } else if (capturedGoalId !== null) {
+        this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(capturedGoalId)
+      }
       return {
         turn: this.getTurn(turnId) as CanonicalTurn,
         execution: this.#execution(this.#one(this.#db.prepare('SELECT * FROM executions WHERE id=?'), executionId)),
@@ -763,6 +921,24 @@ export class SqliteSessionStore implements SessionStore {
   getTurn(turnId: TurnId): CanonicalTurn | null {
     const row = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), turnId)
     return row ? this.#turn(row) : null
+  }
+
+  setTurnActivity(
+    turnId: TurnId,
+    status: Extract<CanonicalTurn['status'], 'running' | 'waiting_tool'>,
+  ): CanonicalTurn {
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), turnId)
+      if (!row) throw new SessionStoreError('not_found', `Turn not found: ${turnId}`)
+      if (!ACTIVE_TURN_STATUSES.has(text(row, 'status'))) {
+        throw new SessionStoreError('turn_not_running', 'Turn activity can only change while the turn is active')
+      }
+      const executionStatus = status === 'waiting_tool' ? 'waiting' : 'running'
+      this.#db.prepare('UPDATE turns SET status=? WHERE id=?').run(status, turnId)
+      this.#db.prepare('UPDATE executions SET status=? WHERE turn_id=?').run(executionStatus, turnId)
+      this.#db.prepare("UPDATE threads SET status='running' WHERE id=?").run(text(row, 'thread_id'))
+      return this.getTurn(turnId) as CanonicalTurn
+    })
   }
 
   appendProviderEvent(input: AppendEventInput): CanonicalItem[] {
@@ -902,6 +1078,438 @@ export class SqliteSessionStore implements SessionStore {
     ), threadId, afterSequence).map((row) => this.#streamEvent(row))
   }
 
+  getGoal(threadId: ThreadId): CanonicalGoal | null {
+    const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE thread_id=?'), threadId)
+    return row ? this.#goal(row) : null
+  }
+
+  listActiveGoals(): CanonicalGoal[] {
+    return this.#all(this.#db.prepare(`
+      SELECT g.* FROM goals g
+      JOIN threads t ON t.id=g.thread_id
+      JOIN sessions s ON s.id=t.session_id
+      WHERE g.status='active' AND s.archived_at IS NULL
+      ORDER BY g.updated_at,g.id
+    `))
+      .map((row) => this.#goal(row))
+  }
+
+  listGoalEvents(threadId: ThreadId, afterSequence = 0): GoalEvent[] {
+    if (!this.getThread(threadId)) throw new SessionStoreError('not_found', `Thread not found: ${threadId}`)
+    return this.#all(this.#db.prepare(
+      'SELECT * FROM goal_events WHERE thread_id=? AND sequence>? ORDER BY sequence',
+    ), threadId, afterSequence).map((row) => this.#goalEvent(row))
+  }
+
+  createGoal(input: CreateGoalInput): CanonicalGoal {
+    validateGoalObjective(input.objective)
+    const tokenBudget = validateNullablePositiveInteger(input.tokenBudget ?? null, 'tokenBudget')
+    const maxAutomaticTurns = validatePositiveInteger(input.maxAutomaticTurns ?? DEFAULT_GOAL_TURNS, 'maxAutomaticTurns')
+    const maxActiveSeconds = validatePositiveInteger(input.maxActiveSeconds ?? DEFAULT_GOAL_ACTIVE_SECONDS, 'maxActiveSeconds')
+    if (!input.model) throw new GoalStoreError('invalid_goal_input', 'Goal model must not be empty')
+    return this.#transaction('IMMEDIATE', () => {
+      const thread = this.getThread(input.threadId)
+      if (!thread) throw new SessionStoreError('not_found', `Thread not found: ${input.threadId}`)
+      const session = this.getSession(thread.sessionId)
+      if (!session) throw new Error('Corrupt database: Goal thread session is missing')
+      if (session.archivedAt) throw new SessionStoreError('session_archived', 'Cannot create a Goal in an archived session')
+      const currentRow = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE thread_id=?'), input.threadId)
+      if (!goalObservationMatches(input.expected, currentRow)) {
+        throw new GoalStoreError('stale_goal_revision', 'Current Goal changed after it was observed')
+      }
+      if (currentRow && text(currentRow, 'status') !== 'complete' && !input.replaceExisting) {
+        throw new GoalStoreError('unfinished_goal_exists', 'An unfinished Goal already exists')
+      }
+      const now = this.#now()
+      if (currentRow) {
+        const previous = this.#goal(currentRow)
+        this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(previous.id)
+        this.#appendGoalEvent(previous, thread.sessionId, 'goal_replaced', { previous }, now)
+        this.#db.prepare('DELETE FROM goals WHERE id=?').run(previous.id)
+      }
+      const id = this.#idFactory()
+      this.#db.prepare(`
+        INSERT INTO goals(
+          id,thread_id,objective,status,status_reason_json,revision,provider,model,effort,
+          token_budget,tokens_used,time_used_seconds,max_automatic_turns,automatic_turns_used,
+          max_active_seconds,no_progress_count,last_progress_digest,created_at,updated_at,started_at,completed_at
+        ) VALUES (?,? ,?,'active',NULL,1,?,?,?, ?,0,0,?,0,?,0,NULL,?,?,?,NULL)
+      `).run(id, input.threadId, input.objective, input.provider, input.model, input.effort ?? null,
+        tokenBudget, maxAutomaticTurns, maxActiveSeconds, now, now, now)
+      const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), id))
+      this.#appendGoalEvent(goal, thread.sessionId, 'goal_created', { goal }, now)
+      return goal
+    })
+  }
+
+  editGoal(input: EditGoalInput): CanonicalGoal {
+    if (input.objective !== undefined) validateGoalObjective(input.objective)
+    if (input.model !== undefined && !input.model) {
+      throw new GoalStoreError('invalid_goal_input', 'Goal model must not be empty')
+    }
+    const requestedTokenBudget = input.tokenBudget === undefined
+      ? undefined
+      : validateNullablePositiveInteger(input.tokenBudget, 'tokenBudget')
+    const requestedMaxTurns = input.maxAutomaticTurns === undefined
+      ? undefined
+      : validatePositiveInteger(input.maxAutomaticTurns, 'maxAutomaticTurns')
+    const requestedMaxSeconds = input.maxActiveSeconds === undefined
+      ? undefined
+      : validatePositiveInteger(input.maxActiveSeconds, 'maxActiveSeconds')
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), input.goalId)
+      if (!row) throw new GoalStoreError('stale_goal_revision', 'Goal was replaced or cleared')
+      const current = this.#goal(row)
+      if (current.revision !== input.expectedRevision) {
+        throw new GoalStoreError('stale_goal_revision', 'Goal revision changed after it was observed')
+      }
+      const changed = input.objective !== undefined || input.provider !== undefined || input.model !== undefined
+        || Object.prototype.hasOwnProperty.call(input, 'effort') || requestedTokenBudget !== undefined
+        || requestedMaxTurns !== undefined || requestedMaxSeconds !== undefined || input.resetLimitCounters === true
+      if (!changed) throw new GoalStoreError('invalid_goal_input', 'Goal edit did not contain any changes')
+
+      let nextStatus = current.status
+      const largerTokenLimit = requestedTokenBudget !== undefined
+        && current.tokenBudget !== null
+        && (requestedTokenBudget === null || requestedTokenBudget > current.tokenBudget)
+      const largerTurnLimit = requestedMaxTurns !== undefined && requestedMaxTurns > current.maxAutomaticTurns
+      const largerTimeLimit = requestedMaxSeconds !== undefined && requestedMaxSeconds > current.maxActiveSeconds
+      const reasonCode = current.statusReason?.code
+      const largerRelevantLimit = reasonCode === 'goal_token_limit'
+        ? largerTokenLimit
+        : reasonCode === 'goal_turn_limit'
+          ? largerTurnLimit
+          : reasonCode === 'goal_time_limit'
+            ? largerTimeLimit
+            : largerTokenLimit || largerTurnLimit || largerTimeLimit
+      if (current.status === 'complete') nextStatus = 'active'
+      if (current.status === 'budget_limited') {
+        const resetRelevantCounter = input.resetLimitCounters === true && reasonCode !== 'goal_token_limit'
+        if (!largerRelevantLimit && !resetRelevantCounter) {
+          throw new GoalStoreError(
+            'invalid_goal_transition',
+            'A budget-limited Goal requires a larger relevant limit or explicit counter reset',
+          )
+        }
+        nextStatus = 'active'
+      }
+      const now = this.#now()
+      const revision = current.revision + 1
+      const resetCounters = input.resetLimitCounters === true
+      this.#db.prepare(`
+        UPDATE goals SET
+          objective=?,status=?,status_reason_json=?,revision=?,provider=?,model=?,effort=?,token_budget=?,
+          tokens_used=?,time_used_seconds=?,max_automatic_turns=?,automatic_turns_used=?,max_active_seconds=?,
+          no_progress_count=0,last_progress_digest=NULL,updated_at=?,completed_at=?
+        WHERE id=? AND revision=?
+      `).run(
+        input.objective ?? current.objective,
+        nextStatus,
+        nextStatus === 'active' ? null : (current.statusReason === null ? null : canonicalJson(current.statusReason)),
+        revision,
+        input.provider ?? current.provider,
+        input.model ?? current.model,
+        Object.prototype.hasOwnProperty.call(input, 'effort') ? (input.effort ?? null) : current.effort,
+        requestedTokenBudget === undefined ? current.tokenBudget : requestedTokenBudget,
+        current.tokensUsed,
+        resetCounters ? 0 : current.timeUsedSeconds,
+        requestedMaxTurns ?? current.maxAutomaticTurns,
+        resetCounters ? 0 : current.automaticTurnsUsed,
+        requestedMaxSeconds ?? current.maxActiveSeconds,
+        now,
+        nextStatus === 'active' ? null : current.completedAt,
+        current.id,
+        current.revision,
+      )
+      this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(current.id)
+      const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), current.id))
+      const thread = this.getThread(goal.threadId)
+      if (!thread) throw new Error('Corrupt database: Goal thread is missing')
+      this.#appendGoalEvent(goal, thread.sessionId, 'goal_edited', { previousRevision: current.revision, goal }, now)
+      return goal
+    })
+  }
+
+  updateGoalStatus(input: UpdateGoalStatusInput): GoalCasResult {
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), input.goalId)
+      if (!row) return { status: 'stale', goal: null }
+      const current = this.#goal(row)
+      if (current.revision !== input.expectedRevision) return { status: 'stale', goal: current }
+      if (!isValidGoalTransition(current.status, input.status, input.resetLimitCounters === true)) {
+        throw new GoalStoreError(
+          'invalid_goal_transition',
+          `Cannot transition Goal from ${current.status} to ${input.status}`,
+        )
+      }
+      if (current.status === 'budget_limited'
+        && current.statusReason?.code === 'goal_token_limit'
+        && input.status === 'active') {
+        throw new GoalStoreError(
+          'invalid_goal_transition',
+          'A token-limited Goal requires a larger token budget before resume',
+        )
+      }
+      if (input.status !== 'active' && input.status !== 'complete' && !input.reason) {
+        throw new GoalStoreError('invalid_goal_input', 'Stopped Goal status requires a reason')
+      }
+      const now = this.#now()
+      const revision = current.revision + 1
+      const resetCounters = input.status === 'active' && input.resetLimitCounters === true
+      const reason = input.status === 'active' || !input.reason ? null : { ...input.reason, at: now }
+      this.#db.prepare(`
+        UPDATE goals SET status=?,status_reason_json=?,revision=?,time_used_seconds=?,automatic_turns_used=?,
+          no_progress_count=?,last_progress_digest=?,updated_at=?,completed_at=?
+        WHERE id=? AND revision=?
+      `).run(
+        input.status,
+        reason === null ? null : canonicalJson(reason),
+        revision,
+        resetCounters ? 0 : current.timeUsedSeconds,
+        resetCounters ? 0 : current.automaticTurnsUsed,
+        input.status === 'active' ? 0 : current.noProgressCount,
+        input.status === 'active' ? null : current.lastProgressDigest,
+        now,
+        input.status === 'complete' ? now : null,
+        current.id,
+        current.revision,
+      )
+      this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(current.id)
+      const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), current.id))
+      const thread = this.getThread(goal.threadId)
+      if (!thread) throw new Error('Corrupt database: Goal thread is missing')
+      this.#appendGoalEvent(goal, thread.sessionId, `goal_${input.status}`, { previousStatus: current.status, goal }, now)
+      return { status: 'applied', goal }
+    })
+  }
+
+  clearGoal(input: ClearGoalInput): void {
+    this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), input.goalId)
+      if (!row) throw new GoalStoreError('stale_goal_revision', 'Goal was replaced or cleared')
+      const current = this.#goal(row)
+      if (current.revision !== input.expectedRevision) {
+        throw new GoalStoreError('stale_goal_revision', 'Goal revision changed after it was observed')
+      }
+      const thread = this.getThread(current.threadId)
+      if (!thread) throw new Error('Corrupt database: Goal thread is missing')
+      const now = this.#now()
+      this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(current.id)
+      this.#db.prepare('DELETE FROM goals WHERE id=?').run(current.id)
+      this.#appendGoalEvent(current, thread.sessionId, 'goal_cleared', { goal: current }, now)
+    })
+  }
+
+  claimGoalLease(input: ClaimGoalLeaseInput): GoalSchedulerLease | null {
+    const duration = validateLeaseDuration(input.leaseDurationMs ?? DEFAULT_GOAL_LEASE_MS)
+    if (!input.ownerId) throw new GoalStoreError('invalid_goal_input', 'Goal lease owner must not be empty')
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), input.goalId)
+      if (!row) return null
+      const goal = this.#goal(row)
+      if (goal.revision !== input.goalRevision || goal.status !== 'active') return null
+      const thread = this.getThread(goal.threadId)
+      if (!thread || thread.status !== 'idle') return null
+      if (this.getSession(thread.sessionId)?.archivedAt) return null
+      const activeTurn = this.#optional(this.#db.prepare(`
+        SELECT id FROM turns WHERE thread_id=? AND status IN ('queued','running','waiting_tool') LIMIT 1
+      `), goal.threadId)
+      if (activeTurn) return null
+      const unsettledTurn = this.#optional(this.#db.prepare(`
+        SELECT t.id FROM turns t
+        WHERE t.thread_id=? AND t.goal_id=? AND t.goal_revision=?
+          AND t.status IN ('completed','cancelled','failed','interrupted')
+          AND NOT EXISTS (
+            SELECT 1 FROM goal_turn_accounting a WHERE a.turn_id=t.id AND a.terminal=1
+          )
+        LIMIT 1
+      `), goal.threadId, goal.id, goal.revision)
+      if (unsettledTurn) return null
+      const now = this.#now()
+      const existing = this.#optional(this.#db.prepare('SELECT * FROM goal_scheduler_leases WHERE goal_id=?'), goal.id)
+      if (existing && text(existing, 'expires_at') > now) return null
+      if (existing) this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(goal.id)
+      const leaseId = this.#idFactory()
+      const expiresAt = addMilliseconds(now, duration)
+      this.#db.prepare(`
+        INSERT INTO goal_scheduler_leases(goal_id,lease_id,goal_revision,owner_id,acquired_at,heartbeat_at,expires_at)
+        VALUES (?,?,?,?,?,?,?)
+      `).run(goal.id, leaseId, goal.revision, input.ownerId, now, now, expiresAt)
+      return this.#goalLease(this.#one(this.#db.prepare('SELECT * FROM goal_scheduler_leases WHERE lease_id=?'), leaseId))
+    })
+  }
+
+  heartbeatGoalLease(input: HeartbeatGoalLeaseInput): GoalSchedulerLease | null {
+    const duration = validateLeaseDuration(input.leaseDurationMs ?? DEFAULT_GOAL_LEASE_MS)
+    return this.#transaction('IMMEDIATE', () => {
+      const now = this.#now()
+      const row = this.#optional(this.#db.prepare(`
+        SELECT l.* FROM goal_scheduler_leases l
+        JOIN goals g ON g.id=l.goal_id
+        JOIN threads t ON t.id=g.thread_id
+        JOIN sessions s ON s.id=t.session_id
+        WHERE l.lease_id=? AND l.goal_id=? AND l.goal_revision=? AND l.owner_id=?
+          AND g.status='active' AND g.revision=l.goal_revision AND s.archived_at IS NULL
+      `), input.leaseId, input.goalId, input.goalRevision, input.ownerId)
+      if (!row || text(row, 'expires_at') <= now) {
+        this.#db.prepare(`
+          DELETE FROM goal_scheduler_leases WHERE lease_id=? AND goal_id=? AND goal_revision=? AND owner_id=?
+        `).run(input.leaseId, input.goalId, input.goalRevision, input.ownerId)
+        return null
+      }
+      const expiresAt = addMilliseconds(now, duration)
+      this.#db.prepare('UPDATE goal_scheduler_leases SET heartbeat_at=?,expires_at=? WHERE lease_id=?')
+        .run(now, expiresAt, input.leaseId)
+      return this.#goalLease(this.#one(this.#db.prepare('SELECT * FROM goal_scheduler_leases WHERE lease_id=?'), input.leaseId))
+    })
+  }
+
+  releaseGoalLease(input: ReleaseGoalLeaseInput): boolean {
+    return this.#transaction('IMMEDIATE', () => {
+      const before = this.#optional(this.#db.prepare(`
+        SELECT lease_id FROM goal_scheduler_leases
+        WHERE lease_id=? AND goal_id=? AND goal_revision=? AND owner_id=?
+      `), input.leaseId, input.goalId, input.goalRevision, input.ownerId)
+      if (!before) return false
+      this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE lease_id=?').run(input.leaseId)
+      return true
+    })
+  }
+
+  checkpointGoalTurn(input: CheckpointGoalTurnInput): GoalCasResult {
+    validateNonNegativeInteger(input.tokensUsed, 'tokensUsed')
+    validateNonNegativeInteger(input.timeUsedSeconds, 'timeUsedSeconds')
+    return this.#transaction('IMMEDIATE', () => this.#checkpointGoalTurn(input))
+  }
+
+  recordGoalTurn(input: RecordGoalTurnInput): GoalCasResult {
+    validateNonNegativeInteger(input.tokensUsed, 'tokensUsed')
+    validateNonNegativeInteger(input.timeUsedSeconds, 'timeUsedSeconds')
+    return this.#transaction('IMMEDIATE', () => {
+      const turn = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), input.turnId)
+      if (!turn) throw new SessionStoreError('not_found', `Turn not found: ${input.turnId}`)
+      if (nullableText(turn, 'goal_id') !== input.goalId || turn.goal_revision !== input.goalRevision) {
+        return { status: 'stale', goal: this.#goalById(input.goalId) }
+      }
+      if (!TERMINAL_TURN_STATUSES.has(text(turn, 'status'))) {
+        throw new SessionStoreError('turn_not_running', 'Goal turn accounting requires a terminal turn')
+      }
+      const duplicate = this.#optional(this.#db.prepare('SELECT * FROM goal_turn_accounting WHERE turn_id=?'), input.turnId)
+      if (duplicate && integer(duplicate, 'terminal') === 1) {
+        const same = text(duplicate, 'goal_id') === input.goalId
+          && integer(duplicate, 'goal_revision') === input.goalRevision
+          && integer(duplicate, 'tokens_used') === input.tokensUsed
+          && integer(duplicate, 'time_used_seconds') === input.timeUsedSeconds
+          && integer(duplicate, 'automatic') === (input.automatic ? 1 : 0)
+          && nullableText(duplicate, 'progress_digest') === input.progressDigest
+        if (!same) throw new GoalStoreError('invalid_goal_input', 'Goal turn was already accounted differently')
+        const current = this.#goalById(input.goalId)
+        return current?.revision === input.goalRevision
+          ? { status: 'applied', goal: current }
+          : { status: 'stale', goal: current }
+      }
+      const checkpoint = this.#checkpointGoalTurn(input)
+      if (checkpoint.status === 'stale' || !checkpoint.goal) return checkpoint
+      const current = checkpoint.goal
+      if (!Number.isSafeInteger(current.automaticTurnsUsed + (input.automatic ? 1 : 0))) {
+        throw new GoalStoreError('invalid_goal_input', 'Goal accounting would exceed safe integer storage')
+      }
+      const now = this.#now()
+      const sameProgress = input.progressDigest !== null && current.lastProgressDigest === input.progressDigest
+      const noProgressCount = input.progressDigest === null
+        ? current.noProgressCount
+        : sameProgress ? current.noProgressCount + 1 : 0
+      this.#db.prepare(`
+        UPDATE goal_turn_accounting
+        SET automatic=?,terminal=1,progress_digest=?,updated_at=?
+        WHERE turn_id=? AND terminal=0
+      `).run(input.automatic ? 1 : 0, input.progressDigest, now, input.turnId)
+      this.#db.prepare(`
+        UPDATE goals SET automatic_turns_used=automatic_turns_used+?,
+          no_progress_count=?,last_progress_digest=?,updated_at=?
+        WHERE id=? AND revision=?
+      `).run(input.automatic ? 1 : 0, noProgressCount,
+        input.progressDigest ?? current.lastProgressDigest, now, current.id, current.revision)
+      const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), current.id))
+      const thread = this.getThread(goal.threadId)
+      if (!thread) throw new Error('Corrupt database: Goal thread is missing')
+      this.#appendGoalEvent(goal, thread.sessionId, 'goal_turn_accounted', {
+        turnId: input.turnId,
+        tokensUsed: input.tokensUsed,
+        timeUsedSeconds: input.timeUsedSeconds,
+        automatic: input.automatic,
+        progressDigest: input.progressDigest,
+      }, now)
+      return { status: 'applied', goal }
+    })
+  }
+
+  #checkpointGoalTurn(input: CheckpointGoalTurnInput): GoalCasResult {
+    const turn = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), input.turnId)
+    if (!turn) throw new SessionStoreError('not_found', `Turn not found: ${input.turnId}`)
+    if (nullableText(turn, 'goal_id') !== input.goalId || turn.goal_revision !== input.goalRevision) {
+      return { status: 'stale', goal: this.#goalById(input.goalId) }
+    }
+    const current = this.#goalById(input.goalId)
+    if (!current || current.revision !== input.goalRevision) return { status: 'stale', goal: current }
+    const previous = this.#optional(this.#db.prepare('SELECT * FROM goal_turn_accounting WHERE turn_id=?'), input.turnId)
+    const previousTokens = previous ? integer(previous, 'tokens_used') : 0
+    const previousSeconds = previous ? integer(previous, 'time_used_seconds') : 0
+    const previousDigest = previous ? nullableText(previous, 'progress_digest') : null
+    if (previous && integer(previous, 'terminal') === 1) {
+      const unchanged = previousTokens === input.tokensUsed
+        && previousSeconds === input.timeUsedSeconds
+        && (input.progressDigest === undefined || input.progressDigest === previousDigest)
+      if (unchanged) return { status: 'applied', goal: current }
+      throw new GoalStoreError('invalid_goal_input', 'A terminal Goal turn cannot accept a different checkpoint')
+    }
+    if (input.tokensUsed < previousTokens || input.timeUsedSeconds < previousSeconds) {
+      throw new GoalStoreError('invalid_goal_input', 'Cumulative Goal checkpoint values cannot decrease')
+    }
+    const tokenDelta = input.tokensUsed - previousTokens
+    const secondsDelta = input.timeUsedSeconds - previousSeconds
+    const progressDigest = input.progressDigest === undefined ? previousDigest : input.progressDigest
+    if (previous && tokenDelta === 0 && secondsDelta === 0 && progressDigest === previousDigest) {
+      return { status: 'applied', goal: current }
+    }
+    if (!Number.isSafeInteger(current.tokensUsed + tokenDelta)
+      || !Number.isSafeInteger(current.timeUsedSeconds + secondsDelta)) {
+      throw new GoalStoreError('invalid_goal_input', 'Goal accounting would exceed safe integer storage')
+    }
+    const now = this.#now()
+    if (previous) {
+      this.#db.prepare(`
+        UPDATE goal_turn_accounting
+        SET tokens_used=?,time_used_seconds=?,progress_digest=?,updated_at=?
+        WHERE turn_id=? AND terminal=0
+      `).run(input.tokensUsed, input.timeUsedSeconds, progressDigest, now, input.turnId)
+    } else {
+      this.#db.prepare(`
+        INSERT INTO goal_turn_accounting(
+          turn_id,goal_id,goal_revision,tokens_used,time_used_seconds,automatic,terminal,
+          progress_digest,created_at,updated_at
+        ) VALUES (?,?,?,?,?,0,0,?,?,?)
+      `).run(input.turnId, input.goalId, input.goalRevision, input.tokensUsed, input.timeUsedSeconds,
+        progressDigest, now, now)
+    }
+    this.#db.prepare(`
+      UPDATE goals SET tokens_used=tokens_used+?,time_used_seconds=time_used_seconds+?,updated_at=?
+      WHERE id=? AND revision=?
+    `).run(tokenDelta, secondsDelta, now, current.id, current.revision)
+    const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), current.id))
+    const thread = this.getThread(goal.threadId)
+    if (!thread) throw new Error('Corrupt database: Goal thread is missing')
+    this.#appendGoalEvent(goal, thread.sessionId, 'goal_turn_checkpointed', {
+      turnId: input.turnId,
+      tokensUsed: input.tokensUsed,
+      timeUsedSeconds: input.timeUsedSeconds,
+      tokenDelta,
+      secondsDelta,
+      progressDigest,
+    }, now)
+    return { status: 'applied', goal }
+  }
+
   recoverInterruptedTurns(): number {
     return this.#transaction('IMMEDIATE', () => {
       const rows = this.#all(this.#db.prepare(`
@@ -912,6 +1520,8 @@ export class SqliteSessionStore implements SessionStore {
       const now = this.#now()
       for (const row of rows) {
         const turnId = text(row, 'id')
+        const goalId = nullableText(row, 'goal_id')
+        const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
         this.#db.prepare("UPDATE turns SET status='interrupted',completed_at=? WHERE id=?").run(now, turnId)
         this.#db.prepare("UPDATE executions SET status='interrupted',completed_at=? WHERE turn_id=?").run(now, turnId)
         this.#db.prepare("UPDATE threads SET status='idle',revision=revision+1,updated_at=? WHERE id=?")
@@ -921,6 +1531,31 @@ export class SqliteSessionStore implements SessionStore {
           status: 'interrupted',
           reason: 'process_restart',
         }, now)
+        if (goalId !== null && goalRevision !== null) {
+          const goalRow = this.#optional(this.#db.prepare(`
+            SELECT * FROM goals WHERE id=? AND revision=? AND status='active'
+          `), goalId, goalRevision)
+          if (goalRow) {
+            const previous = this.#goal(goalRow)
+            const reason: GoalStatusReason = {
+              code: 'runtime_interrupted',
+              source: 'host',
+              message: null,
+              at: now,
+            }
+            this.#db.prepare(`
+              UPDATE goals SET status='blocked',status_reason_json=?,revision=revision+1,updated_at=?
+              WHERE id=? AND revision=? AND status='active'
+            `).run(canonicalJson(reason), now, goalId, goalRevision)
+            this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(goalId)
+            const blocked = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), goalId))
+            this.#appendGoalEvent(blocked, text(row, 'session_id'), 'goal_blocked', {
+              previousStatus: previous.status,
+              interruptedTurnId: turnId,
+              goal: blocked,
+            }, now)
+          }
+        }
       }
       return rows.length
     })
@@ -1372,6 +2007,8 @@ export class SqliteSessionStore implements SessionStore {
     return {
       id: text(row, 'id'),
       threadId: text(row, 'thread_id'),
+      goalId: nullableText(row, 'goal_id'),
+      goalRevision: row.goal_revision === null ? null : integer(row, 'goal_revision'),
       sequence: integer(row, 'sequence'),
       provider: text(row, 'provider') as CanonicalProvider,
       model: text(row, 'model'),
@@ -1451,6 +2088,132 @@ export class SqliteSessionStore implements SessionStore {
       createdAt: text(row, 'created_at'),
     }
   }
+
+  #goal(row: SqlRow): CanonicalGoal {
+    return {
+      id: text(row, 'id'),
+      threadId: text(row, 'thread_id'),
+      objective: text(row, 'objective'),
+      status: text(row, 'status') as GoalStatus,
+      statusReason: parseNullableObject(row.status_reason_json) as unknown as GoalStatusReason | null,
+      revision: integer(row, 'revision'),
+      provider: text(row, 'provider') as CanonicalGoal['provider'],
+      model: text(row, 'model'),
+      effort: nullableText(row, 'effort'),
+      tokenBudget: row.token_budget === null ? null : integer(row, 'token_budget'),
+      tokensUsed: integer(row, 'tokens_used'),
+      timeUsedSeconds: integer(row, 'time_used_seconds'),
+      maxAutomaticTurns: integer(row, 'max_automatic_turns'),
+      automaticTurnsUsed: integer(row, 'automatic_turns_used'),
+      maxActiveSeconds: integer(row, 'max_active_seconds'),
+      noProgressCount: integer(row, 'no_progress_count'),
+      lastProgressDigest: nullableText(row, 'last_progress_digest'),
+      createdAt: text(row, 'created_at'),
+      updatedAt: text(row, 'updated_at'),
+      startedAt: text(row, 'started_at'),
+      completedAt: nullableText(row, 'completed_at'),
+    }
+  }
+
+  #goalById(goalId: string): CanonicalGoal | null {
+    const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), goalId)
+    return row ? this.#goal(row) : null
+  }
+
+  #goalLease(row: SqlRow): GoalSchedulerLease {
+    return {
+      leaseId: text(row, 'lease_id'),
+      goalId: text(row, 'goal_id'),
+      goalRevision: integer(row, 'goal_revision'),
+      ownerId: text(row, 'owner_id'),
+      acquiredAt: text(row, 'acquired_at'),
+      heartbeatAt: text(row, 'heartbeat_at'),
+      expiresAt: text(row, 'expires_at'),
+    }
+  }
+
+  #goalEvent(row: SqlRow): GoalEvent {
+    return {
+      sequence: integer(row, 'sequence'),
+      goalId: text(row, 'goal_id'),
+      threadId: text(row, 'thread_id'),
+      revision: integer(row, 'revision'),
+      type: text(row, 'type'),
+      payload: parseObject(row.payload_json),
+      createdAt: text(row, 'created_at'),
+    }
+  }
+
+  #appendGoalEvent(
+    goal: CanonicalGoal,
+    sessionId: string,
+    type: string,
+    payload: Record<string, unknown>,
+    now: string,
+  ): void {
+    this.#db.prepare(`
+      INSERT INTO goal_events(goal_id,session_id,thread_id,revision,type,payload_json,created_at)
+      VALUES (?,?,?,?,?,?,?)
+    `).run(goal.id, sessionId, goal.threadId, goal.revision, type, canonicalJson(payload), now)
+  }
+}
+
+function validateGoalObjective(objective: string): void {
+  const length = [...objective].length
+  if (length < 1 || length > 4_000) {
+    throw new GoalStoreError('invalid_goal_input', 'Goal objective must contain 1 to 4000 Unicode characters')
+  }
+}
+
+function validatePositiveInteger(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new GoalStoreError('invalid_goal_input', `${field} must be a positive safe integer`)
+  }
+  return value
+}
+
+function validateNullablePositiveInteger(value: number | null, field: string): number | null {
+  return value === null ? null : validatePositiveInteger(value, field)
+}
+
+function validateNonNegativeInteger(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new GoalStoreError('invalid_goal_input', `${field} must be a non-negative safe integer`)
+  }
+  return value
+}
+
+function validateLeaseDuration(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 5 * 60_000) {
+    throw new GoalStoreError('invalid_goal_input', 'Goal lease duration must be between 1 and 300000 milliseconds')
+  }
+  return value
+}
+
+function addMilliseconds(iso: string, milliseconds: number): string {
+  const timestamp = Date.parse(iso)
+  if (!Number.isFinite(timestamp)) throw new Error('Store clock returned an invalid ISO timestamp')
+  return new Date(timestamp + milliseconds).toISOString()
+}
+
+function goalObservationMatches(
+  expected: CreateGoalInput['expected'],
+  current: SqlRow | null,
+): boolean {
+  if (expected.kind === 'none') return current === null
+  return current !== null
+    && text(current, 'id') === expected.goalId
+    && integer(current, 'revision') === expected.revision
+}
+
+function isValidGoalTransition(current: GoalStatus, next: GoalStatus, resetLimitCounters: boolean): boolean {
+  if (current === 'active') {
+    return next === 'paused' || next === 'blocked' || next === 'usage_limited'
+      || next === 'budget_limited' || next === 'complete'
+  }
+  if (next !== 'active') return false
+  if (current === 'paused' || current === 'blocked' || current === 'usage_limited') return true
+  return current === 'budget_limited' && resetLimitCounters
 }
 
 function sessionSelect(): string {

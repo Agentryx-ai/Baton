@@ -201,6 +201,9 @@ export interface CanonicalThread {
 export interface CanonicalTurn {
   id: TurnId
   threadId: ThreadId
+  /** Captured Goal identity at turn start; null for turns outside an active Goal. */
+  goalId: GoalId | null
+  goalRevision: number | null
   sequence: number
   provider: CanonicalProvider
   model: string
