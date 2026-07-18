@@ -8,6 +8,9 @@ import type {
   CreateGoalDto,
   EditGoalDto,
   EnqueueFollowUpDto,
+  FirstTurnDto,
+  FirstTurnResultDto,
+  NativeFolderPickResultDto,
   StartTurnDto,
   ThreadSnapshotDto,
   ProviderModelDescriptorDto,
@@ -50,6 +53,28 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       parsed = undefined
     }
+  }
+  if (!response.ok) {
+    const error = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+    throw new ConversationApiError(
+      response.status,
+      typeof error?.error === 'string' ? error.error : `Request failed with status ${response.status}`,
+      typeof error?.code === 'string' ? error.code : null,
+    )
+  }
+  return parsed as T
+}
+
+async function hostRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json', ...init.headers },
+  })
+  const raw = await response.text()
+  let parsed: unknown
+  if (raw) {
+    try { parsed = JSON.parse(raw) } catch { parsed = undefined }
   }
   if (!response.ok) {
     const error = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
@@ -112,6 +137,18 @@ export const conversationApi = {
 
   createSession: (input: CreateSessionDto): Promise<CanonicalSessionDto> =>
     request('/sessions', jsonRequest('POST', input)),
+
+  createFirstTurn: (
+    sessionId: string,
+    input: FirstTurnDto,
+  ): Promise<FirstTurnResultDto> =>
+    request(`/sessions/${encodeURIComponent(sessionId)}/first-turn`, jsonRequest('PUT', input)),
+
+  pickNativeFolder: (): Promise<NativeFolderPickResultDto> =>
+    hostRequest('/baton/host/folders/pick', {
+      method: 'POST',
+      headers: { 'X-Baton-Interaction': 'native-folder-picker' },
+    }),
 
   archiveSession: (sessionId: string): Promise<CanonicalSessionDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),

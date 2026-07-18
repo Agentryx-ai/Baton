@@ -1,5 +1,6 @@
 import type {
   AppendEventInput,
+  BeginSessionResult,
   BeginTurnInput,
   BeginTurnResult,
   CanonicalItem,
@@ -205,6 +206,28 @@ export type GoalAwareBeginTurnInput = BeginTurnInput & {
   goalContext?: GoalTurnContext | null
 }
 
+export interface BeginSessionInput {
+  sessionId: SessionId
+  clientRequestId: string
+  requestHash: string
+  cwd: string | null
+  instructionSnapshot: Record<string, unknown>
+  provider: CanonicalProvider
+  model: string
+  effort: string | null
+  input: BeginTurnInput['input']
+  adapterVersion: string
+  policySnapshot: BeginTurnInput['policySnapshot']
+  budget?: Record<string, unknown>
+  leaseExpiresAt?: string | null
+}
+
+export interface InitialSessionRequestIdentity {
+  sessionId: SessionId
+  clientRequestId: string
+  requestHash: string
+}
+
 export interface UpdateWorkspaceInput {
   sessionId: SessionId
   expectedThreadRevision: number
@@ -214,6 +237,8 @@ export interface UpdateWorkspaceInput {
 
 export interface SessionStore extends NativeImportStore {
   createSession(input: CreateSessionInput): CanonicalSession
+  getInitialSessionResult(input: InitialSessionRequestIdentity): BeginSessionResult | null
+  beginSession(input: BeginSessionInput): BeginSessionResult
   listSessions(scope?: SessionListScope): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null
   archiveSession(sessionId: SessionId): CanonicalSession
@@ -272,6 +297,7 @@ export class SessionStoreError extends Error {
     | 'turn_not_running'
     | 'invalid_fork'
     | 'duplicate_request'
+    | 'initial_session_conflict'
     | 'session_busy'
     | 'session_archived'
     | 'invalid_reconciliation'
@@ -284,6 +310,7 @@ export class SessionStoreError extends Error {
       | 'turn_not_running'
       | 'invalid_fork'
       | 'duplicate_request'
+      | 'initial_session_conflict'
       | 'session_busy'
       | 'session_archived'
       | 'invalid_reconciliation'

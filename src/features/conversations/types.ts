@@ -297,6 +297,36 @@ export interface CreateSessionDto {
   instructionSnapshot?: JsonObject
 }
 
+export interface FirstTurnDto {
+  clientRequestId: string
+  cwd: string | null
+  instructionSnapshot?: JsonObject
+  provider: CanonicalProvider
+  model: string
+  effort?: string | null
+  input: Array<{
+    kind: 'user_message'
+    visibility: 'portable'
+    payload: JsonObject
+  }>
+}
+
+export interface FirstTurnResultDto {
+  session: CanonicalSessionDto
+  thread: CanonicalThreadDto
+  turn: CanonicalTurnDto
+  execution: {
+    id: string
+    status: string
+  }
+  initialItems: CanonicalItemDto[]
+  duplicate: boolean
+}
+
+export type NativeFolderPickResultDto =
+  | { status: 'selected'; cwd: string }
+  | { status: 'cancelled' }
+
 export interface StartTurnDto {
   provider: CanonicalProvider
   model: string

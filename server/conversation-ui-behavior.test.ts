@@ -1,7 +1,20 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { conversationApi } from '../src/features/conversations/api.ts'
+import { ConversationApiError, conversationApi } from '../src/features/conversations/api.ts'
+import {
+  applyDraftFolderSelection,
+  classifyFirstTurnFailure,
+  conversationRouteUrl,
+  createConversationDraft,
+  editableAfterKnownFailure,
+  freezeFirstTurn,
+  loadConversationDraft,
+  markDeliveryUnknown,
+  markInitialSessionConflict,
+  resolveInitialConversationRoute,
+  saveConversationDraft,
+} from '../src/features/conversations/draft-conversation.ts'
 
 const itemModulePath: string = '../src/features/conversations/ConversationItem.tsx'
 const workspaceModulePath: string = '../src/features/conversations/ConversationWorkspace.tsx'
@@ -261,4 +274,173 @@ test('follow-up API sends the fixed enqueue and revision-CAS cancel bodies', asy
       body: { expectedRevision: 7 },
     },
   ])
+})
+
+test('new conversation draft allocates stable ids without any API call and freezes the exact first turn', () => {
+  const ids = ['session-1', 'request-1']
+  const storage = new Map<string, string>()
+  const draft = createConversationDraft({
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'high',
+    randomId: () => ids.shift()!,
+  })
+  assert.equal(draft.sessionId, 'session-1')
+  assert.equal(draft.clientRequestId, 'request-1')
+  assert.equal(draft.cwd, null)
+  assert.equal(draft.frozenRequest, null)
+
+  const frozen = freezeFirstTurn({
+    ...draft,
+    cwd: 'C:\\projects\\baton',
+    message: '  inspect this project  ',
+  })
+  assert.deepEqual(frozen.frozenRequest, {
+    clientRequestId: 'request-1',
+    cwd: 'C:\\projects\\baton',
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'high',
+    input: [{ kind: 'user_message', visibility: 'portable', payload: { text: 'inspect this project' } }],
+  })
+  assert.equal(freezeFirstTurn({ ...frozen, message: 'changed' }).frozenRequest, frozen.frozenRequest)
+
+  const adapter = {
+    getItem: (key: string) => storage.get(key) ?? null,
+    setItem: (key: string, value: string) => { storage.set(key, value) },
+    removeItem: (key: string) => { storage.delete(key) },
+  }
+  saveConversationDraft(adapter, markDeliveryUnknown(frozen))
+  const restored = loadConversationDraft(adapter)
+  assert.equal(restored?.sessionId, 'session-1')
+  assert.equal(restored?.deliveryUnknown, true)
+  assert.deepEqual(restored?.frozenRequest, frozen.frozenRequest)
+  assert.equal(editableAfterKnownFailure(restored!).frozenRequest, null)
+})
+
+test('conversation draft and persisted routes are deterministic and keep the conversations hash', () => {
+  assert.equal(
+    conversationRouteUrl('http://127.0.0.1:4400/?session=old#settings', { kind: 'draft', sessionId: 'draft/1' }),
+    'http://127.0.0.1:4400/?draft=draft%2F1#conversations',
+  )
+  assert.equal(
+    conversationRouteUrl('http://127.0.0.1:4400/?draft=old#conversations', { kind: 'session', sessionId: 'saved/1' }),
+    'http://127.0.0.1:4400/?session=saved%2F1#conversations',
+  )
+  const stored = createConversationDraft({
+    provider: 'codex', model: 'gpt', effort: 'high', randomId: () => 'stored-draft',
+  })
+  assert.deepEqual(
+    resolveInitialConversationRoute('http://127.0.0.1:4400/?draft=stored-draft#conversations', stored),
+    { draftOpen: true, selectedSessionId: null, invalidDraftRoute: false },
+  )
+  assert.deepEqual(
+    resolveInitialConversationRoute('http://127.0.0.1:4400/?draft=stale#conversations', stored),
+    { draftOpen: false, selectedSessionId: null, invalidDraftRoute: true },
+  )
+  assert.deepEqual(
+    resolveInitialConversationRoute('http://127.0.0.1:4400/?session=session-9#conversations', stored),
+    { draftOpen: false, selectedSessionId: 'session-9', invalidDraftRoute: false },
+  )
+})
+
+test('deferred folder picker completion cannot overwrite a frozen or replaced draft', () => {
+  const draft = createConversationDraft({
+    provider: 'codex', model: 'gpt', effort: 'high', randomId: () => 'draft-a',
+  })
+  const frozen = freezeFirstTurn({ ...draft, message: 'send now' })
+  assert.equal(applyDraftFolderSelection(frozen, 'draft-a', 'C:\\late'), frozen)
+
+  const replacement = { ...draft, sessionId: 'draft-b' }
+  assert.equal(applyDraftFolderSelection(replacement, 'draft-a', 'C:\\late'), replacement)
+  assert.equal(applyDraftFolderSelection(null, 'draft-a', 'C:\\late'), null)
+  assert.equal(applyDraftFolderSelection(draft, 'draft-a', 'C:\\chosen')?.cwd, 'C:\\chosen')
+})
+
+test('first-turn failure classification preserves uncertain payloads and isolates id conflicts', () => {
+  assert.equal(classifyFirstTurnFailure(new ConversationApiError(400, 'bad', 'invalid_request')), 'editable')
+  assert.equal(classifyFirstTurnFailure(new ConversationApiError(400, 'cwd', 'invalid_workspace')), 'editable')
+  assert.equal(classifyFirstTurnFailure(new ConversationApiError(503, 'auth', 'provider_not_ready')), 'editable')
+  assert.equal(classifyFirstTurnFailure(new ConversationApiError(409, 'used', 'initial_session_conflict')), 'conflict')
+  assert.equal(classifyFirstTurnFailure(new ConversationApiError(500, 'failed', 'internal_error')), 'unknown')
+  assert.equal(classifyFirstTurnFailure(new TypeError('network failed')), 'unknown')
+
+  const frozen = freezeFirstTurn({
+    ...createConversationDraft({
+      provider: 'codex', model: 'gpt', effort: 'high', randomId: () => 'fixed-id',
+    }),
+    message: 'immutable',
+  })
+  assert.equal(markInitialSessionConflict(frozen).conflict, true)
+  assert.equal(markInitialSessionConflict(frozen).frozenRequest, frozen.frozenRequest)
+})
+
+test('first-turn and native folder APIs use the exact idempotent PUT and explicit interaction contracts', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; method: string | undefined; headers: Headers; body: unknown }> = []
+  globalThis.fetch = (async (input, init) => {
+    calls.push({
+      url: String(input),
+      method: init?.method,
+      headers: new Headers(init?.headers),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    })
+    if (String(input).endsWith('/folders/pick')) {
+      return Response.json({ status: 'selected', cwd: 'C:\\projects\\baton' })
+    }
+    return Response.json({
+      session: { id: 'session-1' },
+      thread: { id: 'thread-1' },
+      turn: { id: 'turn-1' },
+      execution: { id: 'execution-1', status: 'running' },
+      initialItems: [],
+      duplicate: false,
+    })
+  }) as typeof fetch
+  const request = {
+    clientRequestId: 'request-1',
+    cwd: null,
+    provider: 'claude' as const,
+    model: 'fable-5',
+    effort: 'high',
+    input: [{ kind: 'user_message' as const, visibility: 'portable' as const, payload: { text: 'hello' } }],
+  }
+  try {
+    await conversationApi.createFirstTurn('session/1', request)
+    assert.deepEqual(await conversationApi.pickNativeFolder(), {
+      status: 'selected', cwd: 'C:\\projects\\baton',
+    })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls[0]?.url, '/baton/v1/sessions/session%2F1/first-turn')
+  assert.equal(calls[0]?.method, 'PUT')
+  assert.deepEqual(calls[0]?.body, request)
+  assert.equal(calls[1]?.url, '/baton/host/folders/pick')
+  assert.equal(calls[1]?.method, 'POST')
+  assert.equal(calls[1]?.headers.get('X-Baton-Interaction'), 'native-folder-picker')
+  assert.equal(calls[1]?.body, null)
+})
+
+test('native folder picker exposes cancellation separately and maps typed host errors to actionable copy', async () => {
+  const { folderPickerErrorMessage } = await import(workspaceModulePath) as {
+    folderPickerErrorMessage: (error: unknown) => string
+  }
+  assert.match(
+    folderPickerErrorMessage(new ConversationApiError(503, 'unavailable', 'picker_unavailable')),
+    /데스크톱 세션/,
+  )
+  assert.match(
+    folderPickerErrorMessage(new ConversationApiError(504, 'timeout', 'picker_timeout')),
+    /시간이 만료/,
+  )
+
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => Response.json({ status: 'cancelled' })) as typeof fetch
+  try {
+    assert.deepEqual(await conversationApi.pickNativeFolder(), { status: 'cancelled' })
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })

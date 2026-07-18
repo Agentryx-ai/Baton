@@ -137,10 +137,10 @@
 
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
-| WORKSPACE-01 | 사용자 허용 후 Baton이 로컬 폴더 파일에 접근 | 부분 완료 | 절대 `cwd`의 realpath 검증·CAS와 root 한정 read/list/search/write/replace 도구가 있다(`405d6bd`). Windows native folder picker host API도 명시적 interaction header, UTF-8 Base64 JSON, timeout·크기 제한·typed failure로 구현·커밋했다(`006a7d6`). 대화 UI 연결과 실제 폴더 live E2E가 남았다. |
-| WORKSPACE-02 | 폴더별로 접근을 요청·허용 | 부분 완료 | BFF native picker 기반은 완료됐지만 UI의 폴더 선택·grant 흐름과 세션별 권한 표시가 아직 연결되지 않았다. |
-| WORKSPACE-03 | 폴더(프로젝트)별 작업/세션 생성 | 부분 완료 | session에 verified `cwd`/project grouping은 있지만, 새 대화 시작 UX가 요구와 다르다. |
-| WORKSPACE-04 | “새 대화” 클릭만으로 DB 세션을 만들지 않고 임시 composer에서 폴더/model/message를 고른 뒤 첫 전송 때 원자 생성 | 미착수 | 현재 dialog의 `대화 시작`이 즉시 `POST /sessions`를 호출한다. deferred draft + create-and-start atomic API/UX가 필요하다. |
+| WORKSPACE-01 | 사용자 허용 후 Baton이 로컬 폴더 파일에 접근 | 완료(코드)·live E2E 대기 | 절대 `cwd` realpath/CAS와 root 한정 도구(`405d6bd`), native picker host API(`006a7d6`), 대화 UI 선택·연결을 통합했다. 실제 선택 폴더 read/write turn은 4400 live gate에 남았다. |
+| WORKSPACE-02 | 폴더별로 접근을 요청·허용 | 완료(코드)·live E2E 대기 | 명시적 사용자 클릭의 OS native picker, 취소·typed error, 기존/신규 세션별 연결·해제를 구현했다. |
+| WORKSPACE-03 | 폴더(프로젝트)별 작업/세션 생성 | 완료(코드) | 첫 turn 원자 생성 시 canonical cwd를 session grouping identity로 저장하며, 폴더 없는 `cwd=null` 일반 chat도 지원한다. |
+| WORKSPACE-04 | “새 대화” 클릭만으로 DB 세션을 만들지 않고 임시 composer에서 폴더/model/message를 고른 뒤 첫 전송 때 원자 생성 | 완료(코드)·4400 live 대기 | 클릭은 sessionStorage draft만 만들고 API를 호출하지 않는다. 첫 send의 단일 idempotent PUT이 session/thread/turn/execution/items/events를 `BEGIN IMMEDIATE`로 생성한다. unknown delivery는 frozen ID/body 재시도, 409 conflict는 명시적 새 draft ID로 처리한다. 독립 감사 98/98·전체 323/323 APPROVE. |
 | WORKSPACE-05 | 가져온 세션의 source cwd는 제안일 뿐, 명시 연결 전 권한 없음 | 완료 | source cwd와 authorized cwd를 분리하고 drift/junction 교체를 fail-closed 처리. |
 | WORKSPACE-06 | 실제 file tool call이 동작 | 완료(V1)·live E2E 필요 | read/list/search/write/replace broker와 durability/realpath/CAS 테스트가 있다. 4400에서 사용자 선택 폴더를 연결한 실제 turn E2E는 남음. |
 | WORKSPACE-07 | `run_command`도 안전하게 사용 | 미완료·fail-closed | Windows sandbox가 cwd 밖 read를 막는다는 검증이 부족해 광고하지 않는다. elevated backend/검증 뒤 opt-in 필요. |

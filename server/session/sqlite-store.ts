@@ -3,6 +3,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite'
 
 import type {
   AppendEventInput,
+  BeginSessionResult,
   BeginTurnResult,
   CanonicalFollowUp,
   CanonicalExecution,
@@ -35,6 +36,7 @@ import { uuidV7 } from './domain.ts'
 import type {
   ClaimGoalLeaseInput,
   ClaimFollowUpInput,
+  BeginSessionInput,
   BeginTurnFromFollowUpInput,
   CloseFollowUpWindowResult,
   CheckpointGoalTurnInput,
@@ -50,6 +52,7 @@ import type {
   GoalAwareBeginTurnInput,
   GoalEvent,
   HeartbeatGoalLeaseInput,
+  InitialSessionRequestIdentity,
   RecordGoalTurnInput,
   ReconcileToolInput,
   ReconcileToolResult,
@@ -113,6 +116,19 @@ function canonicalJson(value: unknown): string {
     throw new TypeError(`Canonical JSON rejects ${typeof current} values`)
   }
   return JSON.stringify(visit(value))
+}
+
+const SESSION_PREVIEW_CODE_POINTS = 240
+
+function initialSessionPreview(input: NewCanonicalItem[]): string | null {
+  const textValue = input.find((item) => item.kind === 'user_message')?.payload.text
+  if (typeof textValue !== 'string') return null
+  const normalized = textValue.trim().replace(/\s+/gu, ' ')
+  if (!normalized) return null
+  const points = Array.from(normalized)
+  return points.length <= SESSION_PREVIEW_CODE_POINTS
+    ? normalized
+    : `${points.slice(0, SESSION_PREVIEW_CODE_POINTS - 1).join('')}…`
 }
 
 function parseObject(value: string | number | bigint | null | Uint8Array): Record<string, unknown> {
@@ -808,6 +824,132 @@ export class SqliteSessionStore implements SessionStore {
       this.#appendStreamEvent(sessionId, threadId, null, 'session_created', { sessionId, threadId }, now)
     })
     return this.getSession(sessionId) as CanonicalSession
+  }
+
+  getInitialSessionResult(input: InitialSessionRequestIdentity): BeginSessionResult | null {
+    const session = this.getSession(input.sessionId)
+    if (!session) return null
+    const rootTurnRow = this.#optional(this.#db.prepare(`
+      SELECT turn.* FROM turns turn
+      JOIN threads thread ON thread.id=turn.thread_id
+      WHERE thread.session_id=? AND thread.parent_thread_id IS NULL AND turn.sequence=1
+      ORDER BY thread.created_at,thread.id LIMIT 1
+    `), input.sessionId)
+    if (!rootTurnRow
+      || text(rootTurnRow, 'client_request_id') !== input.clientRequestId
+      || text(rootTurnRow, 'request_hash') !== input.requestHash) {
+      throw new SessionStoreError(
+        'initial_session_conflict',
+        'Session ID was already used by a different initial request',
+      )
+    }
+    const turn = this.#turn(rootTurnRow)
+    const thread = this.getThread(turn.threadId)
+    if (!thread) throw new Error('Corrupt database: initial session thread is missing')
+    const execution = this.#execution(this.#one(
+      this.#db.prepare('SELECT * FROM executions WHERE turn_id=?'),
+      turn.id,
+    ))
+    const initialItems = this.#all(this.#db.prepare(
+      'SELECT * FROM items WHERE turn_id=? AND origin_event_id IS NULL ORDER BY sequence',
+    ), turn.id).map((row) => this.#item(row))
+    return { session, thread, turn, execution, initialItems, duplicate: true }
+  }
+
+  beginSession(input: BeginSessionInput): BeginSessionResult {
+    return this.#transaction('IMMEDIATE', () => {
+      const replay = this.getInitialSessionResult(input)
+      if (replay) return replay
+
+      const threadId = this.#idFactory()
+      const turnId = this.#idFactory()
+      const executionId = this.#idFactory()
+      const now = this.#now()
+      this.#db.prepare(`
+        INSERT INTO sessions(id,title,preview,active_thread_id,project_key,cwd,schema_version,created_at,updated_at)
+        VALUES (?,NULL,?,?,NULL,?,?,?,?)
+      `).run(
+        input.sessionId,
+        initialSessionPreview(input.input),
+        threadId,
+        input.cwd,
+        SCHEMA_VERSION,
+        now,
+        now,
+      )
+      this.#db.prepare(`
+        INSERT INTO threads(
+          id,session_id,parent_thread_id,fork_turn_id,fork_item_id,revision,status,
+          instruction_snapshot_json,created_at,updated_at
+        ) VALUES (?,?,NULL,NULL,NULL,1,'running',?,?,?)
+      `).run(threadId, input.sessionId, canonicalJson(input.instructionSnapshot), now, now)
+      this.#db.prepare(`
+        INSERT INTO turns(
+          id,thread_id,sequence,provider,model,effort,status,client_request_id,request_hash,
+          started_at,goal_id,goal_revision
+        ) VALUES (?,?,1,?,?,?,'running',?,?,?,NULL,NULL)
+      `).run(
+        turnId,
+        threadId,
+        input.provider,
+        input.model,
+        input.effort,
+        input.clientRequestId,
+        input.requestHash,
+        now,
+      )
+      this.#db.prepare(`
+        INSERT INTO executions(
+          id,session_id,thread_id,turn_id,parent_execution_id,spawn_item_id,kind,provider,model,
+          adapter_version,status,policy_snapshot_json,budget_json,usage_json,lease_expires_at,started_at
+        ) VALUES (?,?,?,?,NULL,NULL,'root_turn',?,?,?,'running',?,?,?,?,?)
+      `).run(
+        executionId,
+        input.sessionId,
+        threadId,
+        turnId,
+        input.provider,
+        input.model,
+        input.adapterVersion,
+        canonicalJson(input.policySnapshot),
+        canonicalJson(input.budget ?? {}),
+        canonicalJson({}),
+        input.leaseExpiresAt ?? null,
+        now,
+      )
+      const initialItems = this.#appendItems(
+        input.sessionId,
+        threadId,
+        turnId,
+        null,
+        input.input,
+        null,
+        now,
+      )
+      this.#appendStreamEvent(input.sessionId, threadId, null, 'session_created', {
+        sessionId: input.sessionId,
+        threadId,
+      }, now)
+      this.#appendStreamEvent(input.sessionId, threadId, turnId, 'turn_started', {
+        turnId,
+        executionId,
+        provider: input.provider,
+        model: input.model,
+        effort: input.effort,
+        itemIds: initialItems.map((item) => item.id),
+      }, now)
+      return {
+        session: this.getSession(input.sessionId) as CanonicalSession,
+        thread: this.getThread(threadId) as CanonicalThread,
+        turn: this.getTurn(turnId) as CanonicalTurn,
+        execution: this.#execution(this.#one(
+          this.#db.prepare('SELECT * FROM executions WHERE id=?'),
+          executionId,
+        )),
+        initialItems,
+        duplicate: false,
+      }
+    })
   }
 
   listSessions(scope: SessionListScope = 'active'): CanonicalSession[] {

@@ -12,6 +12,7 @@ import type {
 } from './domain.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
 import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
+import type { BeginSessionInput } from './store.ts'
 import type { NativeSessionCandidate } from './native-import/contracts.ts'
 
 const policy: ExecutionPolicySnapshot = {
@@ -70,6 +71,135 @@ function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): B
     policySnapshot: policy,
   }
 }
+
+function beginSessionInput(
+  overrides: Partial<BeginSessionInput> = {},
+): BeginSessionInput {
+  return {
+    sessionId: 'client-session-1',
+    clientRequestId: 'client-request-1',
+    requestHash: 'initial-hash-1',
+    cwd: 'C:\\verified\\project',
+    instructionSnapshot: { schemaVersion: 1, developerInstructions: 'Keep changes focused.' },
+    provider: 'codex',
+    model: 'gpt-test',
+    effort: 'high',
+    input: [{ kind: 'user_message', payload: { text: '  First\n\nrequest  ' } }],
+    adapterVersion: 'test-adapter/1',
+    policySnapshot: { ...policy, cwd: 'C:\\verified\\project' },
+    budget: { effort: 'high' },
+    ...overrides,
+  }
+}
+
+test('initial session materialization is atomic, idempotent, and keeps schema v12', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  const input = beginSessionInput()
+  const started = store.beginSession(input)
+
+  assert.equal(started.duplicate, false)
+  assert.equal(started.session.id, input.sessionId)
+  assert.equal(started.session.title, null)
+  assert.equal(started.session.preview, 'First request')
+  assert.equal(started.session.projectKey, null)
+  assert.equal(started.session.cwd, input.cwd)
+  assert.equal(started.thread.parentThreadId, null)
+  assert.equal(started.thread.revision, 1)
+  assert.equal(started.thread.status, 'running')
+  assert.deepEqual(started.thread.instructionSnapshot, input.instructionSnapshot)
+  assert.equal(started.turn.sequence, 1)
+  assert.equal(started.execution.kind, 'root_turn')
+  assert.deepEqual(started.initialItems.map((item) => item.kind), ['user_message'])
+  assert.deepEqual(store.listEvents(started.thread.id).map((event) => event.type), [
+    'session_created',
+    'turn_started',
+  ])
+
+  const duplicate = store.beginSession(input)
+  assert.equal(duplicate.duplicate, true)
+  assert.equal(duplicate.thread.id, started.thread.id)
+  assert.equal(duplicate.turn.id, started.turn.id)
+  assert.equal(duplicate.execution.id, started.execution.id)
+  assert.deepEqual(duplicate.initialItems.map((item) => item.id), started.initialItems.map((item) => item.id))
+  assert.throws(
+    () => store.beginSession({ ...input, requestHash: 'different-hash' }),
+    (error) => error instanceof SessionStoreError && error.code === 'initial_session_conflict',
+  )
+
+  const database = new DatabaseSync(path, { readOnly: true })
+  t.after(() => database.close())
+  for (const [table, expected] of [
+    ['sessions', 1],
+    ['threads', 1],
+    ['turns', 1],
+    ['executions', 1],
+    ['items', 1],
+    ['stream_events', 2],
+  ] as const) {
+    const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
+    assert.equal(row.count, expected, table)
+  }
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12)
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  const replayAfterReopen = reopened.getInitialSessionResult(input)
+  assert.equal(replayAfterReopen?.duplicate, true)
+  assert.equal(replayAfterReopen?.turn.id, started.turn.id)
+})
+
+test('initial session rolls every row back when canonical serialization fails', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => store.close())
+  const invalidSnapshot = {
+    schemaVersion: 1,
+    developerInstructions: 'valid',
+    invalid: undefined,
+  } as unknown as Record<string, unknown>
+
+  assert.throws(
+    () => store.beginSession(beginSessionInput({ instructionSnapshot: invalidSnapshot })),
+    /Canonical JSON rejects undefined values/,
+  )
+  assert.deepEqual(store.listSessions('all'), [])
+  const database = new DatabaseSync(path, { readOnly: true })
+  t.after(() => database.close())
+  for (const table of ['sessions', 'threads', 'turns', 'executions', 'items', 'stream_events']) {
+    const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
+    assert.equal(row.count, 0, table)
+  }
+})
+
+test('two open SQLite connections observe one idempotent initial graph', async (t) => {
+  const path = databasePath(t)
+  const first = new SqliteSessionStore(path, deterministicOptions())
+  const second = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => {
+    first.close()
+    second.close()
+  })
+  const input = beginSessionInput({ sessionId: 'two-connection-session' })
+
+  // DatabaseSync calls cannot overlap inside one JS isolate, but separate live connections still
+  // prove that the second transaction observes the committed receipt instead of duplicating it.
+  const results = await Promise.all([
+    Promise.resolve().then(() => first.beginSession(input)),
+    Promise.resolve().then(() => second.beginSession(input)),
+  ])
+  assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true])
+  assert.equal(results[0]?.turn.id, results[1]?.turn.id)
+  assert.equal(first.listSessions('all').length, 1)
+  const database = new DatabaseSync(path, { readOnly: true })
+  t.after(() => database.close())
+  for (const [table, expected] of [
+    ['sessions', 1], ['threads', 1], ['turns', 1], ['executions', 1], ['items', 1], ['stream_events', 2],
+  ] as const) {
+    assert.equal((database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count, expected)
+  }
+})
 
 function nativeCandidate(contents: string[], cwd: string, contentDigest: string): NativeSessionCandidate {
   return {

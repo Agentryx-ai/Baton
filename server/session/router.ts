@@ -12,7 +12,8 @@ import type {
 } from './domain.ts'
 import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
 import { WorkspaceRootError } from './workspace-root.ts'
-import type { ConversationService, StartTurnInput, SubmitFollowUpInput } from './service.ts'
+import { ProviderReadinessError } from './service.ts'
+import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput } from './service.ts'
 import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
 import type { CreateGoalInput, EditGoalInput, ReconcileToolInput } from './store.ts'
 import type { ProviderModelDescriptor } from './model-catalog.ts'
@@ -329,6 +330,62 @@ function parseStartTurnInput(threadId: string, value: unknown): StartTurnInput {
   }
 }
 
+function parseStartSessionInput(sessionId: string, value: unknown): StartSessionInput {
+  const body = bodyRecord(value)
+  requireOnlyKeys(body, [
+    'clientRequestId',
+    'cwd',
+    'instructionSnapshot',
+    'provider',
+    'model',
+    'effort',
+    'input',
+  ])
+  const provider = requiredNonEmptyString(body, 'provider')
+  if (!PROVIDERS.has(provider as CanonicalProvider)) {
+    throw new RequestValidationError('provider must be claude, codex, or gemini')
+  }
+  const cwd = optionalNullableString(body, 'cwd')
+  if (cwd === undefined || (cwd !== null && cwd.trim().length === 0)) {
+    throw new RequestValidationError('cwd must be null or a non-empty string')
+  }
+  const effort = optionalNullableString(body, 'effort')
+  if (effort !== undefined && effort !== null && effort.trim().length === 0) {
+    throw new RequestValidationError('effort must be null or a non-empty string')
+  }
+  const instructionSnapshot = optionalRecord(body, 'instructionSnapshot')
+  let normalizedInstructions: ReturnType<typeof normalizeInstructionSnapshot> | undefined
+  try {
+    normalizedInstructions = instructionSnapshot === undefined
+      ? undefined
+      : normalizeInstructionSnapshot(instructionSnapshot)
+  } catch (error) {
+    throw new RequestValidationError(error instanceof Error ? error.message : String(error))
+  }
+  if (!Array.isArray(body.input) || body.input.length === 0) {
+    throw new RequestValidationError('input must be a non-empty array')
+  }
+  const input = body.input.map(parseNewItem)
+  if (input.some((item) => item.kind !== 'user_message'
+    || (item.visibility !== undefined && item.visibility !== 'portable')
+    || (item.provider !== undefined && item.provider !== null)
+    || (item.nativeId !== undefined && item.nativeId !== null)
+    || typeof item.payload.text !== 'string'
+    || !item.payload.text.trim())) {
+    throw new RequestValidationError('input must contain non-empty portable provider-neutral user messages')
+  }
+  return {
+    sessionId,
+    clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
+    cwd,
+    ...(normalizedInstructions === undefined ? {} : { instructionSnapshot: normalizedInstructions }),
+    provider: provider as CanonicalProvider,
+    model: requiredNonEmptyString(body, 'model'),
+    effort,
+    input,
+  }
+}
+
 function parseFollowUpInput(threadId: string, value: unknown): SubmitFollowUpInput {
   const body = bodyRecord(value)
   requireOnlyKeys(body, ['clientRequestId', 'expectedTurnId', 'delivery', 'input'])
@@ -457,6 +514,15 @@ export function createConversationRouter(
       res.status(201).json(session)
     }),
   )
+
+  router.put('/sessions/:sessionId/first-turn', route(async (req, res) => {
+    const result = await service.startSession(parseStartSessionInput(
+      pathParam(req, 'sessionId'),
+      req.body,
+    ))
+    res.location(`/baton/v1/sessions/${encodeURIComponent(result.session.id)}`)
+    res.status(result.duplicate ? 200 : 202).json(result)
+  }))
 
   router.get('/sessions', route((req, res) => {
     const value = req.query.scope
@@ -820,6 +886,10 @@ export function createConversationRouter(
       res.status(error.code === 'workspace_disconnected' ? 409 : 400).json({ code: error.code, error: error.message })
       return
     }
+    if (error instanceof ProviderReadinessError) {
+      res.status(503).json({ code: error.code, error: error.message })
+      return
+    }
     if (error instanceof FollowUpStoreError) {
       res.status(error.code === 'follow_up_lease_lost' ? 409 : 400).json({ code: error.code, error: error.message })
       return
@@ -848,6 +918,7 @@ export function createConversationRouter(
         turn_not_running: 409,
         invalid_fork: 400,
         duplicate_request: 409,
+        initial_session_conflict: 409,
         session_busy: 409,
         session_archived: 409,
         invalid_reconciliation: 409,

@@ -33,6 +33,23 @@ import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
 import { conversationEntries, latestUsageSummary } from './conversation-presentation'
 import {
+  clearConversationDraft,
+  applyDraftFolderSelection,
+  classifyFirstTurnFailure,
+  conversationRouteFromUrl,
+  conversationRouteUrl,
+  conversationRouteWithoutSelection,
+  createConversationDraft,
+  editableAfterKnownFailure,
+  freezeFirstTurn,
+  loadConversationDraft,
+  markDeliveryUnknown,
+  markInitialSessionConflict,
+  resolveInitialConversationRoute,
+  saveConversationDraft,
+  type ConversationDraft,
+} from './draft-conversation'
+import {
   GOAL_OBJECTIVE_MAX_CHARS,
   limitGoalObjectiveDraft,
   parseGoalComposerCommand,
@@ -63,6 +80,36 @@ import { useConversationEvents } from './useConversationEvents'
 function errorMessage(error: unknown): string {
   if (error instanceof ConversationApiError) return error.message
   return error instanceof Error ? error.message : String(error)
+}
+
+function loadDraftSafely(): ConversationDraft | null {
+  try {
+    return loadConversationDraft(window.sessionStorage)
+  } catch {
+    return null
+  }
+}
+
+interface InitialConversationState {
+  draft: ConversationDraft | null
+  draftOpen: boolean
+  selectedSessionId: string | null
+  invalidDraftRoute: boolean
+}
+
+function loadInitialConversationState(): InitialConversationState {
+  const draft = loadDraftSafely()
+  return { draft, ...resolveInitialConversationRoute(window.location.href, draft) }
+}
+
+export function folderPickerErrorMessage(error: unknown): string {
+  if (!(error instanceof ConversationApiError)) return errorMessage(error)
+  if (error.code === 'unsupported_os') return '이 운영체제에서는 폴더 선택기를 사용할 수 없습니다.'
+  if (error.code === 'picker_unavailable') return '폴더 선택기를 열 수 없습니다. Baton을 데스크톱 세션에서 실행해 주세요.'
+  if (error.code === 'picker_timeout') return '폴더 선택 시간이 만료됐습니다. 다시 선택해 주세요.'
+  if (error.code === 'invalid_picker_response') return '선택한 폴더 경로를 확인할 수 없습니다.'
+  if (error.code === 'interaction_required') return '폴더는 사용자가 직접 누른 선택 버튼으로만 열 수 있습니다.'
+  return error.message
 }
 
 function latestActiveTurn(turns: CanonicalTurnDto[]): CanonicalTurnDto | null {
@@ -550,26 +597,36 @@ export function ConversationWorkspace({
   viewPreferences: SessionViewPreferences
   onViewPreferencesChange: (preferences: SessionViewPreferences) => void
 }) {
+  const [initialConversation] = useState(loadInitialConversationState)
   const [sessions, setSessions] = useState<CanonicalSessionDto[] | null>(null)
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initialConversation.selectedSessionId)
   const [snapshot, setSnapshot] = useState<ThreadSnapshotDto | null>(null)
-  const [provider, setProvider] = useState<CanonicalProvider>('codex')
-  const [model, setModel] = useState('')
-  const [effort, setEffort] = useState<string | null>('high')
+  const [draft, setDraft] = useState<ConversationDraft | null>(initialConversation.draft)
+  const [draftOpen, setDraftOpen] = useState(initialConversation.draftOpen)
+  const [provider, setProvider] = useState<CanonicalProvider>(
+    initialConversation.draft?.frozenRequest?.provider ?? initialConversation.draft?.provider ?? 'codex',
+  )
+  const [model, setModel] = useState(
+    initialConversation.draft?.frozenRequest?.model ?? initialConversation.draft?.model ?? '',
+  )
+  const [effort, setEffort] = useState<string | null>(
+    initialConversation.draft?.frozenRequest?.effort ?? initialConversation.draft?.effort ?? 'high',
+  )
   const [catalogs, setCatalogs] = useState<Record<CanonicalProvider, ModelCatalogState | null>>({
     codex: null,
     claude: null,
     gemini: null,
   })
   const [modelCatalogErrors, setModelCatalogErrors] = useState<Partial<Record<CanonicalProvider, string>>>({})
-  const [prompt, setPrompt] = useState('')
+  const [prompt, setPrompt] = useState(
+    initialConversation.draft?.frozenRequest?.input[0]?.payload.text as string
+      ?? initialConversation.draft?.message
+      ?? '',
+  )
   const [error, setError] = useState<string | null>(null)
   const [loadingSessions, setLoadingSessions] = useState(false)
   const [loadingThread, setLoadingThread] = useState(false)
-  const [creating, setCreating] = useState(false)
-  const [createDialogOpen, setCreateDialogOpen] = useState(false)
-  const [createCwd, setCreateCwd] = useState('')
-  const [createInstructions, setCreateInstructions] = useState('')
+  const [folderPickerBusy, setFolderPickerBusy] = useState(false)
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false)
   const [workspaceCwd, setWorkspaceCwd] = useState('')
   const [workspaceBusy, setWorkspaceBusy] = useState(false)
@@ -595,6 +652,10 @@ export function ConversationWorkspace({
   const threadRequest = useRef(0)
   const sessionListRequest = useRef(0)
   const sessionListBusy = useRef(false)
+  const sessionsRef = useRef<CanonicalSessionDto[] | null>(sessions)
+  const draftSessionIdRef = useRef<string | null>(draft?.sessionId ?? null)
+  const draftRef = useRef<ConversationDraft | null>(draft)
+  const draftOpenRef = useRef(draftOpen)
   const transcriptScroller = useRef<HTMLDivElement | null>(null)
   const lastPositionedThread = useRef<string | null>(null)
   const followOutput = useRef(true)
@@ -603,10 +664,19 @@ export function ConversationWorkspace({
     () => sessions?.find((session) => session.id === selectedSessionId) ?? null,
     [selectedSessionId, sessions],
   )
+  const isDraft = sessionScope === 'active' && draftOpen && draft !== null && selectedSessionId === null
+  const draftSessionId = draft?.sessionId ?? null
+  draftSessionIdRef.current = draftSessionId
+  draftRef.current = draft
+  draftOpenRef.current = draftOpen
+  sessionsRef.current = sessions
   const threadId = selectedSession?.activeThreadId ?? null
   const currentCatalog = catalogs[provider]
   const models = currentCatalog?.models ?? null
   const selectedModel = models?.find((option) => option.id === model) ?? null
+  const frozenDraftRequest = isDraft ? draft?.frozenRequest ?? null : null
+  const frozenModelMissing = Boolean(frozenDraftRequest
+    && !(catalogs[frozenDraftRequest.provider]?.models ?? []).some((option) => option.id === frozenDraftRequest.model))
   const modelDisplayNames = useMemo(() => Object.fromEntries(
     PROVIDERS.flatMap((candidate) => (catalogs[candidate]?.models ?? []).map((option) => [
       option.id,
@@ -627,6 +697,7 @@ export function ConversationWorkspace({
       if (requestId !== sessionListRequest.current) return
       setSessions(result)
       setSelectedSessionId((current) => {
+        if (draftOpenRef.current && draftSessionIdRef.current && sessionScope === 'active' && current === null) return null
         if (current && result.some((session) => session.id === current)) return current
         return result[0]?.id ?? null
       })
@@ -667,14 +738,32 @@ export function ConversationWorkspace({
   }, [])
 
   useEffect(() => {
+    if (draftOpen && draft?.frozenRequest) {
+      setProvider(draft.frozenRequest.provider)
+      setModel(draft.frozenRequest.model)
+      setEffort(draft.frozenRequest.effort ?? null)
+      const text = draft.frozenRequest.input[0]?.payload.text
+      if (typeof text === 'string') setPrompt(text)
+      return
+    }
     if (!currentCatalog) return
-    const option = currentCatalog.models.find((candidate) => candidate.id === model)
+    const preferredModel = draftOpen && draft ? draft.model : model
+    const option = currentCatalog.models.find((candidate) => candidate.id === preferredModel)
       ?? currentCatalog.models.find((candidate) => candidate.id === currentCatalog.defaultModel)
       ?? currentCatalog.models[0]
       ?? null
+    const optionEffort = draftOpen && draft && option
+      && (draft.effort === null || option.effortLevels.includes(draft.effort))
+      ? draft.effort
+      : option?.defaultEffort ?? null
     setModel(option?.id ?? '')
-    setEffort(option?.defaultEffort ?? null)
-  }, [currentCatalog, model, provider])
+    setEffort(optionEffort)
+    if (draftOpen && draft && option && (draft.model !== option.id || draft.effort !== optionEffort)) {
+      const next = { ...draft, model: option.id, effort: optionEffort }
+      setDraft(next)
+      try { saveConversationDraft(window.sessionStorage, next) } catch { /* storage unavailable */ }
+    }
+  }, [currentCatalog, draft, draftOpen, model, provider])
 
   const refreshThread = useCallback(async (): Promise<boolean> => {
     const requestId = ++threadRequest.current
@@ -714,6 +803,62 @@ export function ConversationWorkspace({
   }, [refreshModels])
 
   useEffect(() => {
+    if (!isDraft || !draftSessionId) return
+    window.history.replaceState(
+      { batonConversation: { kind: 'draft', sessionId: draftSessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'draft', sessionId: draftSessionId }),
+    )
+  }, [draftSessionId, isDraft])
+
+  useEffect(() => {
+    if (!initialConversation.invalidDraftRoute) return
+    window.history.replaceState(
+      { batonConversation: null },
+      '',
+      conversationRouteWithoutSelection(window.location.href),
+    )
+  }, [initialConversation])
+
+  useEffect(() => {
+    const onPopState = () => {
+      const route = conversationRouteFromUrl(window.location.href)
+      const currentDraft = draftRef.current
+      if (route.kind === 'draft' && currentDraft?.sessionId === route.sessionId) {
+        const frozen = currentDraft.frozenRequest
+        setDraftOpen(true)
+        setSessionScope('active')
+        setSelectedSessionId(null)
+        setSnapshot(null)
+        setProvider(frozen?.provider ?? currentDraft.provider)
+        setModel(frozen?.model ?? currentDraft.model)
+        setEffort(frozen?.effort ?? currentDraft.effort)
+        const text = frozen?.input[0]?.payload.text
+        setPrompt(typeof text === 'string' ? text : currentDraft.message)
+        return
+      }
+      setDraftOpen(false)
+      setSnapshot(null)
+      setPrompt('')
+      if (route.kind === 'session') {
+        setSessionScope('active')
+        setSelectedSessionId(route.sessionId)
+        return
+      }
+      if (route.kind === 'draft') {
+        window.history.replaceState(
+          { batonConversation: null },
+          '',
+          conversationRouteWithoutSelection(window.location.href),
+        )
+      }
+      setSelectedSessionId(sessionsRef.current?.[0]?.id ?? null)
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
+  useEffect(() => {
     void refreshThread()
     return () => {
       threadRequest.current += 1
@@ -723,27 +868,97 @@ export function ConversationWorkspace({
   const onStreamEvent = useCallback(() => refreshThread(), [refreshThread])
   useConversationEvents(threadId, onStreamEvent)
 
-  const createSession = async () => {
-    setCreating(true)
+  const persistDraft = useCallback((next: ConversationDraft) => {
+    setDraft(next)
     try {
-      const cwd = createCwd.trim()
-      const developerInstructions = createInstructions.trim()
-      const created = await conversationApi.createSession({
-        title: null,
-        cwd: cwd || null,
-        ...(developerInstructions ? { instructionSnapshot: { developerInstructions } } : {}),
-      })
-      setSessions((current) => [created, ...(current ?? []).filter((item) => item.id !== created.id)])
-      setSelectedSessionId(created.id)
-      setMobileSidebarOpen(false)
-      setCreateDialogOpen(false)
-      setCreateCwd('')
-      setCreateInstructions('')
-      setError(null)
+      saveConversationDraft(window.sessionStorage, next)
+    } catch {
+      // The in-memory draft remains usable when browser storage is unavailable.
+    }
+  }, [])
+
+  const beginDraft = () => {
+    const next = draft ?? createConversationDraft({ provider, model, effort })
+    persistDraft(next)
+    setDraftOpen(true)
+    setSessionScope('active')
+    setSelectedSessionId(null)
+    setSnapshot(null)
+    setProvider(next.provider)
+    setModel(next.model)
+    setEffort(next.effort)
+    setPrompt(next.message)
+    setGoalComposerMode(false)
+    setMobileSidebarOpen(false)
+    setError(null)
+    window.history.pushState(
+      { batonConversation: { kind: 'draft', sessionId: next.sessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'draft', sessionId: next.sessionId }),
+    )
+  }
+
+  const discardConflictedDraft = () => {
+    if (!draft?.conflict) return
+    const frozen = draft.frozenRequest
+    const frozenText = frozen?.input[0]?.payload.text
+    const next = {
+      ...createConversationDraft({
+        provider: frozen?.provider ?? draft.provider,
+        model: frozen?.model ?? draft.model,
+        effort: frozen?.effort ?? draft.effort,
+      }),
+      cwd: frozen?.cwd ?? draft.cwd,
+      message: typeof frozenText === 'string' ? frozenText : draft.message,
+    }
+    persistDraft(next)
+    setDraftOpen(true)
+    setSelectedSessionId(null)
+    setProvider(next.provider)
+    setModel(next.model)
+    setEffort(next.effort)
+    setPrompt(next.message)
+    setError(null)
+    window.history.replaceState(
+      { batonConversation: { kind: 'draft', sessionId: next.sessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'draft', sessionId: next.sessionId }),
+    )
+  }
+
+  const updateDraft = (patch: Partial<Pick<ConversationDraft, 'cwd' | 'provider' | 'model' | 'effort' | 'message'>>) => {
+    setDraft((current) => {
+      if (!current || current.frozenRequest) return current
+      const next = { ...current, ...patch }
+      try { saveConversationDraft(window.sessionStorage, next) } catch { /* storage unavailable */ }
+      return next
+    })
+  }
+
+  const pickFolder = async (target: 'draft' | 'workspace') => {
+    const requestedDraftSessionId = target === 'draft' ? draftRef.current?.sessionId ?? null : null
+    setFolderPickerBusy(true)
+    if (target === 'workspace') setWorkspaceError(null)
+    else setError(null)
+    try {
+      const result = await conversationApi.pickNativeFolder()
+      if (result.status === 'cancelled') return
+      if (target === 'workspace') setWorkspaceCwd(result.cwd)
+      else if (requestedDraftSessionId) {
+        setDraft((current) => {
+          const next = applyDraftFolderSelection(current, requestedDraftSessionId, result.cwd)
+          if (next !== current && next) {
+            try { saveConversationDraft(window.sessionStorage, next) } catch { /* storage unavailable */ }
+          }
+          return next
+        })
+      }
     } catch (cause) {
-      setError(errorMessage(cause))
+      const message = folderPickerErrorMessage(cause)
+      if (target === 'workspace') setWorkspaceError(message)
+      else setError(message)
     } finally {
-      setCreating(false)
+      setFolderPickerBusy(false)
     }
   }
 
@@ -897,7 +1112,58 @@ export function ConversationWorkspace({
 
   const startTurn = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!snapshot || !prompt.trim()) return
+    if ((!snapshot && !isDraft) || !prompt.trim()) return
+    if (isDraft && draft) {
+      if (!model.trim()) return
+      setSubmitting(true)
+      let frozen = draft
+      try {
+        frozen = draft.frozenRequest
+          ? draft
+          : freezeFirstTurn({ ...draft, provider, model, effort, message: prompt })
+        persistDraft(frozen)
+        const result = await conversationApi.createFirstTurn(frozen.sessionId, frozen.frozenRequest!)
+        try { clearConversationDraft(window.sessionStorage) } catch { /* storage unavailable */ }
+        setDraft(null)
+        setDraftOpen(false)
+        setPrompt('')
+        setSessions((current) => [result.session, ...(current ?? []).filter((item) => item.id !== result.session.id)])
+        setSelectedSessionId(result.session.id)
+        setSnapshot({
+          session: result.session,
+          thread: result.thread,
+          turns: [result.turn],
+          items: result.initialItems,
+          bindings: [],
+          followUps: [],
+          goal: null,
+        })
+        window.history.replaceState(
+          { batonConversation: { kind: 'session', sessionId: result.session.id } },
+          '',
+          conversationRouteUrl(window.location.href, { kind: 'session', sessionId: result.session.id }),
+        )
+        setError(null)
+        void refreshSessions(true)
+      } catch (cause) {
+        const disposition = classifyFirstTurnFailure(cause)
+        const next = disposition === 'editable'
+          ? editableAfterKnownFailure(frozen)
+          : disposition === 'conflict'
+            ? markInitialSessionConflict(frozen)
+            : markDeliveryUnknown(frozen)
+        persistDraft(next)
+        setError(disposition === 'editable'
+          ? errorMessage(cause)
+          : disposition === 'conflict'
+            ? '이 draft ID가 다른 첫 요청에 이미 사용됐습니다. draft를 폐기하고 새 ID로 다시 시작해야 합니다.'
+            : '응답을 확인하지 못했습니다. 아래 버튼은 같은 요청 ID와 본문을 다시 전송해 중복 생성 없이 결과를 확인합니다.')
+      } finally {
+        setSubmitting(false)
+      }
+      return
+    }
+    if (!snapshot) return
     const submissionKind = composerSubmissionKind(prompt, goalComposerMode, activeTurn?.id ?? null)
     if (goalComposerMode) {
       const objective = prompt.trim()
@@ -1007,15 +1273,20 @@ export function ConversationWorkspace({
   }
 
   const canSubmit = Boolean(
-    snapshot
-      && !selectedSession?.archivedAt
-      && prompt.trim()
+    prompt.trim()
       && !submitting
-      && (activeTurn !== null || (snapshot.thread.status === 'idle' && Boolean(model.trim()))),
+      && !folderPickerBusy
+      && (isDraft
+        ? draft && !draft.conflict && model.trim()
+        : snapshot
+          && !selectedSession?.archivedAt
+          && (activeTurn !== null || (snapshot.thread.status === 'idle' && Boolean(model.trim())))),
   )
 
   const selectSession = (sessionId: string) => {
+    setDraftOpen(false)
     setSelectedSessionId(sessionId)
+    setPrompt('')
     setGoalPanelVersion(0)
     setGoalDialog(null)
     setGoalComposerMode(false)
@@ -1024,11 +1295,17 @@ export function ConversationWorkspace({
     setReconcileNote('')
     setReconcileNotice(null)
     setMobileSidebarOpen(false)
+    window.history.replaceState(
+      { batonConversation: { kind: 'session', sessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'session', sessionId }),
+    )
   }
 
   const changeScope = (scope: 'active' | 'trash') => {
     if (scope === sessionScope) return
     setSessionScope(scope)
+    setDraftOpen(false)
     setSessions(null)
     setSelectedSessionId(null)
     setSnapshot(null)
@@ -1138,14 +1415,12 @@ export function ConversationWorkspace({
       sessions={sessions}
       selectedSessionId={selectedSessionId}
       loading={loadingSessions}
-      creating={creating}
+      creating={submitting && isDraft}
       scope={sessionScope}
       preferences={viewPreferences}
       onSelect={selectSession}
       onCreate={() => {
-        setMobileSidebarOpen(false)
-        setError(null)
-        setCreateDialogOpen(true)
+        beginDraft()
       }}
       onRefresh={() => void refreshSessions()}
       onPreferencesChange={onViewPreferencesChange}
@@ -1190,42 +1465,6 @@ export function ConversationWorkspace({
         onImported={refreshSessions}
       />
 
-      <Dialog open={createDialogOpen} onOpenChange={(open) => { if (!creating) setCreateDialogOpen(open) }}>
-        <DialogContent className="max-w-md">
-          <DialogTitle>새 대화</DialogTitle>
-          <DialogDescription>
-            프로젝트 폴더를 연결하면 Baton이 그 폴더 안에서만 파일 도구를 사용할 수 있습니다.
-          </DialogDescription>
-          {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
-          <label className="space-y-1.5 text-sm">
-            <span className="font-medium">프로젝트 폴더 <span className="font-normal text-muted-foreground">선택</span></span>
-            <input
-              value={createCwd}
-              onChange={(event) => setCreateCwd(event.target.value)}
-              placeholder="C:\\projects\\my-app"
-              autoFocus
-              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            />
-          </label>
-          <details className="rounded-xl border px-3 py-2 text-sm">
-            <summary className="cursor-pointer select-none font-medium">대화 지침</summary>
-            <textarea
-              value={createInstructions}
-              onChange={(event) => setCreateInstructions(event.target.value)}
-              rows={5}
-              className="mt-2 w-full resize-y bg-transparent text-sm leading-6 outline-none"
-              placeholder="이 대화에서 항상 따라야 할 지침"
-            />
-          </details>
-          <div className="flex justify-end gap-2">
-            <Button type="button" variant="ghost" disabled={creating} onClick={() => setCreateDialogOpen(false)}>취소</Button>
-            <Button type="button" disabled={creating} onClick={() => void createSession()}>
-              {creating ? '만드는 중…' : '대화 시작'}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       <Dialog open={workspaceDialogOpen} onOpenChange={(open) => { if (!workspaceBusy) setWorkspaceDialogOpen(open) }}>
         <DialogContent className="max-w-md">
           <DialogTitle>프로젝트 폴더 {snapshot?.session.cwd ? '변경' : '연결'}</DialogTitle>
@@ -1235,14 +1474,25 @@ export function ConversationWorkspace({
           {workspaceError ? <p role="alert" className="text-sm text-destructive">{workspaceError}</p> : null}
           <label className="space-y-1.5 text-sm">
             <span className="font-medium">프로젝트 폴더</span>
-            <input
-              value={workspaceCwd}
-              onChange={(event) => setWorkspaceCwd(event.target.value)}
-              placeholder="C:\\projects\\my-app"
-              autoFocus
-              disabled={workspaceBusy}
-              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            />
+            <div className="flex gap-2">
+              <input
+                value={workspaceCwd}
+                onChange={(event) => setWorkspaceCwd(event.target.value)}
+                placeholder="폴더를 선택하세요"
+                autoFocus
+                disabled={workspaceBusy || folderPickerBusy}
+                className="min-w-0 flex-1 rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                disabled={workspaceBusy || folderPickerBusy}
+                onClick={() => void pickFolder('workspace')}
+              >
+                <FolderOpen aria-hidden />
+                {folderPickerBusy ? '여는 중…' : '폴더 선택'}
+              </Button>
+            </div>
           </label>
           <div className="flex items-center justify-end gap-2">
             {snapshot?.session.cwd ? (
@@ -1418,12 +1668,25 @@ export function ConversationWorkspace({
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {sessionScope === 'trash'
               ? <span>읽기 전용</span>
-              : snapshot ? <SessionStatus status={snapshot.session.workStatus} /> : <span>준비됨</span>}
+              : isDraft ? <span>저장 전</span>
+                : snapshot ? <SessionStatus status={snapshot.session.workStatus} /> : <span>준비됨</span>}
             {sessionScope === 'active' ? <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge> : null}
             {snapshot && sessionScope === 'active' ? (
               <Button type="button" variant="ghost" size="xs" onClick={openWorkspaceDialog}>
                 <FolderOpen aria-hidden />
                 {snapshot.session.cwd ? '폴더 연결됨' : '폴더 연결'}
+              </Button>
+            ) : null}
+            {isDraft ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                disabled={folderPickerBusy || Boolean(draft?.frozenRequest)}
+                onClick={() => void pickFolder('draft')}
+              >
+                <FolderOpen aria-hidden />
+                {draft?.cwd ? '폴더 연결됨' : '폴더 선택'}
               </Button>
             ) : null}
           </div>
@@ -1496,7 +1759,13 @@ export function ConversationWorkspace({
               <div className="m-auto max-w-md py-16 text-center">
                 <h2 className="text-2xl font-semibold tracking-tight">{sessionScope === 'trash' ? '휴지통이 비어 있습니다' : '무엇을 도와드릴까요?'}</h2>
                 <p className="mt-3 text-sm text-muted-foreground">
-                  {sessionScope === 'trash' ? '삭제한 대화는 30일 동안 여기에 보관됩니다.' : '왼쪽에서 대화를 선택하거나 새 대화를 시작하세요.'}
+                  {sessionScope === 'trash'
+                    ? '삭제한 대화는 30일 동안 여기에 보관됩니다.'
+                    : isDraft
+                      ? draft?.cwd
+                        ? `${draft.cwd}에서 파일 도구를 사용합니다. 첫 메시지를 보내면 대화가 저장됩니다.`
+                        : '일반 대화로 시작합니다. 파일 도구가 필요하면 폴더를 선택하세요.'
+                      : '왼쪽에서 대화를 선택하거나 새 대화를 시작하세요.'}
                 </p>
               </div>
             ) : visibleEntries.length === 0 ? (
@@ -1595,6 +1864,19 @@ export function ConversationWorkspace({
               onAction={(action) => { void applyGoalAction(action) }}
             />
           ) : null}
+          {isDraft && draft?.deliveryUnknown ? (
+            <p className="mx-auto mb-2 w-full max-w-3xl rounded-xl border border-warning/50 bg-warning/10 px-3 py-2 text-xs leading-5" role="status">
+              첫 요청의 응답을 확인하지 못했습니다. 입력값을 고정했으며 다시 보내면 같은 요청으로 결과만 확인합니다.
+            </p>
+          ) : null}
+          {isDraft && draft?.conflict ? (
+            <div className="mx-auto mb-2 flex w-full max-w-3xl items-center gap-3 rounded-xl border border-destructive/40 bg-destructive/10 px-3 py-2">
+              <p className="min-w-0 flex-1 text-xs leading-5">이 draft ID는 다른 요청에 이미 사용됐습니다.</p>
+              <Button type="button" size="sm" variant="outline" onClick={discardConflictedDraft}>
+                draft 폐기하고 새 대화
+              </Button>
+            </div>
+          ) : null}
           <form
             className="mx-auto w-full max-w-3xl rounded-2xl border bg-background p-2 shadow-lg shadow-black/5"
             onSubmit={(event) => void startTurn(event)}
@@ -1618,9 +1900,13 @@ export function ConversationWorkspace({
             ) : null}
             <textarea
               value={prompt}
-              onChange={(event) => setPrompt(goalComposerMode
-                ? limitGoalObjectiveDraft(event.target.value)
-                : event.target.value)}
+              onChange={(event) => {
+                const value = goalComposerMode
+                  ? limitGoalObjectiveDraft(event.target.value)
+                  : event.target.value
+                setPrompt(value)
+                if (isDraft) updateDraft({ message: value })
+              }}
               onKeyDown={(event) => {
                 const action = composerKeyAction({
                   key: event.key,
@@ -1633,6 +1919,7 @@ export function ConversationWorkspace({
                 if (canSubmit) event.currentTarget.form?.requestSubmit()
               }}
               rows={2}
+              disabled={Boolean(isDraft && draft?.frozenRequest)}
               placeholder={goalComposerMode ? 'Goal 내용 입력' : activeTurn ? '추가 요청 보내기' : '메시지 보내기'}
               aria-label="메시지"
               aria-keyshortcuts="Enter Shift+Enter"
@@ -1640,7 +1927,32 @@ export function ConversationWorkspace({
             />
 
             <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
-              {!snapshot?.goal && !goalComposerMode ? (
+              {isDraft ? (
+                <div className="flex items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    title={draft?.cwd ?? '파일 도구는 폴더를 선택한 대화에서만 사용할 수 있습니다.'}
+                    disabled={folderPickerBusy || Boolean(draft?.frozenRequest)}
+                    onClick={() => void pickFolder('draft')}
+                  >
+                    <FolderOpen aria-hidden />
+                    {folderPickerBusy ? '여는 중…' : draft?.cwd ? '폴더 변경' : '폴더 선택'}
+                  </Button>
+                  {draft?.cwd ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      disabled={Boolean(draft.frozenRequest)}
+                      onClick={() => updateDraft({ cwd: null })}
+                    >
+                      일반 대화
+                    </Button>
+                  ) : null}
+                </div>
+              ) : !snapshot?.goal && !goalComposerMode ? (
                 <Button
                   type="button"
                   variant="ghost"
@@ -1666,12 +1978,22 @@ export function ConversationWorkspace({
                   setProvider(nextProvider)
                   setModel(next.id)
                   setEffort(next?.defaultEffort ?? null)
+                  if (isDraft) updateDraft({
+                    provider: nextProvider,
+                    model: next.id,
+                    effort: next.defaultEffort ?? null,
+                  })
                 }}
-                disabled={Boolean(activeTurn) || PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
+                disabled={Boolean(activeTurn) || Boolean(isDraft && draft?.frozenRequest) || PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
                 aria-label="모델"
                 className="min-w-0 max-w-64 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs font-medium text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {!model ? <option value="">모델 불러오는 중…</option> : null}
+                >
+                  {!model ? <option value="">모델 불러오는 중…</option> : null}
+                  {frozenModelMissing && frozenDraftRequest ? (
+                    <option value={`${frozenDraftRequest.provider}:${frozenDraftRequest.model}`}>
+                      {frozenDraftRequest.model}
+                    </option>
+                  ) : null}
                 {PROVIDERS.map((candidate) => {
                   const catalog = catalogs[candidate]
                   const unavailable = catalog !== null && catalog.models.length === 0
@@ -1691,15 +2013,21 @@ export function ConversationWorkspace({
                 })}
               </select>
 
-              {selectedModel && selectedModel.effortLevels.length > 0 ? (
+              {(selectedModel && selectedModel.effortLevels.length > 0) || (frozenDraftRequest && effort) ? (
                 <select
                   value={effort ?? ''}
-                  onChange={(event) => setEffort(event.target.value || null)}
-                  disabled={Boolean(activeTurn)}
+                  onChange={(event) => {
+                    const nextEffort = event.target.value || null
+                    setEffort(nextEffort)
+                    if (isDraft) updateDraft({ effort: nextEffort })
+                  }}
+                  disabled={Boolean(activeTurn) || Boolean(isDraft && draft?.frozenRequest)}
                   aria-label="Reasoning effort"
                   className="rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  {selectedModel.effortLevels.map((level) => (
+                  {(selectedModel?.effortLevels.length
+                    ? selectedModel.effortLevels
+                    : effort ? [effort] : []).map((level) => (
                     <option key={level} value={level}>{EFFORT_NAME[level] ?? level}</option>
                   ))}
                 </select>
@@ -1720,7 +2048,7 @@ export function ConversationWorkspace({
                 type="submit"
                 size="icon-sm"
                 disabled={!canSubmit}
-                aria-label={activeTurn ? '추가 요청 보내기' : '메시지 보내기'}
+                aria-label={isDraft && draft?.deliveryUnknown ? '같은 첫 요청 다시 확인' : activeTurn ? '추가 요청 보내기' : '메시지 보내기'}
               >
                 <Send aria-hidden />
               </Button>

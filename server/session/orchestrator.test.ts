@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -15,6 +15,7 @@ import type {
 import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 import { ConversationEventHub } from './event-hub.ts'
 import { chargeableGoalTokens, TurnOrchestrator } from './orchestrator.ts'
+import { ProviderReadinessError } from './service.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
@@ -275,6 +276,251 @@ test('TurnOrchestrator durably executes one canonical turn and deduplicates retr
   assert.equal(duplicate.duplicate, true)
   assert.equal(duplicate.turn.id, started.turn.id)
   assert.equal(orchestrator.getSnapshot(session.activeThreadId)?.turns.length, 1)
+})
+
+test('first send verifies workspace, creates the canonical graph once, and replays before rechecking cwd', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-initial-session-'))
+  const workspace = join(directory, 'workspace')
+  const movedWorkspace = join(directory, 'workspace-moved')
+  mkdirSync(workspace)
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  registry.register(safeAdapter([]))
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const request = {
+    sessionId: 'client-session-first-send',
+    clientRequestId: 'client-request-first-send',
+    cwd: workspace,
+    instructionSnapshot: { developerInstructions: 'Use the verified workspace only.' },
+    provider: 'codex' as const,
+    model: 'gpt-test',
+    effort: 'high',
+    input: [{ kind: 'user_message' as const, visibility: 'portable' as const, payload: { text: 'First request' } }],
+  }
+
+  const started = await orchestrator.startSession(request)
+  await waitForTerminal(store, started.turn.id)
+  assert.equal(started.duplicate, false)
+  assert.equal(started.session.title, null)
+  assert.equal(started.session.preview, 'First request')
+  assert.equal(started.session.projectKey, null)
+  assert.equal(started.session.cwd, realpathSync.native(workspace))
+  assert.deepEqual(started.thread.instructionSnapshot, {
+    schemaVersion: 1,
+    developerInstructions: 'Use the verified workspace only.',
+  })
+  assert.equal(store.listSessions().length, 1)
+
+  renameSync(workspace, movedWorkspace)
+  const replay = await orchestrator.startSession(request)
+  assert.equal(replay.duplicate, true)
+  assert.equal(replay.turn.id, started.turn.id)
+  assert.equal(store.listSessions().length, 1)
+
+  await assert.rejects(
+    orchestrator.startSession({ ...request, clientRequestId: 'different-request' }),
+    (error) => error instanceof Error && /different initial request/.test(error.message),
+  )
+  assert.equal(store.listSessions().length, 1)
+})
+
+test('concurrent equivalent first sends normalize defaults and execute the adapter once', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-initial-concurrent-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const adapter = safeAdapter([])
+  const initialize = adapter.initialize.bind(adapter)
+  const execute = adapter.execute.bind(adapter)
+  let initializeCount = 0
+  let executeCount = 0
+  adapter.initialize = async () => { initializeCount += 1; return initialize() }
+  adapter.execute = async (request, context) => { executeCount += 1; return execute(request, context) }
+  registry.register(adapter)
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const base = {
+    sessionId: 'concurrent-session',
+    clientRequestId: 'concurrent-request',
+    cwd: null,
+    provider: 'codex' as const,
+    model: 'gpt-test',
+    effort: 'high',
+  }
+  const missingDefaults = {
+    ...base,
+    input: [{ kind: 'user_message' as const, payload: { text: 'hello', nested: { b: 2, a: 1 } } }],
+  }
+  const explicitDefaults = {
+    ...base,
+    input: [{
+      kind: 'user_message' as const,
+      visibility: 'portable' as const,
+      payload: { nested: { a: 1, b: 2 }, text: 'hello' },
+      provider: null,
+      nativeId: null,
+    }],
+  }
+
+  const results = await Promise.all([
+    orchestrator.startSession(missingDefaults),
+    orchestrator.startSession(explicitDefaults),
+  ])
+  assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true])
+  assert.equal(results[0]?.turn.id, results[1]?.turn.id)
+  await waitForTerminal(store, results[0]!.turn.id)
+  assert.equal(initializeCount, 1)
+  assert.equal(executeCount, 1)
+  assert.equal(store.listSessions().length, 1)
+  assert.deepEqual(store.getSnapshot(results[0]!.thread.id)?.items[0], {
+    ...results[0]!.initialItems[0],
+    visibility: 'portable',
+    provider: null,
+    nativeId: null,
+    payload: { nested: { a: 1, b: 2 }, text: 'hello' },
+  })
+})
+
+test('direct service rejects non-JSON first-turn payloads before adapter readiness', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-initial-non-json-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const adapter = safeAdapter([])
+  let initializeCount = 0
+  adapter.initialize = async () => { initializeCount += 1; throw new Error('must not initialize') }
+  registry.register(adapter)
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const base = {
+    clientRequestId: 'non-json-request', cwd: null, provider: 'codex' as const, model: 'gpt-test',
+  }
+  const payloads: Record<string, unknown>[] = [
+    { text: 'hello', invalid: undefined },
+    { text: 'hello', invalid: new Date('2026-07-19T00:00:00.000Z') },
+  ]
+  for (const [index, payload] of payloads.entries()) {
+    await assert.rejects(orchestrator.startSession({
+      ...base,
+      sessionId: `non-json-session-${index}`,
+      input: [{ kind: 'user_message', payload }],
+    }), /initial input payload contains/)
+  }
+  assert.equal(initializeCount, 0)
+  assert.deepEqual(store.listSessions('all'), [])
+})
+
+test('committed first-send replay bypasses readiness in a new runtime', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-initial-replay-runtime-'))
+  const databasePath = join(directory, 'sessions.sqlite')
+  const request = {
+    sessionId: 'replayed-session', clientRequestId: 'replayed-request', cwd: null,
+    provider: 'codex' as const, model: 'gpt-test',
+    input: [{ kind: 'user_message' as const, payload: { text: 'persist once' } }],
+  }
+  const firstStore = new SqliteSessionStore(databasePath)
+  const firstRegistry = new AdapterRegistry()
+  firstRegistry.register(safeAdapter([]))
+  const firstRuntime = new TurnOrchestrator(firstStore, firstRegistry, new ConversationEventHub())
+  const started = await firstRuntime.startSession(request)
+  await waitForTerminal(firstStore, started.turn.id)
+  await firstRuntime.close()
+
+  const replayStore = new SqliteSessionStore(databasePath)
+  const replayRegistry = new AdapterRegistry()
+  const unavailable = safeAdapter([])
+  let getReadyCount = 0
+  let executeCount = 0
+  unavailable.initialize = async () => { getReadyCount += 1; throw new Error('provider offline') }
+  unavailable.execute = async () => { executeCount += 1; throw new Error('must not execute') }
+  replayRegistry.register(unavailable)
+  const replayRuntime = new TurnOrchestrator(replayStore, replayRegistry, new ConversationEventHub())
+  t.after(async () => {
+    await replayRuntime.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const replay = await replayRuntime.startSession(request)
+  assert.equal(replay.duplicate, true)
+  assert.equal(replay.turn.id, started.turn.id)
+  assert.equal(getReadyCount, 0)
+  assert.equal(executeCount, 0)
+})
+
+test('invalid workspace and adapter readiness failure leave no canonical rows', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-initial-preflight-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const unavailable = safeAdapter([])
+  unavailable.initialize = async () => { throw new Error('not authenticated') }
+  registry.register(unavailable)
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const base = {
+    clientRequestId: 'client-request-preflight',
+    instructionSnapshot: {},
+    provider: 'codex' as const,
+    model: 'gpt-test',
+    effort: null,
+    input: [{ kind: 'user_message' as const, payload: { text: 'hello' } }],
+  }
+
+  await assert.rejects(
+    orchestrator.startSession({ ...base, sessionId: 'invalid-workspace', cwd: join(directory, 'missing') }),
+    (error) => error instanceof WorkspaceRootError && error.code === 'invalid_workspace',
+  )
+  assert.deepEqual(store.listSessions('all'), [])
+
+  await assert.rejects(
+    orchestrator.startSession({ ...base, sessionId: 'adapter-unavailable', cwd: null }),
+    (error) => error instanceof ProviderReadinessError && error.provider === 'codex',
+  )
+  assert.deepEqual(store.listSessions('all'), [])
+})
+
+test('provider failure after atomic first send leaves a failed canonical turn and session', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-initial-provider-failure-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const failing = safeAdapter([])
+  let executeCount = 0
+  failing.execute = async () => { executeCount += 1; throw new Error('upstream failed after commit') }
+  registry.register(failing)
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  const request = {
+    sessionId: 'provider-failure-session',
+    clientRequestId: 'provider-failure-request',
+    cwd: null,
+    provider: 'codex' as const,
+    model: 'gpt-test',
+    input: [{ kind: 'user_message' as const, payload: { text: 'persist me' } }],
+  }
+  const started = await orchestrator.startSession(request)
+  await waitForTerminal(store, started.turn.id)
+  assert.equal(store.listSessions().length, 1)
+  assert.equal(store.getTurn(started.turn.id)?.status, 'failed')
+  assert.match(String(store.getTurn(started.turn.id)?.error?.message), /upstream failed after commit/)
+
+  const replay = await orchestrator.startSession(request)
+  assert.equal(replay.duplicate, true)
+  assert.equal(replay.turn.id, started.turn.id)
+  assert.equal(replay.turn.status, 'failed')
+  assert.equal(executeCount, 1)
 })
 
 test('follow-up pump consumes accepted steer and drains closed steer before Goal continuation', async (t) => {

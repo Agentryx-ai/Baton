@@ -91,7 +91,7 @@ ID는 바뀌지 않습니다.
 | Canonical conversation runtime | **V1 부분 구현** | 한 요청 안에서 완료 경계까지 반복하는 provider-neutral model/tool loop, durable broker, bounded cancel/recovery |
 | Persistent Goal runtime | **V1 구현** | `/goal`, CAS/lease, 자동 후속 턴, pause/resume/edit/clear, 24턴·2시간·no-progress 안전 한도 |
 | Codex turn adapter | **V1 구현** | app-server ephemeral thread, Baton tools, web/MCP/plugin/subagent 차단, model provenance |
-| Canonical conversation UI | **Preview 구현** | 2-column 대화, 작업 상태, provider/model/effort, Goal panel, 턴 실행·취소 |
+| Canonical conversation UI | **Preview 구현** | 2-column 대화, 첫 전송 전 draft, native 폴더 선택, 작업 상태, provider/model/effort, Goal panel, 턴 실행·취소 |
 | Claude turn adapter | **Preview 구현** | portable text history 기반 stateless 실행; Fable 5 live 검증 완료 |
 | Gemini turn adapter | **Preview 구현·live 차단** | OpenAI 호환 stateless 경로 구현; 현재 proxy 인증 문제로 모델이 0개라 UI에서 비활성화 |
 | Baton-managed child execution | 기반만 구현, 실행 비활성 | execution 기록과 delegation-disabled 정책; child API·실행기는 예정 |
@@ -156,6 +156,8 @@ SPA (React + Vite + Tailwind + shadcn)
   - Codex는 `model_provider=openai`를 유지하고 `openai_base_url`만 Baton loopback bridge로
     설정하는 **기존 세션 유지 모드**와, 별도 `baton` provider 모드를 선택 가능
 - canonical session/thread/turn/item과 provider binding의 SQLite/WAL 영속화
+- 새 대화는 브라우저 draft로만 준비하고, 첫 메시지 전송 때 session/thread/turn/execution/items를 한 transaction으로 생성
+- 명시적 native 폴더 선택 후 검증된 `cwd`만 세션에 연결하며, 응답 불명 재시도는 같은 ID·본문을 사용
 - `/baton/v1` REST API, cursor replay SSE, fork, idempotent retry, cancel, crash recovery
 - provider-neutral agent loop와 Baton tool broker
   - tool call 선기록, read 병렬화, mutation 직렬화, 결과 기록 후 provider 재개

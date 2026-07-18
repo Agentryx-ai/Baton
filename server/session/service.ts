@@ -1,5 +1,6 @@
 import type {
   BeginTurnResult,
+  BeginSessionResult,
   CanonicalItem,
   CanonicalGoal,
   CanonicalFollowUp,
@@ -35,6 +36,29 @@ export interface StartTurnInput {
   input: NewCanonicalItem[]
 }
 
+/** Client-owned draft identity plus the immutable first-turn payload. */
+export interface StartSessionInput {
+  sessionId: SessionId
+  clientRequestId: string
+  cwd: string | null
+  instructionSnapshot?: Record<string, unknown>
+  provider: CanonicalProvider
+  model: string
+  effort?: string | null
+  input: NewCanonicalItem[]
+}
+
+export class ProviderReadinessError extends Error {
+  readonly code = 'provider_not_ready'
+  readonly provider: CanonicalProvider
+
+  constructor(provider: CanonicalProvider, options?: ErrorOptions) {
+    super(`${provider} provider is not ready`, options)
+    this.name = 'ProviderReadinessError'
+    this.provider = provider
+  }
+}
+
 export interface UserGoalStatusInput {
   goalId: string
   expectedRevision: number
@@ -58,6 +82,7 @@ export interface SubmitFollowUpInput {
 
 export interface ConversationService {
   createSession(input: CreateSessionInput): CanonicalSession
+  startSession(input: StartSessionInput): Promise<BeginSessionResult>
   listSessions(scope?: SessionListScope): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null
   archiveSession(sessionId: SessionId): CanonicalSession

@@ -31,7 +31,7 @@
 | Context builder와 compaction | 부분 구현 | fork lineage와 portable text replay는 구현됨 | model context budget, immutable compaction range, artifact-aware materialization은 미구현 |
 | Canonical REST/SSE | 구현됨 | session/thread/turn/item과 Goal 생성·수정·상태·삭제, unknown-mutation 명시 reconciliation API, Goal 상태 cursor replay SSE | child execution API는 아직 없음 |
 | Codex adapter | V1 구현 | app-server ephemeral thread, Baton dynamic tools, web/MCP/plugin/subagent 차단, ID·timeout·model provenance 검증 | 공식적으로 끌 수 없는 provider-local `update_plan` metadata tool 예외가 있음 |
-| Canonical UI | 부분 구현 | 2-column 대화, 상태 표시, transcript, provider/model/effort, Goal panel과 `/goal` 명령 | fork와 cwd/project/instruction 선택 UI는 아직 없음 |
+| Canonical UI | 부분 구현 | 2-column 대화, 상태 표시, transcript, provider/model/effort, Goal panel과 `/goal`, native 폴더 선택, 첫 전송 전 browser draft와 원자 first-turn API | fork와 instruction 선택 UI는 아직 없음. 폴더 file-tool live E2E 대기 |
 | UI provider 선택 | 구현됨 | 서버 모델 catalog를 provider별로 조회하고 모델이 0개인 provider는 비활성화 | Gemini 인증 복구 후 live catalog 표시 검증 필요 |
 | Provider 전환 | 부분 구현 | Codex·Claude·Gemini adapter가 같은 portable history 계약을 사용; Claude Fable 5 live 검증 완료 | Gemini는 현재 proxy 인증 문제로 모델 0개이며 live 실행 미검증 |
 | Claude adapter | **V1 구현** | `/v1/messages` stateless history, Baton tool loop, effort, round별 reported model/fallback, structured provider-private continuation durability, bounded retry/timeout, Fable 5 live 응답 | streaming은 아직 미구현 |

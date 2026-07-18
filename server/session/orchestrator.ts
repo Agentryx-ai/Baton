@@ -6,6 +6,7 @@ import type {
   AgentToolDefinition,
   AgentToolInvocation,
   AgentToolResult,
+  BeginSessionResult,
   BeginTurnResult,
   CanonicalGoal,
   CanonicalFollowUp,
@@ -24,7 +25,9 @@ import type {
 import { ConversationEventHub } from './event-hub.ts'
 import { GoalRuntime, type GoalContinuationRequest } from './goal-runtime.ts'
 import { goalContinuationPrompt } from './goal-prompts.ts'
-import type { ConversationService, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
+import { ProviderReadinessError } from './service.ts'
+import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
+import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
 import type {
   ClearGoalInput,
   CreateGoalInput,
@@ -106,6 +109,71 @@ export class TurnOrchestrator implements ConversationService {
     })
     this.events.publish(session.activeThreadId)
     return session
+  }
+
+  async startSession(input: StartSessionInput): Promise<BeginSessionResult> {
+    if (this.closed) throw new Error('Canonical conversation runtime is closed')
+    const normalized = normalizeStartSessionInput(input)
+    const requestHash = hashSessionStartRequest(normalized)
+    const replay = this.store.getInitialSessionResult({
+      sessionId: normalized.sessionId,
+      clientRequestId: normalized.clientRequestId,
+      requestHash,
+    })
+    if (replay) return replay
+
+    const workspaceCwd = normalized.cwd === null ? null : resolveWorkspaceRoot(normalized.cwd)
+    let ready: Awaited<ReturnType<AdapterRegistry['getReady']>>
+    try {
+      ready = await this.adapters.getReady(normalized.provider)
+    } catch (error) {
+      throw new ProviderReadinessError(normalized.provider, { cause: error })
+    }
+    const workspaceRuntime = this.workspaceRuntime(workspaceCwd)
+    const toolDefinitions: readonly AgentToolDefinition[] = [
+      ...workspaceRuntime.definitions,
+      ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
+    ]
+    const result = this.store.beginSession({
+      sessionId: normalized.sessionId,
+      clientRequestId: normalized.clientRequestId,
+      requestHash,
+      cwd: workspaceCwd,
+      instructionSnapshot: normalized.instructionSnapshot,
+      provider: normalized.provider,
+      model: normalized.model,
+      effort: normalized.effort,
+      input: normalized.input,
+      adapterVersion: ready.handshake.adapterVersion,
+      policySnapshot: {
+        delegationMode: 'disabled',
+        allowedTools: toolDefinitions.map((tool) => tool.name),
+        approvalPolicy: 'never',
+        cwd: workspaceCwd,
+        maxDepth: 0,
+        capabilityGrant: null,
+      },
+      budget: {
+        ...(normalized.effort ? { effort: normalized.effort } : {}),
+        agentLoopLimits: DEFAULT_AGENT_LOOP_LIMITS,
+        goalAutomatic: false,
+      },
+      leaseExpiresAt: null,
+    })
+    this.events.publish(result.thread.id)
+    if (result.duplicate) return result
+
+    const turnInput: StartTurnInput = {
+      threadId: result.thread.id,
+      provider: normalized.provider,
+      model: normalized.model,
+      effort: normalized.effort,
+      clientRequestId: normalized.clientRequestId,
+      expectedRevision: 0,
+      input: normalized.input,
+    }
+    this.launchPersistedTurnSafely(result, turnInput, ready, workspaceRuntime)
+    return result
   }
 
   listSessions(scope: SessionListScope = 'active'): CanonicalSession[] { return this.store.listSessions(scope) }
@@ -497,6 +565,30 @@ export class TurnOrchestrator implements ConversationService {
     activeTurn.completion = completion
     this.active.set(result.turn.id, activeTurn)
     void completion.catch(() => {})
+  }
+
+  private launchPersistedTurnSafely(
+    result: BeginTurnResult,
+    input: StartTurnInput,
+    ready: Awaited<ReturnType<AdapterRegistry['getReady']>>,
+    workspaceRuntime: ToolRuntime,
+  ): void {
+    try {
+      this.launchPersistedTurn(result, input, ready, workspaceRuntime, false)
+    } catch (error) {
+      try {
+        this.store.finishTurn({
+          turnId: result.turn.id,
+          status: 'failed',
+          error: {
+            code: 'runtime_start_failed',
+            message: error instanceof Error ? error.message : String(error),
+          },
+        })
+      } finally {
+        this.events.publish(input.threadId)
+      }
+    }
   }
 
   async cancelTurn(turnId: TurnId): Promise<void> {
@@ -982,6 +1074,111 @@ export function hashTurnRequest(input: StartTurnInput): string {
     clientRequestId: input.clientRequestId,
     input: input.input,
   })).digest('hex')
+}
+
+interface NormalizedStartSessionInput extends Omit<StartSessionInput, 'effort' | 'instructionSnapshot'> {
+  effort: string | null
+  instructionSnapshot: ReturnType<typeof normalizeInstructionSnapshot>
+}
+
+export function hashSessionStartRequest(input: NormalizedStartSessionInput): string {
+  return createHash('sha256').update(stableJson({
+    sessionId: input.sessionId,
+    clientRequestId: input.clientRequestId,
+    cwd: input.cwd,
+    instructionSnapshot: input.instructionSnapshot,
+    provider: input.provider,
+    model: input.model,
+    effort: input.effort,
+    input: input.input,
+  })).digest('hex')
+}
+
+function normalizeStartSessionInput(input: StartSessionInput): NormalizedStartSessionInput {
+  const sessionId = input.sessionId.trim()
+  const clientRequestId = input.clientRequestId.trim()
+  const model = input.model.trim()
+  const effort = input.effort == null ? null : input.effort.trim()
+  const cwd = input.cwd === null ? null : input.cwd.trim()
+  if (!sessionId) throw new Error('sessionId is required')
+  if (!clientRequestId) throw new Error('clientRequestId is required')
+  if (!model) throw new Error('model is required')
+  if (input.effort != null && !effort) throw new Error('effort must be null or a non-empty string')
+  if (input.cwd !== null && !cwd) throw new Error('cwd must be null or a non-empty string')
+  if (input.provider !== 'claude' && input.provider !== 'codex' && input.provider !== 'gemini') {
+    throw new Error('provider must be claude, codex, or gemini')
+  }
+  if (input.input.length === 0) throw new Error('at least one input item is required')
+  const normalizedInput = input.input.map((item) => {
+    const visibility = item.visibility ?? 'portable'
+    if (item.kind !== 'user_message'
+      || visibility !== 'portable'
+      || (item.provider !== undefined && item.provider !== null)
+      || (item.nativeId !== undefined && item.nativeId !== null)
+      || typeof item.payload.text !== 'string'
+      || !item.payload.text.trim()) {
+      throw new Error('initial input accepts non-empty portable provider-neutral user messages only')
+    }
+    return {
+      kind: 'user_message' as const,
+      visibility: 'portable' as const,
+      payload: canonicalJsonObject(item.payload, 'initial input payload'),
+      provider: null,
+      nativeId: null,
+    }
+  })
+  return {
+    sessionId,
+    clientRequestId,
+    cwd,
+    instructionSnapshot: normalizeInstructionSnapshot(input.instructionSnapshot ?? {}),
+    provider: input.provider,
+    model,
+    effort,
+    input: normalizedInput,
+  }
+}
+
+function canonicalJsonObject(value: Record<string, unknown>, label: string): Record<string, unknown> {
+  const active = new Set<object>()
+  const visit = (current: unknown): unknown => {
+    if (current === null || typeof current === 'string' || typeof current === 'boolean') return current
+    if (typeof current === 'number') {
+      if (!Number.isFinite(current)) throw new TypeError(`${label} contains a non-finite number`)
+      return Object.is(current, -0) ? 0 : current
+    }
+    if (Array.isArray(current)) {
+      if (active.has(current)) throw new TypeError(`${label} contains a cycle`)
+      active.add(current)
+      try {
+        for (let index = 0; index < current.length; index += 1) {
+          if (!(index in current)) throw new TypeError(`${label} contains a sparse array`)
+        }
+        return current.map(visit)
+      } finally { active.delete(current) }
+    }
+    if (typeof current === 'object') {
+      const prototype = Object.getPrototypeOf(current)
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError(`${label} contains a non-JSON object`)
+      }
+      if (active.has(current)) throw new TypeError(`${label} contains a cycle`)
+      active.add(current)
+      try {
+        const result: Record<string, unknown> = {}
+        for (const key of Object.keys(current as Record<string, unknown>).sort()) {
+          const child = (current as Record<string, unknown>)[key]
+          if (child === undefined) throw new TypeError(`${label} contains undefined`)
+          result[key] = visit(child)
+        }
+        return result
+      } finally {
+        active.delete(current)
+      }
+    }
+    throw new TypeError(`${label} contains a non-JSON ${typeof current}`)
+  }
+  return visit(value) as Record<string, unknown>
 }
 
 function hashSnapshot(snapshot: ThreadSnapshot | null): string {

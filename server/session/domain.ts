@@ -396,6 +396,12 @@ export interface BeginTurnResult {
   duplicate: boolean
 }
 
+/** Result of atomically materializing a draft conversation and its first turn. */
+export interface BeginSessionResult extends BeginTurnResult {
+  session: CanonicalSession
+  thread: CanonicalThread
+}
+
 export interface UpsertProviderBindingInput {
   threadId: ThreadId
   provider: CanonicalProvider

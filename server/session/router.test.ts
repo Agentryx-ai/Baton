@@ -5,6 +5,7 @@ import test from 'node:test'
 import express from 'express'
 
 import type {
+  BeginSessionResult,
   BeginTurnResult,
   CanonicalExecution,
   CanonicalGoal,
@@ -22,7 +23,8 @@ import {
   type ConversationRouter,
   type ConversationRouterOptions,
 } from './router.ts'
-import type { ConversationService, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput } from './service.ts'
+import { ProviderReadinessError } from './service.ts'
+import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type {
   ClearGoalInput,
@@ -130,6 +132,12 @@ const beginResult: BeginTurnResult = {
   duplicate: false,
 }
 
+const beginSessionResult: BeginSessionResult = {
+  session,
+  thread,
+  ...beginResult,
+}
+
 function streamEvent(sequence: number): CanonicalStreamEvent {
   return {
     sequence,
@@ -151,6 +159,8 @@ class TestConversationService implements ConversationService {
   createdInput: CreateSessionInput | null = null
   forkInput: ForkThreadInput | null = null
   startInput: StartTurnInput | null = null
+  startSessionInput: StartSessionInput | null = null
+  startSessionResult: BeginSessionResult = beginSessionResult
   cancelledTurnId: string | null = null
   reconciledInput: ReconcileToolInput | null = null
   listedScope: SessionListScope | null = null
@@ -161,6 +171,11 @@ class TestConversationService implements ConversationService {
   createSession(input: CreateSessionInput): CanonicalSession {
     this.createdInput = input
     return session
+  }
+
+  async startSession(input: StartSessionInput): Promise<BeginSessionResult> {
+    this.startSessionInput = input
+    return this.startSessionResult
   }
 
   listSessions(scope: SessionListScope = 'active'): CanonicalSession[] {
@@ -372,6 +387,105 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
     },
   })
 })
+
+test('first-turn route parses the immutable draft payload and reports idempotent replay', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl) => {
+    const body = {
+      clientRequestId: 'client-request-1',
+      cwd: 'C:\\repo',
+      instructionSnapshot: { developerInstructions: 'verify' },
+      provider: 'codex',
+      model: 'gpt-5',
+      effort: 'high',
+      input: [{ kind: 'user_message', visibility: 'portable', payload: { text: 'hello' } }],
+    }
+    const started = await fetch(`${baseUrl}/sessions/client-session-1/first-turn`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    assert.equal(started.status, 202)
+    assert.equal(started.headers.get('location'), `/baton/v1/sessions/${session.id}`)
+    assert.equal((await json(started)).duplicate, false)
+    assert.deepEqual(service.startSessionInput, {
+      sessionId: 'client-session-1',
+      clientRequestId: 'client-request-1',
+      cwd: 'C:\\repo',
+      instructionSnapshot: { schemaVersion: 1, developerInstructions: 'verify' },
+      provider: 'codex',
+      model: 'gpt-5',
+      effort: 'high',
+      input: [{
+        kind: 'user_message',
+        visibility: 'portable',
+        payload: { text: 'hello' },
+        provider: undefined,
+        nativeId: undefined,
+      }],
+    })
+
+    service.startSessionResult = { ...beginSessionResult, duplicate: true }
+    const replay = await fetch(`${baseUrl}/sessions/client-session-1/first-turn`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    assert.equal(replay.status, 200)
+    assert.equal((await json(replay)).duplicate, true)
+  })
+})
+
+test('first-turn route rejects malformed drafts and maps conflict/readiness failures', async () => {
+  const malformedService = new TestConversationService()
+  await withServer(malformedService, async (baseUrl) => {
+    const malformed = await fetch(`${baseUrl}/sessions/client-session/first-turn`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientRequestId: 'request', cwd: null, provider: 'codex', model: 'gpt-5',
+        input: [{ kind: 'user_message', payload: { text: '   ' } }], extra: true,
+      }),
+    })
+    assert.equal(malformed.status, 400)
+    assert.equal((await json(malformed)).code, 'invalid_request')
+    assert.equal(malformedService.startSessionInput, null)
+  })
+
+  const conflictService = new TestConversationService()
+  conflictService.startSession = async () => {
+    throw new SessionStoreError('initial_session_conflict', 'different initial request')
+  }
+  await withServer(conflictService, async (baseUrl) => {
+    const conflict = await firstTurnRequest(baseUrl)
+    assert.equal(conflict.status, 409)
+    assert.equal((await json(conflict)).code, 'initial_session_conflict')
+  })
+
+  const unavailableService = new TestConversationService()
+  unavailableService.startSession = async () => {
+    throw new ProviderReadinessError('codex')
+  }
+  await withServer(unavailableService, async (baseUrl) => {
+    const unavailable = await firstTurnRequest(baseUrl)
+    assert.equal(unavailable.status, 503)
+    assert.equal((await json(unavailable)).code, 'provider_not_ready')
+  })
+})
+
+function firstTurnRequest(baseUrl: string): Promise<Response> {
+  return fetch(`${baseUrl}/sessions/client-session/first-turn`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      clientRequestId: 'request',
+      cwd: null,
+      provider: 'codex',
+      model: 'gpt-5',
+      input: [{ kind: 'user_message', payload: { text: 'hello' } }],
+    }),
+  })
+}
 
 async function json(response: Response): Promise<Record<string, unknown>> {
   return (await response.json()) as Record<string, unknown>
