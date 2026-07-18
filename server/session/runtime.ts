@@ -17,6 +17,7 @@ export interface ConversationRuntime {
   router: Router
   service: TurnOrchestrator
   start(): number
+  closeStreams(): void
   close(): Promise<void>
 }
 
@@ -33,6 +34,7 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
     router,
     service,
     start: () => service.recoverInterruptedTurns(),
+    closeStreams: () => router.closeStreams(),
     close: () => service.close(),
   }
 }

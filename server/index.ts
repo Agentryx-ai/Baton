@@ -82,7 +82,21 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true
   console.log(`[baton] ${signal}: shutting down`)
   policyEngine.stop()
-  server.close()
+  const closed = new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()))
+  })
+  conversationRuntime.closeStreams()
+  const drained = await Promise.race([
+    closed.then(() => true),
+    new Promise<false>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5_000)
+      timer.unref()
+    }),
+  ])
+  if (!drained) {
+    server.closeAllConnections()
+    await closed
+  }
   await conversationRuntime.close()
 }
 

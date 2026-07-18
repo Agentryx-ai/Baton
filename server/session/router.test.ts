@@ -15,7 +15,7 @@ import type {
   CreateSessionInput,
   ThreadSnapshot,
 } from './domain.ts'
-import { createConversationRouter } from './router.ts'
+import { createConversationRouter, type ConversationRouter } from './router.ts'
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type { ForkThreadInput } from './store.ts'
@@ -191,10 +191,11 @@ class TestConversationService implements ConversationService {
 
 async function withServer(
   service: ConversationService,
-  run: (baseUrl: string) => Promise<void>,
+  run: (baseUrl: string, router: ConversationRouter) => Promise<void>,
 ): Promise<void> {
   const app = express()
-  app.use('/baton/v1', createConversationRouter(service))
+  const router = createConversationRouter(service)
+  app.use('/baton/v1', router)
   const server = app.listen(0, '127.0.0.1')
   await new Promise<void>((resolve, reject) => {
     server.once('listening', resolve)
@@ -202,7 +203,7 @@ async function withServer(
   })
   const address = server.address() as AddressInfo
   try {
-    await run(`http://127.0.0.1:${address.port}/baton/v1`)
+    await run(`http://127.0.0.1:${address.port}/baton/v1`, router)
   } finally {
     const closed = new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()))
@@ -408,4 +409,16 @@ test('SSE rejects malformed cursors before subscribing', async () => {
     assert.equal((await json(response)).code, 'invalid_request')
   })
   assert.deepEqual(service.calls, [])
+})
+
+test('router shutdown closes open SSE streams and unsubscribes them', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl, router) => {
+    const response = await fetch(`${baseUrl}/threads/${thread.id}/events`)
+    assert.equal(response.status, 200)
+    const reader = response.body!.getReader()
+    router.closeStreams()
+    assert.equal((await reader.read()).done, true)
+  })
+  assert.ok(service.calls.includes('unsubscribe'))
 })

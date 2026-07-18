@@ -30,6 +30,10 @@ const ITEM_KINDS = new Set<CanonicalItemKind>([
 const SSE_HEARTBEAT_MS = 15_000
 const VISIBILITIES = new Set(['portable', 'provider_private', 'baton_private'])
 
+export interface ConversationRouter extends Router {
+  closeStreams(): void
+}
+
 class RequestValidationError extends Error {
   constructor(message: string) {
     super(message)
@@ -184,8 +188,16 @@ function route(
   }
 }
 
-export function createConversationRouter(service: ConversationService): Router {
-  const router = Router()
+export function createConversationRouter(service: ConversationService): ConversationRouter {
+  const router = Router() as ConversationRouter
+  const streams = new Map<Response, () => void>()
+
+  router.closeStreams = () => {
+    for (const [response, cleanup] of [...streams]) {
+      response.end()
+      cleanup()
+    }
+  }
 
   router.use(express.json({ limit: '2mb' }))
 
@@ -263,6 +275,7 @@ export function createConversationRouter(service: ConversationService): Router {
         closed = true
         if (heartbeat) clearInterval(heartbeat)
         unsubscribe()
+        streams.delete(res)
       }
 
       const flush = (): void => {
@@ -308,6 +321,7 @@ export function createConversationRouter(service: ConversationService): Router {
       res.setHeader('Cache-Control', 'no-cache, no-transform')
       res.setHeader('Connection', 'keep-alive')
       res.flushHeaders()
+      streams.set(res, cleanup)
 
       for (const event of initialEvents) {
         if (event.sequence <= cursor) continue
