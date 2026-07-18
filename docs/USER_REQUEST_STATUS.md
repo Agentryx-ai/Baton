@@ -7,7 +7,7 @@
 > [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)다. 여기서 `완료`는 현재 코드·커밋·테스트·라이브
 > 상태 중 해당 요구에 맞는 직접 근거가 있는 경우에만 사용한다.
 >
-> 현재까지 식별한 독립 요청·질문은 **111개**다. 아래 ID가 대화 요청의 추적 키이며, 커밋하지 않은 작업은
+> 현재까지 식별한 독립 요청·질문은 **113개**다. 아래 ID가 대화 요청의 추적 키이며, 커밋하지 않은 작업은
 > 테스트가 통과했더라도 `진행 중` 또는 `부분 완료`로만 기록한다.
 
 ## 상태 표기
@@ -39,7 +39,7 @@
 | META-03 | Claude/Codex/Gemini 등 여러 계정의 usage·상태·라우팅 관리도 동등한 핵심 정체성으로 유지 | 완료 | README Why/Current status/대시보드 및 account control plane 설계에 명시. |
 | META-04 | Baton 저장소를 Agentryx-ai 조직의 public repo로 공개 | 완료 | `Agentryx-ai/Baton`, GitHub visibility=`PUBLIC`; 인증 헤더 없는 `curl`로 `https://github.com/Agentryx-ai/Baton` HTTP 200 재확인. |
 | META-05 | 작업 전·중 원자적 커밋과 push | 부분 완료 | 기능별 원자 커밋과 main push가 지속됐다. 현재 신규 브랜치 `feat/canonical-runtime-workspace`에는 검증 전 WIP가 있어 의도적으로 미커밋 상태다. |
-| META-06 | 큰 작업은 실제 DAG로 분해하고 독립 노드를 병렬 실행 | 진행 중 | follow-up backend/UI/stateless steer를 세 노드로 병렬화했다. 현재 통합 전 상태는 아래 AGENT 항목에 기록한다. |
+| META-06 | 큰 작업은 실제 DAG로 분해하고 독립 노드를 병렬 실행 | 완료·계속 적용 | follow-up backend/UI/stateless steer를 독립 노드로 병렬화해 검수·통합·커밋했고, 현재 deferred session backend/UI와 compaction 사전 검토도 파일 소유권을 분리해 병렬 진행한다. |
 | META-07 | Gemini는 환불 요청 중이므로 메시지를 보내지 말고 기존 대화만 열람 | 완료(운영 제약) | live Gemini 요청을 실행하지 않았다. 인증도 현재 차단 상태다. 이후에도 명시 해제 전 live 메시지 금지. |
 
 ## 2. Claude/Codex CLI·Desktop 프록시 자동 설정
@@ -59,6 +59,7 @@
 | PROXY-11 | Claude Desktop도 OpenAI처럼 base URL만 바꿔 기존 목록 유지 | 불가·안내 완료 | 공식 지원 gateway는 별도 inference provider로 전환되므로 기존 계정 Chat/Cowork 목록 보존을 약속할 수 없음을 README에 명시. |
 | PROXY-12 | Claude connector precedence 경고를 README에 짧게 안내 | 완료 | `bdb08ed`; connectors가 필요하면 Baton proxy 설정을 해제·재시작하도록 안내. |
 | PROXY-13 | 설정을 런타임에 읽는지, 재시작이 필요한지 안내 | 완료 | 설정 적용/해제는 대상 클라이언트를 완전 종료 후 수행하고 재시작하도록 README/UI 계약에 반영. account pause/routing은 다음 요청부터 반영되며 보통 클라이언트 재시작 불필요. |
+| PROXY-18 | Claude Desktop이 CLI를 내부 호출하는지, 독립 코어·설정·세션인지 설명 | 답변 완료 | Claude Desktop은 `~/.claude/settings.json`을 따르는 CLI wrapper가 아니라 독립 애플리케이션 런타임·설정·세션 표면이다. 따라서 Claude CLI 설정만 바꿔 Desktop을 제어할 수 없다. |
 | PROXY-14 | proxy 실제 경유와 선택 계정을 1% 변화 전에 판정 | 부분 완료 | UI target/log와 pause pool로 판단 가능하나, 요청 단위의 확정적 upstream account receipt/trace는 아직 제품 기능으로 완성되지 않았다. |
 | PROXY-15 | Codex Desktop이 잘못된 Agentryx-ai 계정을 쓰는 문제 | 부분 완료 | local login 표시와 CLIProxy upstream 계정은 별개임을 README에 구분했고, paused 계정 우회 방지 수정(`4f81e66`)이 있다. 요청 단위 실제 계정 E2E 증거는 더 필요하다. |
 | PROXY-16 | Codex canonical mode의 “requires zero execution environment roots”를 결정론적으로 해결 | 완료(구조)·live 검증 필요 | Codex native execution root를 넘기지 않고, 검증된 Baton `cwd`는 provider-neutral dynamic file tools로만 노출한다. isolated CODEX_HOME/project-doc 차단도 적용했다. 실제 workspace turn smoke는 WORKSPACE-06에 남아 있다. |
@@ -128,7 +129,7 @@
 | UI-15 | assistant 이름은 필터가 아니라 설정으로 이동 | 완료 | Settings의 assistant display name 항목 존재. |
 | UI-16 | 필터에 group뿐 아니라 sort 제공 | 완료 | session view preferences에 group/sort 포함. |
 | UI-17 | 세션 상태 표시 | 완료 | idle/running/wait/tool/limit/failure/completion/import/archive 상태 projection. |
-| UI-18 | active turn 중 추가 메시지, Stop과 Send 분리, pending FIFO 표시 | 진행 중 (UI만 검증) | UI/API 초안은 app typecheck 및 UI 테스트 10/10 통과. backend가 NO-GO라 실제 4400에는 배포하지 않음. |
+| UI-18 | active turn 중 추가 메시지, Stop과 Send 분리, pending FIFO 표시 | 완료(코드)·4400 live 대기 | durable backend/UI/stateless steer가 독립 적대적 APPROVE와 전체 회귀를 통과해 `f066f5d`로 커밋됐다. 실제 4400 렌더·전송 확인은 최종 live gate에 포함한다. |
 | UI-19 | ChatGPT·Claude·Gemini 웹과 Codex/Claude Desktop/CLI의 대화 표시를 벤치마킹 | 부분 완료 | 2-column, compact tool details, long-message disclosure, model/effort metadata에 반영했다. 제품별 최신 버전의 동일 시나리오 스크린샷 비교표와 최종 시각 승인 기록은 아직 없다. Gemini에는 메시지를 보내지 않았다. |
 | UI-20 | 테스트 메시지를 보내도 응답이 오지 않는 문제 | 부분 완료 | provider loop/오류 표시는 구현됐지만 당시 실제 실패 요청의 end-to-end 원인과 동일 조건 재검증 기록이 없다. Claude live routing 영구 수정 및 workspace live smoke와 함께 다시 확인해야 한다. |
 
@@ -185,6 +186,7 @@
 | MODEL-03 | Fable 5 요청이 Opus 4.8로 fallback될 때 문제 없이 실제 model 기록 | 완료·회귀 유지 | request/response model을 분리하고 Fable 5 live fallback provenance를 검증한 기록과 테스트가 있다. |
 | MODEL-04 | 모델 표시 이름·순서·effort를 실제 제품과 비교 | 부분 완료 | grouping/label/effort UX를 개선했다. 공식 catalog가 바뀔 수 있으므로 최종 release 전 최신 설치 스키마 재검증 필요. |
 | MODEL-05 | 모델 설명은 selector 목록에서만 필요하고 composer에는 노출하지 않음 | 완료 | composer는 compact selection만 표시. |
+| MODEL-06 | “수동 정지 플래그된 모델”은 어떤 경우에도 사용하지 않음 | 의도 확인 필요 | 현재 제품의 수동 정지는 **계정** 단위이며 ACCOUNT-03으로 강제한다. provider model 자체에 대한 별도 수동 차단 플래그는 현재 도메인에 없으므로, 원문이 계정 오타가 아니라 model denylist 요구라면 미구현이다. |
 
 ## 11. 표시 정책 관련 질문의 현재 결론
 
@@ -199,7 +201,7 @@
 
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
-| REVIEW-01 | Codex Native Client Proxy/SSOT 제안서를 공식 계약·로컬 DB/config/log로 적대적 검수 | 완료(설계 판정) | custom `baton` provider가 기존 `openai` thread 가시성을 분리한다는 문제를 확인해 native-openai 옵션으로 반영했다. 결정 문서는 [`CODEX_NATIVE_PROXY_SSOT_DECISION.md`](CODEX_NATIVE_PROXY_SSOT_DECISION.md). |
+| REVIEW-01 | Codex Native Client Proxy/SSOT 제안서를 공식 계약·로컬 DB/config/log로 적대적 검수 | 부분 완료·지정 runtime 검증 증거 없음 | custom `baton` provider가 기존 `openai` thread 가시성을 분리한다는 설계 판정은 native-openai 옵션에 반영했다. 다만 사용자가 요구한 `gpt-5.6-sol/high` authoritative runtime header 검증 결과가 저장소에 남아 있지 않아, 요청 형식 그대로의 독립 검수 완료로는 주장하지 않는다. 결정 문서는 [`CODEX_NATIVE_PROXY_SSOT_DECISION.md`](CODEX_NATIVE_PROXY_SSOT_DECISION.md). |
 | REVIEW-02 | 개인 로컬 proxy라는 실제 threat model로 정보 누출 결론 재검토 | 완료(정책) | Baton은 loopback local control plane이므로 외부 SaaS 전송 위험과 동일시하지 않는다. 그래도 auth 값은 UI/log/문서에 출력하지 않고 BFF가 upstream credential을 대체하며, canonical DB에는 plaintext provider opaque credential을 저장하지 않는다. |
 | REVIEW-03 | proxy 실패 시 direct OpenAI silent fallback 차단 | 구현됨·live 검증 필요 | adapter/provider URL 검증과 Baton loopback bridge가 있다. Desktop ChatGPT/API-key 각 로그인 모드에서 proxy를 죽인 실제 no-direct-fallback smoke가 남아 있다. |
 | REVIEW-04 | 기존 Codex thread ID/history/goal/archive를 transport 변경 뒤 보존 | 구현됨·live 검증 필요 | native-openai는 provider identity를 유지하고 base URL만 바꾼다. 대표 기존 thread의 list/resume/goal을 적용 전후 비교하는 live smoke가 남아 있다. |
@@ -209,18 +211,15 @@
 
 아래가 현재 실제 남은 작업의 우선순위다.
 
-1. **Claude 영구 라우팅 수정** — 95% 선제 pause 제거, 실제 429 cooldown, 403 ineligible, 지원되는
-   fill-first/failover 설정 확인 및 live E2E.
-2. **현재 follow-up WIP 폐기 여부가 아니라 완결** — 확인된 세 correctness bug와 migration/race/API tests를 먼저 수정하고,
-   stateless steer 테스트를 추가한 뒤 UI와 통합한다.
-3. **native folder grant + deferred conversation creation** — 폴더 선택/허용 → 임시 composer → 첫 전송에서
+1. **Claude 영구 라우팅 live gate** — 95% 선제 pause 제거·전체 pool·fill-first 영구 코드는 승인·커밋됐다.
+   실제 429 same-request failover와 403 수동 격리, 정책 ON 재시작 E2E를 남겼다.
+2. **native folder grant + deferred conversation creation** — 폴더 선택/허용 → 임시 composer → 첫 전송에서
    session+turn 원자 생성. 이 경로로 실제 read/write tool E2E를 수행한다.
-4. **Fable 5 quota discovery** — 실제 quota raw schema에서 전용 window가 어디에 있는지 확인하고 누락 시 gateway/BFF
-   별도 조회를 추가한다.
-5. **Baton auto compaction** — immutable canonical history를 유지하는 derived compaction 정책을 context builder와
+3. **Fable 5 quota live UI** — raw schema discovery와 BFF 보강 코드는 `dc4434d`로 완료됐다. 4400 재시작 후 게이지를 검증한다.
+4. **Baton auto compaction** — immutable canonical history를 유지하는 derived compaction 정책을 context builder와
    SQLite/API/UI에 구현하고 exact-range/source-hash/replay/provider-switch tests를 추가한다.
-6. **cache identity** — provider가 지원하는 경우 Baton thread별 안정적인 cache key를 적용하고 A/B 교차 실행 hit/miss를 계측한다.
-7. **전체 완료 audit** — typecheck, lint, full tests, clean build, DB v10→v11 reopen, 4400 browser, Claude/Codex live turn,
+5. **cache identity** — provider가 지원하는 경우 Baton thread별 안정적인 cache key를 적용하고 A/B 교차 실행 hit/miss를 계측한다.
+6. **전체 완료 audit** — typecheck, lint, full tests, clean build, DB v10→v12 reopen, 4400 browser, Claude/Codex live turn,
    proxy failure/no-direct-fallback, workspace tool, Goal/follow-up 우선순위를 검증한다.
 
 ## 14. 명시적으로 누락 여부를 확인할 항목
