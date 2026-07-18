@@ -239,6 +239,7 @@ export type CanonicalStreamEventType =
   | 'turn_cancelled'
   | 'turn_failed'
   | 'turn_interrupted'
+  | 'goal_changed'
 
 export interface CanonicalStreamEventDto {
   sequence: number
@@ -292,6 +293,19 @@ export interface EditGoalDto {
   maxAutomaticTurns?: number
   maxActiveSeconds?: number
   resetLimitCounters?: boolean
+}
+
+export type UnknownMutationResolution = 'succeeded' | 'failed' | 'unknown_acknowledged'
+
+export interface ReconcileUnknownMutationDto {
+  callId: string
+  resolution: UnknownMutationResolution
+  note?: string
+}
+
+export interface ReconcileUnknownMutationResultDto {
+  item: CanonicalItemDto
+  duplicate: boolean
 }
 
 export interface ProviderModelDescriptorDto {

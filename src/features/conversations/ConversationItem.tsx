@@ -1,9 +1,11 @@
+/* oxlint-disable react/only-export-components -- colocated pure presenter is covered by UI tests */
 import { useState } from 'react'
 import { Bot, Brain, ChevronRight, CircleAlert, FilePenLine, Gauge, UserRound, Wrench } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 
 import {
+  activityFailed,
   activitySummary,
   ITEM_LABEL,
   isLongConversationText,
@@ -32,10 +34,12 @@ export function ConversationItem({
   item,
   toolResult = null,
   assistantLabelMode = 'provider',
+  modelDisplayNames = {},
 }: {
   item: CanonicalItemDto
   toolResult?: CanonicalItemDto | null
   assistantLabelMode?: AssistantLabelMode
+  modelDisplayNames?: Readonly<Record<string, string>>
 }) {
   const isError = item.kind === 'error'
   const isReasoning = item.kind === 'reasoning_summary'
@@ -43,14 +47,14 @@ export function ConversationItem({
   const body = isUsage ? usageSummary(item.payload) : payloadText(item)
   const showRawDetail = isError || isReasoning || isUsage || item.kind === 'provider_event'
   const requestedModel = typeof item.payload.requestedModel === 'string'
-    ? friendlyModel(item.payload.requestedModel)
+    ? friendlyModel(item.payload.requestedModel, modelDisplayNames)
     : null
   const observedModel = typeof item.payload.reportedModel === 'string'
-    ? friendlyModel(item.payload.reportedModel)
+    ? friendlyModel(item.payload.reportedModel, modelDisplayNames)
     : typeof item.payload.resolvedModel === 'string'
-      ? friendlyModel(item.payload.resolvedModel)
+      ? friendlyModel(item.payload.resolvedModel, modelDisplayNames)
       : typeof item.payload.actualModel === 'string'
-        ? friendlyModel(item.payload.actualModel)
+        ? friendlyModel(item.payload.actualModel, modelDisplayNames)
         : null
   const effort = typeof item.payload.effort === 'string' ? item.payload.effort : null
   const modelFallback = requestedModel && observedModel && requestedModel !== observedModel
@@ -193,14 +197,6 @@ function LongContent({
   )
 }
 
-function activityFailed(item: CanonicalItemDto): boolean {
-  return item.payload.isError === true
-    || item.payload.success === false
-    || item.payload.status === 'failed'
-    || item.payload.status === 'error'
-    || item.payload.error !== undefined
-}
-
 function assistantLabel(item: CanonicalItemDto, mode: AssistantLabelMode): string {
   const provider = item.provider ? PROVIDER_LABEL[item.provider] : null
   if (mode === 'assistant' || !provider) return 'Assistant'
@@ -208,13 +204,38 @@ function assistantLabel(item: CanonicalItemDto, mode: AssistantLabelMode): strin
   return provider
 }
 
-function friendlyModel(model: string): string {
-  return model
-    .replace(/^claude-/, '')
-    .replace(/-\d{8}$/, '')
-    .split('-')
-    .map((part) => /^\d+$/.test(part) ? part : part[0]?.toUpperCase() + part.slice(1))
-    .join(' ')
+export function friendlyModel(
+  model: string,
+  displayNames: Readonly<Record<string, string>> = {},
+): string {
+  const catalogName = displayNames[model]
+  if (catalogName) return catalogName
+
+  const withoutDate = model.replace(/-\d{8}$/, '')
+  const gpt = /^gpt-([^-]+)(?:-(.+))?$/i.exec(withoutDate)
+  if (gpt) {
+    const suffix = gpt[2] ? ` ${titleModelParts(gpt[2].split('-'))}` : ''
+    return `GPT-${gpt[1]}${suffix}`
+  }
+
+  const claude = /^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?(?:-(.+))?$/i.exec(withoutDate)
+  if (claude) {
+    const version = `${claude[2]}${claude[3] ? `.${claude[3]}` : ''}`
+    const suffix = claude[4] ? ` ${titleModelParts(claude[4].split('-'))}` : ''
+    return `${titleModelPart(claude[1])} ${version}${suffix}`
+  }
+
+  return titleModelParts(withoutDate.replace(/^claude-/, '').split('-'))
+}
+
+function titleModelParts(parts: string[]): string {
+  return parts.map(titleModelPart).join(' ')
+}
+
+function titleModelPart(part: string): string {
+  if (/^o\d+$/i.test(part)) return part.toUpperCase()
+  if (/^\d+(?:\.\d+)*$/.test(part)) return part
+  return part ? part[0]!.toUpperCase() + part.slice(1) : part
 }
 
 function effortLabel(effort: string): string {

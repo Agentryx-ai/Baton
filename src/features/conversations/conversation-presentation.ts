@@ -129,13 +129,18 @@ function semanticActivity(label: string, payload: JsonObject, keys: string[], st
   return detail ? `${label} · ${detail} · ${state}` : `${label} · ${state}`
 }
 
-function toolResultFailed(item: CanonicalItemDto): boolean {
-  return item.payload.isError === true
-    || item.payload.success === false
-    || item.payload.status === 'failed'
-    || item.payload.status === 'error'
-    || item.payload.error !== undefined
+export function activityFailed(item: CanonicalItemDto): boolean {
+  const payload = item.kind === 'tool_result'
+    ? record(item.payload.result) ?? item.payload
+    : item.payload
+  return payload.isError === true
+    || payload.success === false
+    || payload.status === 'failed'
+    || payload.status === 'error'
+    || (payload.error !== undefined && payload.error !== null)
 }
+
+const toolResultFailed = activityFailed
 
 function nestedPayload(payload: JsonObject): JsonObject {
   const direct = record(payload.arguments) ?? record(payload.input)

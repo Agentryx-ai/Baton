@@ -13,6 +13,8 @@ import type {
   NativeImportCommitDto,
   NativeImportPreviewDto,
   NativeImportSourceClient,
+  ReconcileUnknownMutationDto,
+  ReconcileUnknownMutationResultDto,
 } from './types.ts'
 
 const BASE_PATH = '/baton/v1'
@@ -150,6 +152,12 @@ export const conversationApi = {
 
   cancelTurn: (turnId: string): Promise<void> =>
     request(`/turns/${encodeURIComponent(turnId)}/cancel`, { method: 'POST' }),
+
+  reconcileUnknownMutation: (
+    turnId: string,
+    input: ReconcileUnknownMutationDto,
+  ): Promise<ReconcileUnknownMutationResultDto> =>
+    request(`/turns/${encodeURIComponent(turnId)}/reconcile-tool`, jsonRequest('POST', input)),
 
   previewNativeImport: (
     sources?: NativeImportSourceClient[],

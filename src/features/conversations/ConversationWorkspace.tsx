@@ -1,3 +1,4 @@
+/* oxlint-disable react/only-export-components -- colocated UI state guards are covered by UI tests */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ChevronDown,
@@ -43,10 +44,12 @@ import {
 } from './session-view-preferences'
 import { isNearScrollBottom } from './conversation-scroll'
 import type {
+  CanonicalGoalDto,
   CanonicalProvider,
   CanonicalSessionDto,
   CanonicalTurnDto,
   ProviderModelDescriptorDto,
+  UnknownMutationResolution,
   ThreadSnapshotDto,
 } from './types'
 import { useConversationEvents } from './useConversationEvents'
@@ -76,9 +79,97 @@ const EFFORT_NAME: Record<string, string> = {
   max: 'Max',
 }
 
+const SESSION_PROJECTION_POLL_MS = 10_000
+
+interface SessionProjectionPollHost {
+  setInterval(callback: () => void, delayMs: number): number
+  clearInterval(handle: number): void
+  addEventListener(type: 'focus', listener: () => void): void
+  removeEventListener(type: 'focus', listener: () => void): void
+}
+
+interface SessionProjectionVisibilityHost {
+  readonly visibilityState: DocumentVisibilityState
+  addEventListener(type: 'visibilitychange', listener: () => void): void
+  removeEventListener(type: 'visibilitychange', listener: () => void): void
+}
+
+export function installSessionProjectionPolling(
+  refresh: () => void,
+  host: SessionProjectionPollHost,
+  visibilityHost: SessionProjectionVisibilityHost,
+  intervalMs = SESSION_PROJECTION_POLL_MS,
+): () => void {
+  const refreshWhenVisible = (): void => {
+    if (visibilityHost.visibilityState === 'visible') refresh()
+  }
+  const timer = host.setInterval(refreshWhenVisible, intervalMs)
+  host.addEventListener('focus', refreshWhenVisible)
+  visibilityHost.addEventListener('visibilitychange', refreshWhenVisible)
+  return () => {
+    host.clearInterval(timer)
+    host.removeEventListener('focus', refreshWhenVisible)
+    visibilityHost.removeEventListener('visibilitychange', refreshWhenVisible)
+  }
+}
+
 interface ModelCatalogState {
   models: ProviderModelDescriptorDto[]
   defaultModel: string | null
+}
+
+interface GoalStatusMutationResult {
+  status: 'applied' | 'stale'
+}
+
+export function requireAppliedGoalStatus(result: GoalStatusMutationResult): void {
+  if (result.status === 'applied') return
+  throw new Error('Goal 상태가 다른 실행에서 변경되었습니다. 최신 상태를 불러왔으니 다시 확인해 주세요.')
+}
+
+export function goalEditDescription(status: CanonicalGoalDto['status']): string {
+  if (status === 'active') return 'Goal 내용을 저장합니다. 현재 진행 상태와 누적 사용량은 유지됩니다.'
+  if (status === 'complete') return 'Goal 내용을 저장하고 같은 Goal을 다시 시작합니다. 누적 사용량은 유지됩니다.'
+  if (status === 'budget_limited') {
+    return '예산 제한 상태를 유지하려면 내용을 저장할 수 없습니다. 먼저 Goal을 다시 시작한 뒤 수정해 주세요.'
+  }
+  return 'Goal 내용만 저장합니다. 현재 정지 상태와 누적 사용량은 유지됩니다.'
+}
+
+export function replaceSessionProjection(
+  sessions: CanonicalSessionDto[] | null,
+  projection: CanonicalSessionDto,
+): CanonicalSessionDto[] | null {
+  if (!sessions) return sessions
+  return sessions.map((session) => session.id === projection.id ? projection : session)
+}
+
+export interface UnknownMutationCall {
+  turnId: string
+  callId: string
+  toolName: string
+  sideEffect: 'workspace_mutation' | 'workspace_command'
+}
+
+export function unresolvedUnknownMutations(snapshot: ThreadSnapshotDto | null): UnknownMutationCall[] {
+  if (!snapshot) return []
+  const interruptedTurns = new Set(snapshot.turns
+    .filter((turn) => turn.status === 'interrupted' && turn.error?.code === 'unknown_mutation_outcome')
+    .map((turn) => turn.id))
+  if (interruptedTurns.size === 0) return []
+
+  const completed = new Set(snapshot.items
+    .filter((item) => item.kind === 'tool_result' && item.turnId && typeof item.payload.callId === 'string')
+    .map((item) => `${item.turnId}\0${item.payload.callId as string}`))
+  return snapshot.items.flatMap((item) => {
+    if (item.kind !== 'tool_call' || !item.turnId || !interruptedTurns.has(item.turnId)) return []
+    const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
+    const toolName = typeof item.payload.name === 'string' ? item.payload.name : null
+    const sideEffect = item.payload.sideEffect
+    if (!callId || !toolName || completed.has(`${item.turnId}\0${callId}`)
+      || (sideEffect !== 'workspace_mutation' && sideEffect !== 'workspace_command')) return []
+    return [{ turnId: item.turnId, callId, toolName, sideEffect }]
+  })
 }
 
 function SessionSidebar({
@@ -420,12 +511,19 @@ export function ConversationWorkspace({
   const [goalDialog, setGoalDialog] = useState<'create' | 'replace' | 'edit' | 'resume' | 'clear' | null>(null)
   const [goalDraft, setGoalDraft] = useState('')
   const [goalPanelVersion, setGoalPanelVersion] = useState(0)
+  const [reconcileTarget, setReconcileTarget] = useState<UnknownMutationCall | null>(null)
+  const [reconcileResolution, setReconcileResolution] = useState<UnknownMutationResolution | null>(null)
+  const [reconcileNote, setReconcileNote] = useState('')
+  const [reconcileBusy, setReconcileBusy] = useState(false)
+  const [reconcileNotice, setReconcileNotice] = useState<string | null>(null)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
   const [sessionScope, setSessionScope] = useState<'active' | 'trash'>('active')
   const [pendingArchive, setPendingArchive] = useState<CanonicalSessionDto | null>(null)
   const [changingSessionId, setChangingSessionId] = useState<string | null>(null)
   const threadRequest = useRef(0)
+  const sessionListRequest = useRef(0)
+  const sessionListBusy = useRef(false)
   const transcriptScroller = useRef<HTMLDivElement | null>(null)
   const lastPositionedThread = useRef<string | null>(null)
   const followOutput = useRef(true)
@@ -438,21 +536,35 @@ export function ConversationWorkspace({
   const currentCatalog = catalogs[provider]
   const models = currentCatalog?.models ?? null
   const selectedModel = models?.find((option) => option.id === model) ?? null
+  const modelDisplayNames = useMemo(() => Object.fromEntries(
+    PROVIDERS.flatMap((candidate) => (catalogs[candidate]?.models ?? []).map((option) => [
+      option.id,
+      option.displayName,
+    ])),
+  ), [catalogs])
+  const unknownMutations = useMemo(() => unresolvedUnknownMutations(snapshot), [snapshot])
 
-  const refreshSessions = useCallback(async () => {
-    setLoadingSessions(true)
+  const refreshSessions = useCallback(async (background = false) => {
+    if (background && sessionListBusy.current) return
+    const requestId = ++sessionListRequest.current
+    sessionListBusy.current = true
+    if (!background) setLoadingSessions(true)
     try {
       const result = await conversationApi.listSessions(sessionScope)
+      if (requestId !== sessionListRequest.current) return
       setSessions(result)
       setSelectedSessionId((current) => {
         if (current && result.some((session) => session.id === current)) return current
         return result[0]?.id ?? null
       })
-      setError(null)
+      if (!background) setError(null)
     } catch (cause) {
-      setError(errorMessage(cause))
+      if (!background && requestId === sessionListRequest.current) setError(errorMessage(cause))
     } finally {
-      setLoadingSessions(false)
+      if (requestId === sessionListRequest.current) {
+        sessionListBusy.current = false
+        if (!background) setLoadingSessions(false)
+      }
     }
   }, [sessionScope])
 
@@ -491,22 +603,26 @@ export function ConversationWorkspace({
     setEffort(option?.defaultEffort ?? null)
   }, [currentCatalog, model, provider])
 
-  const refreshThread = useCallback(async () => {
+  const refreshThread = useCallback(async (): Promise<boolean> => {
     const requestId = ++threadRequest.current
     if (!threadId) {
       setSnapshot(null)
       setLoadingThread(false)
-      return
+      return true
     }
     setLoadingThread(true)
     try {
       const result = await conversationApi.getThread(threadId)
       if (requestId === threadRequest.current) {
         setSnapshot(result)
+        setSessions((current) => replaceSessionProjection(current, result.session))
         setError(null)
+        return true
       }
+      return false
     } catch (cause) {
       if (requestId === threadRequest.current) setError(errorMessage(cause))
+      return false
     } finally {
       if (requestId === threadRequest.current) setLoadingThread(false)
     }
@@ -514,6 +630,10 @@ export function ConversationWorkspace({
 
   useEffect(() => {
     void refreshSessions()
+  }, [refreshSessions])
+
+  useEffect(() => {
+    return installSessionProjectionPolling(() => { void refreshSessions(true) }, window, document)
   }, [refreshSessions])
 
   useEffect(() => {
@@ -527,9 +647,7 @@ export function ConversationWorkspace({
     }
   }, [refreshThread])
 
-  const onStreamEvent = useCallback(() => {
-    void refreshThread()
-  }, [refreshThread])
+  const onStreamEvent = useCallback(() => refreshThread(), [refreshThread])
   useConversationEvents(threadId, onStreamEvent)
 
   const createSession = async () => {
@@ -573,10 +691,10 @@ export function ConversationWorkspace({
       setGoalDraft('')
       setPrompt('')
       setError(null)
-      await Promise.all([refreshThread(), refreshSessions()])
-    } catch (cause) {
-      setError(errorMessage(cause))
       await refreshThread()
+    } catch (cause) {
+      await refreshThread()
+      setError(errorMessage(cause))
     } finally {
       setGoalBusyAction(null)
     }
@@ -592,6 +710,10 @@ export function ConversationWorkspace({
       return
     }
     if (action === 'edit') {
+      if (current.status === 'budget_limited') {
+        setError('예산 제한 Goal은 먼저 다시 시작한 뒤 수정해 주세요.')
+        return
+      }
       setGoalDraft(current.objective)
       setGoalDialog('edit')
       return
@@ -606,15 +728,16 @@ export function ConversationWorkspace({
     }
     setGoalBusyAction(action)
     try {
-      await conversationApi.setGoalStatus(current.id, {
+      const result = await conversationApi.setGoalStatus(current.id, {
         expectedRevision: current.revision,
         status: action === 'pause' ? 'paused' : 'active',
       })
+      requireAppliedGoalStatus(result)
       setError(null)
-      await Promise.all([refreshThread(), refreshSessions()])
-    } catch (cause) {
-      setError(errorMessage(cause))
       await refreshThread()
+    } catch (cause) {
+      await refreshThread()
+      setError(errorMessage(cause))
     } finally {
       setGoalBusyAction(null)
     }
@@ -640,13 +763,7 @@ export function ConversationWorkspace({
       return
     }
     if (command.type === 'edit') {
-      if (current) {
-        setGoalDraft(current.objective)
-        setGoalDialog('edit')
-      } else {
-        setGoalDraft('')
-        setGoalDialog('create')
-      }
+      await applyGoalAction('edit')
       return
     }
     if (!current) {
@@ -688,8 +805,8 @@ export function ConversationWorkspace({
       setError(null)
       await refreshThread()
     } catch (cause) {
-      setError(errorMessage(cause))
       await refreshThread()
+      setError(errorMessage(cause))
     } finally {
       setSubmitting(false)
     }
@@ -742,6 +859,10 @@ export function ConversationWorkspace({
     setSelectedSessionId(sessionId)
     setGoalPanelVersion(0)
     setGoalDialog(null)
+    setReconcileTarget(null)
+    setReconcileResolution(null)
+    setReconcileNote('')
+    setReconcileNotice(null)
     setMobileSidebarOpen(false)
   }
 
@@ -753,6 +874,10 @@ export function ConversationWorkspace({
     setSnapshot(null)
     setGoalPanelVersion(0)
     setGoalDialog(null)
+    setReconcileTarget(null)
+    setReconcileResolution(null)
+    setReconcileNote('')
+    setReconcileNotice(null)
     lastPositionedThread.current = null
   }
 
@@ -798,20 +923,52 @@ export function ConversationWorkspace({
       if (goalDialog === 'clear') {
         await conversationApi.clearGoal(current.id, current.revision)
       } else {
-        await conversationApi.setGoalStatus(current.id, {
+        const result = await conversationApi.setGoalStatus(current.id, {
           expectedRevision: current.revision,
           status: 'active',
           resetLimitCounters: true,
         })
+        requireAppliedGoalStatus(result)
       }
       setGoalDialog(null)
       setError(null)
-      await Promise.all([refreshThread(), refreshSessions()])
-    } catch (cause) {
-      setError(errorMessage(cause))
       await refreshThread()
+    } catch (cause) {
+      await refreshThread()
+      setError(errorMessage(cause))
     } finally {
       setGoalBusyAction(null)
+    }
+  }
+
+  const openReconciliation = (call: UnknownMutationCall) => {
+    setReconcileTarget(call)
+    setReconcileResolution(null)
+    setReconcileNote('')
+    setReconcileNotice(null)
+  }
+
+  const confirmReconciliation = async () => {
+    if (!reconcileTarget || !reconcileResolution) return
+    setReconcileBusy(true)
+    try {
+      await conversationApi.reconcileUnknownMutation(reconcileTarget.turnId, {
+        callId: reconcileTarget.callId,
+        resolution: reconcileResolution,
+        ...(reconcileNote.trim() ? { note: reconcileNote.trim() } : {}),
+      })
+      await refreshThread()
+      setReconcileTarget(null)
+      setReconcileResolution(null)
+      setReconcileNote('')
+      setReconcileNotice(snapshot?.goal
+        ? '결과 확인을 기록했습니다. 작업은 재실행되지 않았으며 Goal은 계속 정지되어 있습니다. 확인 후 직접 다시 시작하세요.'
+        : '결과 확인을 기록했습니다. 작업은 재실행되지 않았으며 대화도 자동으로 재개되지 않습니다.')
+      setError(null)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setReconcileBusy(false)
     }
   }
 
@@ -899,8 +1056,10 @@ export function ConversationWorkspace({
                   : 'Goal 지우기'}
           </DialogTitle>
           <DialogDescription>
-            {goalDialog === 'create' || goalDialog === 'edit'
+            {goalDialog === 'create'
               ? 'Baton이 이 목표를 대화의 정본으로 저장하고, 완료되거나 안전 한도에 도달할 때까지 이어서 실행합니다.'
+              : goalDialog === 'edit' && snapshot?.goal
+                ? goalEditDescription(snapshot.goal.status)
               : goalDialog === 'replace'
                 ? '현재 Goal을 종료하고 새 Goal ID와 새 실행 한도로 교체합니다. 대화 기록은 그대로 남습니다.'
               : goalDialog === 'resume'
@@ -926,7 +1085,76 @@ export function ConversationWorkspace({
               disabled={goalBusyAction !== null || ((goalDialog === 'create' || goalDialog === 'replace' || goalDialog === 'edit') && !goalDraft.trim())}
               onClick={() => void confirmGoalDialog()}
             >
-              {goalBusyAction ? '처리 중…' : goalDialog === 'clear' ? 'Goal 지우기' : goalDialog === 'resume' ? '다시 시작' : goalDialog === 'replace' ? '교체하고 시작' : '저장하고 시작'}
+              {goalBusyAction ? '처리 중…' : goalDialog === 'clear' ? 'Goal 지우기' : goalDialog === 'resume' ? '다시 시작' : goalDialog === 'replace' ? '교체하고 시작' : goalDialog === 'edit' ? '변경사항 저장' : '저장하고 시작'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={reconcileTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !reconcileBusy) {
+            setReconcileTarget(null)
+            setReconcileResolution(null)
+            setReconcileNote('')
+          }
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogTitle>변경 작업 결과 확인</DialogTitle>
+          <DialogDescription>
+            Baton이 중단되기 전 실행한 {reconcileTarget?.toolName ?? '변경 작업'}의 결과를 확인해 주세요.
+            이 확인 과정에서는 해당 작업을 다시 실행하지 않습니다.
+          </DialogDescription>
+          <fieldset className="space-y-2" disabled={reconcileBusy}>
+            <legend className="sr-only">확인한 결과</legend>
+            {([
+              ['succeeded', '성공함', '의도한 변경이 실제로 완료된 것을 확인했습니다.'],
+              ['failed', '실패함', '변경 작업이 완료되지 않은 것을 확인했습니다.'],
+              ['unknown_acknowledged', '결과를 알 수 없음', '불확실성을 인지하고 기록만 남깁니다.'],
+            ] as Array<[UnknownMutationResolution, string, string]>).map(([value, label, detail]) => (
+              <label key={value} className="flex cursor-pointer items-start gap-3 rounded-xl border px-3 py-2.5 hover:bg-muted/40">
+                <input
+                  type="radio"
+                  name="unknown-mutation-resolution"
+                  value={value}
+                  checked={reconcileResolution === value}
+                  onChange={() => setReconcileResolution(value)}
+                  className="mt-1"
+                />
+                <span>
+                  <span className="block text-sm font-medium">{label}</span>
+                  <span className="mt-0.5 block text-xs leading-5 text-muted-foreground">{detail}</span>
+                </span>
+              </label>
+            ))}
+          </fieldset>
+          <label className="space-y-1.5 text-sm">
+            <span className="font-medium">메모 <span className="font-normal text-muted-foreground">(선택)</span></span>
+            <textarea
+              value={reconcileNote}
+              onChange={(event) => setReconcileNote(event.target.value)}
+              maxLength={500}
+              rows={3}
+              disabled={reconcileBusy}
+              placeholder="확인한 상태를 짧게 기록하세요"
+              className="w-full resize-y rounded-xl border bg-background px-3 py-2 text-sm leading-6 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <p className="text-xs leading-5 text-muted-foreground">
+            {snapshot?.goal
+              ? '기록 후에도 Goal은 자동으로 다시 시작되지 않습니다. 상태를 검토한 뒤 Goal의 다시 시작 버튼을 직접 눌러야 합니다.'
+              : '기록 후에도 대화는 자동으로 다시 시작되지 않습니다. 상태를 검토한 뒤 다음 요청을 직접 보내야 합니다.'}
+          </p>
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" disabled={reconcileBusy} onClick={() => setReconcileTarget(null)}>취소</Button>
+            <Button
+              type="button"
+              disabled={reconcileBusy || reconcileResolution === null}
+              onClick={() => void confirmReconciliation()}
+            >
+              {reconcileBusy ? '기록 중…' : '확인 결과 기록'}
             </Button>
           </div>
         </DialogContent>
@@ -985,6 +1213,31 @@ export function ConversationWorkspace({
               </div>
             )}
 
+            {reconcileNotice ? (
+              <p className="mb-6 rounded-xl border border-ok/40 bg-ok/10 px-4 py-3 text-sm text-foreground" role="status">
+                {reconcileNotice}
+              </p>
+            ) : null}
+
+            {unknownMutations.length > 0 ? (
+              <section className="mb-6 rounded-xl border border-warning/50 bg-warning/10 px-4 py-3" aria-label="결과를 확인해야 하는 변경 작업">
+                <h2 className="text-sm font-semibold">변경 작업의 결과를 확인해야 합니다</h2>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  중단 전에 시작된 변경 작업의 성공 여부가 기록되지 않았습니다. Baton은 안전을 위해 이를 자동으로 재실행하지 않습니다.
+                </p>
+                <div className="mt-3 space-y-2">
+                  {unknownMutations.map((call) => (
+                    <div key={`${call.turnId}:${call.callId}`} className="flex items-center gap-3 rounded-lg border bg-background/70 px-3 py-2">
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{call.toolName}</span>
+                      <Button type="button" variant="outline" size="xs" onClick={() => openReconciliation(call)}>
+                        결과 확인
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+
             {snapshot?.goal ? (
               <GoalControl
                 key={`${snapshot.goal.id}:${goalPanelVersion}`}
@@ -1021,6 +1274,7 @@ export function ConversationWorkspace({
                         item={item}
                         toolResult={toolResult}
                         assistantLabelMode={viewPreferences.assistantLabel}
+                        modelDisplayNames={modelDisplayNames}
                       />
                     </div>
                   )

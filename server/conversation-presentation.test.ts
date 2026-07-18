@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  activityFailed,
   activitySummary,
   conversationEntries,
   isLongConversationText,
@@ -87,6 +88,29 @@ test('tool calls and results become one compact transcript entry', () => {
   assert.equal(entries.length, 1)
   assert.equal(entries[0]?.toolResult?.id, 'result')
   assert.equal(activitySummary(call, result), '읽기 · src/App.tsx · 완료')
+})
+
+test('nested canonical tool results preserve success and failure presentation', () => {
+  const call = {
+    ...item({ callId: 'tool-1', name: 'write_file', input: { path: 'src/App.tsx' } }),
+    kind: 'tool_call' as const,
+  }
+  const failed = {
+    ...item({
+      callId: 'tool-1',
+      result: { success: false, content: {}, error: { code: 'tool_timeout', message: 'timed out' } },
+    }),
+    kind: 'tool_result' as const,
+  }
+  const succeeded = {
+    ...item({ callId: 'tool-1', result: { success: true, content: {}, error: null } }),
+    kind: 'tool_result' as const,
+  }
+
+  assert.equal(activityFailed(failed), true)
+  assert.equal(activitySummary(call, failed), '편집 · src/App.tsx · 실패')
+  assert.equal(activityFailed(succeeded), false)
+  assert.equal(activitySummary(call, succeeded), '편집 · src/App.tsx · 완료')
 })
 
 test('long message detection is deterministic by characters or lines', () => {
