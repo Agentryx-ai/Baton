@@ -423,6 +423,8 @@ Exit: offline contract tests cover Gemini switching, tools, signed parts, compac
 
 - Follow the normative migration/recovery boundary in
   [`NATIVE_SESSION_CONTINUITY_BRIDGE.md`](NATIVE_SESSION_CONTINUITY_BRIDGE.md).
+- The experimental [`../tools/native-session-handoff/`](../tools/native-session-handoff/) package provides a
+  one-shot operator workflow only; it is not the canonical import API and does not close this phase.
 - Add explicit CLI session wrappers/sidecars.
 - Add versioned, read-only importers for supported native session formats.
 - Show provenance and portability loss before import/switch.

@@ -219,6 +219,7 @@ npm start              # http://localhost:4400
 - `src/hooks/` — visibility-aware polling
 - `src/components/` — account, rotation, settings UI와 shadcn primitives
 - `scripts/codex-adapter-smoke.ts` — 실제 Codex app-server handshake·hardening smoke test
+- `tools/native-session-handoff/` — Codex·Claude 로컬 세션의 일회성 inventory·승계 proposal·승인 기반 CLI context-ingest 패키지
 - `docs/DESIGN.md` — 현재 account control plane 설계와 정책
 - `docs/COMMON_SESSION_DESIGN.md` — canonical conversation runtime 설계
 - `docs/BUILD_DAG.md` — 빌드 구조

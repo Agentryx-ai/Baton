@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "context_ingested", "goal_update", "implementation_started", "notes"],
+  "properties": {
+    "status": { "type": "string", "enum": ["acknowledged", "rejected"] },
+    "context_ingested": { "type": "boolean" },
+    "goal_update": { "type": "string", "enum": ["not_requested", "applied", "unavailable", "rejected"] },
+    "implementation_started": { "type": "boolean", "const": false },
+    "notes": { "type": "string" }
+  }
+}
