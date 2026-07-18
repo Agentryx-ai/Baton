@@ -10,6 +10,7 @@ import type {
 } from './adapter.ts'
 import type {
   AgentToolDefinition,
+  AgentToolInvocation,
   AgentToolResult,
   CanonicalProvider,
   NewCanonicalItem,
@@ -58,11 +59,27 @@ interface MaterializedHttpTurn {
 interface NormalizedResponse {
   responseId: string
   requestedModel: string
-  actualModel: string
+  reportedModel: string | null
   effort: string | null
   text: string
   usage: JsonObject
 }
+
+interface ModelRoundProvenance {
+  round: number
+  responseId: string | null
+  requestedModel: string
+  reportedModel: string | null
+  stopReason: string
+  toolDecision: boolean
+}
+
+interface RetryBudget {
+  readonly maximum: number
+  remaining: number
+}
+
+type ProviderToolCall = Pick<AgentToolInvocation, 'providerCallId' | 'name' | 'input'>
 
 class EventQueue<T> implements AsyncIterable<T> {
   private readonly values: T[] = []
@@ -205,7 +222,27 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       resolveTerminal = resolve
     })
 
-    void this.request(body, controller.signal, context).then((response) => {
+    const emitModelRound = (round: ModelRoundProvenance) => {
+      if (controller.signal.aborted) return
+      events.push({
+        eventId: `${this.provider}:model-round:${body.turnId}:${round.round}`,
+        type: 'response/model-round',
+        payload: round,
+        durability: 'durable',
+      })
+    }
+
+    const providerRequest = this.request(body, controller.signal, context, emitModelRound)
+    void Promise.race([providerRequest, rejectOnAbort(controller.signal)]).then((response) => {
+      if (turnTimedOut) {
+        throw new ProviderLoopError(
+          'turn_time_limit',
+          `${this.provider} turn exceeded time limit (${context.limits.turnTimeoutMs}ms)`,
+        )
+      }
+      if (cancellationRequested || controller.signal.aborted) {
+        throw controller.signal.reason ?? new Error('Turn cancelled by user')
+      }
       events.push({
         eventId: `${this.provider}:response:${response.responseId}`,
         type: 'response/completed',
@@ -219,15 +256,23 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       const message = turnTimedOut
         ? `${this.provider} turn exceeded time limit (${context.limits.turnTimeoutMs}ms)`
         : error instanceof Error ? error.message : String(error)
-      resolveTerminal(cancellationRequested
-        ? { status: 'cancelled' }
-        : {
+      resolveTerminal(turnTimedOut
+        ? {
             status: 'failed',
             error: {
-              code: turnTimedOut ? 'turn_time_limit' : providerErrorCode(error),
+              code: 'turn_time_limit',
               message,
             },
-          })
+          }
+        : cancellationRequested
+          ? { status: 'cancelled' }
+          : {
+              status: 'failed',
+              error: {
+                code: providerErrorCode(error),
+                message,
+              },
+            })
     }).finally(() => {
       clearTimeout(timeout)
       context.signal.removeEventListener('abort', abort)
@@ -248,6 +293,16 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
   }
 
   normalize(event: NativeProviderEvent): NewCanonicalItem[] {
+    if (event.type === 'response/model-round') {
+      const round = parseModelRoundProvenance(event.payload)
+      return [{
+        kind: 'provider_event',
+        visibility: 'baton_private',
+        provider: this.provider,
+        nativeId: round.responseId,
+        payload: round,
+      }]
+    }
     if (event.type !== 'response/completed') return []
     const response = parseNormalizedResponse(event.payload)
     return [
@@ -259,8 +314,10 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         payload: {
           text: response.text,
           requestedModel: response.requestedModel,
-          actualModel: response.actualModel,
-          modelFallback: response.requestedModel !== response.actualModel,
+          reportedModel: response.reportedModel,
+          modelFallback: response.reportedModel !== null
+            && response.requestedModel !== response.reportedModel,
+          modelProvenance: response.reportedModel === null ? 'unreported' : 'provider_reported',
           effort: response.effort,
         },
       },
@@ -278,7 +335,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     const response = parseNormalizedResponse(event.payload)
     return {
       nativeResponseId: response.responseId,
-      modelFamily: response.actualModel,
+      ...(response.reportedModel === null ? {} : { modelFamily: response.reportedModel }),
     }
   }
 
@@ -292,23 +349,25 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     body: MaterializedHttpTurn,
     signal: AbortSignal,
     context: ProviderExecutionContext,
+    onModelRound: (round: ModelRoundProvenance) => void,
   ): Promise<NormalizedResponse> {
     if (!this.connection) throw new Error(`${this.provider} proxy connection is unavailable`)
     return this.provider === 'claude'
-      ? this.requestClaude(body, signal, context)
-      : this.requestGemini(body, signal, context)
+      ? this.requestClaude(body, signal, context, onModelRound)
+      : this.requestGemini(body, signal, context, onModelRound)
   }
 
   private async requestClaude(
     body: MaterializedHttpTurn,
     signal: AbortSignal,
     context: ProviderExecutionContext,
+    onModelRound: (round: ModelRoundProvenance) => void,
   ): Promise<NormalizedResponse> {
     const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
     const tools = context.toolDefinitions.map(toClaudeTool)
     const usage: JsonObject = {}
-    let totalToolCalls = 0
-    const identicalCalls = new Map<string, number>()
+    const seenProviderCallIds = new Set<string>()
+    const retryBudget = createRetryBudget(context.limits.maxProviderRetries)
 
     for (let round = 1; round <= context.limits.maxModelRoundTrips; round += 1) {
       const response = await fetchWithRetry(this.fetchImpl, `${this.connection!.baseUrl}/v1/messages`, {
@@ -326,10 +385,21 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           ...(body.effort ? { output_config: { effort: body.effort } } : {}),
         }),
         signal,
-      }, context.limits.maxProviderRetries, signal)
+      }, retryBudget, signal)
       const payload = await responseJson(response, this.provider)
       mergeNumericUsage(usage, objectValue(payload.usage))
       const content = Array.isArray(payload.content) ? payload.content : []
+      const hasToolDecision = content.some((part) => isObject(part) && part.type === 'tool_use')
+      const rawStopReason = stringValue(payload.stop_reason)
+      const stopReason = rawStopReason ?? (hasToolDecision ? 'tool_use' : 'end_turn')
+      onModelRound({
+        round,
+        responseId: stringValue(payload.id),
+        requestedModel: body.model,
+        reportedModel: stringValue(payload.model),
+        stopReason,
+        toolDecision: hasToolDecision,
+      })
       const toolUses = content.flatMap((part) => {
         if (!isObject(part) || part.type !== 'tool_use') return []
         return [{
@@ -340,15 +410,13 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       })
       const text = content.flatMap((part) => isObject(part) && part.type === 'text'
         && typeof part.text === 'string' ? [part.text] : []).join('')
-      const rawStopReason = stringValue(payload.stop_reason)
-      const stopReason = rawStopReason ?? (toolUses.length > 0 ? 'tool_use' : 'end_turn')
 
       if (stopReason === 'end_turn') {
         if (!text) throw new ProviderLoopError('provider_invalid_terminal', 'Claude end_turn response did not contain text')
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
-          actualModel: stringValue(payload.model) ?? body.model,
+          reportedModel: stringValue(payload.model),
           effort: body.effort,
           text,
           usage,
@@ -367,18 +435,16 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       }
       if (toolUses.length === 0) throw new Error('Claude returned tool_use without a tool_use block')
       assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude tool_use')
-      enforceToolLimits(toolUses, totalToolCalls, identicalCalls, context)
-      totalToolCalls += toolUses.length
-      const results = await Promise.all(toolUses.map((toolUse) => context.executeTool({
-        callId: `${body.turnId}:${toolUse.providerCallId}`,
-        providerCallId: toolUse.providerCallId,
-        name: toolUse.name,
-        input: toolUse.input,
-      })))
+      assertUniqueToolCallIds(toolUses, seenProviderCallIds, 'Claude')
+      const results = await executeToolBatch(body.turnId, toolUses, context, signal)
       messages.push({ role: 'assistant', content })
       messages.push({
         role: 'user',
-        content: results.map((result, index) => claudeToolResult(toolUses[index]!.providerCallId, result)),
+        content: results.map((result, index) => claudeToolResult(
+          toolUses[index]!.providerCallId,
+          result,
+          context.limits.toolOutputBytes,
+        )),
       })
     }
     throw new ProviderLoopError(
@@ -391,12 +457,13 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     body: MaterializedHttpTurn,
     signal: AbortSignal,
     context: ProviderExecutionContext,
+    onModelRound: (round: ModelRoundProvenance) => void,
   ): Promise<NormalizedResponse> {
     const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
     const tools = context.toolDefinitions.map(toOpenAiTool)
     const usage: JsonObject = {}
-    let totalToolCalls = 0
-    const identicalCalls = new Map<string, number>()
+    const seenProviderCallIds = new Set<string>()
+    const retryBudget = createRetryBudget(context.limits.maxProviderRetries)
 
     for (let round = 1; round <= context.limits.maxModelRoundTrips; round += 1) {
       const response = await fetchWithRetry(this.fetchImpl, `${this.connection!.baseUrl}/v1/chat/completions`, {
@@ -413,7 +480,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           ...(body.effort ? { reasoning_effort: body.effort } : {}),
         }),
         signal,
-      }, context.limits.maxProviderRetries, signal)
+      }, retryBudget, signal)
       const payload = await responseJson(response, this.provider)
       mergeNumericUsage(usage, objectValue(payload.usage))
       const choices = Array.isArray(payload.choices) ? payload.choices : []
@@ -421,11 +488,20 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       if (!first) throw new Error('Gemini response did not contain a choice')
       const message = objectValue(first.message)
       if (!message) throw new Error('Gemini response did not contain a message')
-      const toolCalls = parseOpenAiToolCalls(message.tool_calls)
       const text = stringValue(message.content)
+      const hasToolDecision = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
       const rawFinishReason = stringValue(first.finish_reason)
-      const finishReason = rawFinishReason ?? (toolCalls.length > 0 ? 'tool_calls' : 'stop')
+      const finishReason = rawFinishReason ?? (hasToolDecision ? 'tool_calls' : 'stop')
       const normalizedFinishReason = finishReason.toLowerCase()
+      onModelRound({
+        round,
+        responseId: stringValue(payload.id),
+        requestedModel: body.model,
+        reportedModel: stringValue(payload.model),
+        stopReason: finishReason,
+        toolDecision: hasToolDecision,
+      })
+      const toolCalls = parseOpenAiToolCalls(message.tool_calls)
 
       if (normalizedFinishReason === 'stop') {
         if (!text) throw new Error('Gemini stop response did not contain text')
@@ -434,7 +510,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
-          actualModel: stringValue(payload.model) ?? body.model,
+          reportedModel: stringValue(payload.model),
           effort: body.effort,
           text,
           usage,
@@ -448,14 +524,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       }
       if (toolCalls.length === 0) throw new Error('Gemini returned tool_calls without a function call')
       assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Gemini tool_calls')
-      enforceToolLimits(toolCalls, totalToolCalls, identicalCalls, context)
-      totalToolCalls += toolCalls.length
-      const results = await Promise.all(toolCalls.map((toolCall) => context.executeTool({
-        callId: `${body.turnId}:${toolCall.providerCallId}`,
-        providerCallId: toolCall.providerCallId,
-        name: toolCall.name,
-        input: toolCall.input,
-      })))
+      assertUniqueToolCallIds(toolCalls, seenProviderCallIds, 'Gemini')
+      const results = await executeToolBatch(body.turnId, toolCalls, context, signal)
       messages.push({
         role: 'assistant',
         content: message.content ?? null,
@@ -466,7 +536,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           role: 'tool',
           tool_call_id: toolCalls[index]!.providerCallId,
           name: toolCalls[index]!.name,
-          content: serializeToolResult(result),
+          content: serializeToolResult(result, context.limits.toolOutputBytes).content,
         })
       }
     }
@@ -477,38 +547,52 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
   }
 }
 
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason)
+      return
+    }
+    signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+  })
+}
+
 async function fetchWithRetry(
   fetchImpl: typeof fetch,
   url: string,
   init: RequestInit,
-  maxRetries: number,
+  budget: RetryBudget,
   signal: AbortSignal,
 ): Promise<Response> {
-  let lastError: unknown = null
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+  let localAttempt = 0
+  while (true) {
     try {
       const response = await fetchImpl(url, init)
       if (!retryableStatus(response.status)) return response
-      if (attempt === maxRetries) {
-        return response
-      }
+      if (!consumeRetry(budget)) return response
       await response.arrayBuffer().catch(() => undefined)
     } catch (error) {
       if (signal.aborted) throw error
-      lastError = error
-      if (attempt === maxRetries) {
+      if (!consumeRetry(budget)) {
         throw new ProviderLoopError(
           'provider_retry_exhausted',
-          `Provider request failed after ${maxRetries} retries: ${error instanceof Error ? error.message : String(error)}`,
+          `Provider request failed after ${budget.maximum} total retries: ${error instanceof Error ? error.message : String(error)}`,
         )
       }
     }
-    await retryDelay(Math.min(1_000, 100 * (2 ** attempt)), signal)
+    await retryDelay(Math.min(1_000, 100 * (2 ** localAttempt)), signal)
+    localAttempt += 1
   }
-  throw new ProviderLoopError(
-    'provider_retry_exhausted',
-    `Provider retry budget was exhausted${lastError ? `: ${String(lastError)}` : ''}`,
-  )
+}
+
+function createRetryBudget(maximum: number): RetryBudget {
+  return { maximum, remaining: maximum }
+}
+
+function consumeRetry(budget: RetryBudget): boolean {
+  if (budget.remaining <= 0) return false
+  budget.remaining -= 1
+  return true
 }
 
 function retryableStatus(status: number): boolean {
@@ -574,23 +658,53 @@ function toOpenAiTool(tool: AgentToolDefinition): JsonObject {
   }
 }
 
-function claudeToolResult(providerCallId: string, result: AgentToolResult): JsonObject {
-  return result.success
-    ? {
-        type: 'tool_result',
-        tool_use_id: providerCallId,
-        content: JSON.stringify(result.content),
-      }
-    : {
-        type: 'tool_result',
-        tool_use_id: providerCallId,
-        content: JSON.stringify(result.error),
-        is_error: true,
-      }
+function claudeToolResult(
+  providerCallId: string,
+  result: AgentToolResult,
+  byteLimit: number,
+): JsonObject {
+  const serialized = serializeToolResult(result, byteLimit)
+  return {
+    type: 'tool_result',
+    tool_use_id: providerCallId,
+    content: serialized.content,
+    ...(serialized.isError ? { is_error: true } : {}),
+  }
 }
 
-function serializeToolResult(result: AgentToolResult): string {
-  return JSON.stringify(result.success ? result.content : { error: result.error })
+function serializeToolResult(
+  result: AgentToolResult,
+  byteLimit: number,
+): { content: string; isError: boolean } {
+  const payload = result.success ? result.content : { error: result.error }
+  let content: string
+  try {
+    content = JSON.stringify(payload)
+  } catch {
+    content = JSON.stringify({ error: { code: 'tool_result_serialization', message: 'Tool result was not JSON serializable' } })
+    return boundedSerializedError(content, byteLimit)
+  }
+  if (utf8Bytes(content) <= byteLimit) return { content, isError: !result.success }
+  return boundedSerializedError(
+    JSON.stringify({
+      error: {
+        code: 'tool_output_limit',
+        message: `Tool result exceeded the ${byteLimit}-byte output limit`,
+      },
+    }),
+    byteLimit,
+  )
+}
+
+function boundedSerializedError(content: string, byteLimit: number): { content: string; isError: true } {
+  for (const candidate of [content, '{"error":"tool_output_limit"}', '"tool_output_limit"', 'null', '']) {
+    if (utf8Bytes(candidate) <= byteLimit) return { content: candidate, isError: true }
+  }
+  return { content: '', isError: true }
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength
 }
 
 function parseOpenAiToolCalls(value: unknown): Array<{
@@ -617,28 +731,61 @@ function parseOpenAiToolCalls(value: unknown): Array<{
   })
 }
 
-function enforceToolLimits(
-  calls: ReadonlyArray<{ name: string; input: JsonObject }>,
-  priorCallCount: number,
-  identicalCalls: Map<string, number>,
-  context: ProviderExecutionContext,
+function assertUniqueToolCallIds(
+  calls: readonly ProviderToolCall[],
+  seen: Set<string>,
+  provider: string,
 ): void {
-  if (priorCallCount + calls.length > context.limits.maxToolCalls) {
-    throw new ProviderLoopError(
-      'tool_call_limit',
-      `Provider exceeded tool-call limit (${context.limits.maxToolCalls})`,
-    )
-  }
+  const batchIds = new Set<string>()
   for (const call of calls) {
-    const fingerprint = `${call.name}:${stableJson(call.input)}`
-    const count = (identicalCalls.get(fingerprint) ?? 0) + 1
-    if (count > context.limits.maxIdenticalToolCalls) {
+    if (seen.has(call.providerCallId) || batchIds.has(call.providerCallId)) {
       throw new ProviderLoopError(
-        'tool_repetition_limit',
-        `Provider repeated an identical tool call more than ${context.limits.maxIdenticalToolCalls} times`,
+        'provider_duplicate_tool_id',
+        `${provider} returned duplicate tool call id ${call.providerCallId}`,
       )
     }
-    identicalCalls.set(fingerprint, count)
+    batchIds.add(call.providerCallId)
+  }
+  for (const id of batchIds) seen.add(id)
+}
+
+async function executeToolBatch(
+  turnId: string,
+  calls: readonly ProviderToolCall[],
+  context: ProviderExecutionContext,
+  signal: AbortSignal,
+): Promise<AgentToolResult[]> {
+  return Promise.all(calls.map((call) => executeToolSafely(turnId, call, context, signal)))
+}
+
+async function executeToolSafely(
+  turnId: string,
+  call: ProviderToolCall,
+  context: ProviderExecutionContext,
+  signal: AbortSignal,
+): Promise<AgentToolResult> {
+  if (signal.aborted) return unavailableToolResult(signal.reason)
+  try {
+    return await context.executeTool({
+      callId: `${turnId}:${call.providerCallId}`,
+      providerCallId: call.providerCallId,
+      name: call.name,
+      input: call.input,
+    })
+  } catch (error) {
+    return unavailableToolResult(error)
+  }
+}
+
+function unavailableToolResult(reason: unknown): AgentToolResult {
+  return {
+    success: false,
+    content: null,
+    error: {
+      code: 'tool_execution_failed',
+      message: reason instanceof Error ? reason.message : String(reason ?? 'Tool was not executed'),
+      retryable: false,
+    },
   }
 }
 
@@ -660,14 +807,6 @@ function mergeNumericUsage(target: JsonObject, source: JsonObject | null): void 
       target[key] = value
     }
   }
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
-  if (isObject(value)) {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`
-  }
-  return JSON.stringify(value)
 }
 
 function parseMaterializedTurn(value: unknown, provider: SupportedProvider): MaterializedHttpTurn {
@@ -693,10 +832,22 @@ function parseNormalizedResponse(value: unknown): NormalizedResponse {
   return {
     responseId: requiredString(value.responseId, 'provider response id'),
     requestedModel: requiredString(value.requestedModel, 'requested model'),
-    actualModel: requiredString(value.actualModel, 'actual model'),
+    reportedModel: typeof value.reportedModel === 'string' ? value.reportedModel : null,
     effort: typeof value.effort === 'string' ? value.effort : null,
     text: requiredString(value.text, 'provider response text'),
     usage: objectValue(value.usage) ?? {},
+  }
+}
+
+function parseModelRoundProvenance(value: unknown): ModelRoundProvenance & JsonObject {
+  if (!isObject(value)) throw new Error('Invalid model-round provenance')
+  return {
+    round: requiredPositiveInteger(value.round, 'model round'),
+    responseId: typeof value.responseId === 'string' ? value.responseId : null,
+    requestedModel: requiredString(value.requestedModel, 'requested model'),
+    reportedModel: typeof value.reportedModel === 'string' ? value.reportedModel : null,
+    stopReason: requiredString(value.stopReason, 'provider stop reason'),
+    toolDecision: value.toolDecision === true,
   }
 }
 
@@ -747,4 +898,11 @@ function requiredString(value: unknown, label: string): string {
   const result = stringValue(value)
   if (!result) throw new Error(`${label} is required`)
   return result
+}
+
+function requiredPositiveInteger(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${label} must be a positive integer`)
+  }
+  return value
 }

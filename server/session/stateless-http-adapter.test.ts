@@ -37,6 +37,10 @@ async function collectExecution(adapter: StatelessHttpCanonicalAdapter, executio
   return { events, terminal: await execution.terminal, adapter }
 }
 
+function normalizedItems(adapter: StatelessHttpCanonicalAdapter, events: Array<{ eventId: string | null; type: string; payload: unknown; durability: 'durable' | 'ephemeral' }>) {
+  return events.flatMap((event) => adapter.normalize(event))
+}
+
 const snapshot: ThreadSnapshot = {
   session: {
     id: 'session-1', title: null, preview: null, activeThreadId: 'thread-1',
@@ -58,7 +62,7 @@ const snapshot: ThreadSnapshot = {
   bindings: [],
 }
 
-test('Claude adapter sends stateless history and records an actual-model fallback', async () => {
+test('Claude adapter sends stateless history and records a provider-reported model fallback', async () => {
   const sentBodies: Record<string, unknown>[] = []
   const adapter = new StatelessHttpCanonicalAdapter({
     provider: 'claude',
@@ -94,15 +98,19 @@ test('Claude adapter sends stateless history and records an actual-model fallbac
     { role: 'user', content: 'question' },
   ])
   assert.equal((await execution.terminal).status, 'completed')
-  const items = adapter.normalize(events[0]!)
-  assert.deepEqual(items[0]?.payload, {
+  const items = normalizedItems(adapter, events)
+  const assistant = items.find((item) => item.kind === 'assistant_message')
+  assert.deepEqual(assistant?.payload, {
     text: 'answer',
     requestedModel: 'claude-fable-5',
-    actualModel: 'claude-opus-4-8',
+    reportedModel: 'claude-opus-4-8',
     modelFallback: true,
+    modelProvenance: 'provider_reported',
     effort: 'high',
   })
-  assert.equal(adapter.extractBinding(events[0]!)?.modelFamily, 'claude-opus-4-8')
+  const completed = events.find((event) => event.type === 'response/completed')
+  assert.ok(completed)
+  assert.equal(adapter.extractBinding(completed)?.modelFamily, 'claude-opus-4-8')
 })
 
 test('Gemini adapter uses the proxy compatibility route without native tools', async () => {
@@ -179,12 +187,26 @@ test('Claude executes a tool-use round and preserves assistant blocks in the con
     { role: 'assistant', content: repliesForAssertionClaudeAssistant },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: JSON.stringify({ text: 'contents' }) }] },
   ])
-  const items = adapter.normalize(result.events[0]!)
-  assert.deepEqual(items[0]?.payload, {
-    text: 'done', requestedModel: 'claude-fable-5', actualModel: 'claude-opus-4-8',
-    modelFallback: true, effort: 'high',
+  const items = normalizedItems(adapter, result.events)
+  const assistant = items.find((item) => item.kind === 'assistant_message')
+  assert.deepEqual(assistant?.payload, {
+    text: 'done', requestedModel: 'claude-fable-5', reportedModel: 'claude-opus-4-8',
+    modelFallback: true, modelProvenance: 'provider_reported', effort: 'high',
   })
-  assert.deepEqual(items[1]?.payload, { input_tokens: 13, output_tokens: 5 })
+  assert.deepEqual(items.find((item) => item.kind === 'usage')?.payload, { input_tokens: 13, output_tokens: 5 })
+  assert.deepEqual(
+    items.filter((item) => item.kind === 'provider_event').map((item) => item.payload),
+    [
+      {
+        round: 1, responseId: 'message-tool', requestedModel: 'claude-fable-5',
+        reportedModel: 'claude-fable-5', stopReason: 'tool_use', toolDecision: true,
+      },
+      {
+        round: 2, responseId: 'message-final', requestedModel: 'claude-fable-5',
+        reportedModel: 'claude-opus-4-8', stopReason: 'end_turn', toolDecision: false,
+      },
+    ],
+  )
 })
 
 const repliesForAssertionClaudeAssistant = [
@@ -232,7 +254,7 @@ test('Claude executes parallel tools but returns one ordered tool-result user me
     role: 'user',
     content: [
       { type: 'tool_result', tool_use_id: 'slow', content: JSON.stringify({ value: 'a' }) },
-      { type: 'tool_result', tool_use_id: 'fast', content: JSON.stringify({ code: 'missing', message: 'not found', retryable: false }), is_error: true },
+      { type: 'tool_result', tool_use_id: 'fast', content: JSON.stringify({ error: { code: 'missing', message: 'not found', retryable: false } }), is_error: true },
     ],
   })
 })
@@ -342,8 +364,8 @@ test('Gemini executes function calls, returns tool messages, and accumulates usa
     { role: 'assistant', content: null, tool_calls: [{ id: 'g-call', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }] },
     { role: 'tool', tool_call_id: 'g-call', name: 'read_file', content: JSON.stringify({ text: 'contents' }) },
   ])
-  const items = adapter.normalize(result.events[0]!)
-  assert.deepEqual(items[1]?.payload, {
+  const items = normalizedItems(adapter, result.events)
+  assert.deepEqual(items.find((item) => item.kind === 'usage')?.payload, {
     prompt_tokens: 7, completion_tokens: 3, input_tokens: 7, output_tokens: 3,
   })
 })
@@ -374,9 +396,8 @@ test('Gemini enforces the model round-trip limit before executing function calls
 test('a provider turn timeout fails instead of being misreported as user cancellation', async () => {
   const adapter = new StatelessHttpCanonicalAdapter({
     provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
-    fetchImpl: async (_url, init) => new Promise<Response>((_resolve, reject) => {
-      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true })
-    }),
+    // Deliberately ignore AbortSignal to verify the adapter-level deadline race.
+    fetchImpl: async () => new Promise<Response>(() => undefined),
   })
   const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
     turnId: 'timeout', model: 'claude-fable-5', input: [{ kind: 'user_message', payload: { text: 'go' } }],
@@ -386,6 +407,46 @@ test('a provider turn timeout fails instead of being misreported as user cancell
   assert.equal(result.terminal.status, 'failed')
   assert.match(String(result.terminal.error?.message), /exceeded time limit/i)
   assert.equal(result.terminal.error?.code, 'turn_time_limit')
+})
+
+test('tool exceptions become ordered provider error results without dropping later calls', async () => {
+  const bodies: Record<string, unknown>[] = []
+  const replies = [
+    {
+      id: 'partial-batch', model: 'claude-fable-5', stop_reason: 'tool_use', usage: {},
+      content: [
+        { type: 'tool_use', id: 'fails', name: 'read_file', input: { path: 'a' } },
+        { type: 'tool_use', id: 'continues', name: 'read_file', input: { path: 'b' } },
+      ],
+    },
+    { id: 'partial-final', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} },
+  ]
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return Response.json(replies.shift())
+    },
+  })
+  const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+    turnId: 'partial-batch', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, snapshot), executionContext({
+    toolDefinitions: [readTool],
+    async executeTool(call) {
+      if (call.providerCallId === 'fails') throw new Error('sandbox unavailable')
+      return { success: true, content: { text: 'still ran' }, error: null }
+    },
+  })))
+  assert.equal(result.terminal.status, 'completed')
+  const continuation = bodies[1]?.messages
+  assert.ok(Array.isArray(continuation))
+  const resultMessage = continuation.at(-1) as Record<string, unknown>
+  const blocks = resultMessage.content as Array<Record<string, unknown>>
+  assert.deepEqual(blocks.map((block) => [block.tool_use_id, block.is_error === true]), [
+    ['fails', true],
+    ['continues', false],
+  ])
 })
 
 test('transient provider failures use the bounded retry budget', async () => {
@@ -441,3 +502,168 @@ for (const finishReason of ['length', 'content_filter', 'MAX_TOKENS', 'SAFETY'])
     assert.match(String(result.terminal.error?.message), new RegExp(finishReason, 'i'))
   })
 }
+
+test('user cancellation wins immediately over a same-tick late provider completion', async () => {
+  let resolveFetch!: (response: Response) => void
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async () => new Promise<Response>((resolve) => { resolveFetch = resolve }),
+  })
+  const execution = await adapter.execute(adapter.materialize({
+    turnId: 'cancel-race', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, snapshot), executionContext())
+
+  const cancellation = execution.cancel()
+  resolveFetch(Response.json({
+    id: 'too-late', model: 'claude-fable-5', stop_reason: 'end_turn',
+    content: [{ type: 'text', text: 'must not persist' }], usage: {},
+  }))
+  await cancellation
+  const result = await collectExecution(adapter, execution)
+  assert.equal(result.terminal.status, 'cancelled')
+  assert.equal(result.events.some((event) => event.type === 'response/completed'), false)
+})
+
+test('provider retries are capped across the entire multi-round turn', async () => {
+  let attempts = 0
+  const replies = [
+    Response.json({ error: { message: 'busy-one' } }, { status: 503 }),
+    Response.json({
+      id: 'tool-round', model: 'claude-fable-5', stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'read', name: 'read_file', input: { path: 'README.md' } }], usage: {},
+    }),
+    Response.json({ error: { message: 'busy-two' } }, { status: 503 }),
+  ]
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async () => { attempts += 1; return replies.shift()! },
+  })
+  const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+    turnId: 'global-retry-budget', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, snapshot), executionContext({
+    toolDefinitions: [readTool],
+    limits: { ...DEFAULT_AGENT_LOOP_LIMITS, maxProviderRetries: 1 },
+    async executeTool() { return { success: true, content: { text: 'ok' }, error: null } },
+  })))
+  assert.equal(result.terminal.status, 'failed')
+  assert.equal(result.terminal.error?.code, 'provider_retry_exhausted')
+  assert.equal(attempts, 3)
+})
+
+test('mixed tool batches are forwarded once in provider order for authoritative coordinator scheduling', async () => {
+  const mutationTool = { ...readTool, name: 'write_file', sideEffect: 'workspace_mutation' as const }
+  const commandTool = { ...readTool, name: 'run_command', sideEffect: 'workspace_command' as const }
+  const calls: string[] = []
+  const bodies: Record<string, unknown>[] = []
+  const replies = [
+    {
+      id: 'mixed', model: 'claude-fable-5', stop_reason: 'tool_use', usage: {},
+      content: [
+        { type: 'tool_use', id: 'read-1', name: 'read_file', input: { path: 'a' } },
+        { type: 'tool_use', id: 'read-2', name: 'read_file', input: { path: 'b' } },
+        { type: 'tool_use', id: 'write-1', name: 'write_file', input: { path: 'c' } },
+        { type: 'tool_use', id: 'read-3', name: 'read_file', input: { path: 'd' } },
+        { type: 'tool_use', id: 'command-1', name: 'run_command', input: { path: 'e' } },
+      ],
+    },
+    { id: 'mixed-final', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} },
+  ]
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return Response.json(replies.shift())
+    },
+  })
+  const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+    turnId: 'mixed-tools', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, snapshot), executionContext({
+    toolDefinitions: [readTool, mutationTool, commandTool],
+    async executeTool(call) {
+      calls.push(call.providerCallId)
+      if (call.providerCallId === 'read-1') await new Promise((resolve) => setTimeout(resolve, 10))
+      return { success: true, content: { id: call.providerCallId }, error: null }
+    },
+  })))
+  assert.equal(result.terminal.status, 'completed')
+  assert.deepEqual(calls, ['read-1', 'read-2', 'write-1', 'read-3', 'command-1'])
+  const continuation = bodies[1]?.messages
+  assert.ok(Array.isArray(continuation))
+  const resultMessage = continuation.at(-1) as Record<string, unknown>
+  const blocks = resultMessage.content as Array<Record<string, unknown>>
+  assert.deepEqual(blocks.map((block) => block.tool_use_id), calls)
+})
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} rejects duplicate provider tool-call ids without executing either call`, async () => {
+    let executions = 0
+    const payload = provider === 'claude'
+      ? {
+          id: 'duplicate', model: 'claude-fable-5', stop_reason: 'tool_use', usage: {},
+          content: [
+            { type: 'tool_use', id: 'same', name: 'read_file', input: { path: 'a' } },
+            { type: 'tool_use', id: 'same', name: 'read_file', input: { path: 'b' } },
+          ],
+        }
+      : {
+          id: 'duplicate', model: 'gemini-3.1-pro', usage: {},
+          choices: [{ finish_reason: 'tool_calls', message: { content: null, tool_calls: [
+            { id: 'same', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } },
+            { id: 'same', type: 'function', function: { name: 'read_file', arguments: '{"path":"b"}' } },
+          ] } }],
+        }
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider, proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async () => Response.json(payload),
+    })
+    const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+      turnId: `${provider}-duplicate`, model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, snapshot), executionContext({
+      toolDefinitions: [readTool],
+      async executeTool() { executions += 1; return { success: true, content: {}, error: null } },
+    })))
+    assert.equal(result.terminal.status, 'failed')
+    assert.equal(result.terminal.error?.code, 'provider_duplicate_tool_id')
+    assert.equal(executions, 0)
+  })
+}
+
+test('tool output byte limits produce a bounded provider-contract error', async () => {
+  const bodies: Record<string, unknown>[] = []
+  const replies = [
+    {
+      id: 'large-tool', model: 'claude-fable-5', stop_reason: 'tool_use', usage: {},
+      content: [{ type: 'tool_use', id: 'large', name: 'read_file', input: { path: 'a' } }],
+    },
+    { id: 'large-final', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} },
+  ]
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return Response.json(replies.shift())
+    },
+  })
+  const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+    turnId: 'large-output', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, snapshot), executionContext({
+    toolDefinitions: [readTool],
+    limits: { ...DEFAULT_AGENT_LOOP_LIMITS, toolOutputBytes: 64 },
+    async executeTool() { return { success: true, content: { text: 'x'.repeat(1_000) }, error: null } },
+  })))
+  assert.equal(result.terminal.status, 'completed')
+  const continuation = bodies[1]?.messages
+  assert.ok(Array.isArray(continuation))
+  const resultMessage = continuation.at(-1)
+  assert.ok(resultMessage && typeof resultMessage === 'object')
+  const resultContent = (resultMessage as Record<string, unknown>).content
+  assert.ok(Array.isArray(resultContent))
+  const resultBlock = resultContent[0] as Record<string, unknown>
+  assert.equal(resultBlock.is_error, true)
+  assert.ok(new TextEncoder().encode(String(resultBlock.content)).byteLength <= 64)
+})
