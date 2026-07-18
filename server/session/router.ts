@@ -12,8 +12,8 @@ import type {
 } from './domain.ts'
 import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
 import { WorkspaceRootError } from './workspace-root.ts'
-import type { ConversationService, StartTurnInput } from './service.ts'
-import { GoalStoreError, SessionStoreError } from './store.ts'
+import type { ConversationService, StartTurnInput, SubmitFollowUpInput } from './service.ts'
+import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
 import type { CreateGoalInput, EditGoalInput, ReconcileToolInput } from './store.ts'
 import type { ProviderModelDescriptor } from './model-catalog.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
@@ -326,6 +326,31 @@ function parseStartTurnInput(threadId: string, value: unknown): StartTurnInput {
     clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
     expectedRevision: body.expectedRevision as number,
     input: body.input.map(parseNewItem),
+  }
+}
+
+function parseFollowUpInput(threadId: string, value: unknown): SubmitFollowUpInput {
+  const body = bodyRecord(value)
+  requireOnlyKeys(body, ['clientRequestId', 'expectedTurnId', 'delivery', 'input'])
+  if (body.delivery !== 'steer_or_queue' && body.delivery !== 'next_turn') {
+    throw new RequestValidationError('delivery must be steer_or_queue or next_turn')
+  }
+  if (!Array.isArray(body.input) || body.input.length === 0) {
+    throw new RequestValidationError('input must be a non-empty array')
+  }
+  const input = body.input.map(parseNewItem)
+  if (input.some((item) => item.kind !== 'user_message'
+    || (item.visibility !== undefined && item.visibility !== 'portable')
+    || (item.provider !== undefined && item.provider !== null)
+    || (item.nativeId !== undefined && item.nativeId !== null))) {
+    throw new RequestValidationError('follow-up input must contain only portable provider-neutral user messages')
+  }
+  return {
+    threadId,
+    clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
+    expectedTurnId: requiredNonEmptyString(body, 'expectedTurnId'),
+    delivery: body.delivery,
+    input,
   }
 }
 
@@ -663,6 +688,20 @@ export function createConversationRouter(
     }),
   )
 
+  router.post('/threads/:threadId/follow-ups', route(async (req, res) => {
+    const followUp = await service.submitFollowUp(parseFollowUpInput(pathParam(req, 'threadId'), req.body))
+    res.status(202).json(followUp)
+  }))
+
+  router.delete('/follow-ups/:followUpId', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['expectedRevision'])
+    res.json(service.cancelFollowUp(
+      pathParam(req, 'followUpId'),
+      requiredPositiveInteger(body, 'expectedRevision'),
+    ))
+  }))
+
   router.get(
     '/threads/:threadId/items',
     route((req, res) => {
@@ -779,6 +818,10 @@ export function createConversationRouter(
     }
     if (error instanceof WorkspaceRootError) {
       res.status(error.code === 'workspace_disconnected' ? 409 : 400).json({ code: error.code, error: error.message })
+      return
+    }
+    if (error instanceof FollowUpStoreError) {
+      res.status(error.code === 'follow_up_lease_lost' ? 409 : 400).json({ code: error.code, error: error.message })
       return
     }
     if (error instanceof NativeImportSecurityError) {

@@ -35,6 +35,7 @@ import { uuidV7 } from './domain.ts'
 import type {
   ClaimGoalLeaseInput,
   ClaimFollowUpInput,
+  BeginTurnFromFollowUpInput,
   CloseFollowUpWindowResult,
   CheckpointGoalTurnInput,
   ClearGoalInput,
@@ -71,7 +72,7 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 10
+const SCHEMA_VERSION = 12
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
 const DEFAULT_GOAL_LEASE_MS = 30_000
@@ -634,7 +635,7 @@ export class SqliteSessionStore implements SessionStore {
             request_hash TEXT NOT NULL,
             sequence INTEGER NOT NULL CHECK(sequence >= 1),
             delivery TEXT NOT NULL CHECK(delivery IN ('steer_or_queue','next_turn')),
-            status TEXT NOT NULL CHECK(status IN ('queued','dispatching','consumed','cancelled','stale_goal')),
+            status TEXT NOT NULL CHECK(status IN ('queued','dispatching','consumed','cancelled','stale_goal','delivery_unknown')),
             target_turn_id TEXT REFERENCES turns(id) ON DELETE RESTRICT,
             consumed_turn_id TEXT REFERENCES turns(id) ON DELETE RESTRICT,
             consumed_item_ids_json TEXT NOT NULL DEFAULT '[]'
@@ -707,6 +708,56 @@ export class SqliteSessionStore implements SessionStore {
           .run(10, 'follow-up-turn-boundary', this.#now())
         this.#db.exec('PRAGMA user_version = 10')
         appliedVersion = 10
+      }
+      if (appliedVersion < 11) {
+        this.#db.exec(`
+          DROP INDEX follow_ups_thread_state_sequence;
+          DROP INDEX follow_ups_target_state_sequence;
+          DROP INDEX follow_ups_expired_dispatch;
+          ALTER TABLE follow_ups RENAME TO follow_ups_v10;
+          CREATE TABLE follow_ups (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            client_request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK(sequence>=1), after_turn_sequence INTEGER NOT NULL CHECK(after_turn_sequence>=0),
+            delivery TEXT NOT NULL CHECK(delivery IN ('steer_or_queue','next_turn')),
+            status TEXT NOT NULL CHECK(status IN ('queued','dispatching','consumed','cancelled','stale_goal','delivery_unknown')),
+            target_turn_id TEXT REFERENCES turns(id) ON DELETE RESTRICT,
+            consumed_turn_id TEXT REFERENCES turns(id) ON DELETE RESTRICT,
+            consumed_item_ids_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(consumed_item_ids_json) AND json_type(consumed_item_ids_json)='array'),
+            goal_id TEXT, goal_revision INTEGER CHECK(goal_revision IS NULL OR goal_revision>=1),
+            input_json TEXT NOT NULL CHECK(json_valid(input_json) AND json_type(input_json)='array'),
+            dispatch_owner TEXT, lease_expires_at TEXT, revision INTEGER NOT NULL DEFAULT 1 CHECK(revision>=1),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, consumed_at TEXT,
+            UNIQUE(thread_id,client_request_id), UNIQUE(thread_id,sequence),
+            CHECK((goal_id IS NULL)=(goal_revision IS NULL)),
+            CHECK((status='dispatching' AND dispatch_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+              OR (status!='dispatching' AND dispatch_owner IS NULL AND lease_expires_at IS NULL)),
+            CHECK((status='consumed' AND consumed_turn_id IS NOT NULL AND consumed_at IS NOT NULL AND json_array_length(consumed_item_ids_json)>0)
+              OR (status!='consumed' AND consumed_turn_id IS NULL AND consumed_at IS NULL AND json_array_length(consumed_item_ids_json)=0))
+          ) STRICT;
+          INSERT INTO follow_ups SELECT * FROM follow_ups_v10;
+          DROP TABLE follow_ups_v10;
+          CREATE INDEX follow_ups_thread_state_sequence ON follow_ups(thread_id,status,sequence);
+          CREATE INDEX follow_ups_target_state_sequence ON follow_ups(target_turn_id,status,sequence);
+          CREATE INDEX follow_ups_expired_dispatch ON follow_ups(lease_expires_at,id) WHERE status='dispatching';
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(11, 'follow-up-delivery-unknown', this.#now())
+        this.#db.exec('PRAGMA user_version = 11')
+        appliedVersion = 11
+      }
+      if (appliedVersion < 12) {
+        this.#db.exec(`
+          ALTER TABLE follow_ups ADD COLUMN dispatch_kind TEXT
+            CHECK(dispatch_kind IS NULL OR dispatch_kind IN ('steer','next_turn'));
+          UPDATE follow_ups SET dispatch_kind=CASE WHEN target_turn_id IS NULL THEN 'next_turn' ELSE 'steer' END
+            WHERE status='dispatching';
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(12, 'follow-up-dispatch-uncertainty', this.#now())
+        this.#db.exec('PRAGMA user_version = 12')
+        appliedVersion = 12
       }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
@@ -1103,6 +1154,79 @@ export class SqliteSessionStore implements SessionStore {
     return row ? this.#turn(row) : null
   }
 
+  beginTurnFromFollowUp(input: BeginTurnFromFollowUpInput): BeginTurnResult {
+    if (!input.ownerId) throw new FollowUpStoreError('invalid_follow_up', 'Follow-up lease owner must not be empty')
+    const result = this.#transaction<BeginTurnResult | null>('IMMEDIATE', () => {
+      const followRow = this.#optional(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), input.followUpId)
+      if (!followRow) throw new SessionStoreError('not_found', `Follow-up not found: ${input.followUpId}`)
+      if (text(followRow, 'status') !== 'dispatching' || nullableText(followRow, 'dispatch_owner') !== input.ownerId) {
+        throw new FollowUpStoreError('follow_up_lease_lost', 'Follow-up next-turn claim is no longer owned')
+      }
+      const observedNow = this.#now()
+      if ((nullableText(followRow, 'lease_expires_at') ?? '') <= observedNow) {
+        throw new FollowUpStoreError('follow_up_lease_lost', 'Follow-up next-turn claim expired before turn creation')
+      }
+      if (text(followRow, 'thread_id') !== input.threadId) {
+        throw new FollowUpStoreError('invalid_follow_up', 'Follow-up claim belongs to a different thread')
+      }
+      if (nullableText(followRow, 'target_turn_id') !== null) {
+        throw new FollowUpStoreError('invalid_follow_up', 'Next-turn follow-up still targets an active turn')
+      }
+      const thread = this.getThread(text(followRow, 'thread_id'))
+      if (!thread) throw new SessionStoreError('not_found', 'Follow-up thread was removed')
+      const session = this.getSession(thread.sessionId)
+      if (!session || session.archivedAt) throw new SessionStoreError('session_archived', 'Follow-up session is archived')
+      if (thread.status !== 'idle') throw new SessionStoreError('turn_not_running', 'Thread already has an active turn')
+      const turnSequence = integer(this.#one(this.#db.prepare(
+        'SELECT COALESCE(MAX(sequence),0)+1 AS next_sequence FROM turns WHERE thread_id=?',
+      ), thread.id), 'next_sequence')
+      if (turnSequence <= integer(followRow, 'after_turn_sequence')) {
+        throw new FollowUpStoreError('invalid_follow_up', 'Follow-up requires a later canonical turn')
+      }
+      const goalId = nullableText(followRow, 'goal_id')
+      const goalRevision = followRow.goal_revision === null ? null : integer(followRow, 'goal_revision')
+      if (goalId !== null && goalRevision !== null && !this.#goalScopeMatches(thread.id, goalId, goalRevision)) {
+        this.#setFollowUpTerminal(followRow, 'stale_goal', this.#now())
+        return null
+      }
+      const now = observedNow
+      const turnId = this.#idFactory()
+      const executionId = this.#idFactory()
+      const followUp = this.#followUp(followRow)
+      this.#db.prepare(`
+        INSERT INTO turns(id,thread_id,sequence,provider,model,effort,status,client_request_id,request_hash,started_at,goal_id,goal_revision)
+        VALUES (?,?,?,?,?,?,'running',?,?,?,?,?)
+      `).run(turnId, thread.id, turnSequence, input.provider, input.model, input.effort ?? null,
+        `follow-up:${followUp.id}`, followUp.requestHash, now, goalId, goalRevision)
+      this.#db.prepare(`
+        INSERT INTO executions(id,session_id,thread_id,turn_id,parent_execution_id,spawn_item_id,kind,provider,model,adapter_version,status,policy_snapshot_json,budget_json,usage_json,lease_expires_at,started_at)
+        VALUES (?,?,?,?,NULL,NULL,'root_turn',?,?,?,'running',?,?,?,?,?)
+      `).run(executionId, thread.sessionId, thread.id, turnId, input.provider, input.model, input.adapterVersion,
+        canonicalJson(input.policySnapshot), canonicalJson(input.budget ?? {}), canonicalJson({}), input.leaseExpiresAt ?? null, now)
+      const items = this.#appendItems(thread.sessionId, thread.id, turnId, null, followUp.input, null, now)
+      this.#db.prepare(`
+        UPDATE follow_ups SET status='consumed',consumed_turn_id=?,consumed_item_ids_json=?,dispatch_owner=NULL,
+          lease_expires_at=NULL,dispatch_kind=NULL,revision=revision+1,updated_at=?,consumed_at=? WHERE id=?
+      `).run(turnId, canonicalJson(items.map((item) => item.id)), now, now, followUp.id)
+      this.#db.prepare("UPDATE threads SET status='running',revision=revision+1,updated_at=? WHERE id=?").run(now, thread.id)
+      this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, thread.sessionId)
+      if (goalId) this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(goalId)
+      this.#appendStreamEvent(thread.sessionId, thread.id, turnId, 'turn_started', {
+        turnId, executionId, provider: input.provider, model: input.model, effort: input.effort ?? null,
+        itemIds: items.map((item) => item.id), followUpId: followUp.id,
+      }, now)
+      this.#appendFollowUpChanged(this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), followUp.id)), now)
+      return {
+        turn: this.getTurn(turnId) as CanonicalTurn,
+        execution: this.#execution(this.#one(this.#db.prepare('SELECT * FROM executions WHERE id=?'), executionId)),
+        initialItems: items,
+        duplicate: false,
+      }
+    })
+    if (!result) throw new GoalStoreError('stale_goal_revision', 'Follow-up Goal revision changed before delivery')
+    return result
+  }
+
   setTurnActivity(
     turnId: TurnId,
     status: Extract<CanonicalTurn['status'], 'running' | 'waiting_tool'>,
@@ -1355,6 +1479,13 @@ export class SqliteSessionStore implements SessionStore {
       .map((row) => this.#followUp(row))
   }
 
+  getFollowUpByClientRequest(threadId: string, clientRequestId: string): CanonicalFollowUp | null {
+    const row = this.#optional(this.#db.prepare(
+      'SELECT * FROM follow_ups WHERE thread_id=? AND client_request_id=?',
+    ), threadId, clientRequestId)
+    return row ? this.#followUp(row) : null
+  }
+
   claimFollowUp(input: ClaimFollowUpInput): CanonicalFollowUp | null {
     const duration = validateFollowUpLeaseDuration(input.leaseDurationMs ?? DEFAULT_FOLLOW_UP_LEASE_MS)
     if (!input.ownerId) throw new FollowUpStoreError('invalid_follow_up', 'Follow-up lease owner must not be empty')
@@ -1383,9 +1514,9 @@ export class SqliteSessionStore implements SessionStore {
       const now = this.#now()
       const expiresAt = new Date(Date.parse(now) + duration).toISOString()
       const changed = this.#db.prepare(`
-        UPDATE follow_ups SET status='dispatching',dispatch_owner=?,lease_expires_at=?,
+        UPDATE follow_ups SET status='dispatching',dispatch_owner=?,lease_expires_at=?,dispatch_kind=?,
           revision=revision+1,updated_at=? WHERE id=? AND status='queued'
-      `).run(input.ownerId, expiresAt, now, text(row, 'id')).changes
+      `).run(input.ownerId, expiresAt, input.purpose, now, text(row, 'id')).changes
       if (changed !== 1) return null
       const claimed = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
       this.#appendFollowUpChanged(claimed, now)
@@ -1445,7 +1576,7 @@ export class SqliteSessionStore implements SessionStore {
         null, followUp.input, null, now)
       this.#db.prepare(`
         UPDATE follow_ups SET status='consumed',consumed_turn_id=?,consumed_item_ids_json=?,
-          dispatch_owner=NULL,lease_expires_at=NULL,revision=revision+1,updated_at=?,consumed_at=?
+          dispatch_owner=NULL,lease_expires_at=NULL,dispatch_kind=NULL,revision=revision+1,updated_at=?,consumed_at=?
         WHERE id=? AND status='dispatching' AND dispatch_owner=?
       `).run(input.turnId, canonicalJson(items.map((item) => item.id)), now, now, followUp.id, input.ownerId)
       const consumed = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), followUp.id))
@@ -1495,6 +1626,11 @@ export class SqliteSessionStore implements SessionStore {
       let recovered = 0
       for (const row of rows) {
         const now = this.#now()
+        if (nullableText(row, 'dispatch_kind') === 'steer') {
+          this.#setFollowUpTerminal(row, 'delivery_unknown', now)
+          recovered += 1
+          continue
+        }
         const goalId = nullableText(row, 'goal_id')
         const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
         if (goalId !== null && goalRevision !== null
@@ -1507,7 +1643,7 @@ export class SqliteSessionStore implements SessionStore {
           const retainedTarget = target && ACTIVE_TURN_STATUSES.has(text(target, 'status'))
             && text(target, 'follow_up_window') === 'accepting' ? targetId : null
           this.#db.prepare(`
-            UPDATE follow_ups SET status='queued',target_turn_id=?,dispatch_owner=NULL,lease_expires_at=NULL,
+            UPDATE follow_ups SET status='queued',target_turn_id=?,dispatch_owner=NULL,lease_expires_at=NULL,dispatch_kind=NULL,
               revision=revision+1,updated_at=? WHERE id=? AND status='dispatching'
           `).run(retainedTarget, now, text(row, 'id'))
           const queued = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
@@ -1516,6 +1652,43 @@ export class SqliteSessionStore implements SessionStore {
         recovered += 1
       }
       return recovered
+    })
+  }
+
+  cancelFollowUp(followUpId: string, expectedRevision: number): CanonicalFollowUp {
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), followUpId)
+      if (!row) throw new SessionStoreError('not_found', `Follow-up not found: ${followUpId}`)
+      if (integer(row, 'revision') !== expectedRevision) {
+        throw new SessionStoreError('revision_conflict', 'Follow-up revision changed after it was observed')
+      }
+      if (text(row, 'status') !== 'queued' && text(row, 'status') !== 'stale_goal') {
+        throw new FollowUpStoreError('invalid_follow_up', 'Only queued or stale follow-ups can be cancelled')
+      }
+      return this.#setFollowUpTerminal(row, 'cancelled', this.#now())
+    })
+  }
+
+  markFollowUpDeliveryUnknown(followUpId: string, ownerId: string): CanonicalFollowUp {
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), followUpId)
+      if (!row) throw new SessionStoreError('not_found', `Follow-up not found: ${followUpId}`)
+      const dispatchOwned = text(row, 'status') === 'dispatching' && nullableText(row, 'dispatch_owner') === ownerId
+      if (!dispatchOwned && text(row, 'status') !== 'queued') {
+        throw new FollowUpStoreError('follow_up_lease_lost', 'Follow-up delivery claim is no longer owned')
+      }
+      return this.#setFollowUpTerminal(row, 'delivery_unknown', this.#now())
+    })
+  }
+
+  markTurnFollowUpsDeliveryUnknown(turnId: string): number {
+    return this.#transaction('IMMEDIATE', () => {
+      const rows = this.#all(this.#db.prepare(`
+        SELECT * FROM follow_ups WHERE target_turn_id=? AND status='dispatching' ORDER BY sequence
+      `), turnId)
+      const now = this.#now()
+      for (const row of rows) this.#setFollowUpTerminal(row, 'delivery_unknown', now)
+      return rows.length
     })
   }
 
@@ -2577,11 +2750,11 @@ export class SqliteSessionStore implements SessionStore {
 
   #setFollowUpTerminal(
     row: SqlRow,
-    status: Extract<CanonicalFollowUp['status'], 'cancelled' | 'stale_goal'>,
+    status: Extract<CanonicalFollowUp['status'], 'cancelled' | 'stale_goal' | 'delivery_unknown'>,
     now: string,
   ): CanonicalFollowUp {
     this.#db.prepare(`
-      UPDATE follow_ups SET status=?,target_turn_id=NULL,dispatch_owner=NULL,lease_expires_at=NULL,
+      UPDATE follow_ups SET status=?,target_turn_id=NULL,dispatch_owner=NULL,lease_expires_at=NULL,dispatch_kind=NULL,
         revision=revision+1,updated_at=? WHERE id=?
     `).run(status, now, text(row, 'id'))
     const followUp = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
@@ -2607,7 +2780,7 @@ export class SqliteSessionStore implements SessionStore {
       }
     }
     this.#db.prepare(`
-      UPDATE follow_ups SET status='queued',target_turn_id=?,dispatch_owner=NULL,lease_expires_at=NULL,
+      UPDATE follow_ups SET status='queued',target_turn_id=?,dispatch_owner=NULL,lease_expires_at=NULL,dispatch_kind=NULL,
         revision=revision+1,updated_at=? WHERE id=? AND status='dispatching' AND dispatch_owner=?
     `).run(targetTurnId, now, text(row, 'id'), ownerId)
     const queued = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
@@ -2638,6 +2811,10 @@ export class SqliteSessionStore implements SessionStore {
       SELECT * FROM follow_ups WHERE target_turn_id=? AND status='dispatching' ORDER BY sequence
     `), turnId)
     for (const row of rows) {
+      if (nullableText(row, 'dispatch_kind') === 'steer') {
+        this.#setFollowUpTerminal(row, 'delivery_unknown', now)
+        continue
+      }
       const goalId = nullableText(row, 'goal_id')
       const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
       if (goalId !== null && goalRevision !== null
@@ -2646,7 +2823,7 @@ export class SqliteSessionStore implements SessionStore {
         continue
       }
       this.#db.prepare(`
-        UPDATE follow_ups SET status='queued',target_turn_id=NULL,dispatch_owner=NULL,lease_expires_at=NULL,
+        UPDATE follow_ups SET status='queued',target_turn_id=NULL,dispatch_owner=NULL,lease_expires_at=NULL,dispatch_kind=NULL,
           revision=revision+1,updated_at=? WHERE id=? AND status='dispatching'
       `).run(now, text(row, 'id'))
       const queued = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))

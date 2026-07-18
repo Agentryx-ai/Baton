@@ -41,6 +41,12 @@ function normalizedItems(adapter: StatelessHttpCanonicalAdapter, events: Array<{
   return events.flatMap((event) => adapter.normalize(event))
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((settle) => { resolve = settle })
+  return { promise, resolve }
+}
+
 function snapshotWithPriorTurn(items: NewCanonicalItem[]): ThreadSnapshot {
   return {
     ...snapshot,
@@ -810,6 +816,214 @@ test('Gemini re-executes durable assistant tool calls and tool results without f
     { role: 'assistant', content: 'done' },
     { role: 'user', content: 'next' },
   ])
+})
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} accepts FIFO live follow-ups at an end boundary only after starting the next request`, async () => {
+    const firstResponse = deferred<Response>()
+    const bodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider, proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        if (bodies.length === 1) return firstResponse.promise
+        return Response.json(provider === 'claude'
+          ? {
+              id: 'second', model: 'claude-fable-5', stop_reason: 'end_turn',
+              content: [{ type: 'text', text: 'second answer' }], usage: {},
+            }
+          : {
+              id: 'second', model: 'gemini-3.1-pro',
+              choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'second answer' } }],
+              usage: {},
+            })
+      },
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `${provider}-live-end`,
+      model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'initial' } }],
+    }, { ...snapshot, items: [] }), executionContext())
+    assert.ok(execution.steer)
+    const collected = collectExecution(adapter, execution)
+    const firstSteer = execution.steer({
+      followUpId: 'follow-1', text: 'first constraint', expectedTurnId: `${provider}-live-end`,
+    })
+    const secondSteer = execution.steer({
+      followUpId: 'follow-2', text: 'second constraint', expectedTurnId: `${provider}-live-end`,
+    })
+    firstResponse.resolve(Response.json(provider === 'claude'
+      ? {
+          id: 'first', model: 'claude-fable-5', stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'first answer' }], usage: {},
+        }
+      : {
+          id: 'first', model: 'gemini-3.1-pro',
+          choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'first answer' } }],
+          usage: {},
+        }))
+
+    assert.deepEqual(await firstSteer, { status: 'accepted' })
+    assert.equal(bodies.length, 2, 'accepted must not resolve before the next fetch starts')
+    assert.deepEqual(await secondSteer, { status: 'accepted' })
+    const result = await collected
+    assert.equal(result.terminal.status, 'completed')
+    const continuationBody = bodies[1]
+    assert.ok(continuationBody)
+    assert.deepEqual((continuationBody.messages as unknown[]).slice(-3), [
+      provider === 'claude'
+        ? { role: 'assistant', content: [{ type: 'text', text: 'first answer' }] }
+        : { role: 'assistant', content: 'first answer' },
+      { role: 'user', content: 'first constraint' },
+      { role: 'user', content: 'second constraint' },
+    ])
+    const items = normalizedItems(adapter, result.events)
+    const privateState = items.find((item) => item.visibility === 'provider_private')
+    assert.ok(privateState)
+    assert.deepEqual((privateState.payload.liveFollowUps as unknown[]).map((entry) =>
+      (entry as { followUpId: string }).followUpId), ['follow-1', 'follow-2'])
+    assert.equal(items.filter((item) => item.kind === 'assistant_message'
+      && item.payload.text === 'first answer').length, 1)
+
+    if (provider === 'claude') {
+      const replaySnapshot = snapshotWithPriorTurn(items)
+      const last = replaySnapshot.items.at(-1)!
+      replaySnapshot.items.push(
+        { ...last, id: 'consumed-follow-1', sequence: last.sequence + 1, kind: 'user_message', visibility: 'portable', provider: null, nativeId: null, payload: { text: 'first constraint' } },
+        { ...last, id: 'consumed-follow-2', sequence: last.sequence + 2, kind: 'user_message', visibility: 'portable', provider: null, nativeId: null, payload: { text: 'second constraint' } },
+      )
+      const replay = adapter.materialize({
+        turnId: 'later', model: 'claude-fable-5',
+        input: [{ kind: 'user_message', payload: { text: 'later' } }],
+      }, replaySnapshot)
+      const replayMessages = (replay.body as { messages: Array<Record<string, unknown>> }).messages
+      assert.equal(replayMessages.filter((message) => JSON.stringify(message.content).includes('first answer')).length, 1)
+      assert.equal(replayMessages.filter((message) => message.content === 'first constraint').length, 1)
+      assert.equal(replayMessages.filter((message) => message.content === 'second constraint').length, 1)
+    }
+  })
+}
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} appends FIFO live follow-ups after every tool result`, async () => {
+    const firstResponse = deferred<Response>()
+    const bodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider, proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        if (bodies.length === 1) return firstResponse.promise
+        return Response.json(provider === 'claude'
+          ? { id: 'final', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} }
+          : { id: 'final', model: 'gemini-3.1-pro', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }], usage: {} })
+      },
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `${provider}-live-tool`, model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'inspect' } }],
+    }, { ...snapshot, items: [] }), executionContext({
+      toolDefinitions: [readTool],
+      async executeTool() { return { success: true, content: { text: 'contents' }, error: null } },
+    }))
+    const collected = collectExecution(adapter, execution)
+    const steers = ['one', 'two'].map((text, index) => execution.steer!({
+      followUpId: `tool-follow-${index}`, text, expectedTurnId: `${provider}-live-tool`,
+    }))
+    firstResponse.resolve(Response.json(provider === 'claude'
+      ? {
+          id: 'tool', model: 'claude-fable-5', stop_reason: 'tool_use', usage: {},
+          content: [{ type: 'tool_use', id: 'call', name: 'read_file', input: { path: 'README.md' } }],
+        }
+      : {
+          id: 'tool', model: 'gemini-3.1-pro', usage: {},
+          choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
+            tool_calls: [{ id: 'call', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }] } }],
+        }))
+    assert.deepEqual(await Promise.all(steers), [{ status: 'accepted' }, { status: 'accepted' }])
+    assert.equal(bodies.length, 2)
+    const messages = bodies[1]?.messages as Array<Record<string, unknown>>
+    assert.deepEqual(messages.slice(-2).map((message) => message.content), ['one', 'two'])
+    const toolResultIndex = messages.findLastIndex((message) => provider === 'claude'
+      ? Array.isArray(message.content) && (message.content as Array<Record<string, unknown>>)[0]?.type === 'tool_result'
+      : message.role === 'tool')
+    assert.ok(toolResultIndex >= 0)
+    assert.equal(messages[toolResultIndex + 1]?.content, 'one')
+    assert.equal((await collected).terminal.status, 'completed')
+  })
+}
+
+for (const stopReason of ['pause_turn', 'max_tokens'] as const) {
+  test(`Claude orders live steer after the ${stopReason} continuation protocol`, async () => {
+    const firstResponse = deferred<Response>()
+    const bodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        if (bodies.length === 1) return firstResponse.promise
+        return Response.json({ id: 'final', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} })
+      },
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `claude-${stopReason}`, model: 'claude-fable-5',
+      input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, { ...snapshot, items: [] }), executionContext())
+    const collected = collectExecution(adapter, execution)
+    const steer = execution.steer!({ followUpId: 'live', text: 'live constraint', expectedTurnId: `claude-${stopReason}` })
+    firstResponse.resolve(Response.json({
+      id: 'boundary', model: 'claude-fable-5', stop_reason: stopReason,
+      content: [{ type: 'text', text: 'boundary text' }], usage: {},
+    }))
+    assert.deepEqual(await steer, { status: 'accepted' })
+    const continuationBody = bodies[1]
+    assert.ok(continuationBody)
+    const tail = (continuationBody.messages as Array<Record<string, unknown>>)
+      .slice(stopReason === 'max_tokens' ? -3 : -2)
+    assert.deepEqual(tail.map((message) => message.content), stopReason === 'max_tokens'
+      ? [[{ type: 'text', text: 'boundary text' }], 'Please continue from where you left off.', 'live constraint']
+      : [[{ type: 'text', text: 'boundary text' }], 'live constraint'])
+    assert.equal((await collected).terminal.status, 'completed')
+  })
+}
+
+test('stateless steer closes at the final round and across cancel, dispose, and terminal races', async () => {
+  const finalGate = deferred<Response>()
+  let finalRequests = 0
+  const finalAdapter = new StatelessHttpCanonicalAdapter({
+    provider: 'gemini', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async () => { finalRequests += 1; return finalGate.promise },
+  })
+  const finalExecution = await finalAdapter.execute(finalAdapter.materialize({
+    turnId: 'final-round', model: 'gemini-3.1-pro', input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, { ...snapshot, items: [] }), executionContext({ limits: { ...DEFAULT_AGENT_LOOP_LIMITS, maxModelRoundTrips: 1 } }))
+  const finalCollected = collectExecution(finalAdapter, finalExecution)
+  const finalSteer = finalExecution.steer!({ followUpId: 'final', text: 'too late', expectedTurnId: 'final-round' })
+  finalGate.resolve(Response.json({ id: 'final', model: 'gemini-3.1-pro', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }], usage: {} }))
+  assert.deepEqual(await finalSteer, { status: 'closed' })
+  assert.equal((await finalCollected).terminal.status, 'completed')
+  assert.equal(finalRequests, 1)
+  assert.deepEqual(await finalExecution.steer!({ followUpId: 'terminal', text: 'late', expectedTurnId: 'final-round' }), { status: 'closed' })
+
+  for (const action of ['cancel', 'dispose'] as const) {
+    const gate = deferred<Response>()
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async () => gate.promise,
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `race-${action}`, model: 'claude-fable-5', input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, { ...snapshot, items: [] }), executionContext())
+    const collected = collectExecution(adapter, execution)
+    const steer = execution.steer!({ followUpId: action, text: 'pending', expectedTurnId: `race-${action}` })
+    await execution[action]()
+    assert.deepEqual(await steer, { status: 'closed' })
+    if (action === 'dispose') {
+      gate.resolve(Response.json({ id: 'done', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} }))
+      assert.equal((await collected).terminal.status, 'completed')
+    } else {
+      assert.equal((await collected).terminal.status, 'cancelled')
+    }
+  }
 })
 
 for (const provider of ['claude', 'gemini'] as const) {

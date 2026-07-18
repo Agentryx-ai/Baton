@@ -2,6 +2,7 @@ import type {
   BeginTurnResult,
   CanonicalItem,
   CanonicalGoal,
+  CanonicalFollowUp,
   CanonicalProvider,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -47,6 +48,14 @@ export interface WorkspaceMutationInput {
   cwd: string
 }
 
+export interface SubmitFollowUpInput {
+  threadId: ThreadId
+  clientRequestId: string
+  expectedTurnId: TurnId
+  delivery: 'steer_or_queue' | 'next_turn'
+  input: NewCanonicalItem[]
+}
+
 export interface ConversationService {
   createSession(input: CreateSessionInput): CanonicalSession
   listSessions(scope?: SessionListScope): CanonicalSession[]
@@ -67,6 +76,8 @@ export interface ConversationService {
   clearGoal(input: ClearGoalInput): Promise<void>
 
   startTurn(input: StartTurnInput): Promise<BeginTurnResult>
+  submitFollowUp(input: SubmitFollowUpInput): Promise<{ followUp: CanonicalFollowUp; duplicate: boolean }>
+  cancelFollowUp(followUpId: string, expectedRevision: number): CanonicalFollowUp
   cancelTurn(turnId: TurnId): Promise<void>
   reconcileTool(input: ReconcileToolInput): ReconcileToolResult
 

@@ -8,6 +8,7 @@ import type {
   BeginTurnResult,
   CanonicalExecution,
   CanonicalGoal,
+  CanonicalFollowUp,
   CanonicalItem,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -21,7 +22,7 @@ import {
   type ConversationRouter,
   type ConversationRouterOptions,
 } from './router.ts'
-import type { ConversationService, StartTurnInput, UserGoalStatusInput } from './service.ts'
+import type { ConversationService, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type {
   ClearGoalInput,
@@ -155,6 +156,7 @@ class TestConversationService implements ConversationService {
   listedScope: SessionListScope | null = null
   workspaceInput: { sessionId: string; expectedRevision: number; cwd: string | null } | null = null
   goal: CanonicalGoal | null = null
+  followUpInput: SubmitFollowUpInput | null = null
 
   createSession(input: CreateSessionInput): CanonicalSession {
     this.createdInput = input
@@ -204,6 +206,30 @@ class TestConversationService implements ConversationService {
   getSnapshot(threadId: string): ThreadSnapshot | null {
     if (threadId !== thread.id) return null
     return { session, thread, turns: [turn], items: this.items, bindings: [] }
+  }
+
+  async submitFollowUp(input: SubmitFollowUpInput): Promise<{ followUp: CanonicalFollowUp; duplicate: boolean }> {
+    this.followUpInput = input
+    return {
+      duplicate: false,
+      followUp: {
+        id: 'follow-up-1', sessionId: session.id, threadId: input.threadId,
+        clientRequestId: input.clientRequestId, requestHash: 'hash', sequence: 1, afterTurnSequence: 1,
+        delivery: input.delivery, status: 'queued', targetTurnId: input.expectedTurnId,
+        consumedTurnId: null, consumedItemIds: [], scope: { kind: 'conversation' }, input: input.input,
+        dispatchOwner: null, leaseExpiresAt: null, revision: 1, createdAt: now, updatedAt: now, consumedAt: null,
+      },
+    }
+  }
+
+  cancelFollowUp(followUpId: string, expectedRevision: number): CanonicalFollowUp {
+    if (followUpId !== 'follow-up-1' || expectedRevision !== 1) throw new SessionStoreError('revision_conflict', 'stale')
+    return {
+      id: followUpId, sessionId: session.id, threadId: thread.id, clientRequestId: 'request', requestHash: 'hash',
+      sequence: 1, afterTurnSequence: 1, delivery: 'next_turn', status: 'cancelled', targetTurnId: null,
+      consumedTurnId: null, consumedItemIds: [], scope: { kind: 'conversation' }, input: [{ kind: 'user_message', payload: { text: 'x' } }],
+      dispatchOwner: null, leaseExpiresAt: null, revision: 2, createdAt: now, updatedAt: now, consumedAt: null,
+    }
   }
 
   forkThread(input: ForkThreadInput): CanonicalThread {
@@ -616,6 +642,32 @@ test('fork, turn, item cursor, and cancellation routes pass validated contracts'
         },
       ],
     })
+
+    const followed = await fetch(`${baseUrl}/threads/${thread.id}/follow-ups`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientRequestId: 'follow-1', expectedTurnId: turn.id, delivery: 'steer_or_queue',
+        input: [{ kind: 'user_message', payload: { text: 'more' } }],
+      }),
+    })
+    assert.equal(followed.status, 202)
+    assert.equal(((await json(followed)).followUp as { id: string }).id, 'follow-up-1')
+    assert.equal(service.followUpInput?.expectedTurnId, turn.id)
+    const followCancelled = await fetch(`${baseUrl}/follow-ups/follow-up-1`, {
+      method: 'DELETE', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: 1 }),
+    })
+    assert.equal(followCancelled.status, 200)
+    assert.equal((await json(followCancelled)).status, 'cancelled')
+
+    const invalidFollow = await fetch(`${baseUrl}/threads/${thread.id}/follow-ups`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientRequestId: 'bad', expectedTurnId: turn.id, delivery: 'steer_or_queue',
+        input: [{ kind: 'assistant_message', payload: { text: 'no' } }],
+      }),
+    })
+    assert.equal(invalidFollow.status, 400)
 
     const listed = await fetch(`${baseUrl}/threads/${thread.id}/items?after=0`)
     assert.equal(listed.status, 200)

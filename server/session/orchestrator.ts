@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { AdapterRegistry } from './adapter-registry.ts'
-import type { ProviderBindingPatch } from './adapter.ts'
+import type { ProviderBindingPatch, ProviderTurnExecution } from './adapter.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type {
   AgentToolDefinition,
@@ -8,6 +8,7 @@ import type {
   AgentToolResult,
   BeginTurnResult,
   CanonicalGoal,
+  CanonicalFollowUp,
   CanonicalItem,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -23,7 +24,7 @@ import type {
 import { ConversationEventHub } from './event-hub.ts'
 import { GoalRuntime, type GoalContinuationRequest } from './goal-runtime.ts'
 import { goalContinuationPrompt } from './goal-prompts.ts'
-import type { ConversationService, StartTurnInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
+import type { ConversationService, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
 import type {
   ClearGoalInput,
   CreateGoalInput,
@@ -35,6 +36,7 @@ import type {
   ReconcileToolResult,
   SessionListScope,
   SessionStore,
+  BeginTurnFromFollowUpInput,
 } from './store.ts'
 import { GoalStoreError, SessionStoreError } from './store.ts'
 import {
@@ -51,6 +53,9 @@ interface ActiveTurn {
   completion: Promise<void>
   turn: CanonicalTurn
   latestTokensUsed: number
+  execution: ProviderTurnExecution | null
+  pump: Promise<void>
+  closing: boolean
 }
 
 const NO_WORKSPACE_RUNTIME: ToolRuntime = Object.freeze({
@@ -72,6 +77,11 @@ export class TurnOrchestrator implements ConversationService {
   private readonly goalRuntime: GoalRuntime
   private readonly active = new Map<TurnId, ActiveTurn>()
   private closed = false
+  private readonly followUpOwner = `follow-up-${process.pid}-${Date.now()}`
+  private readonly followUpRetryCounts = new Map<ThreadId, number>()
+  private readonly followUpRetryTimers = new Map<ThreadId, ReturnType<typeof setTimeout>>()
+  private readonly followUpDrains = new Map<ThreadId, Promise<boolean>>()
+  private readonly shutdownController = new AbortController()
 
   constructor(
     store: SessionStore,
@@ -197,6 +207,196 @@ export class TurnOrchestrator implements ConversationService {
     return this.startTurnInternal(input, null, false)
   }
 
+  async submitFollowUp(input: SubmitFollowUpInput): Promise<{ followUp: CanonicalFollowUp; duplicate: boolean }> {
+    const requestHash = createHash('sha256').update(stableJson({
+      expectedTurnId: input.expectedTurnId, delivery: input.delivery, input: input.input,
+    })).digest('hex')
+    const existing = this.store.getFollowUpByClientRequest(input.threadId, input.clientRequestId)
+    if (existing) {
+      const replay = this.store.enqueueFollowUp({
+        threadId: input.threadId, clientRequestId: input.clientRequestId, requestHash,
+        delivery: input.delivery, targetTurnId: input.delivery === 'steer_or_queue' ? input.expectedTurnId : null,
+        scope: existing.scope, input: input.input,
+      })
+      return replay
+    }
+    const turn = this.store.getTurn(input.expectedTurnId)
+    if (!turn || turn.threadId !== input.threadId || isTerminal(turn.status)) {
+      throw new SessionStoreError('turn_not_running', 'Expected turn is not active in this thread')
+    }
+    const goal = this.store.getGoal(input.threadId)
+    const goalMatchesTarget = goal?.status === 'active'
+      ? turn.goalId === goal.id && turn.goalRevision === goal.revision
+      : turn.goalId === null && turn.goalRevision === null
+    const targetTurnId = input.delivery === 'steer_or_queue' && goalMatchesTarget
+      ? input.expectedTurnId
+      : null
+    const result = this.store.enqueueFollowUp({
+      threadId: input.threadId,
+      clientRequestId: input.clientRequestId,
+      requestHash,
+      delivery: input.delivery,
+      targetTurnId,
+      scope: goal?.status === 'active'
+        ? { kind: 'goal', goalId: goal.id, revision: goal.revision }
+        : { kind: 'conversation' },
+      input: input.input,
+    })
+    this.events.publish(input.threadId)
+    const active = this.active.get(input.expectedTurnId)
+    if (active) this.pumpActiveFollowUps(active)
+    return result
+  }
+
+  cancelFollowUp(followUpId: string, expectedRevision: number): CanonicalFollowUp {
+    const followUp = this.store.cancelFollowUp(followUpId, expectedRevision)
+    this.events.publish(followUp.threadId)
+    return followUp
+  }
+
+  private pumpActiveFollowUps(active: ActiveTurn): void {
+    active.pump = active.pump.then(async () => {
+      while (!active.closing && active.execution) {
+        const claimed = this.store.claimFollowUp({
+          threadId: active.turn.threadId,
+          ownerId: this.followUpOwner,
+          purpose: 'steer',
+          targetTurnId: active.turn.id,
+        })
+        if (!claimed) return
+        try {
+          const outcome = active.execution.steer
+            ? await active.execution.steer({
+                followUpId: claimed.id,
+                text: followUpText(claimed),
+                expectedTurnId: active.turn.id,
+              })
+            : { status: 'unsupported' as const }
+          if (outcome.status === 'accepted') {
+            try {
+              const consumed = this.store.consumeFollowUp({
+                followUpId: claimed.id, ownerId: this.followUpOwner, turnId: active.turn.id,
+              })
+              if (consumed.status !== 'consumed') {
+                this.store.markFollowUpDeliveryUnknown(claimed.id, this.followUpOwner)
+                active.controller.abort(new Error('Accepted follow-up could not be committed canonically'))
+                return
+              }
+            } catch (error) {
+              this.store.markFollowUpDeliveryUnknown(claimed.id, this.followUpOwner)
+              active.controller.abort(error)
+              return
+            }
+          } else {
+            this.store.requeueFollowUp({ followUpId: claimed.id, ownerId: this.followUpOwner, targetTurnId: null })
+          }
+        } catch (error) {
+          try { this.store.markFollowUpDeliveryUnknown(claimed.id, this.followUpOwner) } catch { /* preserve first failure */ }
+          active.controller.abort(error)
+          return
+        } finally {
+          this.events.publish(active.turn.threadId)
+        }
+      }
+    })
+    void active.pump.catch(() => undefined)
+  }
+
+  private drainNextFollowUp(threadId: ThreadId): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false)
+    const existing = this.followUpDrains.get(threadId)
+    if (existing) return existing
+    const drain = this.runNextFollowUpDrain(threadId)
+    this.followUpDrains.set(threadId, drain)
+    void drain.finally(() => {
+      if (this.followUpDrains.get(threadId) === drain) this.followUpDrains.delete(threadId)
+    }).catch(() => undefined)
+    return drain
+  }
+
+  private async runNextFollowUpDrain(threadId: ThreadId): Promise<boolean> {
+    const claimed = this.store.claimFollowUp({
+      threadId, ownerId: this.followUpOwner, purpose: 'next_turn',
+    })
+    if (!claimed) { this.clearFollowUpRetry(threadId); return false }
+    try {
+      const snapshot = this.store.getSnapshot(threadId)
+      const prior = snapshot?.turns.at(-1)
+      if (!snapshot || !prior) throw new Error('Follow-up route has no prior canonical turn')
+      const ready = await resolveUnlessAborted(
+        this.adapters.getReady(prior.provider),
+        this.shutdownController.signal,
+      )
+      if (ready === null || this.closed) {
+        try { this.store.requeueFollowUp({ followUpId: claimed.id, ownerId: this.followUpOwner, targetTurnId: null }) } catch { /* state may be stale */ }
+        this.events.publish(threadId)
+        return false
+      }
+      const workspaceCwd = this.workspaceCwd(threadId)
+      const workspaceRuntime = this.workspaceRuntime(workspaceCwd)
+      const toolDefinitions = [
+        ...workspaceRuntime.definitions,
+        ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
+      ]
+      const result = this.store.beginTurnFromFollowUp({
+        followUpId: claimed.id,
+        ownerId: this.followUpOwner,
+        threadId,
+        provider: prior.provider,
+        model: prior.model,
+        effort: prior.effort,
+        adapterVersion: ready.handshake.adapterVersion,
+        policySnapshot: {
+          delegationMode: 'disabled', allowedTools: toolDefinitions.map((tool) => tool.name),
+          approvalPolicy: 'never', cwd: workspaceCwd, maxDepth: 0, capabilityGrant: null,
+        },
+        budget: { ...(prior.effort ? { effort: prior.effort } : {}), agentLoopLimits: DEFAULT_AGENT_LOOP_LIMITS, goalAutomatic: false },
+      } as BeginTurnFromFollowUpInput)
+      const turnInput: StartTurnInput = {
+        threadId, provider: prior.provider, model: prior.model, effort: prior.effort,
+        clientRequestId: `follow-up:${claimed.id}`,
+        expectedRevision: snapshot.thread.revision,
+        input: claimed.input,
+      }
+      this.events.publish(threadId)
+      this.launchPersistedTurn(result, turnInput, ready, workspaceRuntime, false)
+      this.clearFollowUpRetry(threadId)
+      return true
+    } catch {
+      try { this.store.requeueFollowUp({ followUpId: claimed.id, ownerId: this.followUpOwner, targetTurnId: null }) } catch { /* state may be stale */ }
+      this.events.publish(threadId)
+      const attempts = (this.followUpRetryCounts.get(threadId) ?? 0) + 1
+      this.followUpRetryCounts.set(threadId, attempts)
+      if (!this.closed && attempts < 3) {
+        this.clearFollowUpRetryTimer(threadId)
+        const timer = setTimeout(() => {
+          this.followUpRetryTimers.delete(threadId)
+          if (this.closed) return
+          void this.drainNextFollowUp(threadId).catch(() => undefined)
+        }, attempts * 250)
+        this.followUpRetryTimers.set(threadId, timer)
+        timer.unref?.()
+      }
+      return false
+    }
+  }
+
+  private clearFollowUpRetryTimer(threadId: ThreadId): void {
+    const timer = this.followUpRetryTimers.get(threadId)
+    if (timer) clearTimeout(timer)
+    this.followUpRetryTimers.delete(threadId)
+  }
+
+  private clearFollowUpRetry(threadId: ThreadId): void {
+    this.clearFollowUpRetryTimer(threadId)
+    this.followUpRetryCounts.delete(threadId)
+  }
+
+  private hasPendingUserIntent(threadId: ThreadId): boolean {
+    return this.store.listFollowUps(threadId).some((followUp) =>
+      followUp.status === 'queued' || followUp.status === 'dispatching')
+  }
+
   private async startTurnInternal(
     input: StartTurnInput,
     goalContext: GoalTurnContext | null,
@@ -244,12 +444,26 @@ export class TurnOrchestrator implements ConversationService {
     this.events.publish(input.threadId)
     if (result.duplicate) return result
 
+    this.launchPersistedTurn(result, input, ready, workspaceRuntime, automatic)
+    return result
+  }
+
+  private launchPersistedTurn(
+    result: BeginTurnResult,
+    input: StartTurnInput,
+    ready: Awaited<ReturnType<AdapterRegistry['getReady']>>,
+    workspaceRuntime: ToolRuntime,
+    automatic: boolean,
+  ): void {
     const controller = new AbortController()
     const activeTurn: ActiveTurn = {
       controller,
       completion: Promise.resolve(),
       turn: result.turn,
       latestTokensUsed: 0,
+      execution: null,
+      pump: Promise.resolve(),
+      closing: false,
     }
     const coordinator = new ToolCoordinator({
       store: this.store,
@@ -276,13 +490,13 @@ export class TurnOrchestrator implements ConversationService {
       coordinator,
       automatic,
       (tokens) => { activeTurn.latestTokensUsed = tokens },
+      activeTurn,
     ).finally(() => {
       this.active.delete(result.turn.id)
     })
     activeTurn.completion = completion
     this.active.set(result.turn.id, activeTurn)
     void completion.catch(() => {})
-    return result
   }
 
   async cancelTurn(turnId: TurnId): Promise<void> {
@@ -325,11 +539,22 @@ export class TurnOrchestrator implements ConversationService {
     return this.store.recoverInterruptedTurns()
   }
 
-  async startGoalRuntime(): Promise<void> { await this.goalRuntime.start() }
+  async startGoalRuntime(): Promise<void> {
+    for (const session of this.store.listSessions('active')) {
+      const thread = this.store.getThread(session.activeThreadId)
+      if (thread?.status === 'idle') await this.drainNextFollowUp(thread.id)
+    }
+    await this.goalRuntime.start()
+  }
 
   async close(): Promise<void> {
     this.closed = true
+    this.shutdownController.abort()
+    for (const timer of this.followUpRetryTimers.values()) clearTimeout(timer)
+    this.followUpRetryTimers.clear()
+    this.followUpRetryCounts.clear()
     this.goalRuntime.stop()
+    await Promise.allSettled([...this.followUpDrains.values()])
     const active = [...this.active.values()]
     for (const turn of active) turn.controller.abort(new Error('Baton is shutting down'))
     await this.adapters.shutdownAll()
@@ -353,6 +578,7 @@ export class TurnOrchestrator implements ConversationService {
     coordinator: ToolCoordinator,
     automatic: boolean,
     onTokensUsed: (tokens: number) => void,
+    activeTurn: ActiveTurn,
   ): Promise<void> {
     let terminal: FinishTurnInput = { turnId: turn.id, status: 'completed' }
     let tokensUsed = 0
@@ -415,6 +641,8 @@ export class TurnOrchestrator implements ConversationService {
         async denyApproval() { throw new Error('Provider approval requests are disabled in canonical MVP') },
         async denyToolCall() { throw new Error('Provider tool calls are disabled in canonical MVP') },
       })
+      activeTurn.execution = execution
+      this.pumpActiveFollowUps(activeTurn)
       const cancelOnAbort = () => { void execution.cancel().catch(() => undefined) }
       executionSignal.addEventListener('abort', cancelOnAbort, { once: true })
       try {
@@ -515,9 +743,23 @@ export class TurnOrchestrator implements ConversationService {
     }
     if (goalDeadline !== null) clearTimeout(goalDeadline)
     signal.removeEventListener('abort', forwardAbort)
+    activeTurn.closing = true
+    await activeTurn.pump.catch(() => undefined)
+    const closeResult = this.store.closeFollowUpWindow(turn.id)
+    if (closeResult.inFlight !== 0) {
+      this.store.markTurnFollowUpsDeliveryUnknown(turn.id)
+      terminal = { turnId: turn.id, status: 'interrupted', error: { code: 'follow_up_barrier_failed' } }
+    }
     this.store.finishTurn(terminal)
     this.events.publish(input.threadId)
-    await this.finishGoalTurn(turn, terminal, tokensUsed, automatic, coordinator.goalTerminalIntent)
+    const drained = await this.drainNextFollowUp(turn.threadId)
+    const preserveGoalForUser = drained || this.hasPendingUserIntent(turn.threadId)
+    await this.finishGoalTurn(
+      turn, terminal, tokensUsed, automatic,
+      preserveGoalForUser ? null : coordinator.goalTerminalIntent,
+      !preserveGoalForUser,
+      preserveGoalForUser,
+    )
   }
 
   private workspaceCwd(threadId: ThreadId): string | null {
@@ -562,6 +804,8 @@ export class TurnOrchestrator implements ConversationService {
     tokensUsed: number,
     automatic: boolean,
     goalIntent: GoalTerminalIntent | null,
+    notifyIdle = true,
+    preserveGoalForUser = false,
   ): Promise<void> {
     if (turn.goalId === null || turn.goalRevision === null) return
     const progressDigest = goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision, turn.id)
@@ -575,6 +819,7 @@ export class TurnOrchestrator implements ConversationService {
       progressDigest,
     })
     if (accounted.status === 'stale' || !accounted.goal) return
+    if (preserveGoalForUser) return
     if (terminal.status !== 'completed') {
       const stoppingError = terminal.status === 'cancelled' || terminal.status === 'interrupted'
         ? { ...(terminal.error ?? {}), code: terminal.error?.code ?? 'runtime_interrupted' }
@@ -594,7 +839,7 @@ export class TurnOrchestrator implements ConversationService {
       this.events.publish(turn.threadId)
       return
     }
-    await this.goalRuntime.notifyThreadIdle(turn.threadId)
+    if (notifyIdle) await this.goalRuntime.notifyThreadIdle(turn.threadId)
     this.events.publish(turn.threadId)
   }
 
@@ -659,6 +904,11 @@ export class TurnOrchestrator implements ConversationService {
     if (request.signal.aborted) return { status: 'not_started' as const, reason: 'cancelled' as const }
     const thread = this.store.getThread(request.goal.threadId)
     if (!thread || thread.status !== 'idle') return { status: 'not_started' as const, reason: 'busy' as const }
+    const pendingUserIntent = this.hasPendingUserIntent(thread.id)
+    if (pendingUserIntent) {
+      void this.drainNextFollowUp(thread.id)
+      return { status: 'not_started' as const, reason: 'busy' as const }
+    }
     try {
       const started = await this.startTurnInternal({
         threadId: request.goal.threadId,
@@ -909,4 +1159,33 @@ function isTerminal(status: CanonicalTurn['status']): boolean {
     || status === 'cancelled'
     || status === 'failed'
     || status === 'interrupted'
+}
+
+function resolveUnlessAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T | null> {
+  if (signal.aborted) return Promise.resolve(null)
+  return new Promise<T | null>((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener('abort', abort)
+      resolve(null)
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', abort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', abort)
+        reject(error)
+      },
+    )
+  })
+}
+
+function followUpText(followUp: CanonicalFollowUp): string {
+  return followUp.input.map((item) => {
+    const text = item.payload.text
+    if (typeof text !== 'string') throw new Error('Follow-up user message omitted text')
+    return text
+  }).join('\n')
 }

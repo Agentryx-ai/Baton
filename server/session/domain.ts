@@ -237,7 +237,7 @@ export interface CanonicalItem {
 }
 
 export type FollowUpDelivery = 'steer_or_queue' | 'next_turn'
-export type FollowUpStatus = 'queued' | 'dispatching' | 'consumed' | 'cancelled' | 'stale_goal'
+export type FollowUpStatus = 'queued' | 'dispatching' | 'consumed' | 'cancelled' | 'stale_goal' | 'delivery_unknown'
 export type FollowUpScope =
   | { kind: 'conversation' }
   | { kind: 'goal'; goalId: GoalId; revision: number }

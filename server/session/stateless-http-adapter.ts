@@ -4,6 +4,8 @@ import type {
   NativeProviderEvent,
   NativeTurnRequest,
   ProviderExecutionContext,
+  ProviderSteerRequest,
+  ProviderSteerResult,
   ProviderTerminalResult,
   ProviderTurnExecution,
   SessionProviderAdapter,
@@ -75,6 +77,7 @@ interface ProviderContinuationState {
   assistant: ProviderMessage
   toolResults: ProviderMessage[]
   followUp?: ProviderMessage
+  liveFollowUps?: Array<{ followUpId: string; message: ProviderMessage }>
 }
 
 interface ModelRoundRecord extends ModelRoundProvenance {
@@ -149,6 +152,82 @@ class EventQueue<T> implements AsyncIterable<T> {
   }
 }
 
+interface ClaimedSteer {
+  request: ProviderSteerRequest
+  resolve: (result: ProviderSteerResult) => void
+  settled: boolean
+}
+
+class LiveSteerQueue {
+  private readonly pending: ClaimedSteer[] = []
+  private readonly unsettled = new Set<ClaimedSteer>()
+  private accepting = true
+  private readonly expectedTurnId: string
+
+  constructor(expectedTurnId: string) {
+    this.expectedTurnId = expectedTurnId
+  }
+
+  steer(request: ProviderSteerRequest): Promise<ProviderSteerResult> {
+    if (!request.followUpId || !request.text) {
+      return Promise.reject(new TypeError('Stateless steer requires a follow-up ID and text'))
+    }
+    if (!this.accepting || request.expectedTurnId !== this.expectedTurnId) {
+      return Promise.resolve({ status: 'closed' })
+    }
+    return new Promise((resolve) => {
+      const entry = { request, resolve, settled: false }
+      this.pending.push(entry)
+      this.unsettled.add(entry)
+    })
+  }
+
+  claim(round: number, limit: number, sealIfEmpty = false): ClaimedSteer[] {
+    if (!this.accepting || round >= limit) {
+      this.close()
+      return []
+    }
+    if (this.pending.length === 0) {
+      if (sealIfEmpty) this.close()
+      return []
+    }
+    return this.pending.splice(0)
+  }
+
+  continuation(batch: readonly ClaimedSteer[]): NonNullable<ProviderContinuationState['liveFollowUps']> {
+    return batch.filter((entry) => !entry.settled).map((entry) => ({
+      followUpId: entry.request.followUpId,
+      message: { role: 'user', content: entry.request.text },
+    }))
+  }
+
+  appendAndAccept(messages: ProviderMessage[], batch: readonly ClaimedSteer[]): number {
+    if (!this.accepting) return 0
+    let accepted = 0
+    for (const entry of batch) {
+      if (entry.settled) continue
+      messages.push({ role: 'user', content: entry.request.text })
+      entry.settled = true
+      this.unsettled.delete(entry)
+      entry.resolve({ status: 'accepted' })
+      accepted += 1
+    }
+    return accepted
+  }
+
+  close(): void {
+    if (!this.accepting && this.unsettled.size === 0) return
+    this.accepting = false
+    this.pending.length = 0
+    for (const entry of this.unsettled) {
+      if (entry.settled) continue
+      entry.settled = true
+      entry.resolve({ status: 'closed' })
+    }
+    this.unsettled.clear()
+  }
+}
+
 export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
   readonly provider: SupportedProvider
   private readonly proxyConnectionProvider: () => Promise<StatelessProxyConnection>
@@ -211,7 +290,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     this.validate(request, snapshot)
     const messages = materializeProviderHistory(snapshot, this.provider)
     for (const item of request.input) {
-      appendMessage(messages, 'user', portableText(item.payload) as string)
+      messages.push({ role: 'user', content: portableText(item.payload) as string })
     }
     const body: MaterializedHttpTurn = {
       turnId: request.turnId,
@@ -250,6 +329,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     }, context.limits.turnTimeoutMs)
 
     const events = new EventQueue<NativeProviderEvent>()
+    const steerQueue = new LiveSteerQueue(body.turnId)
     let resolveTerminal!: (result: ProviderTerminalResult) => void
     const terminal = new Promise<ProviderTerminalResult>((resolve) => {
       resolveTerminal = resolve
@@ -275,7 +355,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       return events.pushAndWait(event)
     }
 
-    const providerRequest = this.request(body, controller.signal, context, emitModelRound)
+    const providerRequest = this.request(body, controller.signal, context, emitModelRound, steerQueue)
     void Promise.race([providerRequest, rejectOnAbort(controller.signal)]).then((response) => {
       if (turnTimedOut) {
         throw new ProviderLoopError(
@@ -286,6 +366,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       if (cancellationRequested || controller.signal.aborted) {
         throw controller.signal.reason ?? new Error('Turn cancelled by user')
       }
+      steerQueue.close()
       events.push({
         eventId: `${this.provider}:response:${response.responseId}`,
         type: 'response/completed',
@@ -295,6 +376,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       events.end()
       resolveTerminal({ status: 'completed', usage: response.usage })
     }).catch((error: unknown) => {
+      steerQueue.close()
       events.end()
       const message = turnTimedOut
         ? `${this.provider} turn exceeded time limit (${context.limits.turnTimeoutMs}ms)`
@@ -325,11 +407,14 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     return {
       events,
       terminal,
+      steer: (steerRequest) => steerQueue.steer(steerRequest),
       cancel: async () => {
         cancellationRequested = true
+        steerQueue.close()
         controller.abort(new Error('Turn cancelled by user'))
       },
       dispose: async () => {
+        steerQueue.close()
         context.signal.removeEventListener('abort', abort)
       },
     }
@@ -371,6 +456,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
             assistant: continuation.assistant,
             toolResults: continuation.toolResults,
             ...(continuation.followUp ? { followUp: continuation.followUp } : {}),
+            ...(continuation.liveFollowUps ? { liveFollowUps: continuation.liveFollowUps } : {}),
           },
         })
         if (round.stopReason === 'max_tokens' || round.stopReason === 'model_context_window_exceeded') {
@@ -389,6 +475,26 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
                 modelProvenance: round.reportedModel === null ? 'unreported' : 'provider_reported',
                 incomplete: true,
                 continuationIndex: round.round,
+              },
+            })
+          }
+        }
+        if (continuation.liveFollowUps?.length
+          && (round.stopReason === 'end_turn' || round.stopReason.toLowerCase() === 'stop')) {
+          const intermediateText = providerMessageText(continuation.assistant)
+          if (intermediateText) {
+            items.push({
+              kind: 'assistant_message',
+              visibility: 'portable',
+              provider: this.provider,
+              nativeId: round.responseId,
+              payload: {
+                text: intermediateText,
+                requestedModel: round.requestedModel,
+                reportedModel: round.reportedModel,
+                modelFallback: round.reportedModel !== null && round.requestedModel !== round.reportedModel,
+                modelProvenance: round.reportedModel === null ? 'unreported' : 'provider_reported',
+                continuation: true,
               },
             })
           }
@@ -447,11 +553,12 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       usage: JsonObject,
       continuation?: ProviderContinuationState,
     ) => Promise<void>,
+    steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
     if (!this.connection) throw new Error(`${this.provider} proxy connection is unavailable`)
     return this.provider === 'claude'
-      ? this.requestClaude(body, signal, context, onModelRound)
-      : this.requestGemini(body, signal, context, onModelRound)
+      ? this.requestClaude(body, signal, context, onModelRound, steerQueue)
+      : this.requestGemini(body, signal, context, onModelRound, steerQueue)
   }
 
   private async requestClaude(
@@ -463,6 +570,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       usage: JsonObject,
       continuation?: ProviderContinuationState,
     ) => Promise<void>,
+    steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
     const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
     const tools = context.toolDefinitions.map(toClaudeTool)
@@ -562,7 +670,21 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           await recordRound()
           throw new ProviderLoopError('provider_invalid_terminal', 'Claude end_turn response did not contain text')
         }
-        await recordRound()
+        const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips, true)
+        if (steers.length > 0) {
+          await recordRound({
+            assistant: assistantMessage,
+            toolResults: [],
+            liveFollowUps: steerQueue.continuation(steers),
+          })
+          messages.push(assistantMessage)
+          if (steerQueue.appendAndAccept(messages, steers) > 0) {
+            requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
+            continue
+          }
+        } else {
+          await recordRound()
+        }
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
@@ -573,9 +695,15 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         }
       }
       if (stopReason === 'pause_turn') {
-        await recordRound({ assistant: assistantMessage, toolResults: [] })
+        const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
+        await recordRound({
+          assistant: assistantMessage,
+          toolResults: [],
+          ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
+        })
         assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude pause_turn')
         messages.push(assistantMessage)
+        steerQueue.appendAndAccept(messages, steers)
         continue
       }
       if (stopReason === 'max_tokens') {
@@ -589,10 +717,14 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         const followUp = canContinue
           ? { role: 'user', content: 'Please continue from where you left off.' }
           : undefined
+        const steers = canContinue
+          ? steerQueue.claim(round, context.limits.maxModelRoundTrips)
+          : []
         await recordRound({
           assistant: assistantMessage,
           toolResults: [],
           ...(followUp ? { followUp } : {}),
+          ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
         })
         if (outputContinuations > CLAUDE_OUTPUT_CONTINUATION_LIMIT) {
           throw new ProviderLoopError(
@@ -603,6 +735,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude max_tokens')
         if (!followUp) throw new Error('Claude continuation follow-up was not materialized')
         messages.push(assistantMessage, followUp)
+        steerQueue.appendAndAccept(messages, steers)
         continue
       }
       if (stopReason !== 'tool_use') {
@@ -642,11 +775,14 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           context.limits.toolOutputBytes,
         )),
       }
+      const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
       await recordRound({
         assistant: assistantMessage,
         toolResults: [toolResultMessage],
+        ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
       })
       messages.push(assistantMessage, toolResultMessage)
+      steerQueue.appendAndAccept(messages, steers)
       requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
     }
     throw new ProviderLoopError(
@@ -664,6 +800,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       usage: JsonObject,
       continuation?: ProviderContinuationState,
     ) => Promise<void>,
+    steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
     const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
     const tools = context.toolDefinitions.map(toOpenAiTool)
@@ -727,7 +864,19 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           )
         }
         if (!text) throw new ProviderLoopError('provider_invalid_terminal', 'Gemini stop response did not contain text')
-        await onModelRound(roundRecord, usage)
+        const assistantMessage = { role: 'assistant', content: text }
+        const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips, true)
+        if (steers.length > 0) {
+          await onModelRound(roundRecord, usage, {
+            assistant: assistantMessage,
+            toolResults: [],
+            liveFollowUps: steerQueue.continuation(steers),
+          })
+          messages.push(assistantMessage)
+          if (steerQueue.appendAndAccept(messages, steers) > 0) continue
+        } else {
+          await onModelRound(roundRecord, usage)
+        }
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
@@ -761,11 +910,14 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           content: serializeToolResult(result, context.limits.toolOutputBytes).content,
         })
       }
+      const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
       await onModelRound(roundRecord, usage, {
         assistant: assistantMessage,
         toolResults: toolResultMessages,
+        ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
       })
       messages.push(assistantMessage, ...toolResultMessages)
+      steerQueue.appendAndAccept(messages, steers)
     }
     throw new ProviderLoopError(
       'model_round_limit',
@@ -1133,13 +1285,27 @@ function parseProviderContinuation(value: unknown): ProviderContinuationState | 
   if (!Array.isArray(continuation.toolResults) || continuation.toolResults.some((result) => !isObject(result))) {
     throw new Error('Provider continuation tool results must be structured messages')
   }
+  const liveFollowUps = parseLiveFollowUps(continuation.liveFollowUps)
   return {
     assistant,
     toolResults: continuation.toolResults as ProviderMessage[],
     ...(continuation.followUp === undefined
       ? {}
       : { followUp: requiredObject(continuation.followUp, 'provider continuation follow-up') }),
+    ...(liveFollowUps ? { liveFollowUps } : {}),
   }
+}
+
+function parseLiveFollowUps(value: unknown): ProviderContinuationState['liveFollowUps'] {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) throw new Error('Provider live follow-ups must be an array')
+  return value.map((entry) => {
+    const parsed = requiredObject(entry, 'provider live follow-up')
+    return {
+      followUpId: requiredString(parsed.followUpId, 'provider live follow-up id'),
+      message: requiredObject(parsed.message, 'provider live follow-up message'),
+    }
+  })
 }
 
 function providerMessageText(message: ProviderMessage): string | null {
@@ -1192,12 +1358,17 @@ function materializeProviderHistory(
         continue
       }
       if (item.visibility !== 'portable') continue
-      if (hasExactContinuation && item.kind === 'assistant_message' && item.payload.incomplete === true) {
+      if (hasExactContinuation && item.kind === 'assistant_message'
+        && (item.payload.incomplete === true || item.payload.continuation === true)) {
         continue
       }
       const text = portableHistoryText(item.kind, item.payload)
       if (text === null) continue
       const role = item.kind === 'user_message' ? 'user' : 'assistant'
+      if (hasExactContinuation) {
+        messages.push({ role, content: text })
+        continue
+      }
       appendMessage(
         messages,
         role,
@@ -1217,10 +1388,12 @@ function parseStoredProviderContinuation(payload: JsonObject): ProviderContinuat
   if (payload.followUp !== undefined && !isObject(payload.followUp)) {
     throw new Error('Stored provider continuation follow-up must be a structured message')
   }
+  const liveFollowUps = parseLiveFollowUps(payload.liveFollowUps)
   return {
     assistant: payload.assistant,
     toolResults: payload.toolResults,
     ...(payload.followUp === undefined ? {} : { followUp: payload.followUp }),
+    ...(liveFollowUps ? { liveFollowUps } : {}),
   }
 }
 

@@ -2,10 +2,12 @@ import type {
   BeginTurnResultDto,
   CanonicalItemDto,
   CanonicalGoalDto,
+  CanonicalFollowUpDto,
   CanonicalSessionDto,
   CreateSessionDto,
   CreateGoalDto,
   EditGoalDto,
+  EnqueueFollowUpDto,
   StartTurnDto,
   ThreadSnapshotDto,
   ProviderModelDescriptorDto,
@@ -155,6 +157,15 @@ export const conversationApi = {
 
   startTurn: (threadId: string, input: StartTurnDto): Promise<BeginTurnResultDto> =>
     request(`/threads/${encodeURIComponent(threadId)}/turns`, jsonRequest('POST', input)),
+
+  enqueueFollowUp: (
+    threadId: string,
+    input: EnqueueFollowUpDto,
+  ): Promise<{ followUp: CanonicalFollowUpDto; duplicate: boolean }> =>
+    request(`/threads/${encodeURIComponent(threadId)}/follow-ups`, jsonRequest('POST', input)),
+
+  cancelFollowUp: (followUpId: string, expectedRevision: number): Promise<CanonicalFollowUpDto> =>
+    request(`/follow-ups/${encodeURIComponent(followUpId)}`, jsonRequest('DELETE', { expectedRevision })),
 
   cancelTurn: (turnId: string): Promise<void> =>
     request(`/turns/${encodeURIComponent(turnId)}/cancel`, { method: 'POST' }),

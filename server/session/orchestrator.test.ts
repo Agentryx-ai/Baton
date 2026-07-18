@@ -17,6 +17,16 @@ import { ConversationEventHub } from './event-hub.ts'
 import { chargeableGoalTokens, TurnOrchestrator } from './orchestrator.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 function safeAdapter(
   snapshots: ThreadSnapshot[],
   nativeChildExecution: 'disabled' | 'exposed' = 'disabled',
@@ -265,6 +275,399 @@ test('TurnOrchestrator durably executes one canonical turn and deduplicates retr
   assert.equal(duplicate.duplicate, true)
   assert.equal(duplicate.turn.id, started.turn.id)
   assert.equal(orchestrator.getSnapshot(session.activeThreadId)?.turns.length, 1)
+})
+
+test('follow-up pump consumes accepted steer and drains closed steer before Goal continuation', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-follow-up-pump-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const controls: Array<{ resolve: (status: 'completed' | 'cancelled') => void }> = []
+  let firstSteer = true
+  const adapter = safeAdapter([])
+  adapter.execute = async (): Promise<ProviderTurnExecution> => {
+    let resolve!: (value: { status: 'completed' | 'cancelled' }) => void
+    const terminal = new Promise<{ status: 'completed' | 'cancelled' }>((done) => { resolve = done })
+    controls.push({ resolve: (status) => resolve({ status }) })
+    return {
+      events: emptyEvents(terminal), terminal,
+      async steer(request) {
+        if (request.text === 'unsupported live') return { status: 'unsupported' }
+        if (firstSteer) { firstSteer = false; return { status: 'closed' } }
+        return { status: 'accepted' }
+      },
+      async cancel() { resolve({ status: 'cancelled' }) }, async dispose() {},
+    }
+  }
+  registry.register(adapter)
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => { await orchestrator.close(); rmSync(directory, { recursive: true, force: true }) })
+  const session = orchestrator.createSession({})
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'keep ownership',
+    provider: 'codex', model: 'gpt-test',
+  })
+  const started = await orchestrator.startTurn({
+    threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test', clientRequestId: 'turn',
+    expectedRevision: 0, input: [{ kind: 'user_message', payload: { text: 'start' } }],
+  })
+  while (controls.length < 1) await new Promise((resolve) => setTimeout(resolve, 1))
+  const submitted = await orchestrator.submitFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'follow', expectedTurnId: started.turn.id,
+    delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  })
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (store.listFollowUps(session.activeThreadId)[0]?.targetTurnId === null) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  controls[0]!.resolve('completed')
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controls.length >= 2) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.equal(controls.length, 2)
+  assert.equal(store.getGoalById(goal.id)?.status, 'active')
+  assert.equal(store.getGoalById(goal.id)?.revision, goal.revision)
+  assert.equal(store.listFollowUps(session.activeThreadId)[0]?.status, 'consumed')
+  assert.equal(store.listFollowUps(session.activeThreadId)[0]?.id, submitted.followUp.id)
+  const secondTurn = store.getSnapshot(session.activeThreadId)!.turns.at(-1)!
+  const unsupported = await orchestrator.submitFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'unsupported', expectedTurnId: secondTurn.id,
+    delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'unsupported live' } }],
+  })
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (store.listFollowUps(session.activeThreadId).find((item) => item.id === unsupported.followUp.id)?.targetTurnId === null) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  controls[1]!.resolve('completed')
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controls.length >= 3) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.equal(store.listFollowUps(session.activeThreadId).find((item) => item.id === unsupported.followUp.id)?.status, 'consumed')
+  const thirdTurn = store.getSnapshot(session.activeThreadId)!.turns.at(-1)!
+  const accepted = await orchestrator.submitFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'accepted', expectedTurnId: thirdTurn.id,
+    delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'accepted live' } }],
+  })
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (store.listFollowUps(session.activeThreadId).find((item) => item.id === accepted.followUp.id)?.status === 'consumed') break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.equal(store.listFollowUps(session.activeThreadId).find((item) => item.id === accepted.followUp.id)?.status, 'consumed')
+  controls[2]!.resolve('completed')
+  await waitForTerminal(store, thirdTurn.id)
+})
+
+test('queued user intent survives a transient drain failure before Goal terminal mutation', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-follow-up-goal-retry-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  let executionCount = 0
+  let resolveFirst!: (result: { status: 'failed'; error: { code: string } }) => void
+  let resolveSecond!: (result: { status: 'cancelled' }) => void
+  let markIntentStaged!: () => void
+  const intentStaged = new Promise<void>((resolve) => { markIntentStaged = resolve })
+  const adapter = safeAdapter([])
+  adapter.execute = async (_request, context): Promise<ProviderTurnExecution> => {
+    executionCount += 1
+    if (executionCount === 1) {
+      const released = new Promise<{ status: 'failed'; error: { code: string } }>((resolve) => { resolveFirst = resolve })
+      const terminal = (async () => {
+        const result = await context.executeTool({
+          callId: 'stage-complete', providerCallId: 'provider-stage-complete', name: 'update_goal',
+          input: { status: 'complete', evidence: [{ requirement: 'preserve intent', proof: 'queued user input wins' }] },
+        })
+        assert.equal(result.success, true)
+        markIntentStaged()
+        return released
+      })().then((result) => result)
+      return {
+        events: emptyEvents(terminal), terminal,
+        async steer() { return { status: 'closed' } },
+        async cancel() { resolveFirst({ status: 'failed', error: { code: 'cancelled' } }) },
+        async dispose() {},
+      }
+    }
+    const terminal = new Promise<{ status: 'cancelled' }>((resolve) => { resolveSecond = resolve })
+    return {
+      events: emptyEvents(terminal), terminal,
+      async cancel() { resolveSecond({ status: 'cancelled' }) }, async dispose() {},
+    }
+  }
+  registry.register(adapter)
+  const originalGetReady = registry.getReady.bind(registry)
+  let failNextReady = false
+  let failedReadyCalls = 0
+  registry.getReady = async (provider) => {
+    if (failNextReady) {
+      failNextReady = false
+      failedReadyCalls += 1
+      throw new Error('transient adapter readiness failure')
+    }
+    return originalGetReady(provider)
+  }
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => { await orchestrator.close(); rmSync(directory, { recursive: true, force: true }) })
+  const session = orchestrator.createSession({})
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'keep user ownership',
+    provider: 'codex', model: 'gpt-test',
+  })
+  const started = await orchestrator.startTurn({
+    threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test', clientRequestId: 'goal-turn',
+    expectedRevision: store.getThread(session.activeThreadId)?.revision ?? 0,
+    input: [{ kind: 'user_message', payload: { text: 'start' } }],
+  })
+  await intentStaged
+  const submitted = await orchestrator.submitFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'queued-after-close', expectedTurnId: started.turn.id,
+    delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'user correction' } }],
+  })
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (store.listFollowUps(session.activeThreadId)[0]?.targetTurnId === null) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  failNextReady = true
+  resolveFirst({ status: 'failed', error: { code: 'provider_failure' } })
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (failedReadyCalls === 1 && store.listFollowUps(session.activeThreadId)[0]?.status === 'queued') break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.equal(failedReadyCalls, 1)
+  assert.equal(store.getGoalById(goal.id)?.status, 'active')
+  assert.equal(store.getGoalById(goal.id)?.revision, goal.revision)
+  assert.equal(store.listFollowUps(session.activeThreadId)[0]?.status, 'queued')
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (executionCount === 2) break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(executionCount, 2)
+  assert.equal(store.listFollowUps(session.activeThreadId)[0]?.id, submitted.followUp.id)
+  assert.equal(store.listFollowUps(session.activeThreadId)[0]?.status, 'consumed')
+  const retryTurn = store.getSnapshot(session.activeThreadId)!.turns.at(-1)!
+  assert.equal(retryTurn.goalId, goal.id)
+  assert.equal(retryTurn.goalRevision, goal.revision)
+  assert.equal(store.getGoalById(goal.id)?.status, 'active')
+  assert.equal(store.getGoalById(goal.id)?.revision, goal.revision)
+})
+
+test('closing the orchestrator cancels a scheduled follow-up drain retry', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-follow-up-close-retry-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  let resolveTurn!: (result: { status: 'completed' }) => void
+  const adapter = safeAdapter([])
+  adapter.execute = async (): Promise<ProviderTurnExecution> => {
+    const terminal = new Promise<{ status: 'completed' }>((resolve) => { resolveTurn = resolve })
+    return {
+      events: emptyEvents(terminal), terminal,
+      async steer() { return { status: 'closed' } },
+      async cancel() { resolveTurn({ status: 'completed' }) }, async dispose() {},
+    }
+  }
+  registry.register(adapter)
+  const originalGetReady = registry.getReady.bind(registry)
+  let failNextReady = false
+  let trackDrainReady = false
+  let drainReadyCalls = 0
+  registry.getReady = async (provider) => {
+    if (trackDrainReady) drainReadyCalls += 1
+    if (failNextReady) {
+      failNextReady = false
+      throw new Error('transient adapter readiness failure')
+    }
+    return originalGetReady(provider)
+  }
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(() => { rmSync(directory, { recursive: true, force: true }) })
+  const session = orchestrator.createSession({})
+  const started = await orchestrator.startTurn({
+    threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test', clientRequestId: 'turn-before-close',
+    expectedRevision: 0, input: [{ kind: 'user_message', payload: { text: 'start' } }],
+  })
+  await orchestrator.submitFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'retry-after-close', expectedTurnId: started.turn.id,
+    delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'queued' } }],
+  })
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (store.listFollowUps(session.activeThreadId)[0]?.targetTurnId === null) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  trackDrainReady = true
+  failNextReady = true
+  resolveTurn({ status: 'completed' })
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (drainReadyCalls === 1 && store.listFollowUps(session.activeThreadId)[0]?.status === 'queued') break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.equal(drainReadyCalls, 1)
+  await orchestrator.close()
+  await new Promise((resolve) => setTimeout(resolve, 350))
+  assert.equal(drainReadyCalls, 1)
+})
+
+test('closing waits for an already-fired follow-up drain without launching after shutdown', async (t) => {
+  for (const outcome of ['resolve', 'reject'] as const) {
+    await t.test(outcome, async () => {
+      const directory = mkdtempSync(join(tmpdir(), `baton-follow-up-close-inflight-${outcome}-`))
+      const database = join(directory, 'sessions.sqlite')
+      const store = new SqliteSessionStore(database)
+      const registry = new AdapterRegistry()
+      let resolveTurn!: (result: { status: 'completed' }) => void
+      const adapter = safeAdapter([])
+      adapter.execute = async (): Promise<ProviderTurnExecution> => {
+        const terminal = new Promise<{ status: 'completed' }>((resolve) => { resolveTurn = resolve })
+        return {
+          events: emptyEvents(terminal), terminal,
+          async steer() { return { status: 'closed' } },
+          async cancel() { resolveTurn({ status: 'completed' }) }, async dispose() {},
+        }
+      }
+      registry.register(adapter)
+      const originalGetReady = registry.getReady.bind(registry)
+      const ready = await originalGetReady('codex')
+      const pendingReady = deferred<typeof ready>()
+      const drainEntered = deferred<void>()
+      let deferDrain = false
+      registry.getReady = async (provider) => {
+        if (!deferDrain) return originalGetReady(provider)
+        drainEntered.resolve()
+        return pendingReady.promise
+      }
+      const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+      t.after(() => { rmSync(directory, { recursive: true, force: true }) })
+
+      const session = orchestrator.createSession({})
+      const started = await orchestrator.startTurn({
+        threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test', clientRequestId: 'turn-before-inflight-close',
+        expectedRevision: 0, input: [{ kind: 'user_message', payload: { text: 'start' } }],
+      })
+      await orchestrator.submitFollowUp({
+        threadId: session.activeThreadId, clientRequestId: 'retry-inflight-close', expectedTurnId: started.turn.id,
+        delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'queued' } }],
+      })
+      for (let attempt = 0; attempt < 50; attempt += 1) {
+        if (store.listFollowUps(session.activeThreadId)[0]?.targetTurnId === null) break
+        await new Promise((resolve) => setTimeout(resolve, 1))
+      }
+      deferDrain = true
+      resolveTurn({ status: 'completed' })
+      await drainEntered.promise
+
+      const closeResult = await Promise.race([
+        orchestrator.close().then(() => 'closed' as const),
+        new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 1_000)),
+      ])
+      assert.equal(closeResult, 'closed')
+      if (outcome === 'resolve') pendingReady.resolve(ready)
+      else pendingReady.reject(new Error('late readiness failure'))
+      await new Promise((resolve) => setTimeout(resolve, 10))
+
+      const reopened = new SqliteSessionStore(database)
+      try {
+        const snapshot = reopened.getSnapshot(session.activeThreadId)
+        assert.equal(snapshot?.turns.length, 1)
+        assert.equal(snapshot?.turns.some((turn) => turn.status === 'running' || turn.status === 'queued'), false)
+        assert.equal(reopened.listFollowUps(session.activeThreadId)[0]?.status, 'queued')
+      } finally {
+        reopened.close()
+      }
+    })
+  }
+})
+
+test('rejected steer becomes delivery_unknown and cancels the owning turn', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-follow-up-unknown-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const adapter = safeAdapter([])
+  adapter.execute = async (): Promise<ProviderTurnExecution> => {
+    let resolve!: (value: { status: 'cancelled' }) => void
+    const terminal = new Promise<{ status: 'cancelled' }>((done) => { resolve = done })
+    return {
+      events: emptyEvents(terminal), terminal,
+      async steer() { throw new Error('transport outcome unknown') },
+      async cancel() { resolve({ status: 'cancelled' }) }, async dispose() {},
+    }
+  }
+  registry.register(adapter)
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => { await orchestrator.close(); rmSync(directory, { recursive: true, force: true }) })
+  const session = orchestrator.createSession({})
+  const started = await orchestrator.startTurn({
+    threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test', clientRequestId: 'turn',
+    expectedRevision: 0, input: [{ kind: 'user_message', payload: { text: 'start' } }],
+  })
+  await orchestrator.submitFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'unknown', expectedTurnId: started.turn.id,
+    delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'maybe' } }],
+  })
+  await waitForTerminal(store, started.turn.id)
+  assert.equal(store.listFollowUps(session.activeThreadId)[0]?.status, 'delivery_unknown')
+  assert.equal(store.getTurn(started.turn.id)?.status, 'cancelled')
+})
+
+test('startup drains pending user follow-up before Goal automatic continuation', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-follow-up-startup-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'continue later',
+    provider: 'codex', model: 'gpt-test',
+  })
+  const prior = store.beginTurn({
+    threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test', clientRequestId: 'prior',
+    requestHash: 'prior-hash', expectedRevision: 0, input: [{ kind: 'user_message', payload: { text: 'prior' } }],
+    adapterVersion: 'test/1', policySnapshot: { delegationMode: 'disabled', allowedTools: [], approvalPolicy: 'never', cwd: null, maxDepth: 0, capabilityGrant: null },
+  })
+  store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'pending-user', requestHash: 'pending-hash',
+    delivery: 'next_turn', targetTurnId: null, scope: { kind: 'goal', goalId: goal.id, revision: goal.revision },
+    input: [{ kind: 'user_message', payload: { text: 'user wins' } }],
+  })
+  store.finishTurn({ turnId: prior.turn.id, status: 'completed' })
+  const registry = new AdapterRegistry(); registry.register(safeAdapter([]))
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => { await orchestrator.close(); rmSync(directory, { recursive: true, force: true }) })
+  await orchestrator.startGoalRuntime()
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if ((store.getSnapshot(session.activeThreadId)?.turns.length ?? 0) >= 2) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  const second = store.getSnapshot(session.activeThreadId)!.turns[1]!
+  const secondInput = store.getSnapshot(session.activeThreadId)!.items.find((item) => item.turnId === second.id && item.kind === 'user_message')
+  assert.equal(secondInput?.payload.text, 'user wins')
+  assert.match(second.clientRequestId, /^follow-up:/)
+})
+
+test('a Goal created after turn start forces follow-up to the next turn without steering stale ownership', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-follow-up-goal-race-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry(); registry.register(cancellableAdapter())
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => { await orchestrator.close(); rmSync(directory, { recursive: true, force: true }) })
+  const session = orchestrator.createSession({})
+  const started = await orchestrator.startTurn({
+    threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test', clientRequestId: 'ordinary',
+    expectedRevision: 0, input: [{ kind: 'user_message', payload: { text: 'ordinary' } }],
+  })
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'new Goal', provider: 'codex', model: 'gpt-test',
+  })
+  const submitted = await orchestrator.submitFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'goal-race', expectedTurnId: started.turn.id,
+    delivery: 'steer_or_queue', input: [{ kind: 'user_message', payload: { text: 'belongs to new Goal' } }],
+  })
+  assert.equal(submitted.followUp.targetTurnId, null)
+  assert.deepEqual(submitted.followUp.scope, { kind: 'goal', goalId: goal.id, revision: goal.revision })
+  await orchestrator.cancelTurn(started.turn.id)
+  const followUp = store.listFollowUps(session.activeThreadId)[0]
+  const retryTurn = store.getSnapshot(session.activeThreadId)!.turns.at(-1)!
+  assert.equal(followUp?.status, 'consumed')
+  assert.equal(retryTurn.goalId, goal.id)
+  assert.equal(retryTurn.goalRevision, goal.revision)
+  assert.equal(store.getGoalById(goal.id)?.status, 'active')
+  assert.equal(store.getGoalById(goal.id)?.revision, goal.revision)
 })
 
 test('TurnOrchestrator rejects an adapter that exposes native child execution before persistence', async (t) => {

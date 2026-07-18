@@ -195,6 +195,12 @@ export interface CloseFollowUpWindowResult {
   inFlight: number
 }
 
+export type BeginTurnFromFollowUpInput = Omit<BeginTurnInput,
+  'clientRequestId' | 'requestHash' | 'expectedRevision' | 'input'> & {
+    followUpId: FollowUpId
+    ownerId: string
+  }
+
 export type GoalAwareBeginTurnInput = BeginTurnInput & {
   goalContext?: GoalTurnContext | null
 }
@@ -219,6 +225,7 @@ export interface SessionStore extends NativeImportStore {
   forkThread(input: ForkThreadInput): CanonicalThread
 
   beginTurn(input: GoalAwareBeginTurnInput): BeginTurnResult
+  beginTurnFromFollowUp(input: BeginTurnFromFollowUpInput): BeginTurnResult
   getTurn(turnId: TurnId): CanonicalTurn | null
   setTurnActivity(turnId: TurnId, status: Extract<CanonicalTurn['status'], 'running' | 'waiting_tool'>): CanonicalTurn
   appendProviderEvent(input: AppendEventInput): CanonicalItem[]
@@ -226,12 +233,16 @@ export interface SessionStore extends NativeImportStore {
   finishTurn(input: FinishTurnInput): CanonicalTurn
   enqueueFollowUp(input: EnqueueFollowUpInput): EnqueueFollowUpResult
   listFollowUps(threadId: ThreadId): CanonicalFollowUp[]
+  getFollowUpByClientRequest(threadId: ThreadId, clientRequestId: string): CanonicalFollowUp | null
   claimFollowUp(input: ClaimFollowUpInput): CanonicalFollowUp | null
   consumeFollowUp(input: ConsumeFollowUpInput): ConsumeFollowUpResult
   requeueFollowUp(input: RequeueFollowUpInput): CanonicalFollowUp
   closeFollowUpWindow(turnId: TurnId): CloseFollowUpWindowResult
   markStaleGoalFollowUps(threadId: ThreadId): number
   recoverExpiredFollowUpClaims(cutoffIso?: string): number
+  cancelFollowUp(followUpId: FollowUpId, expectedRevision: number): CanonicalFollowUp
+  markFollowUpDeliveryUnknown(followUpId: FollowUpId, ownerId: string): CanonicalFollowUp
+  markTurnFollowUpsDeliveryUnknown(turnId: TurnId): number
   upsertProviderBinding(input: UpsertProviderBindingInput): ProviderBinding
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]
   listEvents(threadId: ThreadId, afterSequence?: number): CanonicalStreamEvent[]

@@ -49,6 +49,7 @@ import {
 } from './session-view-preferences'
 import { isNearScrollBottom } from './conversation-scroll'
 import type {
+  CanonicalFollowUpDto,
   CanonicalGoalDto,
   CanonicalProvider,
   CanonicalSessionDto,
@@ -139,6 +140,56 @@ export function goalEditDescription(status: CanonicalGoalDto['status']): string 
     return '예산 제한 상태를 유지하려면 내용을 저장할 수 없습니다. 먼저 Goal을 다시 시작한 뒤 수정해 주세요.'
   }
   return 'Goal 내용만 저장합니다. 현재 정지 상태와 누적 사용량은 유지됩니다.'
+}
+
+export interface FollowUpPresentation {
+  label: string
+  tone: 'muted' | 'info' | 'warning'
+  cancellable: boolean
+}
+
+export function followUpPresentation(
+  followUp: Pick<CanonicalFollowUpDto, 'status' | 'targetTurnId' | 'delivery'>,
+  activeTurnId: string | null,
+): FollowUpPresentation {
+  if (followUp.status === 'delivery_unknown') {
+    return { label: '전달 확인 필요', tone: 'warning', cancellable: false }
+  }
+  if (followUp.status === 'stale_goal') {
+    return { label: 'Goal 변경으로 제외', tone: 'muted', cancellable: false }
+  }
+  const targetsCurrent = followUp.targetTurnId !== null && followUp.targetTurnId === activeTurnId
+  if (followUp.status === 'dispatching') {
+    return {
+      label: targetsCurrent ? '현재 턴 전달 중' : '다음 턴 전달 중',
+      tone: 'info',
+      cancellable: false,
+    }
+  }
+  if (followUp.status === 'queued' && targetsCurrent && followUp.delivery === 'steer_or_queue') {
+    return { label: '현재 턴 전달 대기', tone: 'info', cancellable: true }
+  }
+  return { label: '다음 턴 대기', tone: 'muted', cancellable: followUp.status === 'queued' }
+}
+
+export function pendingFollowUps(followUps: readonly CanonicalFollowUpDto[]): CanonicalFollowUpDto[] {
+  return followUps
+    .filter((followUp) => followUp.status !== 'consumed' && followUp.status !== 'cancelled')
+    .toSorted((left, right) => left.sequence - right.sequence)
+}
+
+export function followUpText(followUp: Pick<CanonicalFollowUpDto, 'input'>): string {
+  const text = followUp.input[0]?.payload.text
+  return typeof text === 'string' && text.trim() ? text : '추가 요청'
+}
+
+export function composerSubmissionKind(
+  prompt: string,
+  goalComposerMode: boolean,
+  activeTurnId: string | null,
+): 'goal' | 'follow_up' | 'turn' {
+  if (goalComposerMode || parseGoalComposerCommand(prompt) !== null) return 'goal'
+  return activeTurnId === null ? 'turn' : 'follow_up'
 }
 
 export function replaceSessionProjection(
@@ -525,6 +576,7 @@ export function ConversationWorkspace({
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [cancellingFollowUpId, setCancellingFollowUpId] = useState<string | null>(null)
   const [goalBusyAction, setGoalBusyAction] = useState<GoalAction | 'create' | null>(null)
   const [goalDialog, setGoalDialog] = useState<'create' | 'replace' | 'edit' | 'resume' | 'clear' | null>(null)
   const [goalDraft, setGoalDraft] = useState('')
@@ -562,6 +614,8 @@ export function ConversationWorkspace({
     ])),
   ), [catalogs])
   const unknownMutations = useMemo(() => unresolvedUnknownMutations(snapshot), [snapshot])
+  const activeTurn = snapshot ? latestActiveTurn(snapshot.turns) : null
+  const visibleFollowUps = pendingFollowUps(snapshot?.followUps ?? [])
 
   const refreshSessions = useCallback(async (background = false) => {
     if (background && sessionListBusy.current) return
@@ -843,7 +897,8 @@ export function ConversationWorkspace({
 
   const startTurn = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!snapshot || !prompt.trim() || !model.trim()) return
+    if (!snapshot || !prompt.trim()) return
+    const submissionKind = composerSubmissionKind(prompt, goalComposerMode, activeTurn?.id ?? null)
     if (goalComposerMode) {
       const objective = prompt.trim()
       const accepted = await handleGoalCommand({ type: 'set', objective })
@@ -853,7 +908,7 @@ export function ConversationWorkspace({
       }
       return
     }
-    const goalCommand = parseGoalComposerCommand(prompt)
+    const goalCommand = submissionKind === 'goal' ? parseGoalComposerCommand(prompt) : null
     if (goalCommand) {
       if (goalCommand.type === 'open') {
         setGoalComposerMode(true)
@@ -866,20 +921,29 @@ export function ConversationWorkspace({
     }
     setSubmitting(true)
     try {
-      await conversationApi.startTurn(snapshot.thread.id, {
-        provider,
-        model: model.trim(),
-        effort,
-        clientRequestId: crypto.randomUUID(),
-        expectedRevision: snapshot.thread.revision,
-        input: [
-          {
-            kind: 'user_message',
-            visibility: 'portable',
-            payload: { text: prompt.trim() },
-          },
-        ],
-      })
+      const input = [{
+        kind: 'user_message' as const,
+        visibility: 'portable' as const,
+        payload: { text: prompt.trim() },
+      }]
+      if (submissionKind === 'follow_up' && activeTurn) {
+        await conversationApi.enqueueFollowUp(snapshot.thread.id, {
+          clientRequestId: crypto.randomUUID(),
+          expectedTurnId: activeTurn.id,
+          delivery: 'steer_or_queue',
+          input,
+        })
+      } else {
+        if (!model.trim()) return
+        await conversationApi.startTurn(snapshot.thread.id, {
+          provider,
+          model: model.trim(),
+          effort,
+          clientRequestId: crypto.randomUUID(),
+          expectedRevision: snapshot.thread.revision,
+          input,
+        })
+      }
       setPrompt('')
       setError(null)
       await refreshThread()
@@ -891,7 +955,6 @@ export function ConversationWorkspace({
     }
   }
 
-  const activeTurn = snapshot ? latestActiveTurn(snapshot.turns) : null
   const latestTurn = snapshot?.turns.at(-1) ?? null
   const latestUsage = latestUsageSummary(snapshot?.turns ?? [])
   const visibleEntries = conversationEntries(snapshot?.items ?? [])
@@ -929,13 +992,26 @@ export function ConversationWorkspace({
     }
   }
 
+  const cancelFollowUp = async (followUp: CanonicalFollowUpDto) => {
+    setCancellingFollowUpId(followUp.id)
+    try {
+      await conversationApi.cancelFollowUp(followUp.id, followUp.revision)
+      setError(null)
+      await refreshThread()
+    } catch (cause) {
+      await refreshThread()
+      setError(errorMessage(cause))
+    } finally {
+      setCancellingFollowUpId(null)
+    }
+  }
+
   const canSubmit = Boolean(
     snapshot
       && !selectedSession?.archivedAt
-      && snapshot.thread.status === 'idle'
       && prompt.trim()
-      && model.trim()
-      && !submitting,
+      && !submitting
+      && (activeTurn !== null || (snapshot.thread.status === 'idle' && Boolean(model.trim()))),
   )
 
   const selectSession = (sessionId: string) => {
@@ -1467,6 +1543,48 @@ export function ConversationWorkspace({
           </div>
         ) : (
         <div className="shrink-0 bg-gradient-to-t from-background via-background to-background/0 px-3 pb-4 pt-2 sm:px-6 sm:pb-6">
+          {visibleFollowUps.length > 0 ? (
+            <section
+              className="mx-auto mb-2 w-full max-w-3xl rounded-xl border bg-background/95 px-3 py-2 shadow-sm"
+              aria-label="대기 중인 추가 요청"
+            >
+              <div className="mb-1 flex items-center gap-2 text-xs font-medium">
+                <span>추가 요청</span>
+                <span className="tabular-nums text-muted-foreground">{visibleFollowUps.length}</span>
+              </div>
+              <div className="space-y-1">
+                {visibleFollowUps.map((followUp) => {
+                  const presentation = followUpPresentation(followUp, activeTurn?.id ?? null)
+                  return (
+                    <div key={followUp.id} className="flex min-w-0 items-center gap-2 rounded-lg px-1 py-1 text-xs">
+                      <span className="w-5 shrink-0 text-right tabular-nums text-muted-foreground">{followUp.sequence}</span>
+                      <span className="min-w-0 flex-1 truncate" title={followUpText(followUp)}>{followUpText(followUp)}</span>
+                      <span className={cn(
+                        'shrink-0 rounded-md px-1.5 py-0.5',
+                        presentation.tone === 'warning' && 'bg-warning/15 text-warning-foreground',
+                        presentation.tone === 'info' && 'bg-info/10 text-info',
+                        presentation.tone === 'muted' && 'bg-muted text-muted-foreground',
+                      )}>
+                        {presentation.label}
+                      </span>
+                      {presentation.cancellable ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          disabled={cancellingFollowUpId === followUp.id}
+                          onClick={() => void cancelFollowUp(followUp)}
+                          aria-label={`추가 요청 ${followUp.sequence} 취소`}
+                        >
+                          ×
+                        </Button>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            </section>
+          ) : null}
           {snapshot?.goal ? (
             <GoalControl
               key={`${snapshot.goal.id}:${goalPanelVersion}`}
@@ -1515,7 +1633,7 @@ export function ConversationWorkspace({
                 if (canSubmit) event.currentTarget.form?.requestSubmit()
               }}
               rows={2}
-              placeholder={goalComposerMode ? 'Goal 내용 입력' : '메시지 보내기'}
+              placeholder={goalComposerMode ? 'Goal 내용 입력' : activeTurn ? '추가 요청 보내기' : '메시지 보내기'}
               aria-label="메시지"
               aria-keyshortcuts="Enter Shift+Enter"
               className="max-h-48 min-h-14 w-full resize-none bg-transparent px-2 py-2 text-[0.9375rem] leading-6 text-foreground outline-none placeholder:text-muted-foreground"
@@ -1549,7 +1667,7 @@ export function ConversationWorkspace({
                   setModel(next.id)
                   setEffort(next?.defaultEffort ?? null)
                 }}
-                disabled={PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
+                disabled={Boolean(activeTurn) || PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
                 aria-label="모델"
                 className="min-w-0 max-w-64 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs font-medium text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
               >
@@ -1577,6 +1695,7 @@ export function ConversationWorkspace({
                 <select
                   value={effort ?? ''}
                   onChange={(event) => setEffort(event.target.value || null)}
+                  disabled={Boolean(activeTurn)}
                   aria-label="Reasoning effort"
                   className="rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
                 >
@@ -1594,9 +1713,17 @@ export function ConversationWorkspace({
               />
 
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                {snapshot?.thread.status === 'running' ? '응답을 생성하고 있습니다' : ''}
+                {activeTurn ? '응답 생성 중 · 추가 요청 가능' : ''}
               </span>
 
+              <Button
+                type="submit"
+                size="icon-sm"
+                disabled={!canSubmit}
+                aria-label={activeTurn ? '추가 요청 보내기' : '메시지 보내기'}
+              >
+                <Send aria-hidden />
+              </Button>
               {activeTurn ? (
                 <Button
                   type="button"
@@ -1608,11 +1735,7 @@ export function ConversationWorkspace({
                 >
                   <Square className="size-3 fill-current" aria-hidden />
                 </Button>
-              ) : (
-                <Button type="submit" size="icon-sm" disabled={!canSubmit} aria-label="메시지 보내기">
-                  <Send aria-hidden />
-                </Button>
-              )}
+              ) : null}
             </div>
           </form>
           {modelCatalogErrors[provider] ? (

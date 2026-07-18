@@ -199,7 +199,44 @@ export interface ThreadSnapshotDto {
   turns: CanonicalTurnDto[]
   items: CanonicalItemDto[]
   bindings: JsonValue[]
+  followUps?: CanonicalFollowUpDto[]
   goal?: CanonicalGoalDto | null
+}
+
+export type FollowUpDeliveryDto = 'steer_or_queue' | 'next_turn'
+export type FollowUpStatusDto =
+  | 'queued'
+  | 'dispatching'
+  | 'consumed'
+  | 'cancelled'
+  | 'stale_goal'
+  | 'delivery_unknown'
+
+export interface CanonicalFollowUpDto {
+  id: string
+  sessionId: string
+  threadId: string
+  clientRequestId: string
+  requestHash: string
+  sequence: number
+  afterTurnSequence: number
+  delivery: FollowUpDeliveryDto
+  status: FollowUpStatusDto
+  targetTurnId: string | null
+  consumedTurnId: string | null
+  consumedItemIds: string[]
+  scope: { kind: 'conversation' } | { kind: 'goal'; goalId: string; revision: number }
+  input: Array<{
+    kind: 'user_message'
+    visibility?: 'portable'
+    payload: JsonObject
+  }>
+  dispatchOwner: string | null
+  leaseExpiresAt: string | null
+  revision: number
+  createdAt: string
+  updatedAt: string
+  consumedAt: string | null
 }
 
 export interface CanonicalGoalDto {
@@ -266,6 +303,17 @@ export interface StartTurnDto {
   effort?: string | null
   clientRequestId: string
   expectedRevision: number
+  input: Array<{
+    kind: 'user_message'
+    visibility: 'portable'
+    payload: JsonObject
+  }>
+}
+
+export interface EnqueueFollowUpDto {
+  clientRequestId: string
+  expectedTurnId: string
+  delivery: FollowUpDeliveryDto
   input: Array<{
     kind: 'user_message'
     visibility: 'portable'

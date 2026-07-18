@@ -184,3 +184,81 @@ test('unknown mutation reconciliation sends the explicit user resolution without
     body: { callId: 'call-1', resolution: 'unknown_acknowledged', note: '외부 상태를 확인함' },
   }])
 })
+
+test('follow-up presentation preserves FIFO and exposes cancellation only while queued', async () => {
+  const { composerSubmissionKind, followUpPresentation, pendingFollowUps, followUpText } = await import(workspaceModulePath) as {
+    composerSubmissionKind: (prompt: string, goalMode: boolean, activeTurnId: string | null) => string
+    followUpPresentation: (
+      followUp: { status: string; targetTurnId: string | null; delivery: string },
+      activeTurnId: string | null,
+    ) => { label: string; cancellable: boolean }
+    pendingFollowUps: (followUps: Array<Record<string, unknown>>) => Array<Record<string, unknown>>
+    followUpText: (followUp: { input: Array<{ payload: Record<string, unknown> }> }) => string
+  }
+  assert.deepEqual(followUpPresentation({
+    status: 'dispatching', targetTurnId: 'turn-1', delivery: 'steer_or_queue',
+  }, 'turn-1'), { label: '현재 턴 전달 중', tone: 'info', cancellable: false })
+  assert.deepEqual(followUpPresentation({
+    status: 'queued', targetTurnId: null, delivery: 'next_turn',
+  }, 'turn-1'), { label: '다음 턴 대기', tone: 'muted', cancellable: true })
+  assert.equal(followUpPresentation({
+    status: 'delivery_unknown', targetTurnId: 'turn-1', delivery: 'steer_or_queue',
+  }, 'turn-1').label, '전달 확인 필요')
+  assert.equal(followUpPresentation({
+    status: 'stale_goal', targetTurnId: null, delivery: 'next_turn',
+  }, null).cancellable, false)
+
+  const pending = pendingFollowUps([
+    { id: 'later', sequence: 2, status: 'queued' },
+    { id: 'done', sequence: 3, status: 'consumed' },
+    { id: 'first', sequence: 1, status: 'delivery_unknown' },
+    { id: 'cancelled', sequence: 4, status: 'cancelled' },
+  ])
+  assert.deepEqual(pending.map((followUp) => followUp.id), ['first', 'later'])
+  assert.equal(followUpText({ input: [{ payload: { text: '추가 제약' } }] }), '추가 제약')
+  assert.equal(composerSubmissionKind('일반 추가 요청', false, 'turn-1'), 'follow_up')
+  assert.equal(composerSubmissionKind('/goal pause', false, 'turn-1'), 'goal')
+  assert.equal(composerSubmissionKind('새 목표', true, 'turn-1'), 'goal')
+  assert.equal(composerSubmissionKind('새 요청', false, null), 'turn')
+})
+
+test('follow-up API sends the fixed enqueue and revision-CAS cancel bodies', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; method: string | undefined; body: unknown }> = []
+  globalThis.fetch = (async (input, init) => {
+    calls.push({
+      url: String(input),
+      method: init?.method,
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    })
+    return Response.json({ followUp: { id: 'follow-up-1' }, duplicate: false })
+  }) as typeof fetch
+  try {
+    await conversationApi.enqueueFollowUp('thread/1', {
+      clientRequestId: 'request-1',
+      expectedTurnId: 'turn-1',
+      delivery: 'steer_or_queue',
+      input: [{ kind: 'user_message', visibility: 'portable', payload: { text: 'continue' } }],
+    })
+    await conversationApi.cancelFollowUp('follow-up/1', 7)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(calls, [
+    {
+      url: '/baton/v1/threads/thread%2F1/follow-ups',
+      method: 'POST',
+      body: {
+        clientRequestId: 'request-1',
+        expectedTurnId: 'turn-1',
+        delivery: 'steer_or_queue',
+        input: [{ kind: 'user_message', visibility: 'portable', payload: { text: 'continue' } }],
+      },
+    },
+    {
+      url: '/baton/v1/follow-ups/follow-up%2F1',
+      method: 'DELETE',
+      body: { expectedRevision: 7 },
+    },
+  ])
+})

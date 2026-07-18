@@ -108,7 +108,7 @@ function nativeCandidate(contents: string[], cwd: string, contentDigest: string)
   }
 }
 
-test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t) => {
+test('schema v1 migrates through v12 with durable follow-up dispatch uncertainty', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -118,6 +118,7 @@ test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t
     CREATE TABLE sessions(
       id TEXT PRIMARY KEY, archived_at TEXT
     ) STRICT;
+    CREATE TABLE threads(id TEXT PRIMARY KEY) STRICT;
     CREATE TABLE turns(
       id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sequence INTEGER NOT NULL,
       provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
@@ -148,10 +149,10 @@ test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -178,7 +179,7 @@ test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t
   }).follow_up_window, 'closed')
 })
 
-test('schema v6 migrates to v10 in place and reopens without replaying migrations', (t) => {
+test('schema v6 migrates to v12 in place and reopens without replaying migrations', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -231,11 +232,11 @@ test('schema v6 migrates to v10 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -245,6 +246,44 @@ test('schema v6 migrates to v10 in place and reopens without replaying migration
     .get() as { count: number }).count, 1)
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=10")
     .get() as { count: number }).count, 1)
+})
+
+test('schema v10 rebuilds follow-up constraints through v12 with foreign keys and reopens once', (t) => {
+  const path = databasePath(t)
+  const legacy = new DatabaseSync(path)
+  legacy.exec(`
+    CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,applied_at TEXT NOT NULL) STRICT;
+    INSERT INTO schema_migrations SELECT value,'v'||value,'2026-07-18T00:00:00.000Z' FROM json_each('[1,2,3,4,5,6,7,8,9,10]');
+    PRAGMA user_version=10;
+    CREATE TABLE sessions(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE threads(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE turns(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE native_import_meta(key TEXT PRIMARY KEY,value BLOB NOT NULL) STRICT;
+    INSERT INTO native_import_meta VALUES('identity_hmac_key',zeroblob(32));
+    CREATE TABLE follow_ups(
+      id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),thread_id TEXT NOT NULL REFERENCES threads(id),
+      client_request_id TEXT NOT NULL,request_hash TEXT NOT NULL,sequence INTEGER NOT NULL,after_turn_sequence INTEGER NOT NULL,
+      delivery TEXT NOT NULL,status TEXT NOT NULL,target_turn_id TEXT REFERENCES turns(id),consumed_turn_id TEXT REFERENCES turns(id),
+      consumed_item_ids_json TEXT NOT NULL,goal_id TEXT,goal_revision INTEGER,input_json TEXT NOT NULL,
+      dispatch_owner TEXT,lease_expires_at TEXT,revision INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,consumed_at TEXT,
+      UNIQUE(thread_id,client_request_id),UNIQUE(thread_id,sequence)
+    ) STRICT;
+    CREATE INDEX follow_ups_thread_state_sequence ON follow_ups(thread_id,status,sequence);
+    CREATE INDEX follow_ups_target_state_sequence ON follow_ups(target_turn_id,status,sequence);
+    CREATE INDEX follow_ups_expired_dispatch ON follow_ups(lease_expires_at,id) WHERE status='dispatching';
+    INSERT INTO sessions VALUES('s'); INSERT INTO threads VALUES('th');
+    INSERT INTO follow_ups VALUES('f','s','th','r','h',1,0,'next_turn','queued',NULL,NULL,'[]',NULL,NULL,'[{"kind":"user_message","payload":{"text":"x"}}]',NULL,NULL,1,'2026-07-18','2026-07-18',NULL);
+  `)
+  legacy.close()
+  const first = new SqliteSessionStore(path)
+  first.close()
+  const reopened = new SqliteSessionStore(path)
+  t.after(() => reopened.close())
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12)
+  assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
+  assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
 })
 
 test('sessions move to trash, remain readable for restore, and reject new work while archived', (t) => {
@@ -1087,14 +1126,14 @@ test('follow-up closing and expired-lease recovery preserve FIFO intent for the 
     status: followUp.status,
     targetTurnId: followUp.targetTurnId,
   })), [
-    { id: first.id, status: 'queued', targetTurnId: null },
+    { id: first.id, status: 'delivery_unknown', targetTurnId: null },
     { id: second.id, status: 'queued', targetTurnId: null },
   ])
   assert.equal(store.claimFollowUp({
     threadId: session.activeThreadId,
     ownerId: 'next-turn-dispatcher',
     purpose: 'next_turn',
-  })?.id, first.id)
+  })?.id, second.id)
 })
 
 test('next-turn follow-ups reject the existing turn and survive lease recovery for a later turn', (t) => {
@@ -1141,7 +1180,16 @@ test('next-turn follow-ups reject the existing turn and survive lease recovery f
     leaseDurationMs: 1_000,
   })?.id, followUp.id)
 
+  assert.throws(() => store.beginTurnFromFollowUp({
+    followUpId: followUp.id, ownerId: 'crashed-dispatcher', threadId: 'foreign-thread',
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  }), (error: unknown) => error instanceof FollowUpStoreError && error.code === 'invalid_follow_up')
+
   now = '2026-07-18T00:00:02.000Z'
+  assert.throws(() => store.beginTurnFromFollowUp({
+    followUpId: followUp.id, ownerId: 'crashed-dispatcher', threadId: session.activeThreadId,
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  }), (error: unknown) => error instanceof FollowUpStoreError && error.code === 'follow_up_lease_lost')
   assert.equal(store.recoverExpiredFollowUpClaims(), 1)
   assert.equal(store.claimFollowUp({
     threadId: session.activeThreadId,
@@ -1156,6 +1204,66 @@ test('next-turn follow-ups reject the existing turn and survive lease recovery f
   assert.equal(consumed.status, 'consumed')
   assert.deepEqual(consumed.items.map((item) => item.payload), [{ text: 'deliver only later' }])
   assert.equal(consumed.followUp.consumedTurnId, later.turn.id)
+})
+
+test('follow-up cancellation CAS and delivery-unknown are terminal and replay-safe', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const queued = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'cancel-me', requestHash: 'cancel-hash',
+    delivery: 'next_turn', targetTurnId: null, scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'cancel' } }],
+  }).followUp
+  assert.equal(store.cancelFollowUp(queued.id, queued.revision).status, 'cancelled')
+  assert.throws(() => store.cancelFollowUp(queued.id, queued.revision),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict')
+
+  const active = store.beginTurn(beginInput(session.activeThreadId))
+  const uncertain = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'unknown', requestHash: 'unknown-hash',
+    delivery: 'steer_or_queue', targetTurnId: active.turn.id, scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'maybe delivered' } }],
+  }).followUp
+  store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'pump', purpose: 'steer', targetTurnId: active.turn.id })
+  assert.equal(store.markFollowUpDeliveryUnknown(uncertain.id, 'pump').status, 'delivery_unknown')
+  assert.equal(store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'retry', purpose: 'steer', targetTurnId: active.turn.id }), null)
+})
+
+test('beginTurnFromFollowUp atomically consumes input and commits stale Goal observation', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const existing = store.beginTurn(beginInput(session.activeThreadId))
+  const next = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'next', requestHash: 'next-hash',
+    delivery: 'next_turn', targetTurnId: null, scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'atomic next' } }],
+  }).followUp
+  store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'next-owner', purpose: 'next_turn' })
+  store.finishTurn({ turnId: existing.turn.id, status: 'completed' })
+  const started = store.beginTurnFromFollowUp({
+    followUpId: next.id, ownerId: 'next-owner', threadId: session.activeThreadId,
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  })
+  assert.equal(started.initialItems[0]?.payload.text, 'atomic next')
+  assert.equal(store.listFollowUps(session.activeThreadId).find((item) => item.id === next.id)?.status, 'consumed')
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  const goal = store.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'old', provider: 'codex', model: 'gpt-test',
+  })
+  const stale = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'stale-next', requestHash: 'stale-hash',
+    delivery: 'next_turn', targetTurnId: null, scope: { kind: 'goal', goalId: goal.id, revision: goal.revision },
+    input: [{ kind: 'user_message', payload: { text: 'old goal only' } }],
+  }).followUp
+  store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'stale-owner', purpose: 'next_turn' })
+  store.editGoal({ goalId: goal.id, expectedRevision: goal.revision, objective: 'new' })
+  assert.throws(() => store.beginTurnFromFollowUp({
+    followUpId: stale.id, ownerId: 'stale-owner', threadId: session.activeThreadId,
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  }), (error: unknown) => error instanceof GoalStoreError && error.code === 'stale_goal_revision')
+  assert.equal(store.listFollowUps(session.activeThreadId).find((item) => item.id === stale.id)?.status, 'stale_goal')
 })
 
 test('Goal-scoped follow-ups become stale deterministically without appending unseen input', (t) => {
@@ -1347,7 +1455,12 @@ test('startup recovery deterministically interrupts durable active turns once', 
     status: candidate.status,
     targetTurnId: candidate.targetTurnId,
     dispatchOwner: candidate.dispatchOwner,
-  })), [{ status: 'queued', targetTurnId: null, dispatchOwner: null }])
+  })), [{ status: 'delivery_unknown', targetTurnId: null, dispatchOwner: null }])
+  assert.equal(recoveredStore.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'replacement-runtime',
+    purpose: 'next_turn',
+  }), null)
   assert.equal(
     recoveredStore.listEvents(session.activeThreadId).filter((event) => event.type === 'turn_interrupted').length,
     1,
