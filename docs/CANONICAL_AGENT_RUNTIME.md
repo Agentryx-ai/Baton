@@ -1,7 +1,9 @@
 # Canonical agent runtime
 
-> Status: **TARGET CONTRACT — NOT IMPLEMENTED.** Conformance requires every MUST in this document
-> and the verification matrix. Current text-only adapters are non-conforming.
+> Status: **V1 PARTIALLY IMPLEMENTED (2026-07-19).** The provider-neutral model/tool loop,
+> durable tool coordinator, bounded execution, cancellation precedence, and crash recovery are
+> active. Approval/user-input waits, context compaction, and a verified workspace-only command
+> sandbox remain outside the implemented subset.
 
 ## 1. Purpose
 
@@ -49,6 +51,12 @@ canonical turn after this boundary; it never changes what a turn means.
 - execute an unregistered native shell, plugin, app, MCP server, or tool;
 - silently continue after a Baton limit, cancellation, or policy denial;
 - claim completion for truncation, refusal, malformed output, or a pending tool exchange.
+
+Codex currently exposes `update_plan` unconditionally and provides no supported switch to remove it.
+Baton permits this one provider-local metadata tool because it has no external side effect or child
+execution and normalizes its output into canonical `plan` items. It is recorded in adapter
+enforcement evidence. This exception does not permit native shell, web search, MCP, plugin, app, or
+subagent tools; those remain disabled and fail-closed.
 
 ## 3. Tool contract
 

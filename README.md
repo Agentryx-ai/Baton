@@ -88,9 +88,10 @@ ID는 바뀌지 않습니다.
 | 여러 provider/계정 대시보드 | 구현됨 | Claude/Codex 계정, quota, reset, 상태 관리 |
 | Smart rotation | **부분 구현** | quota 기반 target/reserve 활성 풀 조향; 실제 target 우선 라우팅은 미보장 |
 | 클라이언트 프록시 자동 설정 | 구현됨 | Claude/Codex CLI·Desktop별 결정론적 적용/해제, Codex 기존 세션 유지 모드, 종료·lock 검사 |
-| Canonical conversation runtime | **Preview 구현** | SQLite 정본 저장소, session/thread/turn/item, replay, fork, SSE, cancel, 시작 시 recovery |
-| Codex turn adapter | **Preview 구현** | app-server 기반 stateless replay, ephemeral native thread, fail-closed capability 검증 |
-| Canonical conversation UI | **Preview 구현** | 공통 앱 셸, 세션 생성·선택, provider/model/effort 선택, 턴 실행·스트리밍·취소 |
+| Canonical conversation runtime | **V1 부분 구현** | SQLite 정본, provider-neutral model/tool loop, durable broker, bounded cancel/recovery |
+| Persistent Goal runtime | **V1 구현** | `/goal`, CAS/lease, 자동 후속 턴, pause/resume/edit/clear, 24턴·2시간·no-progress 안전 한도 |
+| Codex turn adapter | **V1 구현** | app-server ephemeral thread, Baton tools, web/MCP/plugin/subagent 차단, model provenance |
+| Canonical conversation UI | **Preview 구현** | 2-column 대화, 작업 상태, provider/model/effort, Goal panel, 턴 실행·취소 |
 | Claude turn adapter | **Preview 구현** | portable text history 기반 stateless 실행; Fable 5 live 검증 완료 |
 | Gemini turn adapter | **Preview 구현·live 차단** | OpenAI 호환 stateless 경로 구현; 현재 proxy 인증 문제로 모델이 0개라 UI에서 비활성화 |
 | Baton-managed child execution | 기반만 구현, 실행 비활성 | execution 기록과 delegation-disabled 정책; child API·실행기는 예정 |
@@ -154,6 +155,13 @@ SPA (React + Vite + Tailwind + shadcn)
     설정하는 **기존 세션 유지 모드**와, 별도 `baton` provider 모드를 선택 가능
 - canonical session/thread/turn/item과 provider binding의 SQLite/WAL 영속화
 - `/baton/v1` REST API, cursor replay SSE, fork, idempotent retry, cancel, crash recovery
+- provider-neutral agent loop와 Baton tool broker
+  - tool call 선기록, read 병렬화, mutation 직렬화, 결과 기록 후 provider 재개
+  - workspace read/list/search/write/replace와 provider-neutral Goal tools
+  - model round/tool/retry/time/output 한도와 late completion보다 cancellation 우선
+- persistent Goal runtime
+  - `/goal`, `/goal edit|pause|resume|clear`, Goal panel과 세션 상태
+  - SQLite CAS/event, scheduler lease, 자동 continuation, token/turn/time/no-progress 한도
 - Codex app-server adapter
   - portable history를 ephemeral native thread에 주입하는 stateless continuation
   - approval, shell, MCP, plugin, multi-agent 실행면을 비활성화하고 시작 시 검증
@@ -234,18 +242,18 @@ npm start              # http://localhost:4400
 
 ## Known limitations
 
-- Canonical conversation runtime은 Preview입니다. Claude/Gemini는 stateless adapter이고 provider 고유
-  streaming/tool 확장은 아직 제한됩니다. Native session import는 독립 `fork_copy`만 지원하며 native
+- Canonical conversation runtime은 V1 부분 구현입니다. Claude/Gemini는 stateless adapter이고 provider 고유
+  streaming/content part 확장은 아직 제한됩니다. Native session import는 독립 `fork_copy`만 지원하며 native
   원본의 authority 승계·동기화·`/goal` 변경은 아직 구현되지 않았습니다.
-- Preview UI가 아직 미지원인 Claude/Gemini를 선택 가능하게 노출합니다. 이는 지원 상태가 아니라
-  수정해야 할 false affordance입니다.
 - Smart rotation의 `현재 타깃`은 계산상 1순위일 뿐 실제 요청 우선권을 보장하지 않습니다.
   target과 reserve가 모두 활성인 `round-robin`에서는 두 계정이 순환되므로, 엄밀한
   reset-imminent-first 정책은 아직 완성되지 않았습니다.
 - quota 응답에는 freshness 시각이 있지만 현재 카드 UI에는 설계된 “n초 전 기준” 표시가
   연결되지 않았습니다.
 - 현재 canonical Codex 턴은 text 중심이며 native tool calling, shell, MCP, plugin, multi-agent를
-  의도적으로 비활성화합니다. Baton-managed tool/child execution은 후속 단계입니다.
+  의도적으로 비활성화합니다. 대신 provider-neutral Baton workspace/Goal tools를 사용합니다.
+- `run_command`는 현재 Windows sandbox가 작업공간 밖 읽기까지 차단할 수 있다고 검증되지 않아
+  기본 도구 목록에서 fail-closed로 제외됩니다. 파일 read/write 도구는 realpath 경계를 별도로 강제합니다.
 - fork는 API와 저장소에서 지원하지만 현재 preview UI에는 fork 조작 화면이 없습니다.
 - 수정하지 않은 native Desktop UI는 외부 session protocol을 보장하지 않으므로 transparent한
   공유를 약속하지 않습니다. 명시적 Baton UI/API 또는 지원되는 bridge가 정본 경로입니다.

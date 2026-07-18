@@ -1,6 +1,6 @@
 # Baton 구현 정합성 현황
 
-> 기준일: 2026-07-18
+> 기준일: 2026-07-19
 > 판정 기준: 제품 계약은 [`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md), 현재 상태는
 > 소스와 테스트를 기준으로 한다. 구현이 설계와 다르다는 이유만으로 설계를 구현에 맞춰
 > 축소하지 않는다.
@@ -28,14 +28,15 @@
 | Canonical domain과 SQLite | 구현됨 | session/thread/turn/item/execution/binding 스키마, WAL, transaction, idempotency, fork lineage, 재시작 recovery 테스트 | 없음 |
 | Canonical item/content 계약 | 부분 구현 | Preview enum과 자유형 `payload` JSON은 존재 | 설계의 ordered content parts, artifact digest store, command/web/compaction/diagnostic 표현은 아직 없음 |
 | Context builder와 compaction | 부분 구현 | fork lineage와 portable text replay는 구현됨 | model context budget, immutable compaction range, artifact-aware materialization은 미구현 |
-| Canonical REST/SSE | 구현됨 | `/baton/v1` session 조회·생성, thread snapshot/fork, turn 시작·취소, item cursor, SSE replay | child execution/import API는 아직 없음 |
-| Codex adapter | 부분 구현 | app-server handshake, ephemeral `thread/start`, `thread/inject_items`, `turn/start`, interrupt, durable text/plan/reasoning/usage/error 정규화 | 현재 text 중심 Preview. 일반 tool/file-change 실행 계약은 아직 충족하지 않음 |
-| Canonical UI | 부분 구현 | 홈·대화·설정이 동일한 앱 셸을 사용하며 세션, transcript, SSE, provider/model/effort, 턴 실행·취소를 제공 | fork UI와 cwd/project/instruction 설정은 아직 없음 |
+| Canonical REST/SSE | 구현됨 | session/thread/turn/item과 Goal 생성·수정·상태·삭제 API, cursor replay SSE | child execution API는 아직 없음 |
+| Codex adapter | V1 구현 | app-server ephemeral thread, Baton dynamic tools, web/MCP/plugin/subagent 차단, ID·timeout·model provenance 검증 | 공식적으로 끌 수 없는 provider-local `update_plan` metadata tool 예외가 있음 |
+| Canonical UI | 부분 구현 | 2-column 대화, 상태 표시, transcript, provider/model/effort, Goal panel과 `/goal` 명령 | fork와 cwd/project/instruction 선택 UI는 아직 없음 |
 | UI provider 선택 | 구현됨 | 서버 모델 catalog를 provider별로 조회하고 모델이 0개인 provider는 비활성화 | Gemini 인증 복구 후 live catalog 표시 검증 필요 |
 | Provider 전환 | 부분 구현 | Codex·Claude·Gemini adapter가 같은 portable history 계약을 사용; Claude Fable 5 live 검증 완료 | Gemini는 현재 proxy 인증 문제로 모델 0개이며 live 실행 미검증 |
-| Claude adapter | **Preview 구현** | `/v1/messages` stateless history, effort 전달, 요청/실제 model 및 fallback 기록, mock 통합 테스트와 Fable 5 live 응답 확인 | streaming과 provider 고유 content part 확장 필요 |
-| Gemini adapter | **Preview 구현·live 차단** | `/v1/chat/completions` 호환 경로, reasoning effort, usage 정규화와 mock 통합 테스트 | 현재 인증 버그로 live catalog/turn 검증 불가; 인증 복구 전 UI 비활성화 유지 |
-| 일반 tool 실행 | 부분 구현 | item/domain 계약은 있으나 현재 turn policy는 `allowedTools: []`; Codex adapter는 shell, MCP, plugin과 approval/tool 요청을 차단 | Baton 소유 tool 실행과 approval 정책을 설계대로 구현하기 전까지 text-only 제약 유지 |
+| Claude adapter | **V1 구현** | `/v1/messages` stateless history, Baton tool loop, effort, round별 reported model/fallback, bounded retry/timeout, Fable 5 live 응답 | streaming과 provider 고유 content part 확장 필요 |
+| Gemini adapter | **V1 구현·live 차단** | `/v1/chat/completions` 호환 history/tool loop, reasoning effort, round provenance, bounded retry/timeout | 현재 인증 버그로 live catalog/turn 검증 불가; 인증 복구 전 UI 비활성화 유지 |
+| 일반 tool 실행 | 부분 구현 | provider-neutral broker가 call 선기록, read 병렬·mutation 직렬화, result 후속 기록을 강제하며 read/list/search/write/replace와 Goal tools를 제공 | 이 Windows 환경은 cwd 밖 read 제한에 elevated backend가 필요해 `run_command`를 fail-closed로 미노출. approval/user-input wait도 미구현 |
+| Persistent Goal runtime | V1 구현 | Goal projection/event, CAS, 30초 lease/10초 heartbeat, 24턴·2시간·3회 no-progress, 자동 continuation, pause/resume/edit/clear, `/goal` UI | Gemini live 검증은 인증 복구 전까지 차단 |
 | Provider opaque state | 부분 구현 | binding 스키마와 invalidation은 구현됨 | at-rest encryption이 없어 non-null opaque state 저장을 fail-closed로 거부함 |
 | Provider binding freshness | 설계 변경 | 구현은 `last_turn_id` 대신 `synced_revision`과 `context_digest`로 exact context compatibility를 판정 | 공통 설계 문서의 binding 필드를 이 결정에 맞춰 갱신 |
 | Baton-managed child execution | 부분 구현·비활성 | execution 기록과 `delegationMode: disabled`, native child capability 검증이 있음 | child API, scheduler/executor, budget/depth/join/cancel 구현 필요 |
@@ -54,6 +55,11 @@ GET    /baton/v1/sessions/:sessionId
 GET    /baton/v1/threads/:threadId
 POST   /baton/v1/threads/:threadId/fork
 POST   /baton/v1/threads/:threadId/turns
+GET    /baton/v1/threads/:threadId/goal
+POST   /baton/v1/threads/:threadId/goal
+PATCH  /baton/v1/goals/:goalId
+POST   /baton/v1/goals/:goalId/status
+DELETE /baton/v1/goals/:goalId?expectedRevision=<revision>
 GET    /baton/v1/threads/:threadId/items?after=<cursor>
 GET    /baton/v1/threads/:threadId/events?after=<cursor>   (SSE)
 POST   /baton/v1/turns/:turnId/cancel

@@ -1,7 +1,9 @@
 # Persistent Goal runtime
 
-> Status: **TARGET CONTRACT — NOT IMPLEMENTED.** Conformance requires every MUST in this document
-> and the verification matrix. Current text-only adapters are non-conforming.
+> Status: **V1 IMPLEMENTED (2026-07-19).** SQLite projection/events, revision CAS, leases,
+> automatic continuation, limits, recovery, Goal tools, REST API, `/goal` commands, and UI controls
+> are active. Claude and Codex have deterministic mock/integration coverage; Gemini live execution
+> remains unverified while its proxy authentication is unavailable.
 
 ## 1. Purpose and separation
 
