@@ -222,7 +222,10 @@ function SessionSidebar({
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
+        <div className={cn(
+          'min-h-0 flex-1 overflow-y-auto',
+          preferences.groupBy === 'none' ? 'space-y-1' : 'space-y-3',
+        )}>
           {sessions === null ? (
             <p className="px-2 py-4 text-xs text-muted-foreground">불러오는 중…</p>
           ) : sessions.length === 0 ? (
@@ -242,7 +245,7 @@ function SessionSidebar({
                 />
               ))
             ) : (
-              <section key={group.id} className="pb-2 pt-1 first:pt-0">
+              <section key={group.id}>
                 <button
                   type="button"
                   className="sticky top-0 z-10 flex min-h-8 w-full items-center gap-2 rounded-lg border border-transparent bg-sidebar/95 px-2 py-1.5 text-left text-xs font-semibold text-sidebar-foreground backdrop-blur-sm hover:border-sidebar-border hover:bg-sidebar-accent"
@@ -258,7 +261,7 @@ function SessionSidebar({
                   </span>
                 </button>
                 {!collapsed.has(group.id) ? (
-                  <div className="ml-3 mt-0.5 space-y-0.5 border-l border-sidebar-border pl-1.5">
+                  <div className="ml-3 mt-1 space-y-1 border-l border-sidebar-border pl-1.5">
                     {group.sessions.map((session) => (
                       <SessionButton
                         key={session.id}
