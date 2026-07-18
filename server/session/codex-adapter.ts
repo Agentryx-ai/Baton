@@ -48,12 +48,19 @@ export interface CodexAppServerProcess {
 export type CodexProcessFactory = (
   executable: string,
   args: readonly string[],
+  environment?: Readonly<Record<string, string>>,
 ) => CodexAppServerProcess
+
+export interface CodexProxyConnection {
+  baseUrl: string
+  token: string
+}
 
 export interface CodexAdapterOptions {
   executable?: string
   processFactory?: CodexProcessFactory
   shutdownTimeoutMs?: number
+  proxyConnection?: () => Promise<CodexProxyConnection>
 }
 
 interface MaterializedCodexTurn {
@@ -216,6 +223,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   private readonly executable: string
   private readonly processFactory: CodexProcessFactory
   private readonly shutdownTimeoutMs: number
+  private readonly proxyConnectionProvider: (() => Promise<CodexProxyConnection>) | undefined
+  private proxyConnection: CodexProxyConnection | null = null
   private initializePromise: Promise<AdapterHandshake> | null = null
   private mcpDisableOverrides: Record<string, false> = {}
   private readonly active = new Set<ProviderTurnExecution>()
@@ -225,6 +234,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     this.executable = options.executable ?? (process.platform === 'win32' ? 'codex.cmd' : 'codex')
     this.processFactory = options.processFactory ?? spawnCodexProcess
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000
+    this.proxyConnectionProvider = options.proxyConnection
   }
 
   initialize(): Promise<AdapterHandshake> {
@@ -283,7 +293,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     if (this.shuttingDown) throw new Error('Codex adapter is shutting down')
     await this.initialize()
     const body = parseMaterializedRequest(request.body)
-    const process = this.processFactory(this.executable, launchArgs(this.mcpDisableOverrides))
+    const process = this.processFactory(
+      this.executable,
+      launchArgs(this.mcpDisableOverrides, this.proxyConnection),
+      proxyEnvironment(this.proxyConnection),
+    )
     const client = new CodexJsonlRpcClient(process)
     const eventQueue = new AsyncQueue<NativeProviderEvent>()
     let terminalResult: ProviderTerminalResult | null = null
@@ -400,6 +414,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           model: body.model,
           cwd: body.cwd,
           environments: [],
+          runtimeWorkspaceRoots: [],
           ephemeral: true,
           approvalPolicy: 'never',
           approvalsReviewer: 'user',
@@ -434,6 +449,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           input: body.input,
           model: body.model,
           environments: [],
+          runtimeWorkspaceRoots: [],
           approvalsReviewer: 'user',
           approvalPolicy: 'never',
         }),
@@ -553,6 +569,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   }
 
   private async preflight(): Promise<AdapterHandshake> {
+    this.proxyConnection = this.proxyConnectionProvider
+      ? await this.proxyConnectionProvider()
+      : null
     const initial = await this.inspectConfig({})
     const config = asObject(initial.configRead.config, 'config/read config')
     this.mcpDisableOverrides = mcpServerDisableOverrides(config)
@@ -585,7 +604,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   private async inspectConfig(
     overrides: Record<string, false>,
   ): Promise<{ initialized: JsonObject; configRead: JsonObject }> {
-    const process = this.processFactory(this.executable, launchArgs(overrides))
+    const process = this.processFactory(
+      this.executable,
+      launchArgs(overrides, this.proxyConnection),
+      proxyEnvironment(this.proxyConnection),
+    )
     const client = new CodexJsonlRpcClient(process)
     try {
       const initialized = asObject(
@@ -609,8 +632,22 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   }
 }
 
-function launchArgs(additional: Record<string, false> = {}): string[] {
-  const overrides = Object.entries({ ...HARDENING_OVERRIDES, ...additional }).flatMap(([key, value]) => [
+function launchArgs(
+  additional: Record<string, false> = {},
+  connection: CodexProxyConnection | null = null,
+): string[] {
+  const providerOverrides = connection ? {
+    model_provider: 'baton',
+    'model_providers.baton.name': 'Baton CLIProxy',
+    'model_providers.baton.base_url': `${connection.baseUrl}/v1`,
+    'model_providers.baton.env_key': 'BATON_PROXY_TOKEN',
+    'model_providers.baton.wire_api': 'responses',
+  } : {}
+  const overrides = Object.entries({
+    ...HARDENING_OVERRIDES,
+    ...providerOverrides,
+    ...additional,
+  }).flatMap(([key, value]) => [
     '--config',
     `${key}=${valueAsToml(value)}`,
   ])
@@ -619,8 +656,15 @@ function launchArgs(additional: Record<string, false> = {}): string[] {
 
 function valueAsToml(value: unknown): string {
   if (typeof value === 'boolean') return String(value)
+  if (typeof value === 'string') return JSON.stringify(value)
   if (value && typeof value === 'object' && Object.keys(value as JsonObject).length === 0) return '{}'
   throw new Error('Unsupported Codex hardening override')
+}
+
+function proxyEnvironment(
+  connection: CodexProxyConnection | null,
+): Readonly<Record<string, string>> | undefined {
+  return connection ? { BATON_PROXY_TOKEN: connection.token } : undefined
 }
 
 function assertHardeningConfig(result: JsonObject): Record<string, unknown> {
@@ -755,13 +799,18 @@ function portableText(payload: JsonObject): string | null {
   return null
 }
 
-function spawnCodexProcess(executable: string, args: readonly string[]): CodexAppServerProcess {
+function spawnCodexProcess(
+  executable: string,
+  args: readonly string[],
+  environment: Readonly<Record<string, string>> = {},
+): CodexAppServerProcess {
   const invocation = resolveCodexInvocation(executable, args)
   const child = spawn(invocation.executable, invocation.args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
     shell: false,
     detached: process.platform !== 'win32',
+    env: { ...process.env, ...environment },
   })
   let stderr = ''
   child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })

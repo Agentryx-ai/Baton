@@ -34,6 +34,13 @@ export interface ConversationRouter extends Router {
   closeStreams(): void
 }
 
+export interface ConversationRouterOptions {
+  listModels?: (provider: CanonicalProvider) => Promise<{
+    models: string[]
+    defaultModel: string | null
+  }>
+}
+
 class RequestValidationError extends Error {
   constructor(message: string) {
     super(message)
@@ -188,7 +195,10 @@ function route(
   }
 }
 
-export function createConversationRouter(service: ConversationService): ConversationRouter {
+export function createConversationRouter(
+  service: ConversationService,
+  options: ConversationRouterOptions = {},
+): ConversationRouter {
   const router = Router() as ConversationRouter
   const streams = new Map<Response, () => void>()
 
@@ -212,6 +222,22 @@ export function createConversationRouter(service: ConversationService): Conversa
   router.get('/sessions', (_req, res) => {
     res.json({ sessions: service.listSessions() })
   })
+
+  router.get(
+    '/providers/:provider/models',
+    route(async (req, res) => {
+      const provider = pathParam(req, 'provider')
+      if (!PROVIDERS.has(provider as CanonicalProvider)) {
+        throw new RequestValidationError('provider must be claude, codex, or gemini')
+      }
+      if (!options.listModels) {
+        res.status(503).json({ code: 'model_catalog_unavailable', error: 'model catalog is unavailable' })
+        return
+      }
+      const catalog = await options.listModels(provider as CanonicalProvider)
+      res.json({ provider, ...catalog })
+    }),
+  )
 
   router.get('/sessions/:sessionId', (req, res) => {
     const session = service.getSession(pathParam(req, 'sessionId'))

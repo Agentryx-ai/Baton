@@ -79,6 +79,8 @@ export function ConversationWorkspace() {
   const [title, setTitle] = useState('')
   const provider: CanonicalProvider = 'codex'
   const [model, setModel] = useState('')
+  const [models, setModels] = useState<string[] | null>(null)
+  const [modelCatalogError, setModelCatalogError] = useState<string | null>(null)
   const [prompt, setPrompt] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [loadingSessions, setLoadingSessions] = useState(false)
@@ -111,6 +113,21 @@ export function ConversationWorkspace() {
     }
   }, [])
 
+  const refreshModels = useCallback(async () => {
+    try {
+      const catalog = await conversationApi.listModels(provider)
+      setModels(catalog.models)
+      setModel((current) => {
+        if (catalog.models.includes(current)) return current
+        return catalog.defaultModel ?? catalog.models[0] ?? ''
+      })
+      setModelCatalogError(null)
+    } catch (cause) {
+      setModels([])
+      setModelCatalogError(errorMessage(cause))
+    }
+  }, [provider])
+
   const refreshThread = useCallback(async () => {
     const requestId = ++threadRequest.current
     if (!threadId) {
@@ -135,6 +152,10 @@ export function ConversationWorkspace() {
   useEffect(() => {
     void refreshSessions()
   }, [refreshSessions])
+
+  useEffect(() => {
+    void refreshModels()
+  }, [refreshModels])
 
   useEffect(() => {
     void refreshThread()
@@ -194,6 +215,12 @@ export function ConversationWorkspace() {
   }
 
   const activeTurn = snapshot ? latestActiveTurn(snapshot.turns) : null
+  const latestTurn = snapshot?.turns.at(-1) ?? null
+  const latestTurnError = latestTurn?.status === 'failed' && latestTurn.error
+    ? typeof latestTurn.error.message === 'string'
+      ? latestTurn.error.message
+      : JSON.stringify(latestTurn.error)
+    : null
   const cancelTurn = async () => {
     if (!activeTurn) return
     setCancelling(true)
@@ -244,6 +271,12 @@ export function ConversationWorkspace() {
       {error && (
         <p role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {error}
+        </p>
+      )}
+
+      {latestTurnError && (
+        <p role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          마지막 턴 실패: {latestTurnError}
         </p>
       )}
 
@@ -355,11 +388,25 @@ export function ConversationWorkspace() {
                 </label>
                 <label className="space-y-1 text-xs text-muted-foreground">
                   Model
-                  <Input
+                  <select
                     value={model}
                     onChange={(event) => setModel(event.target.value)}
-                    placeholder="실행할 정확한 model ID"
-                  />
+                    disabled={models === null || models.length === 0}
+                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  >
+                    {models === null ? (
+                      <option value="">모델 목록을 불러오는 중…</option>
+                    ) : models.length === 0 ? (
+                      <option value="">사용 가능한 모델 없음</option>
+                    ) : (
+                      models.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)
+                    )}
+                  </select>
+                  <span className="block">
+                    {modelCatalogError
+                      ? `목록 조회 실패: ${modelCatalogError}`
+                      : '현재 CLIProxy가 제공하는 Codex 모델입니다.'}
+                  </span>
                 </label>
               </div>
 

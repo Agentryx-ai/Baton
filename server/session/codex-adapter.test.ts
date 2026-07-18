@@ -124,9 +124,15 @@ function featureResult(): Record<string, unknown> {
   }
 }
 
-function scriptedFactory(scenario: Scenario, created: FakeProcess[], argsSeen: string[][]): CodexProcessFactory {
-  return (_executable, args) => {
+function scriptedFactory(
+  scenario: Scenario,
+  created: FakeProcess[],
+  argsSeen: string[][],
+  environmentsSeen: Array<Readonly<Record<string, string>> | undefined> = [],
+): CodexProcessFactory {
+  return (_executable, args, environment) => {
     argsSeen.push([...args])
+    environmentsSeen.push(environment)
     const process = new FakeProcess((message, self) => {
       const method = message.method
       if (method === 'initialize') {
@@ -318,8 +324,13 @@ test('preflight discovers inherited MCP servers and relaunches with each one dis
 test('adapter applies process and thread hardening and normalizes durable text, plan, and usage', async () => {
   const created: FakeProcess[] = []
   const argsSeen: string[][] = []
+  const environmentsSeen: Array<Readonly<Record<string, string>> | undefined> = []
   const adapter = new CodexCanonicalAdapter({
-    processFactory: scriptedFactory('normal', created, argsSeen),
+    processFactory: scriptedFactory('normal', created, argsSeen, environmentsSeen),
+    proxyConnection: async () => ({
+      baseUrl: 'http://127.0.0.1:8317',
+      token: 'proxy-token',
+    }),
     shutdownTimeoutMs: 20,
   })
   const handshake = await adapter.initialize()
@@ -342,13 +353,24 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     assert.ok(args.includes('features.multi_agent_v2=false'))
     assert.ok(args.includes('features.enable_fanout=false'))
     assert.ok(args.includes('features.shell_tool=false'))
+    assert.ok(args.includes('model_provider="baton"'))
+    assert.ok(args.includes('model_providers.baton.name="Baton CLIProxy"'))
+    assert.ok(args.includes('model_providers.baton.base_url="http://127.0.0.1:8317/v1"'))
+    assert.ok(args.includes('model_providers.baton.env_key="BATON_PROXY_TOKEN"'))
+    assert.ok(args.includes('model_providers.baton.wire_api="responses"'))
+    assert.ok(!args.some((argument) => argument.includes('proxy-token')))
   }
+  assert.deepEqual(environmentsSeen, [
+    { BATON_PROXY_TOKEN: 'proxy-token' },
+    { BATON_PROXY_TOKEN: 'proxy-token' },
+  ])
   const turnProcess = created[1]
   const threadStart = turnProcess.writes.find((message) => message.method === 'thread/start')
   assert.ok(threadStart)
   const params = threadStart.params as Record<string, unknown>
   assert.equal(params.ephemeral, true)
   assert.deepEqual(params.environments, [])
+  assert.deepEqual(params.runtimeWorkspaceRoots, [])
   assert.equal(params.approvalsReviewer, 'user')
   assert.equal(params.approvalPolicy, 'never')
   assert.deepEqual(params.config, {
@@ -362,6 +384,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   const turnStart = turnProcess.writes.find((message) => message.method === 'turn/start')
   assert.ok(turnStart)
   assert.deepEqual((turnStart.params as Record<string, unknown>).environments, [])
+  assert.deepEqual((turnStart.params as Record<string, unknown>).runtimeWorkspaceRoots, [])
   assert.ok(turnProcess.writes.some((message) => message.method === 'thread/inject_items'))
   await adapter.shutdown()
 })

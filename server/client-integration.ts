@@ -410,7 +410,7 @@ async function requireTargetsStopped(targets: ClientIntegrationTarget[]): Promis
   }
 }
 
-async function loadProxyConnection(includeModels: boolean): Promise<{
+export async function loadProxyConnection(includeModels: boolean): Promise<{
   baseUrl: string
   token: string
   models: string[]

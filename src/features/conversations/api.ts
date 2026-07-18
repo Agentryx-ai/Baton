@@ -59,6 +59,12 @@ function jsonRequest(method: 'POST', body: unknown): RequestInit {
 }
 
 export const conversationApi = {
+  listModels: (provider: string): Promise<{
+    provider: string
+    models: string[]
+    defaultModel: string | null
+  }> => request(`/providers/${encodeURIComponent(provider)}/models`),
+
   listSessions: async (): Promise<CanonicalSessionDto[]> => {
     const result = await request<{ sessions: CanonicalSessionDto[] }>('/sessions')
     return result.sessions

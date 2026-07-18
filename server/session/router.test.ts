@@ -15,7 +15,11 @@ import type {
   CreateSessionInput,
   ThreadSnapshot,
 } from './domain.ts'
-import { createConversationRouter, type ConversationRouter } from './router.ts'
+import {
+  createConversationRouter,
+  type ConversationRouter,
+  type ConversationRouterOptions,
+} from './router.ts'
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type { ForkThreadInput } from './store.ts'
@@ -192,9 +196,10 @@ class TestConversationService implements ConversationService {
 async function withServer(
   service: ConversationService,
   run: (baseUrl: string, router: ConversationRouter) => Promise<void>,
+  options: ConversationRouterOptions = {},
 ): Promise<void> {
   const app = express()
-  const router = createConversationRouter(service)
+  const router = createConversationRouter(service, options)
   app.use('/baton/v1', router)
   const server = app.listen(0, '127.0.0.1')
   await new Promise<void>((resolve, reject) => {
@@ -212,6 +217,33 @@ async function withServer(
     await closed
   }
 }
+
+test('provider model route exposes the runtime catalog and rejects unknown providers', async () => {
+  const service = new TestConversationService()
+  const requested: string[] = []
+  await withServer(service, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/providers/codex/models`)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await json(response), {
+      provider: 'codex',
+      models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+      defaultModel: 'gpt-5.6-sol',
+    })
+    assert.deepEqual(requested, ['codex'])
+
+    const invalid = await fetch(`${baseUrl}/providers/other/models`)
+    assert.equal(invalid.status, 400)
+    assert.equal((await json(invalid)).code, 'invalid_request')
+  }, {
+    listModels: async (provider) => {
+      requested.push(provider)
+      return {
+        models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+        defaultModel: 'gpt-5.6-sol',
+      }
+    },
+  })
+})
 
 async function json(response: Response): Promise<Record<string, unknown>> {
   return (await response.json()) as Record<string, unknown>
