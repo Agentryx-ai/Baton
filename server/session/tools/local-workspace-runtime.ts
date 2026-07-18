@@ -3,14 +3,19 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import {
   lstat,
+  mkdir,
+  mkdtemp,
   open,
   readdir,
   readFile,
   realpath,
   rename,
+  rm,
   stat,
   unlink,
+  writeFile as writeFsFile,
 } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type {
   AgentToolDefinition,
@@ -23,6 +28,7 @@ const DEFAULT_OUTPUT_BYTES = 256 * 1024
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000
 const SHA256_PATTERN = /^[a-f0-9]{64}$/i
 const NEVER_ABORTED_SIGNAL = new AbortController().signal
+const MUTATION_LOCKS = new Map<string, Promise<void>>()
 
 type JsonObject = Record<string, unknown>
 
@@ -74,13 +80,22 @@ export class CodexSandboxCommandRunner implements SandboxCommandRunner {
     this.#executable = executable ?? resolveCodexExecutable()
   }
 
-  run(request: SandboxCommandRequest): Promise<{ exitCode: number | null }> {
-    return new Promise((resolve, reject) => {
+  async run(request: SandboxCommandRequest): Promise<{ exitCode: number | null }> {
+    const sandboxHome = await mkdtemp(path.join(tmpdir(), 'baton-command-'))
+    const commandTemp = path.join(sandboxHome, 'tmp')
+    await mkdir(commandTemp)
+    await writeFsFile(path.join(sandboxHome, 'config.toml'), commandSandboxConfig(request.cwd, commandTemp), {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+    try {
+      return await new Promise((resolve, reject) => {
       const child = spawn(this.#executable, [
-        'sandbox', '-P', ':workspace', '-C', request.cwd,
+        'sandbox', '-P', 'baton-workspace', '-C', request.cwd,
         '--sandbox-state-disable-network', '--', ...request.argv,
       ], {
         cwd: request.cwd,
+        env: commandEnvironment(sandboxHome, commandTemp),
         windowsHide: true,
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -109,21 +124,27 @@ export class CodexSandboxCommandRunner implements SandboxCommandRunner {
       child.once('close', (code) => finish(() => resolve({ exitCode: code })))
       request.signal.addEventListener('abort', abort, { once: true })
       if (request.signal.aborted) abort()
-    })
+      })
+    } finally {
+      await rm(sandboxHome, { recursive: true, force: true })
+    }
   }
 }
 
 export interface LocalWorkspaceToolRuntimeOptions {
   cwd: string
   commandRunner?: SandboxCommandRunner
+  /** Commands stay unavailable unless a strict external-read sandbox has been verified by the host. */
+  enableCommands?: boolean
   maxOutputBytes?: number
 }
 
 export class LocalWorkspaceToolRuntime {
-  readonly definitions = LOCAL_WORKSPACE_TOOL_DEFINITIONS
+  readonly definitions: readonly AgentToolDefinition[]
   readonly #cwd: string
   readonly #commandRunner: SandboxCommandRunner
   readonly #maxOutputBytes: number
+  readonly #enableCommands: boolean
 
   constructor(options: LocalWorkspaceToolRuntimeOptions) {
     if (!path.isAbsolute(options.cwd)) throw new Error('LocalWorkspaceToolRuntime cwd must be absolute')
@@ -133,6 +154,10 @@ export class LocalWorkspaceToolRuntime {
     }
     this.#cwd = path.resolve(options.cwd)
     this.#commandRunner = options.commandRunner ?? new CodexSandboxCommandRunner()
+    this.#enableCommands = options.enableCommands === true
+    this.definitions = this.#enableCommands
+      ? LOCAL_WORKSPACE_TOOL_DEFINITIONS
+      : LOCAL_WORKSPACE_TOOL_DEFINITIONS.filter((definition) => definition.name !== 'run_command')
     this.#maxOutputBytes = options.maxOutputBytes ?? DEFAULT_OUTPUT_BYTES
   }
 
@@ -145,7 +170,16 @@ export class LocalWorkspaceToolRuntime {
         case 'search_text': return ok(await this.#searchText(validateSearchText(invocation.input), signal))
         case 'write_file': return ok(await this.#writeFile(validateWriteFile(invocation.input), signal))
         case 'replace_text': return ok(await this.#replaceText(validateReplaceText(invocation.input), signal))
-        case 'run_command': return ok(await this.#runCommand(validateRunCommand(invocation.input), signal))
+        case 'run_command': {
+          if (!this.#enableCommands) {
+            throw new ToolRuntimeError(
+              'tool_unavailable',
+              'run_command is disabled until the host verifies strict workspace-only read isolation',
+              false,
+            )
+          }
+          return ok(await this.#runCommand(validateRunCommand(invocation.input), signal))
+        }
         default: throw new ToolRuntimeError('tool_not_found', `Unregistered tool: ${invocation.name}`, false)
       }
     } catch (error) {
@@ -166,7 +200,7 @@ export class LocalWorkspaceToolRuntime {
     const requestedOffset = Math.min(input.offset ?? 0, content.length)
     let start = requestedOffset
     while (start < content.length && isContinuationByte(content[start]!)) start += 1
-    let end = Math.min(start + (input.limit ?? 1_048_576), content.length)
+    let end = Math.min(start + Math.min(input.limit ?? this.#maxOutputBytes, this.#maxOutputBytes), content.length)
     while (end > start && end < content.length && isContinuationByte(content[end]!)) end -= 1
     if (end === start && start < content.length) {
       end = start + 1
@@ -255,43 +289,47 @@ export class LocalWorkspaceToolRuntime {
     const content = Buffer.from(input.content, 'utf8')
     if (content.length > MAX_FILE_BYTES) throw new ToolRuntimeError('file_too_large', 'File exceeds 2 MiB', false)
     const resolved = await this.#resolvePath(input.path, true)
-    const before = await readOptionalFile(resolved.absolute)
-    if (input.expectedSha256 === null) {
-      if (before !== null) throw new ToolRuntimeError('target_exists', 'Creation target already exists', false)
-    } else {
-      if (before === null) throw new ToolRuntimeError('path_not_found', 'Overwrite target does not exist', false)
-      assertDigest(input.expectedSha256, before)
-    }
-    abortIfNeeded(signal)
-    await this.#atomicWrite(resolved.absolute, content, input.expectedSha256, signal)
-    return {
-      path: resolved.relative, sha256: sha256(content), bytes: content.length, created: before === null,
-    }
+    return withMutationLock(resolved.absolute, async () => {
+      const before = await readOptionalFile(resolved.absolute)
+      if (input.expectedSha256 === null) {
+        if (before !== null) throw new ToolRuntimeError('target_exists', 'Creation target already exists', false)
+      } else {
+        if (before === null) throw new ToolRuntimeError('path_not_found', 'Overwrite target does not exist', false)
+        assertDigest(input.expectedSha256, before)
+      }
+      abortIfNeeded(signal)
+      await this.#atomicWrite(resolved.absolute, content, input.expectedSha256, signal)
+      return {
+        path: resolved.relative, sha256: sha256(content), bytes: content.length, created: before === null,
+      }
+    })
   }
 
   async #replaceText(input: ReplaceTextInput, signal: AbortSignal): Promise<JsonObject> {
     const resolved = await this.#resolvePath(input.path, false)
-    const before = await readFile(resolved.absolute)
-    if (before.length > MAX_FILE_BYTES) throw new ToolRuntimeError('file_too_large', 'File exceeds 2 MiB', false)
-    assertValidUtf8(before)
-    assertDigest(input.expectedSha256, before)
-    const text = before.toString('utf8')
-    const occurrences = countOccurrences(text, input.oldText)
-    if (input.expectedOccurrences !== undefined && occurrences !== input.expectedOccurrences) {
-      throw new ToolRuntimeError(
-        'occurrence_mismatch',
-        `Expected ${input.expectedOccurrences} occurrence(s), found ${occurrences}`,
-        false,
-      )
-    }
-    if (occurrences === 0) throw new ToolRuntimeError('occurrence_mismatch', 'Text was not found', false)
-    const content = Buffer.from(text.split(input.oldText).join(input.newText), 'utf8')
-    if (content.length > MAX_FILE_BYTES) throw new ToolRuntimeError('file_too_large', 'File exceeds 2 MiB', false)
-    abortIfNeeded(signal)
-    await this.#atomicWrite(resolved.absolute, content, input.expectedSha256, signal)
-    return {
-      path: resolved.relative, sha256: sha256(content), bytes: content.length, replacements: occurrences,
-    }
+    return withMutationLock(resolved.absolute, async () => {
+      const before = await readFile(resolved.absolute)
+      if (before.length > MAX_FILE_BYTES) throw new ToolRuntimeError('file_too_large', 'File exceeds 2 MiB', false)
+      assertValidUtf8(before)
+      assertDigest(input.expectedSha256, before)
+      const text = before.toString('utf8')
+      const occurrences = countOccurrences(text, input.oldText)
+      if (input.expectedOccurrences !== undefined && occurrences !== input.expectedOccurrences) {
+        throw new ToolRuntimeError(
+          'occurrence_mismatch',
+          `Expected ${input.expectedOccurrences} occurrence(s), found ${occurrences}`,
+          false,
+        )
+      }
+      if (occurrences === 0) throw new ToolRuntimeError('occurrence_mismatch', 'Text was not found', false)
+      const content = Buffer.from(text.split(input.oldText).join(input.newText), 'utf8')
+      if (content.length > MAX_FILE_BYTES) throw new ToolRuntimeError('file_too_large', 'File exceeds 2 MiB', false)
+      abortIfNeeded(signal)
+      await this.#atomicWrite(resolved.absolute, content, input.expectedSha256, signal)
+      return {
+        path: resolved.relative, sha256: sha256(content), bytes: content.length, replacements: occurrences,
+      }
+    })
   }
 
   async #runCommand(input: RunCommandInput, signal: AbortSignal): Promise<JsonObject> {
@@ -320,19 +358,13 @@ export class LocalWorkspaceToolRuntime {
     try {
       let exitCode: number | null
       try {
-        const runnerPromise = this.#commandRunner.run({
+        const result = await this.#commandRunner.run({
           argv: input.argv,
           cwd: root.absolute,
           signal: controller.signal,
           onStdout: (chunk) => collect(stdout, chunk),
           onStderr: (chunk) => collect(stderr, chunk),
         })
-        const abortPromise = new Promise<{ exitCode: null }>((resolve) => {
-          if (controller.signal.aborted) resolve({ exitCode: null })
-          else controller.signal.addEventListener('abort', () => resolve({ exitCode: null }), { once: true })
-        })
-        const result = await Promise.race([runnerPromise, abortPromise])
-        void runnerPromise.catch(() => undefined)
         exitCode = result.exitCode
       } catch (error) {
         if (!timedOut) {
@@ -354,7 +386,7 @@ export class LocalWorkspaceToolRuntime {
       if (timedOut) {
         throw new ToolRuntimeError(
           'tool_timeout',
-          'Command exceeded its timeout; process outcome may be unknown',
+          'Command exceeded its timeout and its process tree was terminated',
           false,
           output,
         )
@@ -714,6 +746,52 @@ function safeOutputText(value: Buffer): string {
   const actual = value.length - leadIndex
   const end = actual < expected ? leadIndex : value.length
   return value.subarray(0, end).toString('utf8')
+}
+
+function commandSandboxConfig(cwd: string, commandTemp: string): string {
+  return [
+    'default_permissions = "baton-workspace"',
+    '',
+    '[permissions.baton-workspace.filesystem]',
+    '":minimal" = "read"',
+    `${JSON.stringify(path.resolve(cwd))} = "write"`,
+    `${JSON.stringify(path.resolve(commandTemp))} = "write"`,
+    '',
+    '[permissions.baton-workspace.network]',
+    'enabled = false',
+    '',
+  ].join('\n')
+}
+
+function commandEnvironment(sandboxHome: string, commandTemp: string): NodeJS.ProcessEnv {
+  const inherited = ['PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'COMSPEC', 'OS',
+    'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS']
+  const environment: NodeJS.ProcessEnv = {}
+  for (const key of inherited) {
+    if (process.env[key] !== undefined) environment[key] = process.env[key]
+  }
+  environment.CODEX_HOME = sandboxHome
+  environment.HOME = sandboxHome
+  environment.USERPROFILE = sandboxHome
+  environment.TEMP = commandTemp
+  environment.TMP = commandTemp
+  return environment
+}
+
+async function withMutationLock<T>(target: string, operation: () => Promise<T>): Promise<T> {
+  const key = process.platform === 'win32' ? path.resolve(target).toLowerCase() : path.resolve(target)
+  const previous = MUTATION_LOCKS.get(key) ?? Promise.resolve()
+  let release: (() => void) | undefined
+  const current = new Promise<void>((resolve) => { release = resolve })
+  const queued = previous.then(() => current)
+  MUTATION_LOCKS.set(key, queued)
+  await previous
+  try {
+    return await operation()
+  } finally {
+    release?.()
+    if (MUTATION_LOCKS.get(key) === queued) MUTATION_LOCKS.delete(key)
+  }
 }
 
 function resolveCodexExecutable(): string {

@@ -5,6 +5,7 @@ import path from 'node:path'
 import test, { type TestContext } from 'node:test'
 import type { AgentToolInvocation } from '../domain.ts'
 import {
+  CodexSandboxCommandRunner,
   LocalWorkspaceToolRuntime,
   type SandboxCommandRequest,
   type SandboxCommandRunner,
@@ -144,7 +145,7 @@ test('run_command times out, preserves partial output, and reports a null exit c
     await new Promise<void>((resolve) => request.signal.addEventListener('abort', () => resolve(), { once: true }))
     return null
   })
-  const runtime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: runner })
+  const runtime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: runner, enableCommands: true })
   const result = await runtime.execute(invocation('run_command', { argv: ['fake'], timeoutMs: 10 }))
   assert.equal(result.success, false)
   assert.equal(result.error?.code, 'tool_timeout')
@@ -160,7 +161,7 @@ test('run_command caps aggregate output bytes and rejects invalid argv', async (
     request.onStderr(Buffer.from('abcdef'))
     return 0
   })
-  const runtime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: runner, maxOutputBytes: 8 })
+  const runtime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: runner, enableCommands: true, maxOutputBytes: 8 })
   const result = await runtime.execute(invocation('run_command', { argv: ['fake'] }))
   assert.equal(result.success, true)
   assert.deepEqual(result.content, {
@@ -172,26 +173,87 @@ test('run_command caps aggregate output bytes and rejects invalid argv', async (
   assert.equal(invalid.error?.code, 'invalid_tool_input')
 })
 
-test('run_command does not split UTF-8 output and times out a runner that ignores abort', async (t) => {
+test('run_command does not split UTF-8 output and waits for termination after timeout', async (t) => {
   const cwd = await workspace(t)
   const outputRunner = new FakeRunner(async (request) => {
     request.onStdout(Buffer.from('한B'))
     return 0
   })
-  const outputRuntime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: outputRunner, maxOutputBytes: 3 })
+  const outputRuntime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: outputRunner, enableCommands: true, maxOutputBytes: 3 })
   const output = await outputRuntime.execute(invocation('run_command', { argv: ['fake'] }))
   assert.equal(output.success, true)
   assert.equal(output.content?.stdout, '한')
   assert.equal(output.content?.truncated, true)
 
-  const ignoringRunner = new FakeRunner(() => new Promise(() => undefined))
-  const timeoutRuntime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: ignoringRunner })
+  let terminated = false
+  const delayedTerminationRunner = new FakeRunner(async (request) => {
+    await new Promise<void>((resolve) => request.signal.addEventListener('abort', () => {
+      setTimeout(() => { terminated = true; resolve() }, 40)
+    }, { once: true }))
+    return null
+  })
+  const timeoutRuntime = new LocalWorkspaceToolRuntime({ cwd, commandRunner: delayedTerminationRunner, enableCommands: true })
   const startedAt = Date.now()
   const timeout = await timeoutRuntime.execute(invocation('run_command', { argv: ['fake'], timeoutMs: 10 }))
   assert.equal(timeout.success, false)
   assert.equal(timeout.error?.code, 'tool_timeout')
   assert.equal(timeout.metadata?.timedOut, true)
-  assert.ok(Date.now() - startedAt < 1_000)
+  assert.equal(terminated, true)
+  assert.ok(Date.now() - startedAt >= 40)
+})
+
+test('concurrent Baton writers serialize SHA-256 CAS so only one mutation wins', async (t) => {
+  const cwd = await workspace(t)
+  const runtime = new LocalWorkspaceToolRuntime({ cwd })
+  const results = await Promise.all([
+    runtime.execute(invocation('write_file', { path: 'race.txt', content: 'first', expectedSha256: null })),
+    runtime.execute({ ...invocation('write_file', { path: 'race.txt', content: 'second', expectedSha256: null }), callId: 'race-2' }),
+  ])
+  assert.equal(results.filter((result) => result.success).length, 1)
+  assert.equal(results.filter((result) => !result.success && result.error?.code === 'target_exists').length, 1)
+})
+
+test('real command sandbox hides Baton environment and denies reads outside cwd', { skip: process.platform !== 'win32' }, async (t) => {
+  const cwd = await workspace(t)
+  const outside = await workspace(t)
+  const sentinel = 'BATON_OUTSIDE_SENTINEL_7f2e'
+  const outsideFile = path.join(outside, 'outside.txt')
+  await writeFile(outsideFile, sentinel)
+  const previous = process.env.BATON_TEST_SECRET
+  process.env.BATON_TEST_SECRET = 'BATON_ENV_SENTINEL_4b91'
+  t.after(() => {
+    if (previous === undefined) delete process.env.BATON_TEST_SECRET
+    else process.env.BATON_TEST_SECRET = previous
+  })
+  const stdout: Buffer[] = []
+  const stderr: Buffer[] = []
+  const runner = new CodexSandboxCommandRunner()
+  const command = `if defined BATON_TEST_SECRET (echo secret-visible) else (echo secret-hidden) & type "${outsideFile}"`
+  const result = await runner.run({
+    argv: ['cmd.exe', '/d', '/s', '/c', command],
+    cwd,
+    signal: new AbortController().signal,
+    onStdout: (chunk) => stdout.push(Buffer.from(chunk)),
+    onStderr: (chunk) => stderr.push(Buffer.from(chunk)),
+  })
+  const visible = Buffer.concat([...stdout, ...stderr]).toString('utf8')
+  assert.doesNotMatch(visible, /BATON_ENV_SENTINEL_4b91/u)
+  assert.doesNotMatch(visible, new RegExp(sentinel, 'u'))
+  if (/Restricted read-only access requires the elevated Windows sandbox backend/u.test(visible)) {
+    assert.notEqual(result.exitCode, 0, 'unsupported strict isolation must fail closed before command execution')
+  } else {
+    assert.equal(result.exitCode === 0 || result.exitCode === 1, true)
+    assert.match(visible, /secret-hidden/u)
+  }
+})
+
+test('run_command is not advertised or executable before strict sandbox verification', async (t) => {
+  const cwd = await workspace(t)
+  const runtime = new LocalWorkspaceToolRuntime({ cwd })
+  assert.equal(runtime.definitions.some((definition) => definition.name === 'run_command'), false)
+  const result = await runtime.execute(invocation('run_command', { argv: ['cmd.exe', '/c', 'echo unsafe'] }))
+  assert.equal(result.success, false)
+  assert.equal(result.error?.code, 'tool_unavailable')
 })
 
 test('list_files and search_text return deterministic workspace-relative results', async (t) => {
