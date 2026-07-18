@@ -16,6 +16,7 @@ import type {
   NewCanonicalItem,
   ThreadSnapshot,
 } from './domain.ts'
+import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 
 type SupportedProvider = Extract<CanonicalProvider, 'claude' | 'gemini'>
 type JsonObject = Record<string, unknown>
@@ -41,11 +42,6 @@ export interface StatelessHttpAdapterOptions {
   fetchImpl?: typeof fetch
 }
 
-interface PortableMessage {
-  role: 'user' | 'assistant'
-  content: string
-}
-
 type ProviderMessage = Record<string, unknown>
 
 interface MaterializedHttpTurn {
@@ -53,7 +49,8 @@ interface MaterializedHttpTurn {
   provider: SupportedProvider
   model: string
   effort: string | null
-  messages: PortableMessage[]
+  developerInstructions: string | null
+  messages: ProviderMessage[]
 }
 
 interface NormalizedResponse {
@@ -77,6 +74,7 @@ interface ModelRoundProvenance {
 interface ProviderContinuationState {
   assistant: ProviderMessage
   toolResults: ProviderMessage[]
+  followUp?: ProviderMessage
 }
 
 interface ModelRoundRecord extends ModelRoundProvenance {
@@ -89,6 +87,10 @@ interface RetryBudget {
   readonly maximum: number
   remaining: number
 }
+
+const CLAUDE_INITIAL_MAX_TOKENS = 16_384
+const CLAUDE_MAX_TOKENS = 65_536
+const CLAUDE_OUTPUT_CONTINUATION_LIMIT = 3
 
 type ProviderToolCall = Pick<AgentToolInvocation, 'providerCallId' | 'name' | 'input'>
 
@@ -207,13 +209,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
 
   materialize(request: CanonicalTurnRequest, snapshot: ThreadSnapshot): NativeTurnRequest {
     this.validate(request, snapshot)
-    const messages: PortableMessage[] = []
-    for (const item of snapshot.items) {
-      if (item.visibility !== 'portable') continue
-      const text = portableHistoryText(item.kind, item.payload)
-      if (text === null) continue
-      appendMessage(messages, item.kind === 'user_message' ? 'user' : 'assistant', text)
-    }
+    const messages = materializeProviderHistory(snapshot, this.provider)
     for (const item of request.input) {
       appendMessage(messages, 'user', portableText(item.payload) as string)
     }
@@ -222,6 +218,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       provider: this.provider,
       model: request.model,
       effort: request.effort ?? null,
+      developerInstructions: canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
       messages,
     }
     return { body }
@@ -373,8 +370,29 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
             round: round.round,
             assistant: continuation.assistant,
             toolResults: continuation.toolResults,
+            ...(continuation.followUp ? { followUp: continuation.followUp } : {}),
           },
         })
+        if (round.stopReason === 'max_tokens' || round.stopReason === 'model_context_window_exceeded') {
+          const partialText = providerMessageText(continuation.assistant)
+          if (partialText) {
+            items.push({
+              kind: 'assistant_message',
+              visibility: 'portable',
+              provider: this.provider,
+              nativeId: round.responseId,
+              payload: {
+                text: partialText,
+                requestedModel: round.requestedModel,
+                reportedModel: round.reportedModel,
+                modelFallback: round.reportedModel !== null && round.requestedModel !== round.reportedModel,
+                modelProvenance: round.reportedModel === null ? 'unreported' : 'provider_reported',
+                incomplete: true,
+                continuationIndex: round.round,
+              },
+            })
+          }
+        }
       }
       return items
     }
@@ -451,6 +469,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     const usage: JsonObject = {}
     const seenProviderCallIds = new Set<string>()
     const retryBudget = createRetryBudget(context.limits.maxProviderRetries)
+    let outputContinuations = 0
+    let requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
 
     for (let round = 1; round <= context.limits.maxModelRoundTrips; round += 1) {
       const response = await fetchWithRetry(this.fetchImpl, `${this.connection!.baseUrl}/v1/messages`, {
@@ -462,7 +482,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         },
         body: JSON.stringify({
           model: body.model,
-          max_tokens: 16_384,
+          max_tokens: requestMaxTokens,
+          ...(body.developerInstructions ? { system: body.developerInstructions } : {}),
           messages,
           ...(tools.length > 0 ? { tools } : {}),
           ...(body.effort ? { output_config: { effort: body.effort } } : {}),
@@ -474,13 +495,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       const content = Array.isArray(payload.content) ? payload.content : []
       const hasToolDecision = content.some((part) => isObject(part) && part.type === 'tool_use')
       const rawStopReason = stringValue(payload.stop_reason)
-      if (!rawStopReason) {
-        throw new ProviderLoopError(
-          'provider_invalid_terminal',
-          'Claude response did not contain stop_reason',
-        )
-      }
-      const stopReason = rawStopReason
+      const stopReason = rawStopReason ?? 'missing'
       const roundRecord: ModelRoundProvenance = {
         round,
         responseId: stringValue(payload.id),
@@ -489,26 +504,65 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         stopReason,
         toolDecision: hasToolDecision,
       }
-      const toolUses = content.flatMap((part) => {
-        if (!isObject(part) || part.type !== 'tool_use') return []
-        return [{
-          providerCallId: requiredString(part.id, 'Claude tool use id'),
-          name: requiredString(part.name, 'Claude tool name'),
-          input: requiredObject(part.input, 'Claude tool input'),
-        }]
-      })
+      let roundRecorded = false
+      const recordRound = async (continuation?: ProviderContinuationState): Promise<void> => {
+        if (roundRecorded) return
+        roundRecorded = true
+        await onModelRound(roundRecord, usage, continuation)
+      }
       const text = content.flatMap((part) => isObject(part) && part.type === 'text'
         && typeof part.text === 'string' ? [part.text] : []).join('')
+      const assistantMessage = { role: 'assistant', content }
+
+      if (!rawStopReason) {
+        await recordRound()
+        throw new ProviderLoopError(
+          'provider_invalid_terminal',
+          'Claude response did not contain stop_reason',
+        )
+      }
+
+      if (stopReason === 'max_tokens' && hasToolDecision) {
+        await recordRound()
+        if (requestMaxTokens >= CLAUDE_MAX_TOKENS) {
+          throw new ProviderLoopError(
+            'provider_incomplete_tool_call',
+            `Claude reached max_tokens with an incomplete tool call at the retry cap (${CLAUDE_MAX_TOKENS})`,
+          )
+        }
+        assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude incomplete tool retry')
+        requestMaxTokens = Math.min(requestMaxTokens * 2, CLAUDE_MAX_TOKENS)
+        continue
+      }
+
+      let toolUses: ProviderToolCall[]
+      try {
+        toolUses = content.flatMap((part) => {
+          if (!isObject(part) || part.type !== 'tool_use') return []
+          return [{
+            providerCallId: requiredString(part.id, 'Claude tool use id'),
+            name: requiredString(part.name, 'Claude tool name'),
+            input: requiredObject(part.input, 'Claude tool input'),
+          }]
+        })
+      } catch (error) {
+        await recordRound()
+        throw error
+      }
 
       if (stopReason === 'end_turn') {
         if (toolUses.length > 0) {
+          await recordRound()
           throw new ProviderLoopError(
             'provider_invalid_terminal',
             'Claude end_turn response contained pending tool_use blocks',
           )
         }
-        if (!text) throw new ProviderLoopError('provider_invalid_terminal', 'Claude end_turn response did not contain text')
-        await onModelRound(roundRecord, usage)
+        if (!text) {
+          await recordRound()
+          throw new ProviderLoopError('provider_invalid_terminal', 'Claude end_turn response did not contain text')
+        }
+        await recordRound()
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
@@ -519,23 +573,67 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         }
       }
       if (stopReason === 'pause_turn') {
+        await recordRound({ assistant: assistantMessage, toolResults: [] })
         assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude pause_turn')
-        const assistantMessage = { role: 'assistant', content }
-        await onModelRound(roundRecord, usage, { assistant: assistantMessage, toolResults: [] })
         messages.push(assistantMessage)
         continue
       }
+      if (stopReason === 'max_tokens') {
+        if (!text) {
+          await recordRound({ assistant: assistantMessage, toolResults: [] })
+          throw new ProviderLoopError('provider_continuation_stalled', 'Claude max_tokens response contained no text')
+        }
+        outputContinuations += 1
+        const canContinue = outputContinuations <= CLAUDE_OUTPUT_CONTINUATION_LIMIT
+          && round < context.limits.maxModelRoundTrips
+        const followUp = canContinue
+          ? { role: 'user', content: 'Please continue from where you left off.' }
+          : undefined
+        await recordRound({
+          assistant: assistantMessage,
+          toolResults: [],
+          ...(followUp ? { followUp } : {}),
+        })
+        if (outputContinuations > CLAUDE_OUTPUT_CONTINUATION_LIMIT) {
+          throw new ProviderLoopError(
+            'output_continuation_limit',
+            `Claude exceeded the bounded output continuation limit (${CLAUDE_OUTPUT_CONTINUATION_LIMIT})`,
+          )
+        }
+        assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude max_tokens')
+        if (!followUp) throw new Error('Claude continuation follow-up was not materialized')
+        messages.push(assistantMessage, followUp)
+        continue
+      }
       if (stopReason !== 'tool_use') {
+        await recordRound(
+          stopReason === 'model_context_window_exceeded'
+            ? { assistant: { role: 'assistant', content }, toolResults: [] }
+            : undefined,
+        )
         throw new ProviderLoopError(
           stopReason === 'refusal' ? 'provider_refusal' : 'provider_incomplete',
           `Claude stopped without completing the turn: ${stopReason}`,
         )
       }
-      if (toolUses.length === 0) throw new Error('Claude returned tool_use without a tool_use block')
+      if (toolUses.length === 0) {
+        await recordRound()
+        throw new ProviderLoopError('provider_invalid_terminal', 'Claude returned tool_use without a tool_use block')
+      }
+      if (round >= context.limits.maxModelRoundTrips) {
+        await recordRound({
+          assistant: { role: 'assistant', content },
+          toolResults: [],
+        })
+      }
       assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude tool_use')
-      assertUniqueToolCallIds(toolUses, seenProviderCallIds, 'Claude')
+      try {
+        assertUniqueToolCallIds(toolUses, seenProviderCallIds, 'Claude')
+      } catch (error) {
+        await recordRound()
+        throw error
+      }
       const results = await executeToolBatch(body.turnId, toolUses, context, signal)
-      const assistantMessage = { role: 'assistant', content }
       const toolResultMessage = {
         role: 'user',
         content: results.map((result, index) => claudeToolResult(
@@ -544,11 +642,12 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           context.limits.toolOutputBytes,
         )),
       }
-      await onModelRound(roundRecord, usage, {
+      await recordRound({
         assistant: assistantMessage,
         toolResults: [toolResultMessage],
       })
       messages.push(assistantMessage, toolResultMessage)
+      requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
     }
     throw new ProviderLoopError(
       'model_round_limit',
@@ -581,7 +680,9 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         },
         body: JSON.stringify({
           model: body.model,
-          messages,
+          messages: body.developerInstructions
+            ? [{ role: 'system', content: body.developerInstructions }, ...messages]
+            : messages,
           max_tokens: 16_384,
           ...(tools.length > 0 ? { tools } : {}),
           ...(body.effort ? { reasoning_effort: body.effort } : {}),
@@ -949,13 +1050,56 @@ function parseMaterializedTurn(value: unknown, provider: SupportedProvider): Mat
     provider,
     model: requiredString(value.model, `${provider} model`),
     effort: typeof value.effort === 'string' ? value.effort : null,
-    messages: value.messages.map((message) => {
-      if (!isObject(message) || (message.role !== 'user' && message.role !== 'assistant')) {
-        throw new Error(`Invalid ${provider} history message`)
-      }
-      return { role: message.role, content: requiredString(message.content, 'message content') }
-    }),
+    developerInstructions: typeof value.developerInstructions === 'string' ? value.developerInstructions : null,
+    messages: value.messages.map((message) => parseProviderHistoryMessage(message, provider)),
   }
+}
+
+function parseProviderHistoryMessage(value: unknown, provider: SupportedProvider): ProviderMessage {
+  if (!isObject(value)) throw new Error(`Invalid ${provider} history message`)
+  return provider === 'claude'
+    ? parseClaudeHistoryMessage(value)
+    : parseGeminiHistoryMessage(value)
+}
+
+function parseClaudeHistoryMessage(message: JsonObject): ProviderMessage {
+  if (message.role !== 'user' && message.role !== 'assistant') {
+    throw new Error('Invalid claude history role')
+  }
+  if (typeof message.content === 'string') {
+    return { role: message.role, content: message.content }
+  }
+  if (!Array.isArray(message.content) || message.content.some((part) => !isObject(part))) {
+    throw new Error('Invalid claude structured history content')
+  }
+  return { role: message.role, content: message.content }
+}
+
+function parseGeminiHistoryMessage(message: JsonObject): ProviderMessage {
+  if (message.role === 'user') {
+    return { role: 'user', content: requiredString(message.content, 'Gemini user message content') }
+  }
+  if (message.role === 'tool') {
+    return {
+      role: 'tool',
+      tool_call_id: requiredString(message.tool_call_id, 'Gemini tool call id'),
+      name: requiredString(message.name, 'Gemini tool name'),
+      content: requiredString(message.content, 'Gemini tool result content'),
+    }
+  }
+  if (message.role !== 'assistant') throw new Error('Invalid gemini history role')
+  const content = message.content === null
+    ? null
+    : requiredString(message.content, 'Gemini assistant message content')
+  if (message.tool_calls === undefined) {
+    if (content === null) throw new Error('Gemini assistant history requires content or tool calls')
+    return { role: 'assistant', content }
+  }
+  if (!Array.isArray(message.tool_calls) || message.tool_calls.length === 0
+    || message.tool_calls.some((call) => !isObject(call))) {
+    throw new Error('Invalid Gemini assistant tool calls')
+  }
+  return { role: 'assistant', content, tool_calls: message.tool_calls }
 }
 
 function parseNormalizedResponse(value: unknown): NormalizedResponse {
@@ -992,12 +1136,104 @@ function parseProviderContinuation(value: unknown): ProviderContinuationState | 
   return {
     assistant,
     toolResults: continuation.toolResults as ProviderMessage[],
+    ...(continuation.followUp === undefined
+      ? {}
+      : { followUp: requiredObject(continuation.followUp, 'provider continuation follow-up') }),
   }
 }
 
-function appendMessage(messages: PortableMessage[], role: PortableMessage['role'], content: string): void {
+function providerMessageText(message: ProviderMessage): string | null {
+  if (typeof message.content === 'string') return message.content.trim() ? message.content : null
+  if (!Array.isArray(message.content)) return null
+  const text = message.content.flatMap((part) => isObject(part) && part.type === 'text'
+    && typeof part.text === 'string' ? [part.text] : []).join('')
+  return text.trim() ? text : null
+}
+
+function materializeProviderHistory(
+  snapshot: ThreadSnapshot,
+  provider: SupportedProvider,
+): ProviderMessage[] {
+  const messages: ProviderMessage[] = []
+  const ordered = [...snapshot.items].sort((left, right) => left.sequence - right.sequence)
+  for (let index = 0; index < ordered.length;) {
+    const first = ordered[index]!
+    const turnKey = first.turnId ?? `item:${first.id}`
+    const group = []
+    while (index < ordered.length) {
+      const item = ordered[index]!
+      const itemTurnKey = item.turnId ?? `item:${item.id}`
+      if (itemTurnKey !== turnKey) break
+      group.push(item)
+      index += 1
+    }
+
+    const exactContinuations = group.flatMap((item) => {
+      if (item.visibility !== 'provider_private' || item.provider !== provider) return []
+      const continuation = parseStoredProviderContinuation(item.payload)
+      return continuation === null ? [] : [{ item, continuation }]
+    })
+    const exactByItemId = new Map(exactContinuations.map((entry) => [entry.item.id, entry.continuation]))
+    const hasExactContinuation = exactContinuations.length > 0
+    const aggregatePortableContinuation = !hasExactContinuation && group.some((item) => (
+      item.visibility === 'portable'
+      && item.kind === 'assistant_message'
+      && item.payload.incomplete === true
+    ))
+
+    for (const item of group) {
+      const exact = exactByItemId.get(item.id)
+      if (exact) {
+        messages.push(
+          { ...exact.assistant },
+          ...exact.toolResults.map((result) => ({ ...result })),
+          ...(exact.followUp ? [{ ...exact.followUp }] : []),
+        )
+        continue
+      }
+      if (item.visibility !== 'portable') continue
+      if (hasExactContinuation && item.kind === 'assistant_message' && item.payload.incomplete === true) {
+        continue
+      }
+      const text = portableHistoryText(item.kind, item.payload)
+      if (text === null) continue
+      const role = item.kind === 'user_message' ? 'user' : 'assistant'
+      appendMessage(
+        messages,
+        role,
+        text,
+        aggregatePortableContinuation && role === 'assistant' ? '' : '\n\n',
+      )
+    }
+  }
+  return messages
+}
+
+function parseStoredProviderContinuation(payload: JsonObject): ProviderContinuationState | null {
+  if (payload.stateVersion !== 1 || !isObject(payload.assistant)) return null
+  if (!Array.isArray(payload.toolResults) || payload.toolResults.some((result) => !isObject(result))) {
+    throw new Error('Stored provider continuation tool results must be structured messages')
+  }
+  if (payload.followUp !== undefined && !isObject(payload.followUp)) {
+    throw new Error('Stored provider continuation follow-up must be a structured message')
+  }
+  return {
+    assistant: payload.assistant,
+    toolResults: payload.toolResults,
+    ...(payload.followUp === undefined ? {} : { followUp: payload.followUp }),
+  }
+}
+
+function appendMessage(
+  messages: ProviderMessage[],
+  role: 'user' | 'assistant',
+  content: string,
+  separator = '\n\n',
+): void {
   const previous = messages.at(-1)
-  if (previous?.role === role) previous.content += `\n\n${content}`
+  if (previous?.role === role && typeof previous.content === 'string') {
+    previous.content += `${separator}${content}`
+  }
   else messages.push({ role, content })
 }
 

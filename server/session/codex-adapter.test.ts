@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 import type { NativeProviderEvent, ProviderExecutionContext } from './adapter.ts'
 import {
@@ -13,6 +15,7 @@ import type { AgentToolDefinition, AgentToolInvocation, NewCanonicalItem, Thread
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null }
 type Scenario =
   | 'normal'
+  | 'compaction'
   | 'tool'
   | 'twoTools'
   | 'twoIdentical'
@@ -27,6 +30,12 @@ type Scenario =
   | 'collab'
   | 'cancel'
   | 'hangInterrupt'
+  | 'steerMalformed'
+  | 'steerNull'
+  | 'steerForeign'
+  | 'steerClosed'
+  | 'steerUnsupported'
+  | 'steerManual'
   | 'usageLimit'
   | 'exit'
 
@@ -117,6 +126,7 @@ function configResult(): Record<string, unknown> {
     config: {
       agents: { enabled: false },
       web_search: 'disabled',
+      project_doc_max_bytes: 0,
       features: {
         multi_agent: false,
         multi_agent_v2: false,
@@ -194,6 +204,19 @@ function scriptedFactory(
             emitScenario(self, scenario)
           }
         })
+      } else if (method === 'turn/steer') {
+        if (scenario === 'steerManual') return
+        if (scenario === 'steerMalformed') self.emit({ id: idOf(message), result: {} })
+        else if (scenario === 'steerNull') self.emit({ id: idOf(message), result: null })
+        else if (scenario === 'steerForeign') self.emit({ id: idOf(message), result: { turnId: 'foreign-turn' } })
+        else if (scenario === 'steerClosed') {
+          self.emit({
+            id: idOf(message),
+            error: { code: -32600, message: 'Active turn not steerable', data: { type: 'ActiveTurnNotSteerable' } },
+          })
+        } else if (scenario === 'steerUnsupported') {
+          self.emit({ id: idOf(message), error: { code: -32601, message: 'Method not found' } })
+        } else self.emit({ id: idOf(message), result: { turnId: 'native-turn' } })
       } else if (method === 'turn/interrupt') {
         if (scenario === 'hangInterrupt') return
         self.emit({ id: idOf(message), result: {} })
@@ -325,7 +348,7 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
     })
     return
   }
-  if (scenario === 'cancel' || scenario === 'hangInterrupt') return
+  if (scenario === 'cancel' || scenario === 'hangInterrupt' || scenario.startsWith('steer')) return
   if (scenario === 'twoRounds') {
     emitUsage(process, 1)
     emitUsage(process, 2)
@@ -339,6 +362,15 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
         fromModel: 'gpt-resolved',
         toModel: 'gpt-routed',
         reason: 'serverReroute',
+      },
+    })
+  }
+  if (scenario === 'compaction') {
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'native-thread', turnId: 'native-turn',
+        item: { id: 'compact-1', type: 'contextCompaction' },
       },
     })
   }
@@ -554,7 +586,9 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.equal(handshake.capabilities.toolCalling, true)
   assert.equal(handshake.enforcementEvidence.source, 'config/read')
   assert.deepEqual(handshake.enforcementEvidence.providerLocalMetadataTools, ['update_plan'])
-  const materialized = adapter.materialize(request(), snapshot())
+  const instructedSnapshot = snapshot()
+  instructedSnapshot.thread.instructionSnapshot = { developerInstructions: 'Verify before finishing.' }
+  const materialized = adapter.materialize(request(), instructedSnapshot)
   const execution = await adapter.execute(materialized, context())
   const [events, terminal] = await Promise.all([collect(execution.events), execution.terminal])
   assert.equal(terminal.status, 'completed')
@@ -574,6 +608,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   })
   for (const args of argsSeen) {
     assert.ok(args.includes('web_search="disabled"'))
+    assert.ok(args.includes('project_doc_max_bytes=0'))
     assert.ok(args.includes('features.multi_agent=false'))
     assert.ok(args.includes('features.multi_agent_v2=false'))
     assert.ok(args.includes('features.enable_fanout=false'))
@@ -588,10 +623,11 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     assert.ok(args.includes('model_providers.baton.stream_max_retries=0'))
     assert.ok(!args.some((argument) => argument.includes('proxy-token')))
   }
-  assert.deepEqual(environmentsSeen, [
-    { BATON_PROXY_TOKEN: 'proxy-token' },
-    { BATON_PROXY_TOKEN: 'proxy-token' },
-  ])
+  assert.equal(environmentsSeen.length, 2)
+  for (const environment of environmentsSeen) {
+    assert.equal(environment?.BATON_PROXY_TOKEN, 'proxy-token')
+    assert.equal(environment?.CODEX_HOME, path.join(tmpdir(), 'baton-codex-test-home'))
+  }
   const turnProcess = created[1]
   const threadStart = turnProcess.writes.find((message) => message.method === 'thread/start')
   assert.ok(threadStart)
@@ -601,9 +637,11 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.deepEqual(params.runtimeWorkspaceRoots, [])
   assert.equal(params.approvalsReviewer, 'user')
   assert.equal(params.approvalPolicy, 'never')
+  assert.equal(params.developerInstructions, 'Verify before finishing.')
   assert.deepEqual(params.dynamicTools, [])
   assert.deepEqual(params.config, {
     web_search: 'disabled',
+    project_doc_max_bytes: 0,
     'features.multi_agent': false,
     'features.multi_agent_v2': false,
     'features.enable_fanout': false,
@@ -620,6 +658,24 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.equal((threadStart.params as Record<string, unknown>).allowProviderModelFallback, false)
   assert.ok(turnProcess.writes.some((message) => message.method === 'thread/inject_items'))
   await adapter.shutdown()
+})
+
+test('Codex automatic compaction is recorded as private lifecycle metadata instead of a capability failure', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('compaction', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const events = await collect(execution.events)
+  assert.equal((await execution.terminal).status, 'completed')
+  assert.deepEqual(events.flatMap((event) => adapter.normalize(event)).find((item) =>
+    item.kind === 'provider_event' && item.payload.event === 'context_compaction'), {
+    kind: 'provider_event',
+    visibility: 'baton_private',
+    payload: { event: 'context_compaction', status: 'completed' },
+    provider: 'codex',
+    nativeId: 'compact-1',
+  })
 })
 
 test('adapter falls back to last usage only when Codex omits the cumulative total', async () => {
@@ -948,6 +1004,130 @@ test('cancel sends turn/interrupt and waits for interrupted completion', async (
   await execution.cancel()
   assert.equal((await execution.terminal).status, 'cancelled')
   assert.ok(created[1].writes.some((message) => message.method === 'turn/interrupt'))
+})
+
+test('live follow-up uses exact turn/steer contract and never injects it as reconstructed history', async () => {
+  const created: FakeProcess[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('cancel', created, []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  assert.ok(execution.steer)
+  const turnProcess = created[1]
+  const initialInjectCount = turnProcess.writes.filter((message) => message.method === 'thread/inject_items').length
+  const initialSteerCount = turnProcess.writes.filter((message) => message.method === 'turn/steer').length
+
+  assert.deepEqual(await execution.steer({
+    followUpId: 'follow-up-wrong-turn',
+    text: 'must not be sent',
+    expectedTurnId: 'another-canonical-turn',
+  }), { status: 'closed' })
+  assert.equal(turnProcess.writes.filter((message) => message.method === 'turn/steer').length, initialSteerCount)
+
+  assert.deepEqual(await execution.steer({
+    followUpId: 'follow-up-1',
+    text: 'continue with this constraint',
+    expectedTurnId: 'canonical-turn',
+  }), { status: 'accepted' })
+  const steerRpc = turnProcess.writes.find((message) => message.method === 'turn/steer')
+  assert.deepEqual(steerRpc?.params, {
+    threadId: 'native-thread',
+    clientUserMessageId: 'follow-up-1',
+    input: [{ type: 'text', text: 'continue with this constraint' }],
+    expectedTurnId: 'native-turn',
+  })
+  assert.equal(
+    turnProcess.writes.filter((message) => message.method === 'thread/inject_items').length,
+    initialInjectCount,
+    'live follow-up must not use thread/inject_items',
+  )
+
+  await execution.cancel()
+  assert.deepEqual(await execution.steer({
+    followUpId: 'follow-up-after-close',
+    text: 'must remain queued',
+    expectedTurnId: 'canonical-turn',
+  }), { status: 'closed' })
+  assert.equal(turnProcess.writes.filter((message) => message.method === 'turn/steer').length, initialSteerCount + 1)
+})
+
+test('malformed or foreign turn/steer acknowledgements remain unknown outcomes', async (t) => {
+  for (const scenario of ['steerMalformed', 'steerNull', 'steerForeign'] as const) {
+    await t.test(scenario, async () => {
+      const created: FakeProcess[] = []
+      const adapter = new CodexCanonicalAdapter({
+        processFactory: scriptedFactory(scenario, created, []),
+        shutdownTimeoutMs: 20,
+      })
+      const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+      assert.ok(execution.steer)
+      await assert.rejects(execution.steer({
+        followUpId: `follow-up-${scenario}`,
+        text: 'keep this pending',
+        expectedTurnId: 'canonical-turn',
+      }), /outcome is unknown and must not be consumed or retried automatically/)
+      assert.equal(created[1].writes.filter((message) => message.method === 'turn/steer').length, 1)
+      await execution.cancel()
+      assert.equal((await execution.terminal).status, 'cancelled')
+    })
+  }
+})
+
+test('official Codex steer closure and unsupported errors are deterministic outcomes', async (t) => {
+  for (const [scenario, status] of [
+    ['steerClosed', 'closed'],
+    ['steerUnsupported', 'unsupported'],
+  ] as const) {
+    await t.test(scenario, async () => {
+      const adapter = new CodexCanonicalAdapter({
+        processFactory: scriptedFactory(scenario, [], []),
+        shutdownTimeoutMs: 20,
+      })
+      const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+      assert.ok(execution.steer)
+      assert.deepEqual(await execution.steer({
+        followUpId: `follow-up-${scenario}`,
+        text: 'classify without retry',
+        expectedTurnId: 'canonical-turn',
+      }), { status })
+      await execution.cancel()
+    })
+  }
+})
+
+test('cancel closes queued steers and waits for the in-flight acknowledgement', async () => {
+  const created: FakeProcess[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('steerManual', created, []),
+    shutdownTimeoutMs: 50,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  assert.ok(execution.steer)
+  const first = execution.steer({
+    followUpId: 'follow-up-in-flight',
+    text: 'first',
+    expectedTurnId: 'canonical-turn',
+  })
+  await Promise.resolve()
+  const process = created[1]
+  const firstRpc = process.writes.find((message) => message.method === 'turn/steer')
+  assert.ok(firstRpc)
+  const second = execution.steer({
+    followUpId: 'follow-up-queued',
+    text: 'second',
+    expectedTurnId: 'canonical-turn',
+  })
+  const cancelling = execution.cancel()
+  await Promise.resolve()
+  assert.equal(process.writes.filter((message) => message.method === 'turn/steer').length, 1)
+
+  process.emit({ id: idOf(firstRpc), result: { turnId: 'native-turn' } })
+  assert.deepEqual(await first, { status: 'accepted' })
+  assert.deepEqual(await second, { status: 'closed' })
+  await cancelling
+  assert.equal((await execution.terminal).status, 'cancelled')
+  assert.equal(process.writes.filter((message) => message.method === 'turn/steer').length, 1)
 })
 
 test('cancel hard-stops a Codex process when turn/interrupt never answers', async () => {

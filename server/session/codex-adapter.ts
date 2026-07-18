@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type {
   AdapterHandshake,
@@ -8,14 +9,18 @@ import type {
   NativeProviderEvent,
   NativeTurnRequest,
   ProviderExecutionContext,
+  ProviderSteerRequest,
+  ProviderSteerResult,
   ProviderTerminalResult,
   ProviderTurnExecution,
   SessionProviderAdapter,
 } from './adapter.ts'
 import type { AgentToolResult, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
+  project_doc_max_bytes: 0,
   'features.multi_agent': false,
   'features.multi_agent_v2': false,
   'features.enable_fanout': false,
@@ -41,6 +46,7 @@ const ALLOWED_ITEM_TYPES = new Set([
   'reasoning',
   'plan',
   'dynamicToolCall',
+  'contextCompaction',
 ])
 
 type JsonObject = Record<string, unknown>
@@ -70,6 +76,8 @@ export interface CodexAdapterOptions {
   processFactory?: CodexProcessFactory
   shutdownTimeoutMs?: number
   proxyConnection?: () => Promise<CodexProxyConnection>
+  /** Test/embedding override. Production defaults to a fresh Baton-owned temporary home. */
+  isolatedCodexHome?: string
 }
 
 interface MaterializedCodexTurn {
@@ -77,6 +85,7 @@ interface MaterializedCodexTurn {
   model: string
   effort: string | null
   cwd: string | null
+  developerInstructions: string | null
   history: JsonObject[]
   input: Array<{ type: 'text'; text: string }>
 }
@@ -87,6 +96,18 @@ interface RpcMessage {
   params?: unknown
   result?: unknown
   error?: { code?: number; message?: string; data?: unknown }
+}
+
+class CodexRpcError extends Error {
+  readonly code: number | undefined
+  readonly data: unknown
+
+  constructor(error: NonNullable<RpcMessage['error']>) {
+    super(`Codex app-server request failed: ${error.message ?? 'unknown JSON-RPC error'}`)
+    this.name = 'CodexRpcError'
+    this.code = error.code
+    this.data = error.data
+  }
 }
 
 class AsyncQueue<T> implements AsyncIterable<T> {
@@ -215,11 +236,7 @@ export class CodexJsonlRpcClient {
       if (!pending) return
       this.pending.delete(message.id)
       if (message.error) {
-        pending.reject(
-          new Error(
-            `Codex app-server request failed: ${message.error.message ?? 'unknown JSON-RPC error'}`,
-          ),
-        )
+        pending.reject(new CodexRpcError(message.error))
       } else pending.resolve(message.result)
       return
     }
@@ -238,6 +255,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   private readonly processFactory: CodexProcessFactory
   private readonly shutdownTimeoutMs: number
   private readonly proxyConnectionProvider: (() => Promise<CodexProxyConnection>) | undefined
+  private readonly isolatedCodexHome: string
+  private readonly ownsIsolatedCodexHome: boolean
   private proxyConnection: CodexProxyConnection | null = null
   private initializePromise: Promise<AdapterHandshake> | null = null
   private mcpDisableOverrides: Record<string, false> = {}
@@ -249,6 +268,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     this.processFactory = options.processFactory ?? spawnCodexProcess
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000
     this.proxyConnectionProvider = options.proxyConnection
+    this.ownsIsolatedCodexHome = options.isolatedCodexHome === undefined && options.processFactory === undefined
+    this.isolatedCodexHome = options.isolatedCodexHome
+      ?? (options.processFactory
+        ? path.join(tmpdir(), 'baton-codex-test-home')
+        : mkdtempSync(path.join(tmpdir(), 'baton-codex-')))
   }
 
   initialize(): Promise<AdapterHandshake> {
@@ -292,6 +316,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       model: request.model,
       effort: request.effort ?? null,
       cwd: snapshot.session.cwd,
+      developerInstructions: canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
       history,
       input: request.input.map((item) => ({
         type: 'text',
@@ -311,7 +336,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     const process = this.processFactory(
       this.executable,
       launchArgs(this.mcpDisableOverrides, this.proxyConnection),
-      proxyEnvironment(this.proxyConnection),
+      proxyEnvironment(this.proxyConnection, this.isolatedCodexHome),
     )
     const client = new CodexJsonlRpcClient(process)
     const eventQueue = new AsyncQueue<NativeProviderEvent>()
@@ -334,9 +359,46 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     const rpcRequestIds = new Set<string | number>()
     let abortListener: (() => void) | null = null
     let turnTimer: NodeJS.Timeout | null = null
+    let acceptingSteers = false
+    let steerSerial: Promise<void> = Promise.resolve()
+
+    const closeSteers = (): Promise<void> => {
+      acceptingSteers = false
+      return steerSerial
+    }
+
+    const steer = (steerRequest: ProviderSteerRequest): Promise<ProviderSteerResult> => {
+      if (!steerRequest.followUpId || !steerRequest.text) {
+        return Promise.reject(new TypeError('Codex steer requires a follow-up ID and text'))
+      }
+      if (steerRequest.expectedTurnId !== body.turnId || !acceptingSteers
+        || nativeThreadId === null || nativeTurnId === null || terminalResult !== null) {
+        return Promise.resolve({ status: 'closed' })
+      }
+      const operation = steerSerial.then(async (): Promise<ProviderSteerResult> => {
+        if (!acceptingSteers || nativeThreadId === null || nativeTurnId === null || terminalResult !== null) {
+          return { status: 'closed' }
+        }
+        try {
+          const response = await client.request('turn/steer', {
+            threadId: nativeThreadId,
+            clientUserMessageId: steerRequest.followUpId,
+            input: [{ type: 'text', text: steerRequest.text }],
+            expectedTurnId: nativeTurnId,
+          })
+          assertCodexSteerResponse(response, nativeTurnId)
+          return { status: 'accepted' }
+        } catch (error) {
+          return codexSteerFailure(error)
+        }
+      })
+      steerSerial = operation.then(() => undefined, () => undefined)
+      return operation
+    }
 
     const finish = (result: ProviderTerminalResult): void => {
       if (terminalResult !== null) return
+      acceptingSteers = false
       const effectiveResult = terminalOverride ?? result
       terminalResult = effectiveResult
       if (turnTimer !== null) clearTimeout(turnTimer)
@@ -368,6 +430,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     const dispose = async (): Promise<void> => {
       if (disposed) return
       disposed = true
+      acceptingSteers = false
+      await Promise.race([closeSteers(), delay(this.shutdownTimeoutMs)])
       await process.closeInput().catch(() => undefined)
       const exited = await Promise.race([
         process.exited.then(() => true, () => true),
@@ -383,12 +447,14 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     }
 
     const cancel = async (code = 'user_cancelled', message = 'Codex turn was cancelled'): Promise<void> => {
+      acceptingSteers = false
       if (terminalResult !== null) return
       const priorCode = terminalOverride?.error?.code
       if (terminalOverride === null || (code === 'user_cancelled' && priorCode !== 'user_cancelled')) {
         terminalOverride = { status: 'cancelled', error: { code, message } }
       }
       cancelPromise ??= (async () => {
+        await Promise.race([closeSteers(), delay(this.shutdownTimeoutMs)])
         if (terminalResult !== null) return
         if (nativeThreadId === null || nativeTurnId === null) {
           finish(terminalOverride as ProviderTerminalResult)
@@ -434,7 +500,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       return cancelPromise
     }
 
-    const execution: ProviderTurnExecution = { events: eventQueue, terminal, cancel, dispose }
+    const execution: ProviderTurnExecution = { events: eventQueue, terminal, steer, cancel, dispose }
     this.active.add(execution)
     void terminal.finally(() => {
       this.active.delete(execution)
@@ -476,6 +542,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           model: body.model,
           allowProviderModelFallback: false,
           cwd: body.cwd,
+          developerInstructions: body.developerInstructions,
           environments: [],
           runtimeWorkspaceRoots: [],
           ephemeral: true,
@@ -529,6 +596,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         'turn/start result',
       )
       nativeTurnId = requiredString(asObject(turnStart.turn, 'turn/start turn').id, 'Codex turn id')
+      if (terminalResult === null && terminalOverride === null && !disposed) acceptingSteers = true
 
       void (async () => {
         try {
@@ -703,6 +771,15 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       if (type === 'plan' && typeof item.text === 'string') {
         return [{ kind: 'plan', payload: { text: item.text }, provider: 'codex', nativeId }]
       }
+      if (type === 'contextCompaction') {
+        return [{
+          kind: 'provider_event',
+          visibility: 'baton_private',
+          payload: { event: 'context_compaction', status: 'completed' },
+          provider: 'codex',
+          nativeId,
+        }]
+      }
     }
     if (event.type === 'turn/plan/updated') {
       return [{
@@ -743,6 +820,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   async shutdown(): Promise<void> {
     this.shuttingDown = true
     await Promise.allSettled([...this.active].map((execution) => execution.dispose()))
+    if (this.ownsIsolatedCodexHome) rmSync(this.isolatedCodexHome, { recursive: true, force: true })
   }
 
   private async preflight(): Promise<AdapterHandshake> {
@@ -786,7 +864,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     const process = this.processFactory(
       this.executable,
       launchArgs(overrides, this.proxyConnection),
-      proxyEnvironment(this.proxyConnection),
+      proxyEnvironment(this.proxyConnection, this.isolatedCodexHome),
     )
     const client = new CodexJsonlRpcClient(process)
     try {
@@ -850,8 +928,12 @@ function valueAsToml(value: unknown): string {
 
 function proxyEnvironment(
   connection: CodexProxyConnection | null,
-): Readonly<Record<string, string>> | undefined {
-  return connection ? { BATON_PROXY_TOKEN: connection.token } : undefined
+  isolatedCodexHome: string,
+): Readonly<Record<string, string>> {
+  return {
+    CODEX_HOME: isolatedCodexHome,
+    ...(connection ? { BATON_PROXY_TOKEN: connection.token } : {}),
+  }
 }
 
 function assertHardeningConfig(result: JsonObject): Record<string, unknown> {
@@ -917,6 +999,7 @@ function parseMaterializedRequest(value: unknown): MaterializedCodexTurn {
     model: requiredString(body.model, 'Codex model'),
     effort: typeof body.effort === 'string' ? body.effort : null,
     cwd: typeof body.cwd === 'string' ? body.cwd : null,
+    developerInstructions: typeof body.developerInstructions === 'string' ? body.developerInstructions : null,
     history: body.history.map((item) => asObject(item, 'Codex history item')),
     input: body.input.map((item) => {
       const input = asObject(item, 'Codex text input')
@@ -1046,6 +1129,38 @@ function terminalStatus(value: unknown): ProviderTerminalResult['status'] {
   if (value === 'interrupted') return 'interrupted'
   if (value === 'failed') return 'failed'
   throw new Error(`Unexpected Codex terminal status ${String(value)}`)
+}
+
+function codexSteerFailure(error: unknown): ProviderSteerResult {
+  if (!(error instanceof CodexRpcError)) throw error
+  const detail = `${error.message} ${safeErrorData(error.data)}`.toLowerCase()
+  if (error.code === -32601 || detail.includes('method not found')) return { status: 'unsupported' }
+  if (detail.includes('active turn not steerable')
+    || detail.includes('activeturnnotsteerable')
+    || detail.includes('no active turn')
+    || detail.includes('expected turn')
+    || detail.includes('expectedturnid')
+    || detail.includes('turn mismatch')) {
+    return { status: 'closed' }
+  }
+  throw error
+}
+
+function assertCodexSteerResponse(value: unknown, expectedNativeTurnId: string): void {
+  const response = asOptionalObject(value)
+  if (response?.turnId !== expectedNativeTurnId) {
+    throw new Error(
+      'Codex turn/steer did not confirm the active native turn; delivery outcome is unknown and must not be consumed or retried automatically',
+    )
+  }
+}
+
+function safeErrorData(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? ''
+  } catch {
+    return ''
+  }
 }
 
 function portableHistoryText(kind: string, payload: JsonObject): string | null {

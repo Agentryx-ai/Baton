@@ -51,9 +51,23 @@ export interface ProviderTerminalResult {
   error?: Record<string, unknown> | null
 }
 
+export interface ProviderSteerRequest {
+  followUpId: string
+  text: string
+  /** Baton canonical turn identity observed when the follow-up was enqueued. */
+  expectedTurnId: TurnId
+}
+
+export type ProviderSteerResult =
+  | { status: 'accepted' }
+  | { status: 'closed' }
+  | { status: 'unsupported' }
+
 export interface ProviderTurnExecution {
   events: AsyncIterable<NativeProviderEvent>
   terminal: Promise<ProviderTerminalResult>
+  /** A rejection is an unknown delivery outcome: never consume it or retry it automatically. */
+  steer?(request: ProviderSteerRequest): Promise<ProviderSteerResult>
   cancel(): Promise<void>
   dispose(): Promise<void>
 }
