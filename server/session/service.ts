@@ -19,6 +19,8 @@ import type {
   EditGoalInput,
   ForkThreadInput,
   GoalCasResult,
+  ReconcileToolInput,
+  ReconcileToolResult,
   SessionListScope,
 } from './store.ts'
 
@@ -58,6 +60,7 @@ export interface ConversationService {
 
   startTurn(input: StartTurnInput): Promise<BeginTurnResult>
   cancelTurn(turnId: TurnId): Promise<void>
+  reconcileTool(input: ReconcileToolInput): ReconcileToolResult
 
   subscribe(threadId: ThreadId, listener: () => void): () => void
 }

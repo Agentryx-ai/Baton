@@ -7,6 +7,7 @@ import type {
   AgentToolResult,
   CanonicalGoal,
   CanonicalProvider,
+  GoalId,
   GoalObservation,
   NewCanonicalItem,
   ThreadId,
@@ -15,9 +16,7 @@ import type {
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type {
   CreateGoalInput,
-  GoalCasResult,
   SessionStore,
-  UpdateGoalStatusInput,
 } from './store.ts'
 import { GoalStoreError } from './store.ts'
 import { LocalWorkspaceToolRuntime } from './tools/local-workspace-runtime.ts'
@@ -30,9 +29,27 @@ export const GOAL_TOOL_DEFINITIONS: readonly AgentToolDefinition[] = Object.free
     objective: { type: 'string', minLength: 1, maxLength: 4_000 },
     tokenBudget: { type: 'integer', minimum: 1 },
   }, ['objective']),
-  definition('update_goal', 'Mark the current Goal complete or blocked after satisfying the Goal audit rules.', {
-    status: { type: 'string', enum: ['complete', 'blocked'] },
-  }, ['status']),
+  definition('update_goal', 'Mark the current Goal complete after satisfying the Goal audit rules.', {
+    status: { type: 'string', enum: ['complete'] },
+    evidence: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 64,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['requirement', 'proof'],
+        properties: {
+          requirement: { type: 'string', minLength: 1, maxLength: 500 },
+          proof: { type: 'string', minLength: 1, maxLength: 1_000 },
+        },
+      },
+    },
+  }, ['status'], {
+    allOf: [
+      { if: { properties: { status: { const: 'complete' } } }, then: { required: ['evidence'] } },
+    ],
+  }),
 ])
 
 /** The narrow durable API needed by the coordinator, intentionally easy to fake in tests. */
@@ -42,7 +59,6 @@ export type ToolCoordinatorStore = Pick<SessionStore,
   | 'listItems'
   | 'getGoal'
   | 'createGoal'
-  | 'updateGoalStatus'
 >
 
 export interface ToolRuntime {
@@ -64,7 +80,7 @@ export interface ToolCoordinatorOptions {
   limits?: Partial<AgentLoopLimits>
   initialGoalObservation: GoalObservation
   /** Flush cumulative Goal accounting before a model-owned Goal mutation. */
-  flushGoalAccounting?: () => void | Promise<void>
+  flushGoalAccounting?: () => unknown | Promise<unknown>
   /** Returns durable final tokens after the accounting flush. */
   finalTokensUsed?: () => number
   /** Set only when the user or a higher-level instruction explicitly requested Goal creation. */
@@ -78,6 +94,26 @@ interface PersistedCall {
   result: AgentToolResult | null
 }
 
+export type ToolTerminalFailureCode = 'tool_call_limit' | 'tool_repetition_limit'
+
+export interface ToolTerminalFailure {
+  readonly [key: string]: unknown
+  readonly code: ToolTerminalFailureCode
+  readonly message: string
+}
+
+export interface GoalTerminalIntent {
+  readonly goalId: GoalId
+  readonly expectedRevision: number
+  readonly status: 'complete'
+  readonly completionEvidence?: readonly GoalCompletionEvidence[]
+}
+
+export interface GoalCompletionEvidence {
+  readonly requirement: string
+  readonly proof: string
+}
+
 export class ToolCoordinator {
   readonly definitions: readonly AgentToolDefinition[]
   readonly #store: ToolCoordinatorStore
@@ -88,7 +124,7 @@ export class ToolCoordinator {
   readonly #effort: string | null
   readonly #runtime: ToolRuntime
   readonly #limits: AgentLoopLimits
-  readonly #flushGoalAccounting: () => void | Promise<void>
+  readonly #flushGoalAccounting: () => unknown | Promise<unknown>
   readonly #finalTokensUsed: () => number
   readonly #goalCreationRequested: boolean
   readonly #definitionsByName: ReadonlyMap<string, AgentToolDefinition>
@@ -96,11 +132,14 @@ export class ToolCoordinator {
   readonly #persisted = new Map<string, PersistedCall>()
   readonly #identicalCounts = new Map<string, number>()
   readonly #scheduledReads = new Set<Promise<void>>()
+  readonly #unresolvedMutations = new Set<string>()
   #exclusiveTail: Promise<void> = Promise.resolve()
   #toolCalls = 0
   #activeCalls = 0
   #goalObservation: GoalObservation
   #fatalError: unknown = null
+  #terminalFailure: ToolTerminalFailure | null = null
+  #goalTerminalIntent: GoalTerminalIntent | null = null
 
   constructor(options: ToolCoordinatorOptions) {
     if (!options.model) throw new Error('ToolCoordinator model must not be empty')
@@ -129,7 +168,10 @@ export class ToolCoordinator {
     if (workspace.some((tool) => reservedNames.has(tool.name))) {
       throw new Error('Workspace runtime cannot override a Baton Goal tool')
     }
-    this.definitions = Object.freeze([...workspace, ...GOAL_TOOL_DEFINITIONS])
+    const goalTools = GOAL_TOOL_DEFINITIONS.filter((tool) => (
+      tool.name !== 'create_goal' || this.#goalCreationRequested
+    ))
+    this.definitions = Object.freeze([...workspace, ...goalTools])
     this.#definitionsByName = new Map(this.definitions.map((tool) => [tool.name, tool]))
     this.#loadPersistedCalls()
   }
@@ -161,16 +203,41 @@ export class ToolCoordinator {
     return promise
   }
 
+  /** The first host-authoritative tool limit exhausted by this turn. */
+  get terminalFailure(): ToolTerminalFailure | null {
+    return this.#terminalFailure
+  }
+
+  /** A model-requested Goal terminal transition, committed only after a valid provider terminal. */
+  get goalTerminalIntent(): GoalTerminalIntent | null {
+    return this.#goalTerminalIntent
+  }
+
+  /** True when a durable workspace mutation/command call has no durable result. */
+  get hasUnknownMutationOutcome(): boolean {
+    return this.#unresolvedMutations.size > 0
+  }
+
+  /** Wait until every accepted call has durably settled before the owning turn becomes terminal. */
+  async settle(): Promise<void> {
+    while (this.#inFlight.size > 0) {
+      await Promise.allSettled([...this.#inFlight.values()].map((entry) => entry.promise))
+    }
+    if (this.#fatalError !== null) throw this.#fatalError
+  }
+
   async #executeOnce(
     invocation: AgentToolInvocation,
     signal?: AbortSignal,
   ): Promise<AgentToolResult> {
     const definition = this.#definitionsByName.get(invocation.name)
     const limitResult = this.#reserveLimits(invocation)
-    this.#appendCall(invocation, definition?.sideEffect ?? null)
-    this.#activeCalls += 1
-    this.#store.setTurnActivity(this.#turnId, 'waiting_tool')
+    let activityStarted = false
     try {
+      this.#appendCall(invocation, definition?.sideEffect ?? null)
+      this.#activeCalls += 1
+      activityStarted = true
+      this.#store.setTurnActivity(this.#turnId, 'waiting_tool')
       if (limitResult) return this.#persistResult(invocation, limitResult)
       if (!definition) {
         return this.#persistResult(invocation, failure('tool_not_found', `Unregistered tool: ${invocation.name}`))
@@ -188,26 +255,45 @@ export class ToolCoordinator {
       this.#fatalError = error
       throw error
     } finally {
-      this.#activeCalls -= 1
-      if (this.#activeCalls === 0) this.#store.setTurnActivity(this.#turnId, 'running')
+      if (activityStarted) {
+        this.#activeCalls -= 1
+        if (this.#activeCalls === 0 && this.#fatalError === null) {
+          try {
+            this.#store.setTurnActivity(this.#turnId, 'running')
+          } catch (error) {
+            this.#fatalError = error
+          }
+        }
+      }
     }
   }
 
   #reserveLimits(invocation: AgentToolInvocation): AgentToolResult | null {
+    if (this.#terminalFailure !== null) {
+      return failure(this.#terminalFailure.code, this.#terminalFailure.message)
+    }
     this.#toolCalls += 1
     const fingerprint = repetitionFingerprint(invocation)
     const identical = (this.#identicalCounts.get(fingerprint) ?? 0) + 1
     this.#identicalCounts.set(fingerprint, identical)
     if (this.#toolCalls > this.#limits.maxToolCalls) {
-      return failure('tool_call_limit', `Turn exceeded ${this.#limits.maxToolCalls} tool calls`)
+      return this.#latchTerminalFailure(
+        'tool_call_limit',
+        `Turn exceeded ${this.#limits.maxToolCalls} tool calls`,
+      )
     }
     if (identical > this.#limits.maxIdenticalToolCalls) {
-      return failure(
+      return this.#latchTerminalFailure(
         'tool_repetition_limit',
         `Turn exceeded ${this.#limits.maxIdenticalToolCalls} identical tool calls`,
       )
     }
     return null
+  }
+
+  #latchTerminalFailure(code: ToolTerminalFailureCode, message: string): AgentToolResult {
+    this.#terminalFailure ??= Object.freeze({ code, message })
+    return failure(this.#terminalFailure.code, this.#terminalFailure.message)
   }
 
   #schedule(
@@ -237,6 +323,7 @@ export class ToolCoordinator {
     const result = capResult(value, this.#limits.toolOutputBytes)
     this.#appendResult(invocation, result)
     this.#persisted.set(invocation.callId, { invocation, result })
+    this.#unresolvedMutations.delete(invocation.callId)
     return result
   }
 
@@ -296,31 +383,25 @@ export class ToolCoordinator {
     if (this.#goalObservation.kind === 'none') {
       return failure('goal_not_found', 'No Goal was observed for this turn')
     }
-    if (!current || current.id !== this.#goalObservation.goalId) {
+    if (!current || current.id !== this.#goalObservation.goalId
+      || current.revision !== this.#goalObservation.revision) {
       return failure('stale_goal_revision', 'Current Goal changed after it was observed', { goal: current })
     }
-    if (input.status === 'blocked' && current.noProgressCount < 2) {
+    const intent = Object.freeze({
+      goalId: this.#goalObservation.goalId,
+      expectedRevision: this.#goalObservation.revision,
+      status: input.status,
+      ...(input.status === 'complete' ? { completionEvidence: input.evidence } : {}),
+    } satisfies GoalTerminalIntent)
+    if (this.#goalTerminalIntent !== null
+      && canonicalJson(this.#goalTerminalIntent) !== canonicalJson(intent)) {
       return failure(
-        'invalid_goal_transition',
-        'A Goal may be blocked only after three consecutive externally blocked turns',
+        'goal_terminal_intent_conflict',
+        `Goal terminal intent is already staged as ${this.#goalTerminalIntent.status}`,
       )
     }
-    try {
-      const updated = this.#store.updateGoalStatus({
-        goalId: this.#goalObservation.goalId,
-        expectedRevision: this.#goalObservation.revision,
-        status: input.status,
-        ...(input.status === 'blocked' ? {
-          reason: { code: 'model_blocked', source: 'model', message: null, at: '' },
-        } : {}),
-      } satisfies UpdateGoalStatusInput)
-      if (updated.status === 'stale') return staleGoalResult(updated)
-      if (!updated.goal) return failure('goal_not_found', 'Goal no longer exists')
-      this.#goalObservation = observation(updated.goal)
-      return success({ goal: updated.goal, finalTokensUsed: this.#finalTokensUsed() })
-    } catch (error) {
-      return goalFailure(error)
-    }
+    this.#goalTerminalIntent ??= intent
+    return success({ goal: current, stagedStatus: input.status, finalTokensUsed: this.#finalTokensUsed() })
   }
 
   #appendCall(invocation: AgentToolInvocation, sideEffect: string | null): void {
@@ -330,6 +411,9 @@ export class ToolCoordinator {
       items: [toolCallItem(invocation, sideEffect)],
     })
     this.#persisted.set(invocation.callId, { invocation, result: null })
+    if (sideEffect === 'workspace_mutation' || sideEffect === 'workspace_command') {
+      this.#unresolvedMutations.add(invocation.callId)
+    }
   }
 
   #appendResult(invocation: AgentToolInvocation, result: AgentToolResult): void {
@@ -361,11 +445,17 @@ export class ToolCoordinator {
         const input = object(item.payload.input)
         if (providerCallId && name && input) {
           this.#persisted.set(callId, { invocation: { callId, providerCallId, name, input }, result: null })
+          if (item.payload.sideEffect === 'workspace_mutation' || item.payload.sideEffect === 'workspace_command') {
+            this.#unresolvedMutations.add(callId)
+          }
         }
       } else if (item.kind === 'tool_result') {
         const existing = this.#persisted.get(callId)
         const result = agentToolResult(item.payload.result)
-        if (existing && result) this.#persisted.set(callId, { ...existing, result })
+        if (existing && result) {
+          this.#persisted.set(callId, { ...existing, result })
+          this.#unresolvedMutations.delete(callId)
+        }
       }
     }
   }
@@ -448,16 +538,28 @@ function validateCreateGoal(input: JsonObject):
 }
 
 function validateUpdateGoal(input: JsonObject):
-  | { status: 'complete' | 'blocked' }
+  | { status: 'complete'; evidence: readonly GoalCompletionEvidence[] }
   | { error: AgentToolResult } {
-  if (!onlyKeys(input, ['status'])) return { error: invalidInput('update_goal received unsupported properties') }
-  return input.status === 'complete' || input.status === 'blocked'
-    ? { status: input.status }
-    : { error: invalidInput('status must be complete or blocked') }
-}
-
-function staleGoalResult(result: GoalCasResult): AgentToolResult {
-  return failure('stale_goal_revision', 'Current Goal changed after it was observed', { goal: result.goal })
+  if (!onlyKeys(input, ['status', 'evidence'])) {
+    return { error: invalidInput('update_goal received unsupported properties') }
+  }
+  if (input.status !== 'complete') return { error: invalidInput('status must be complete') }
+  if (!Array.isArray(input.evidence) || input.evidence.length < 1 || input.evidence.length > 64) {
+    return { error: invalidInput('complete status requires 1..64 evidence entries') }
+  }
+  const evidence: GoalCompletionEvidence[] = []
+  for (const entry of input.evidence) {
+    const evidenceObject = object(entry)
+    if (!evidenceObject || !onlyKeys(evidenceObject, ['requirement', 'proof'])
+      || typeof evidenceObject.requirement !== 'string' || evidenceObject.requirement.trim().length < 1
+      || [...evidenceObject.requirement].length > 500
+      || typeof evidenceObject.proof !== 'string' || evidenceObject.proof.trim().length < 1
+      || [...evidenceObject.proof].length > 1_000) {
+      return { error: invalidInput('each completion evidence entry requires bounded requirement and proof strings') }
+    }
+    evidence.push(Object.freeze({ requirement: evidenceObject.requirement, proof: evidenceObject.proof }))
+  }
+  return { status: 'complete', evidence: Object.freeze(evidence) }
 }
 
 function goalFailure(error: unknown): AgentToolResult {
@@ -502,12 +604,13 @@ function definition(
   description: string,
   properties: JsonObject,
   required: string[] = [],
+  schemaExtras: JsonObject = {},
 ): AgentToolDefinition {
   return {
     name,
     description,
     sideEffect: 'goal',
-    inputSchema: { type: 'object', properties, required, additionalProperties: false },
+    inputSchema: { type: 'object', properties, required, additionalProperties: false, ...schemaExtras },
   }
 }
 

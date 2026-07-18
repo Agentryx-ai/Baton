@@ -31,16 +31,25 @@ import type {
   ForkThreadInput,
   GoalCasResult,
   GoalTurnContext,
+  ReconcileToolInput,
+  ReconcileToolResult,
   SessionListScope,
   SessionStore,
 } from './store.ts'
 import { GoalStoreError, SessionStoreError } from './store.ts'
-import { GOAL_TOOL_DEFINITIONS, ToolCoordinator, type ToolRuntime } from './tool-coordinator.ts'
+import {
+  GOAL_TOOL_DEFINITIONS,
+  ToolCoordinator,
+  type GoalTerminalIntent,
+  type ToolRuntime,
+} from './tool-coordinator.ts'
 import { LocalWorkspaceToolRuntime } from './tools/local-workspace-runtime.ts'
 
 interface ActiveTurn {
   controller: AbortController
   completion: Promise<void>
+  turn: CanonicalTurn
+  latestTokensUsed: number
 }
 
 const NO_WORKSPACE_RUNTIME: ToolRuntime = Object.freeze({
@@ -108,21 +117,27 @@ export class TurnOrchestrator implements ConversationService {
   getGoal(threadId: ThreadId): CanonicalGoal | null { return this.store.getGoal(threadId) }
 
   async createGoal(input: CreateGoalInput): Promise<CanonicalGoal> {
+    const previous = this.store.getGoal(input.threadId)
+    if (previous) this.flushActiveGoalTurns(previous.id)
     const goal = this.store.createGoal(input)
     this.events.publish(goal.threadId)
+    if (previous && previous.id !== goal.id) await this.interruptGoalTurns(previous.id)
     void this.goalRuntime.notifyThreadIdle(goal.threadId)
     return goal
   }
 
   async editGoal(input: EditGoalInput): Promise<CanonicalGoal> {
+    this.flushActiveGoalTurns(input.goalId)
     const goal = this.store.editGoal(input)
     this.events.publish(goal.threadId)
+    await this.interruptGoalTurns(goal.id)
     if (goal.status === 'active') void this.goalRuntime.notifyThreadIdle(goal.threadId)
     return goal
   }
 
   async updateGoalStatus(input: UserGoalStatusInput): Promise<GoalCasResult> {
     const before = this.store.getGoalById(input.goalId)
+    this.flushActiveGoalTurns(input.goalId)
     const result = this.store.updateGoalStatus({
       ...input,
       ...(input.status === 'paused' ? {
@@ -143,6 +158,7 @@ export class TurnOrchestrator implements ConversationService {
 
   async clearGoal(input: ClearGoalInput): Promise<void> {
     const goal = this.store.getGoalById(input.goalId)
+    this.flushActiveGoalTurns(input.goalId)
     this.store.clearGoal(input)
     if (goal) {
       this.events.publish(goal.threadId)
@@ -162,15 +178,18 @@ export class TurnOrchestrator implements ConversationService {
     input: StartTurnInput,
     goalContext: GoalTurnContext | null,
     automatic: boolean,
+    startSignal?: AbortSignal,
   ): Promise<BeginTurnResult> {
     if (this.closed) throw new Error('Canonical conversation runtime is closed')
     validateTurnInput(input, automatic)
 
     const ready = await this.adapters.getReady(input.provider)
+    if (startSignal?.aborted) throw startSignal.reason ?? new Error('Goal continuation start was cancelled')
     const workspaceRuntime = this.workspaceRuntime(input.threadId)
+    const goalToolDefinitions = GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal')
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
-      ...GOAL_TOOL_DEFINITIONS,
+      ...goalToolDefinitions,
     ]
     const result = this.store.beginTurn({
       threadId: input.threadId,
@@ -190,14 +209,24 @@ export class TurnOrchestrator implements ConversationService {
         maxDepth: 0,
         capabilityGrant: null,
       },
-      budget: input.effort ? { effort: input.effort } : {},
+      budget: {
+        ...(input.effort ? { effort: input.effort } : {}),
+        agentLoopLimits: DEFAULT_AGENT_LOOP_LIMITS,
+        goalAutomatic: automatic,
+      },
       leaseExpiresAt: null,
       goalContext,
     })
     this.events.publish(input.threadId)
     if (result.duplicate) return result
 
-    let latestTokensUsed = 0
+    const controller = new AbortController()
+    const activeTurn: ActiveTurn = {
+      controller,
+      completion: Promise.resolve(),
+      turn: result.turn,
+      latestTokensUsed: 0,
+    }
     const coordinator = new ToolCoordinator({
       store: this.store,
       turnId: result.turn.id,
@@ -211,10 +240,9 @@ export class TurnOrchestrator implements ConversationService {
         ? { kind: 'none' }
         : { kind: 'goal', goalId: result.turn.goalId, revision: result.turn.goalRevision },
       goalCreationRequested: false,
-      flushGoalAccounting: () => this.checkpointGoalTurn(result.turn, latestTokensUsed),
-      finalTokensUsed: () => latestTokensUsed,
+      flushGoalAccounting: () => { this.checkpointGoalTurn(result.turn, activeTurn.latestTokensUsed) },
+      finalTokensUsed: () => activeTurn.latestTokensUsed,
     })
-    const controller = new AbortController()
     const completion = this.executeTurn(
       result.turn,
       input,
@@ -223,11 +251,12 @@ export class TurnOrchestrator implements ConversationService {
       controller.signal,
       coordinator,
       automatic,
-      (tokens) => { latestTokensUsed = tokens },
+      (tokens) => { activeTurn.latestTokensUsed = tokens },
     ).finally(() => {
       this.active.delete(result.turn.id)
     })
-    this.active.set(result.turn.id, { controller, completion })
+    activeTurn.completion = completion
+    this.active.set(result.turn.id, activeTurn)
     void completion.catch(() => {})
     return result
   }
@@ -242,11 +271,15 @@ export class TurnOrchestrator implements ConversationService {
       const turn = this.store.getTurn(turnId)
       const goal = turn?.goalId ? this.store.getGoalById(turn.goalId) : null
       if (turn?.goalId && turn.goalRevision !== null && goal?.status === 'active') {
-        await this.goalRuntime.pauseBeforeInterrupt({
+        this.checkpointGoalTurn(turn, active.latestTokensUsed)
+        const paused = await this.goalRuntime.pauseBeforeInterrupt({
           goalId: turn.goalId,
-          goalRevision: turn.goalRevision,
+          goalRevision: goal.revision,
           interrupt,
         })
+        if (paused.status !== 'applied') {
+          throw new GoalStoreError('stale_goal_revision', 'Goal changed while the turn was being cancelled')
+        }
       } else {
         await interrupt()
       }
@@ -256,6 +289,12 @@ export class TurnOrchestrator implements ConversationService {
     if (!turn) throw new Error(`Turn not found: ${turnId}`)
     if (isTerminal(turn.status)) return
     throw new Error(`Turn ${turnId} is not owned by this runtime process`)
+  }
+
+  reconcileTool(input: ReconcileToolInput): ReconcileToolResult {
+    const result = this.store.reconcileTool(input)
+    this.events.publish(result.item.threadId)
+    return result
   }
 
   recoverInterruptedTurns(): number {
@@ -293,6 +332,24 @@ export class TurnOrchestrator implements ConversationService {
   ): Promise<void> {
     let terminal: FinishTurnInput = { turnId: turn.id, status: 'completed' }
     let tokensUsed = 0
+    let goalLimitFailure: GoalExecutionLimitError | null = null
+    const toolExecutions = new Set<Promise<AgentToolResult>>()
+    const executionController = new AbortController()
+    const forwardAbort = () => executionController.abort(signal.reason)
+    signal.addEventListener('abort', forwardAbort, { once: true })
+    if (signal.aborted) forwardAbort()
+    const capturedGoal = turn.goalId === null || turn.goalRevision === null
+      ? null
+      : this.store.getGoalById(turn.goalId)
+    const remainingGoalMs = capturedGoal?.status === 'active'
+      && capturedGoal.revision === turn.goalRevision
+      ? Math.max(1, (capturedGoal.maxActiveSeconds - capturedGoal.timeUsedSeconds) * 1_000)
+      : null
+    const goalDeadline = remainingGoalMs === null ? null : setTimeout(() => {
+      goalLimitFailure ??= new GoalExecutionLimitError('goal_time_limit')
+      executionController.abort(goalLimitFailure)
+    }, remainingGoalMs)
+    const executionSignal = executionController.signal
     try {
       const persisted = this.store.getSnapshot(input.threadId)
       if (!persisted) throw new Error(`Thread disappeared after turn start: ${input.threadId}`)
@@ -308,24 +365,34 @@ export class TurnOrchestrator implements ConversationService {
       const nativeRequest = adapter.materialize(request, snapshot)
 
       const execution = await adapter.execute(nativeRequest, {
-        signal,
+        signal: executionSignal,
         toolDefinitions: coordinator.definitions,
         limits: DEFAULT_AGENT_LOOP_LIMITS,
-        executeTool: async (invocation) => {
-          const pending = coordinator.execute(invocation, signal)
-          this.events.publish(input.threadId)
-          try {
-            return await pending
-          } finally {
-            this.checkpointGoalTurn(turn, tokensUsed, true)
+        executeTool: (invocation) => {
+          const execution = (async () => {
+            const pending = coordinator.execute(invocation, executionSignal)
             this.events.publish(input.threadId)
-          }
+            try {
+              const result = await pending
+              const limited = runningGoalLimit(this.checkpointGoalTurn(turn, tokensUsed, true))
+              if (limited) {
+                goalLimitFailure = new GoalExecutionLimitError(limited)
+                throw goalLimitFailure
+              }
+              return result
+            } finally {
+              this.events.publish(input.threadId)
+            }
+          })()
+          toolExecutions.add(execution)
+          void execution.finally(() => toolExecutions.delete(execution)).catch(() => undefined)
+          return execution
         },
         async denyApproval() { throw new Error('Provider approval requests are disabled in canonical MVP') },
         async denyToolCall() { throw new Error('Provider tool calls are disabled in canonical MVP') },
       })
       const cancelOnAbort = () => { void execution.cancel().catch(() => undefined) }
-      signal.addEventListener('abort', cancelOnAbort, { once: true })
+      executionSignal.addEventListener('abort', cancelOnAbort, { once: true })
       try {
         for await (const event of execution.events) {
           const items = adapter.normalize(event)
@@ -339,11 +406,16 @@ export class TurnOrchestrator implements ConversationService {
           if (patch) this.persistBinding(input, capabilities, patch)
           tokensUsed = Math.max(tokensUsed, chargeableGoalTokens(event.payload))
           onTokensUsed(tokensUsed)
-          this.checkpointGoalTurn(turn, tokensUsed)
+          const limited = runningGoalLimit(this.checkpointGoalTurn(turn, tokensUsed))
+          if (limited) {
+            goalLimitFailure = new GoalExecutionLimitError(limited)
+            await execution.cancel()
+            throw goalLimitFailure
+          }
           this.events.publish(input.threadId)
         }
         const result = await execution.terminal
-        if (signal.aborted) throw signal.reason ?? new Error('Turn cancelled by user')
+        if (executionSignal.aborted) throw executionSignal.reason ?? new Error('Turn cancelled by user')
         tokensUsed = Math.max(tokensUsed, chargeableGoalTokens(result.usage))
         onTokensUsed(tokensUsed)
         terminal = {
@@ -352,23 +424,76 @@ export class TurnOrchestrator implements ConversationService {
           usage: result.usage,
           error: result.error,
         }
+        const toolLimit = coordinator.terminalFailure
+        if (toolLimit) {
+          terminal = {
+            turnId: turn.id,
+            status: 'failed',
+            usage: result.usage,
+            error: { ...toolLimit },
+          }
+        }
       } finally {
-        signal.removeEventListener('abort', cancelOnAbort)
+        executionSignal.removeEventListener('abort', cancelOnAbort)
         await execution.dispose()
       }
     } catch (error) {
-      terminal = signal.aborted
-        ? { turnId: turn.id, status: 'cancelled' }
+      terminal = error instanceof GoalExecutionLimitError
+        ? {
+            turnId: turn.id,
+            status: 'failed',
+            error: { code: error.code, message: error.message },
+          }
+        : signal.aborted
+          ? { turnId: turn.id, status: 'cancelled' }
         : {
             turnId: turn.id,
             status: 'failed',
-            error: { message: error instanceof Error ? error.message : String(error) },
+            error: {
+              ...(error instanceof GoalExecutionLimitError ? { code: error.code } : {}),
+              message: error instanceof Error ? error.message : String(error),
+            },
           }
     }
-    this.checkpointGoalTurn(turn, tokensUsed)
+    await Promise.allSettled([...toolExecutions])
+    try {
+      await coordinator.settle()
+    } catch (error) {
+      if (coordinator.hasUnknownMutationOutcome) {
+        terminal = {
+          turnId: turn.id,
+          status: 'interrupted',
+          error: {
+            code: 'unknown_mutation_outcome',
+            message: 'A durable workspace mutation has no durable result; reconcile it before continuing',
+          },
+        }
+      } else if (terminal.status !== 'cancelled') {
+        terminal = {
+          turnId: turn.id,
+          status: 'failed',
+          error: {
+            code: 'tool_durability_failure',
+            message: error instanceof Error ? error.message : String(error),
+          },
+        }
+      }
+    }
+    const finalLimit = runningGoalLimit(this.checkpointGoalTurn(turn, tokensUsed))
+    if (finalLimit && terminal.status !== 'cancelled' && terminal.status !== 'interrupted') {
+      goalLimitFailure ??= new GoalExecutionLimitError(finalLimit)
+      terminal = {
+        turnId: turn.id,
+        status: 'failed',
+        usage: terminal.usage,
+        error: { code: goalLimitFailure.code, message: goalLimitFailure.message },
+      }
+    }
+    if (goalDeadline !== null) clearTimeout(goalDeadline)
+    signal.removeEventListener('abort', forwardAbort)
     this.store.finishTurn(terminal)
     this.events.publish(input.threadId)
-    await this.finishGoalTurn(turn, terminal, tokensUsed, automatic)
+    await this.finishGoalTurn(turn, terminal, tokensUsed, automatic, coordinator.goalTerminalIntent)
   }
 
   private workspaceCwd(threadId: ThreadId): string | null {
@@ -377,7 +502,14 @@ export class TurnOrchestrator implements ConversationService {
     const instructed = instructionCwd(snapshot.thread.instructionSnapshot)
     if (instructed) return instructed
     if (snapshot.session.cwd) return snapshot.session.cwd
-    return snapshot.session.source ? null : process.cwd()
+    return null
+  }
+
+  private flushActiveGoalTurns(goalId: string): void {
+    for (const active of this.active.values()) {
+      if (active.turn.goalId !== goalId) continue
+      this.checkpointGoalTurn(active.turn, active.latestTokensUsed, true)
+    }
   }
 
   private workspaceRuntime(threadId: ThreadId): ToolRuntime {
@@ -385,9 +517,13 @@ export class TurnOrchestrator implements ConversationService {
     return cwd ? new LocalWorkspaceToolRuntime({ cwd }) : NO_WORKSPACE_RUNTIME
   }
 
-  private checkpointGoalTurn(turn: CanonicalTurn, tokensUsed: number, includeProgress = false): void {
-    if (turn.goalId === null || turn.goalRevision === null) return
-    this.store.checkpointGoalTurn({
+  private checkpointGoalTurn(
+    turn: CanonicalTurn,
+    tokensUsed: number,
+    includeProgress = false,
+  ): CanonicalGoal | null {
+    if (turn.goalId === null || turn.goalRevision === null) return null
+    return this.store.checkpointGoalTurn({
       turnId: turn.id,
       goalId: turn.goalId,
       goalRevision: turn.goalRevision,
@@ -396,7 +532,7 @@ export class TurnOrchestrator implements ConversationService {
       ...(includeProgress ? {
         progressDigest: goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision, turn.id),
       } : {}),
-    })
+    }).goal
   }
 
   private async finishGoalTurn(
@@ -404,6 +540,7 @@ export class TurnOrchestrator implements ConversationService {
     terminal: FinishTurnInput,
     tokensUsed: number,
     automatic: boolean,
+    goalIntent: GoalTerminalIntent | null,
   ): Promise<void> {
     if (turn.goalId === null || turn.goalRevision === null) return
     const progressDigest = goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision, turn.id)
@@ -417,8 +554,22 @@ export class TurnOrchestrator implements ConversationService {
       progressDigest,
     })
     if (accounted.status === 'stale' || !accounted.goal) return
-    if (terminal.status === 'failed') {
-      this.stopGoalForTerminal(accounted.goal, terminal.error)
+    if (terminal.status !== 'completed') {
+      const stoppingError = terminal.status === 'cancelled' || terminal.status === 'interrupted'
+        ? { ...(terminal.error ?? {}), code: terminal.error?.code ?? 'runtime_interrupted' }
+        : terminal.error
+      this.stopGoalForTerminal(accounted.goal, stoppingError)
+      this.events.publish(turn.threadId)
+      return
+    }
+    if (goalIntent) {
+      if (goalIntent.goalId !== accounted.goal.id
+        || goalIntent.expectedRevision !== accounted.goal.revision) return
+      this.store.updateGoalStatus({
+        goalId: goalIntent.goalId,
+        expectedRevision: goalIntent.expectedRevision,
+        status: 'complete',
+      })
       this.events.publish(turn.threadId)
       return
     }
@@ -447,6 +598,34 @@ export class TurnOrchestrator implements ConversationService {
       })
       return
     }
+    if (code === 'runtime_interrupted') {
+      this.store.updateGoalStatus({
+        goalId: goal.id,
+        expectedRevision: goal.revision,
+        status: 'blocked',
+        reason: {
+          code: 'runtime_interrupted',
+          source: 'host',
+          message: typeof error?.message === 'string' ? error.message : null,
+          at: new Date().toISOString(),
+        },
+      })
+      return
+    }
+    if (code === 'unknown_mutation_outcome') {
+      this.store.updateGoalStatus({
+        goalId: goal.id,
+        expectedRevision: goal.revision,
+        status: 'blocked',
+        reason: {
+          code: 'unknown_mutation_outcome',
+          source: 'host',
+          message: typeof error?.message === 'string' ? error.message : null,
+          at: new Date().toISOString(),
+        },
+      })
+      return
+    }
     this.goalRuntime.stopForProviderFailure({
       goalId: goal.id,
       goalRevision: goal.revision,
@@ -472,7 +651,7 @@ export class TurnOrchestrator implements ConversationService {
           visibility: 'baton_private',
           payload: { text: goalContinuationPrompt(request.goal), goalContinuation: true },
         }],
-      }, request.goalContext, true)
+      }, request.goalContext, true, request.signal)
       return { status: 'started' as const, turnId: started.turn.id }
     } catch (error) {
       if (error instanceof GoalStoreError && error.code === 'goal_lease_lost') {
@@ -615,14 +794,25 @@ function firstFinite(object: Record<string, unknown>, keys: readonly string[]): 
 
 function elapsedTurnSeconds(turn: CanonicalTurn, endIso: string): number {
   if (!turn.startedAt) return 0
-  return Math.max(0, Math.floor((Date.parse(endIso) - Date.parse(turn.startedAt)) / 1_000))
+  return Math.max(0, Math.ceil((Date.parse(endIso) - Date.parse(turn.startedAt)) / 1_000))
 }
 
 function goalProgressDigest(snapshot: ThreadSnapshot | null, goalRevision: number, turnId: TurnId): string | null {
-  const evidence = snapshot?.items
-    .filter((item) => item.turnId === turnId && (item.kind === 'tool_result' || item.kind === 'file_change'
-      || item.kind === 'plan' || item.kind === 'task'))
-    .map((item) => stableProgressEvidence(item.kind, item.payload)) ?? []
+  const turnItems = snapshot?.items.filter((item) => item.turnId === turnId) ?? []
+  const mutatingCalls = new Set(turnItems.flatMap((item) => {
+    if (item.kind !== 'tool_call' || item.payload.sideEffect !== 'workspace_mutation') return []
+    return typeof item.payload.callId === 'string' ? [item.payload.callId] : []
+  }))
+  const evidence = turnItems
+    .filter((item) => {
+      if (item.kind === 'file_change' || item.kind === 'plan' || item.kind === 'task') return true
+      if (item.kind !== 'tool_result') return false
+      const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
+      const result = item.payload.result
+      return callId !== null && mutatingCalls.has(callId)
+        && typeof result === 'object' && result !== null && (result as { success?: unknown }).success === true
+    })
+    .map((item) => stableProgressEvidence(item.kind, item.payload))
   if (evidence.length === 0) return null
   return createHash('sha256').update(stableJson({
     goalRevision,
@@ -647,6 +837,26 @@ function budgetLimitReason(code: string): string | null {
   if (code === 'tool_repetition_limit') return 'tool_repetition_limit'
   if (code === 'turn_time_limit') return 'turn_time_limit'
   if (code === 'turn_budget_limit') return 'turn_budget_limit'
+  if (code === 'goal_token_limit') return 'goal_token_limit'
+  if (code === 'goal_time_limit') return 'goal_time_limit'
+  return null
+}
+
+class GoalExecutionLimitError extends Error {
+  readonly code: 'goal_token_limit' | 'goal_time_limit'
+
+  constructor(code: 'goal_token_limit' | 'goal_time_limit') {
+    super(code === 'goal_token_limit'
+      ? 'Goal token budget was reached during this turn'
+      : 'Goal active-time budget was reached during this turn')
+    this.code = code
+  }
+}
+
+function runningGoalLimit(goal: CanonicalGoal | null): 'goal_token_limit' | 'goal_time_limit' | null {
+  if (!goal || goal.status !== 'active') return null
+  if (goal.tokenBudget !== null && goal.tokensUsed >= goal.tokenBudget) return 'goal_token_limit'
+  if (goal.timeUsedSeconds >= goal.maxActiveSeconds) return 'goal_time_limit'
   return null
 }
 

@@ -43,6 +43,8 @@ import type {
   GoalEvent,
   HeartbeatGoalLeaseInput,
   RecordGoalTurnInput,
+  ReconcileToolInput,
+  ReconcileToolResult,
   ReleaseGoalLeaseInput,
   SessionListScope,
   SessionStore,
@@ -115,6 +117,12 @@ function parseNullableObject(
   value: string | number | bigint | null | Uint8Array,
 ): Record<string, unknown> | null {
   return value === null ? null : parseObject(value)
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
 }
 
 function text(row: SqlRow, key: string): string {
@@ -868,6 +876,7 @@ export class SqliteSessionStore implements SessionStore {
       )
       let capturedGoalId = currentGoalRow ? text(currentGoalRow, 'id') : null
       let capturedGoalRevision = currentGoalRow ? integer(currentGoalRow, 'revision') : null
+      let capturedLeaseSeconds = 0
       if (goalContext) {
         const lease = this.#optional(this.#db.prepare(`
           SELECT l.* FROM goal_scheduler_leases l
@@ -880,6 +889,13 @@ export class SqliteSessionStore implements SessionStore {
         }
         capturedGoalId = goalContext.goalId
         capturedGoalRevision = goalContext.goalRevision
+        capturedLeaseSeconds = Math.max(0, Math.floor(
+          (Date.parse(now) - Date.parse(text(lease, 'acquired_at'))) / 1_000,
+        ))
+        if (!currentGoalRow
+          || !Number.isSafeInteger(integer(currentGoalRow, 'time_used_seconds') + capturedLeaseSeconds)) {
+          throw new GoalStoreError('invalid_goal_input', 'Goal lease accounting would exceed safe integer storage')
+        }
       }
 
       const turnId = this.#idFactory()
@@ -910,6 +926,12 @@ export class SqliteSessionStore implements SessionStore {
         itemIds: initialItems.map((item) => item.id),
       }, now)
       if (goalContext) {
+        if (capturedLeaseSeconds > 0) {
+          this.#db.prepare(`
+            UPDATE goals SET time_used_seconds=time_used_seconds+?,updated_at=?
+            WHERE id=? AND revision=? AND status='active'
+          `).run(capturedLeaseSeconds, now, goalContext.goalId, goalContext.goalRevision)
+        }
         this.#db.prepare(`
           DELETE FROM goal_scheduler_leases
           WHERE lease_id=? AND goal_id=? AND goal_revision=?
@@ -978,6 +1000,98 @@ export class SqliteSessionStore implements SessionStore {
         }, now)
       }
       return items
+    })
+  }
+
+  reconcileTool(input: ReconcileToolInput): ReconcileToolResult {
+    validateToolReconciliation(input)
+    return this.#transaction('IMMEDIATE', () => {
+      const turn = this.#optional(this.#db.prepare(`
+        SELECT turns.*,threads.session_id AS session_id FROM turns
+        JOIN threads ON threads.id=turns.thread_id WHERE turns.id=?
+      `), input.turnId)
+      if (!turn) throw new SessionStoreError('not_found', `Turn not found: ${input.turnId}`)
+      const turnError = parseNullableObject(turn.error_json)
+      if (text(turn, 'status') !== 'interrupted' || turnError?.code !== 'unknown_mutation_outcome') {
+        throw new SessionStoreError(
+          'invalid_reconciliation',
+          'Tool reconciliation requires an interrupted unknown-mutation turn',
+        )
+      }
+
+      const rows = this.#all(this.#db.prepare(
+        "SELECT * FROM items WHERE turn_id=? AND kind IN ('tool_call','tool_result') ORDER BY sequence",
+      ), input.turnId)
+      const note = input.note ?? null
+      for (const row of rows) {
+        if (text(row, 'kind') !== 'tool_result') continue
+        const payload = parseObject(row.payload_json)
+        if (payload.callId !== input.callId) continue
+        const reconciliation = objectValue(payload.reconciliation)
+        if (reconciliation) {
+          if (reconciliation.resolution === input.resolution && (reconciliation.note ?? null) === note) {
+            return { item: this.#item(row), duplicate: true }
+          }
+          throw new SessionStoreError(
+            'reconciliation_conflict',
+            'Tool call was already reconciled with a different resolution or note',
+          )
+        }
+        throw new SessionStoreError('invalid_reconciliation', 'Tool call already has a canonical result')
+      }
+
+      const callRow = rows.find((row) => {
+        if (text(row, 'kind') !== 'tool_call') return false
+        return parseObject(row.payload_json).callId === input.callId
+      })
+      if (!callRow) throw new SessionStoreError('invalid_reconciliation', 'Unresolved tool call was not found')
+      const call = parseObject(callRow.payload_json)
+      if (call.sideEffect !== 'workspace_mutation' && call.sideEffect !== 'workspace_command') {
+        throw new SessionStoreError(
+          'invalid_reconciliation',
+          'Only unresolved mutating or command tool calls can be reconciled',
+        )
+      }
+      const providerCallId = typeof call.providerCallId === 'string' ? call.providerCallId : null
+      const toolName = typeof call.name === 'string' ? call.name : null
+      if (!providerCallId || !toolName) throw new Error('Corrupt database: tool call identity is incomplete')
+
+      const now = this.#now()
+      const reconciliation = { resolution: input.resolution, note }
+      const result = reconciliationToolResult(input.resolution, note)
+      const [item] = this.#appendItems(
+        text(turn, 'session_id'),
+        text(turn, 'thread_id'),
+        input.turnId,
+        text(turn, 'provider') as CanonicalProvider,
+        [{
+          kind: 'tool_result',
+          visibility: 'portable',
+          nativeId: providerCallId,
+          payload: {
+            callId: input.callId,
+            providerCallId,
+            toolName,
+            reconciliation,
+            result,
+          },
+        }],
+        `baton:reconcile:${input.callId}`,
+        now,
+      )
+      if (!item) throw new Error('Tool reconciliation failed to append its canonical result')
+      this.#db.prepare('UPDATE threads SET revision=revision+1,updated_at=? WHERE id=?')
+        .run(now, text(turn, 'thread_id'))
+      this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, text(turn, 'session_id'))
+      this.#appendStreamEvent(
+        text(turn, 'session_id'),
+        text(turn, 'thread_id'),
+        input.turnId,
+        'items_appended',
+        { itemIds: [item.id], reconciliation: true },
+        now,
+      )
+      return { item, duplicate: false }
     })
   }
 
@@ -1151,6 +1265,7 @@ export class SqliteSessionStore implements SessionStore {
         tokenBudget, maxAutomaticTurns, maxActiveSeconds, now, now, now)
       const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), id))
       this.#appendGoalEvent(goal, thread.sessionId, 'goal_created', { goal }, now)
+      this.#appendGoalChanged(goal, thread.sessionId, null, now)
       return goal
     })
   }
@@ -1239,6 +1354,7 @@ export class SqliteSessionStore implements SessionStore {
       const thread = this.getThread(goal.threadId)
       if (!thread) throw new Error('Corrupt database: Goal thread is missing')
       this.#appendGoalEvent(goal, thread.sessionId, 'goal_edited', { previousRevision: current.revision, goal }, now)
+      this.#appendGoalChanged(goal, thread.sessionId, null, now)
       return goal
     })
   }
@@ -1270,6 +1386,7 @@ export class SqliteSessionStore implements SessionStore {
       const revision = current.revision + 1
       const resetCounters = input.status === 'active' && input.resetLimitCounters === true
       const reason = input.status === 'active' || !input.reason ? null : { ...input.reason, at: now }
+      const stoppedForTimeLimit = input.status === 'budget_limited' && reason?.code === 'goal_time_limit'
       this.#db.prepare(`
         UPDATE goals SET status=?,status_reason_json=?,revision=?,time_used_seconds=?,automatic_turns_used=?,
           no_progress_count=?,last_progress_digest=?,updated_at=?,completed_at=?
@@ -1278,7 +1395,9 @@ export class SqliteSessionStore implements SessionStore {
         input.status,
         reason === null ? null : canonicalJson(reason),
         revision,
-        resetCounters ? 0 : current.timeUsedSeconds,
+        resetCounters ? 0 : stoppedForTimeLimit
+          ? Math.max(current.timeUsedSeconds, current.maxActiveSeconds)
+          : current.timeUsedSeconds,
         resetCounters ? 0 : current.automaticTurnsUsed,
         input.status === 'active' ? 0 : current.noProgressCount,
         input.status === 'active' ? null : current.lastProgressDigest,
@@ -1292,6 +1411,7 @@ export class SqliteSessionStore implements SessionStore {
       const thread = this.getThread(goal.threadId)
       if (!thread) throw new Error('Corrupt database: Goal thread is missing')
       this.#appendGoalEvent(goal, thread.sessionId, `goal_${input.status}`, { previousStatus: current.status, goal }, now)
+      this.#appendGoalChanged(goal, thread.sessionId, null, now)
       return { status: 'applied', goal }
     })
   }
@@ -1310,6 +1430,7 @@ export class SqliteSessionStore implements SessionStore {
       this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(current.id)
       this.#db.prepare('DELETE FROM goals WHERE id=?').run(current.id)
       this.#appendGoalEvent(current, thread.sessionId, 'goal_cleared', { goal: current }, now)
+      this.#appendGoalChanged(current, thread.sessionId, null, now, 'cleared')
     })
   }
 
@@ -1421,7 +1542,7 @@ export class SqliteSessionStore implements SessionStore {
           ? { status: 'applied', goal: current }
           : { status: 'stale', goal: current }
       }
-      const checkpoint = this.#checkpointGoalTurn(input)
+      const checkpoint = this.#checkpointGoalTurn(input, false)
       if (checkpoint.status === 'stale' || !checkpoint.goal) return checkpoint
       const current = checkpoint.goal
       if (!Number.isSafeInteger(current.automaticTurnsUsed + (input.automatic ? 1 : 0))) {
@@ -1453,11 +1574,12 @@ export class SqliteSessionStore implements SessionStore {
         automatic: input.automatic,
         progressDigest: input.progressDigest,
       }, now)
+      this.#appendGoalChanged(goal, thread.sessionId, input.turnId, now)
       return { status: 'applied', goal }
     })
   }
 
-  #checkpointGoalTurn(input: CheckpointGoalTurnInput): GoalCasResult {
+  #checkpointGoalTurn(input: CheckpointGoalTurnInput, emitStreamEvent = true): GoalCasResult {
     const turn = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), input.turnId)
     if (!turn) throw new SessionStoreError('not_found', `Turn not found: ${input.turnId}`)
     if (nullableText(turn, 'goal_id') !== input.goalId || turn.goal_revision !== input.goalRevision) {
@@ -1520,23 +1642,28 @@ export class SqliteSessionStore implements SessionStore {
       secondsDelta,
       progressDigest,
     }, now)
+    if (emitStreamEvent) this.#appendGoalChanged(goal, thread.sessionId, input.turnId, now)
     return { status: 'applied', goal }
   }
 
   recoverInterruptedTurns(): number {
     return this.#transaction('IMMEDIATE', () => {
       const rows = this.#all(this.#db.prepare(`
-        SELECT turns.*,threads.session_id AS session_id FROM turns JOIN threads ON threads.id=turns.thread_id
+        SELECT turns.*,threads.session_id AS session_id,executions.budget_json AS execution_budget_json
+        FROM turns JOIN threads ON threads.id=turns.thread_id
+        JOIN executions ON executions.turn_id=turns.id
         WHERE turns.status IN ('queued','running','waiting_tool') ORDER BY turns.id
       `))
-      if (rows.length === 0) return 0
       const now = this.#now()
+      const recoveredTurnIds = new Set<string>()
       for (const row of rows) {
         const turnId = text(row, 'id')
+        recoveredTurnIds.add(turnId)
         const unknownMutation = this.#hasUnresolvedMutatingToolCall(turnId)
         const recoveryCode = unknownMutation ? 'unknown_mutation_outcome' : 'runtime_interrupted'
         const goalId = nullableText(row, 'goal_id')
         const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
+        const automatic = parseObject(row.execution_budget_json).goalAutomatic === true
         this.#db.prepare("UPDATE turns SET status='interrupted',completed_at=?,error_json=? WHERE id=?")
           .run(now, canonicalJson({ code: recoveryCode }), turnId)
         this.#db.prepare("UPDATE executions SET status='interrupted',completed_at=? WHERE turn_id=?").run(now, turnId)
@@ -1560,9 +1687,10 @@ export class SqliteSessionStore implements SessionStore {
               at: now,
             }
             this.#db.prepare(`
-              UPDATE goals SET status='blocked',status_reason_json=?,revision=revision+1,updated_at=?
+              UPDATE goals SET status='blocked',status_reason_json=?,revision=revision+1,
+                automatic_turns_used=automatic_turns_used+?,updated_at=?
               WHERE id=? AND revision=? AND status='active'
-            `).run(canonicalJson(reason), now, goalId, goalRevision)
+            `).run(canonicalJson(reason), automatic ? 1 : 0, now, goalId, goalRevision)
             this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(goalId)
             const blocked = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), goalId))
             this.#appendGoalEvent(blocked, text(row, 'session_id'), 'goal_blocked', {
@@ -1570,10 +1698,72 @@ export class SqliteSessionStore implements SessionStore {
               interruptedTurnId: turnId,
               goal: blocked,
             }, now)
+            this.#appendGoalChanged(blocked, text(row, 'session_id'), turnId, now)
           }
         }
       }
-      return rows.length
+
+      const unsettledGoalTurns = this.#all(this.#db.prepare(`
+        SELECT turns.*,threads.session_id AS session_id,executions.budget_json AS execution_budget_json
+        FROM turns JOIN threads ON threads.id=turns.thread_id
+        JOIN executions ON executions.turn_id=turns.id
+        WHERE turns.goal_id IS NOT NULL AND turns.goal_revision IS NOT NULL
+          AND turns.status IN ('completed','cancelled','failed','interrupted')
+          AND NOT EXISTS (
+            SELECT 1 FROM goal_turn_accounting a
+            WHERE a.turn_id=turns.id AND a.terminal=1
+          )
+        ORDER BY turns.id
+      `))
+      for (const row of unsettledGoalTurns) {
+        const turnId = text(row, 'id')
+        const goalId = text(row, 'goal_id')
+        const goalRevision = integer(row, 'goal_revision')
+        const automatic = parseObject(row.execution_budget_json).goalAutomatic === true
+        recoveredTurnIds.add(turnId)
+        const accounting = this.#optional(this.#db.prepare(
+          'SELECT * FROM goal_turn_accounting WHERE turn_id=?',
+        ), turnId)
+        if (accounting) {
+          this.#db.prepare(`
+            UPDATE goal_turn_accounting SET automatic=?,terminal=1,updated_at=?
+            WHERE turn_id=? AND terminal=0
+          `).run(automatic ? 1 : 0, now, turnId)
+        } else {
+          this.#db.prepare(`
+            INSERT INTO goal_turn_accounting(
+              turn_id,goal_id,goal_revision,tokens_used,time_used_seconds,automatic,terminal,
+              progress_digest,created_at,updated_at
+            ) VALUES (?,?,?,0,0,?,1,NULL,?,?)
+          `).run(turnId, goalId, goalRevision, automatic ? 1 : 0, now, now)
+        }
+
+        const goalRow = this.#optional(this.#db.prepare(`
+          SELECT * FROM goals WHERE id=? AND revision=? AND status='active'
+        `), goalId, goalRevision)
+        if (!goalRow) continue
+        const previous = this.#goal(goalRow)
+        const reason: GoalStatusReason = {
+          code: 'goal_accounting_interrupted',
+          source: 'host',
+          message: null,
+          at: now,
+        }
+        this.#db.prepare(`
+          UPDATE goals SET status='blocked',status_reason_json=?,revision=revision+1,
+            automatic_turns_used=automatic_turns_used+?,updated_at=?
+          WHERE id=? AND revision=? AND status='active'
+        `).run(canonicalJson(reason), automatic ? 1 : 0, now, goalId, goalRevision)
+        this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(goalId)
+        const blocked = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), goalId))
+        this.#appendGoalEvent(blocked, text(row, 'session_id'), 'goal_blocked', {
+          previousStatus: previous.status,
+          interruptedTurnId: turnId,
+          goal: blocked,
+        }, now)
+        this.#appendGoalChanged(blocked, text(row, 'session_id'), turnId, now)
+      }
+      return recoveredTurnIds.size
     })
   }
 
@@ -2192,12 +2382,70 @@ export class SqliteSessionStore implements SessionStore {
       VALUES (?,?,?,?,?,?,?)
     `).run(goal.id, sessionId, goal.threadId, goal.revision, type, canonicalJson(payload), now)
   }
+
+  #appendGoalChanged(
+    goal: CanonicalGoal,
+    sessionId: string,
+    turnId: string | null,
+    now: string,
+    status: GoalStatus | 'cleared' = goal.status,
+  ): void {
+    this.#appendStreamEvent(sessionId, goal.threadId, turnId, 'goal_changed', {
+      goalId: goal.id,
+      revision: goal.revision,
+      status,
+    }, now)
+  }
 }
 
 function validateGoalObjective(objective: string): void {
   const length = [...objective].length
   if (length < 1 || length > 4_000) {
     throw new GoalStoreError('invalid_goal_input', 'Goal objective must contain 1 to 4000 Unicode characters')
+  }
+}
+
+function validateToolReconciliation(input: ReconcileToolInput): void {
+  if (typeof input.callId !== 'string' || !input.callId.trim()) {
+    throw new SessionStoreError('invalid_reconciliation', 'Tool reconciliation callId is required')
+  }
+  if (input.resolution !== 'succeeded'
+    && input.resolution !== 'failed'
+    && input.resolution !== 'unknown_acknowledged') {
+    throw new SessionStoreError('invalid_reconciliation', 'Tool reconciliation resolution is invalid')
+  }
+  if (input.note !== undefined) {
+    if (typeof input.note !== 'string') {
+      throw new SessionStoreError('invalid_reconciliation', 'Tool reconciliation note must be a string')
+    }
+    if ([...input.note].length > 500) {
+      throw new SessionStoreError('invalid_reconciliation', 'Tool reconciliation note exceeds 500 Unicode characters')
+    }
+  }
+}
+
+function reconciliationToolResult(
+  resolution: ReconcileToolInput['resolution'],
+  note: string | null,
+): Record<string, unknown> {
+  if (resolution === 'succeeded') {
+    return {
+      success: true,
+      content: { reconciliation: { resolution, note } },
+      error: null,
+    }
+  }
+  const code = resolution === 'failed'
+    ? 'reconciled_tool_failure'
+    : 'unknown_mutation_acknowledged'
+  const message = resolution === 'failed'
+    ? 'User confirmed that the interrupted tool operation failed'
+    : 'User acknowledged that the interrupted tool outcome remains unknown'
+  return {
+    success: false,
+    content: null,
+    metadata: { reconciliation: { resolution, note } },
+    error: { code, message, retryable: false },
   }
 }
 

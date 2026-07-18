@@ -72,6 +72,7 @@ test('Claude adapter sends stateless history and records a provider-reported mod
       return Response.json({
         id: 'message-1',
         model: 'claude-opus-4-8',
+        stop_reason: 'end_turn',
         content: [{ type: 'text', text: 'answer' }],
         usage: { input_tokens: 10, output_tokens: 2 },
       })
@@ -122,7 +123,7 @@ test('Gemini adapter uses the proxy compatibility route without native tools', a
       requestedUrl = String(url)
       return Response.json({
         id: 'response-1', model: 'gemini-3.1-pro',
-        choices: [{ message: { content: 'answer' } }],
+        choices: [{ finish_reason: 'stop', message: { content: 'answer' } }],
         usage: { prompt_tokens: 4, completion_tokens: 2 },
       })
     },
@@ -193,9 +194,20 @@ test('Claude executes a tool-use round and preserves assistant blocks in the con
     text: 'done', requestedModel: 'claude-fable-5', reportedModel: 'claude-opus-4-8',
     modelFallback: true, modelProvenance: 'provider_reported', effort: 'high',
   })
-  assert.deepEqual(items.find((item) => item.kind === 'usage')?.payload, { input_tokens: 13, output_tokens: 5 })
+  assert.deepEqual(items.filter((item) => item.kind === 'usage').map((item) => item.payload), [
+    {
+      input_tokens: 8, output_tokens: 3, round: 1,
+      usageProvenance: 'provider_rounds_cumulative',
+    },
+    {
+      input_tokens: 13, output_tokens: 5, round: 2,
+      usageProvenance: 'provider_rounds_cumulative',
+    },
+    { input_tokens: 13, output_tokens: 5 },
+  ])
   assert.deepEqual(
-    items.filter((item) => item.kind === 'provider_event').map((item) => item.payload),
+    items.filter((item) => item.kind === 'provider_event' && item.visibility === 'baton_private')
+      .map((item) => item.payload),
     [
       {
         round: 1, responseId: 'message-tool', requestedModel: 'claude-fable-5',
@@ -207,6 +219,15 @@ test('Claude executes a tool-use round and preserves assistant blocks in the con
       },
     ],
   )
+  assert.deepEqual(items.find((item) => item.visibility === 'provider_private')?.payload, {
+    stateVersion: 1,
+    round: 1,
+    assistant: { role: 'assistant', content: repliesForAssertionClaudeAssistant },
+    toolResults: [{
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: JSON.stringify({ text: 'contents' }) }],
+    }],
+  })
 })
 
 const repliesForAssertionClaudeAssistant = [
@@ -365,10 +386,116 @@ test('Gemini executes function calls, returns tool messages, and accumulates usa
     { role: 'tool', tool_call_id: 'g-call', name: 'read_file', content: JSON.stringify({ text: 'contents' }) },
   ])
   const items = normalizedItems(adapter, result.events)
-  assert.deepEqual(items.find((item) => item.kind === 'usage')?.payload, {
-    prompt_tokens: 7, completion_tokens: 3, input_tokens: 7, output_tokens: 3,
+  assert.deepEqual(items.filter((item) => item.kind === 'usage').map((item) => item.payload), [
+    {
+      prompt_tokens: 4, completion_tokens: 2, input_tokens: 4, output_tokens: 2, round: 1,
+      usageProvenance: 'provider_rounds_cumulative',
+    },
+    {
+      prompt_tokens: 7, completion_tokens: 3, input_tokens: 7, output_tokens: 3, round: 2,
+      usageProvenance: 'provider_rounds_cumulative',
+    },
+    { prompt_tokens: 7, completion_tokens: 3, input_tokens: 7, output_tokens: 3 },
+  ])
+  assert.deepEqual(items.find((item) => item.visibility === 'provider_private')?.payload, {
+    stateVersion: 1,
+    round: 1,
+    assistant: {
+      role: 'assistant', content: null,
+      tool_calls: [{ id: 'g-call', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }],
+    },
+    toolResults: [{
+      role: 'tool', tool_call_id: 'g-call', name: 'read_file',
+      content: JSON.stringify({ text: 'contents' }),
+    }],
   })
 })
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} persists cumulative usage and private continuation state before the next request`, async () => {
+    let requestCount = 0
+    let continuationPersisted = false
+    let cumulativeUsagePersisted = false
+    let cumulativeUsageAtBoundary: Record<string, unknown> | null = null
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider,
+      proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async () => {
+        requestCount += 1
+        if (requestCount === 1) {
+          return Response.json(provider === 'claude'
+            ? {
+                id: 'private-tool', model: 'claude-fable-5', stop_reason: 'tool_use',
+                usage: { input_tokens: 2, output_tokens: 1 },
+                content: [{ type: 'tool_use', id: 'private-call', name: 'read_file', input: { path: 'fixture.txt' } }],
+              }
+            : {
+                id: 'private-tool', model: 'gemini-3.1-pro',
+                usage: { prompt_tokens: 2, completion_tokens: 1 },
+                choices: [{ finish_reason: 'tool_calls', message: {
+                  role: 'assistant', content: null,
+                  tool_calls: [{
+                    id: 'private-call', type: 'function',
+                    function: { name: 'read_file', arguments: '{"path":"fixture.txt"}' },
+                  }],
+                } }],
+              })
+        }
+        assert.equal(continuationPersisted, true)
+        assert.equal(cumulativeUsagePersisted, true)
+        assert.deepEqual(cumulativeUsageAtBoundary, provider === 'claude'
+          ? {
+              input_tokens: 2, output_tokens: 1, round: 1,
+              usageProvenance: 'provider_rounds_cumulative',
+            }
+          : {
+              prompt_tokens: 2, completion_tokens: 1, input_tokens: 2, output_tokens: 1, round: 1,
+              usageProvenance: 'provider_rounds_cumulative',
+            })
+        return Response.json(provider === 'claude'
+          ? {
+              id: 'private-final', model: 'claude-fable-5', stop_reason: 'end_turn', usage: {},
+              content: [{ type: 'text', text: 'done' }],
+            }
+          : {
+              id: 'private-final', model: 'gemini-3.1-pro', usage: {},
+              choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }],
+            })
+      },
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `${provider}-private-state`,
+      model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'inspect fixture' } }],
+    }, snapshot), executionContext({
+      toolDefinitions: [readTool],
+      async executeTool() { return { success: true, content: { text: 'fixture-result' }, error: null } },
+    }))
+
+    for await (const event of execution.events) {
+      const normalized = adapter.normalize(event)
+      if (normalized.some((item) => item.kind === 'usage'
+        && item.payload.usageProvenance === 'provider_rounds_cumulative')) {
+        cumulativeUsagePersisted = true
+        cumulativeUsageAtBoundary = normalized.find((item) => item.kind === 'usage'
+          && item.payload.usageProvenance === 'provider_rounds_cumulative')?.payload ?? null
+      }
+      const continuation = normalized.find((item) => item.visibility === 'provider_private')
+      if (!continuation) continue
+      assert.equal(continuation.kind, 'provider_event')
+      assert.equal(continuation.provider, provider)
+      assert.equal(continuation.payload.stateVersion, 1)
+      assert.equal(continuation.payload.round, 1)
+      assert.ok(continuation.payload.assistant)
+      assert.ok(Array.isArray(continuation.payload.toolResults))
+      continuationPersisted = true
+    }
+    assert.equal((await execution.terminal).status, 'completed')
+    assert.equal(continuationPersisted, true)
+    assert.equal(cumulativeUsagePersisted, true)
+    assert.equal(requestCount, 2)
+  })
+}
 
 test('Gemini enforces the model round-trip limit before executing function calls', async () => {
   let toolExecuted = false
@@ -408,6 +535,75 @@ test('a provider turn timeout fails instead of being misreported as user cancell
   assert.match(String(result.terminal.error?.message), /exceeded time limit/i)
   assert.equal(result.terminal.error?.code, 'turn_time_limit')
 })
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} rejects a response with no explicit terminal reason`, async () => {
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider,
+      proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async () => Response.json(provider === 'claude'
+        ? {
+            id: 'missing-stop', model: 'claude-fable-5', usage: {},
+            content: [{ type: 'text', text: 'ambiguous' }],
+          }
+        : {
+            id: 'missing-finish', model: 'gemini-3.1-pro', usage: {},
+            choices: [{ message: { content: 'ambiguous' } }],
+          }),
+    })
+    const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+      turnId: `${provider}-missing-terminal-reason`,
+      model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, snapshot), executionContext()))
+
+    assert.equal(result.terminal.status, 'failed')
+    assert.equal(result.terminal.error?.code, 'provider_invalid_terminal')
+  })
+}
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} rejects a final reason that still contains pending tool calls`, async () => {
+    let toolExecuted = false
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider,
+      proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async () => Response.json(provider === 'claude'
+        ? {
+            id: 'contradictory-stop', model: 'claude-fable-5', stop_reason: 'end_turn', usage: {},
+            content: [
+              { type: 'text', text: 'looks final' },
+              { type: 'tool_use', id: 'still-pending', name: 'read_file', input: { path: 'a' } },
+            ],
+          }
+        : {
+            id: 'contradictory-finish', model: 'gemini-3.1-pro', usage: {},
+            choices: [{
+              finish_reason: 'stop',
+              message: {
+                content: 'looks final',
+                tool_calls: [{
+                  id: 'still-pending', type: 'function',
+                  function: { name: 'read_file', arguments: '{"path":"a"}' },
+                }],
+              },
+            }],
+          }),
+    })
+    const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+      turnId: `${provider}-contradictory-terminal`,
+      model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, snapshot), executionContext({
+      toolDefinitions: [readTool],
+      async executeTool() { toolExecuted = true; return { success: true, content: {}, error: null } },
+    })))
+
+    assert.equal(result.terminal.status, 'failed')
+    assert.equal(result.terminal.error?.code, 'provider_invalid_terminal')
+    assert.equal(toolExecuted, false)
+  })
+}
 
 test('tool exceptions become ordered provider error results without dropping later calls', async () => {
   const bodies: Record<string, unknown>[] = []
@@ -484,6 +680,48 @@ test('retry exhaustion is a typed provider failure', async () => {
   })))
   assert.equal(result.terminal.status, 'failed')
   assert.equal(result.terminal.error?.code, 'provider_retry_exhausted')
+})
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} classifies exhausted HTTP 429 responses as a provider usage limit`, async () => {
+    let attempts = 0
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider,
+      proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async () => {
+        attempts += 1
+        return Response.json({ error: { message: 'quota exhausted' } }, { status: 429 })
+      },
+    })
+    const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+      turnId: `${provider}-usage-limited`,
+      model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, snapshot), executionContext({
+      limits: { ...DEFAULT_AGENT_LOOP_LIMITS, maxProviderRetries: 1 },
+    })))
+
+    assert.equal(result.terminal.status, 'failed')
+    assert.equal(result.terminal.error?.code, 'provider_usage_limit')
+    assert.equal(attempts, 2)
+  })
+}
+
+test('a non-JSON HTTP 429 still preserves the provider usage-limit category', async () => {
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async () => new Response('rate limited', { status: 429 }),
+  })
+  const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+    turnId: 'claude-non-json-usage-limited', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, snapshot), executionContext({
+    limits: { ...DEFAULT_AGENT_LOOP_LIMITS, maxProviderRetries: 1 },
+  })))
+
+  assert.equal(result.terminal.status, 'failed')
+  assert.equal(result.terminal.error?.code, 'provider_usage_limit')
 })
 
 for (const finishReason of ['length', 'content_filter', 'MAX_TOKENS', 'SAFETY']) {

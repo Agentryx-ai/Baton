@@ -242,6 +242,7 @@ export type CanonicalStreamEventType =
   | 'turn_cancelled'
   | 'turn_failed'
   | 'turn_interrupted'
+  | 'goal_changed'
 
 export interface CanonicalStreamEvent {
   /** Database-monotonic durable SSE cursor. */

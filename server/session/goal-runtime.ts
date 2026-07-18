@@ -248,6 +248,28 @@ export class GoalRuntime {
     const controller = new AbortController()
     this.#pendingControllers.set(goal.id, controller)
     let leaseLost = false
+    let timeLimitReached = false
+    const remainingActiveMs = Math.max(1, (goal.maxActiveSeconds - goal.timeUsedSeconds) * 1_000)
+    const activeTimeLimit = setTimeout(() => {
+      timeLimitReached = true
+      controller.abort(new Error('Goal active-time limit reached while preparing continuation'))
+      try {
+        this.#store.updateGoalStatus({
+          goalId: goal.id,
+          expectedRevision: goal.revision,
+          status: 'budget_limited',
+          reason: {
+            code: 'goal_time_limit',
+            source: 'host',
+            message: null,
+            at: this.#now().toISOString(),
+          },
+        })
+      } catch {
+        // A concurrent user mutation wins its revision CAS; the aborted launch
+        // still cannot consume the stale lease.
+      }
+    }, remainingActiveMs)
     const heartbeat = setInterval(() => {
       try {
         const refreshed = this.#store.heartbeatGoalLease({
@@ -276,6 +298,9 @@ export class GoalRuntime {
         clientRequestId: continuationClientRequestId(goal),
         signal: controller.signal,
       })
+      if (timeLimitReached) {
+        return { status: 'limited', goal: this.#store.getGoal(goal.threadId) }
+      }
       if (result.status === 'started') {
         return { status: 'started', goal, turnId: result.turnId }
       }
@@ -296,6 +321,9 @@ export class GoalRuntime {
       }
       return { status: 'lease_unavailable', goal }
     } catch {
+      if (timeLimitReached) {
+        return { status: 'limited', goal: this.#store.getGoal(goal.threadId) }
+      }
       if (leaseLost || controller.signal.aborted) {
         return { status: 'lease_lost', goal: this.#store.getGoal(goal.threadId) }
       }
@@ -307,6 +335,7 @@ export class GoalRuntime {
       })
       return { status: 'failed', goal: stopped.goal }
     } finally {
+      clearTimeout(activeTimeLimit)
       clearInterval(heartbeat)
       this.#store.releaseGoalLease({
         leaseId: lease.leaseId,

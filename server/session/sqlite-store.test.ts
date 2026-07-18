@@ -491,6 +491,90 @@ test('Goal status transitions are deterministic and stopped states require expli
   }).status, 'active')
 })
 
+test('Goal projection mutations append objective-free durable SSE cursors', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'do not expose this objective in SSE',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const edited = store.editGoal({
+    goalId: goal.id,
+    expectedRevision: goal.revision,
+    objective: 'still private from SSE',
+  })
+  const paused = store.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: edited.revision,
+    status: 'paused',
+    reason: { code: 'user_paused', source: 'user', message: null, at: '' },
+  }).goal
+  assert.ok(paused)
+  const resumed = store.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: paused.revision,
+    status: 'active',
+  }).goal
+  assert.ok(resumed)
+  const started = store.beginTurn(beginInput(session.activeThreadId))
+  store.checkpointGoalTurn({
+    turnId: started.turn.id,
+    goalId: resumed.id,
+    goalRevision: resumed.revision,
+    tokensUsed: 2,
+    timeUsedSeconds: 1,
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id,
+    goalId: resumed.id,
+    goalRevision: resumed.revision,
+    tokensUsed: 2,
+    timeUsedSeconds: 1,
+    automatic: false,
+    progressDigest: null,
+  })
+  store.clearGoal({ goalId: resumed.id, expectedRevision: resumed.revision })
+
+  const events = store.listEvents(session.activeThreadId).filter((event) => event.type === 'goal_changed')
+  assert.deepEqual(events.map((event) => event.payload), [
+    { goalId: goal.id, revision: 1, status: 'active' },
+    { goalId: goal.id, revision: 2, status: 'active' },
+    { goalId: goal.id, revision: 3, status: 'paused' },
+    { goalId: goal.id, revision: 4, status: 'active' },
+    { goalId: goal.id, revision: 4, status: 'active' },
+    { goalId: goal.id, revision: 4, status: 'active' },
+    { goalId: goal.id, revision: 4, status: 'cleared' },
+  ])
+  assert.ok(events.every((event, index) => index === 0 || event.sequence > events[index - 1]!.sequence))
+  assert.ok(events.every((event) => !('objective' in event.payload)))
+})
+
+test('a lease-side Goal time limit records the exhausted active-time boundary', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'bound readiness time',
+    provider: 'codex',
+    model: 'gpt-test',
+    maxActiveSeconds: 5,
+  })
+  const limited = store.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: goal.revision,
+    status: 'budget_limited',
+    reason: { code: 'goal_time_limit', source: 'host', message: null, at: '' },
+  }).goal
+  assert.equal(limited?.timeUsedSeconds, 5)
+})
+
 test('Goal scheduler lease is exclusive, heartbeats, expires, and is consumed with the turn link', (t) => {
   let now = '2026-07-18T00:00:00.000Z'
   let id = 0
@@ -524,6 +608,7 @@ test('Goal scheduler lease is exclusive, heartbeats, expires, and is consumed wi
   assert.ok(reclaimed)
   assert.notEqual(reclaimed.leaseId, first.leaseId)
 
+  now = '2026-07-18T00:00:46.000Z'
   const linked = store.beginTurn({
     ...beginInput(session.activeThreadId),
     goalContext: { goalId: goal.id, goalRevision: goal.revision, leaseId: reclaimed.leaseId },
@@ -543,6 +628,7 @@ test('Goal scheduler lease is exclusive, heartbeats, expires, and is consumed wi
   }
   assert.equal(turnRow.goal_id, goal.id)
   assert.equal(turnRow.goal_revision, goal.revision)
+  assert.equal(store.getGoalById(goal.id)?.timeUsedSeconds, 5)
 })
 
 test('ordinary turns capture only an active Goal', (t) => {
@@ -872,6 +958,7 @@ test('startup recovery blocks the exact active Goal revision owned by an interru
   assert.ok(lease)
   firstStore.beginTurn({
     ...beginInput(session.activeThreadId),
+    budget: { goalAutomatic: true },
     goalContext: { goalId: goal.id, goalRevision: goal.revision, leaseId: lease.leaseId },
   } as BeginTurnInput & { goalContext: { goalId: string; goalRevision: number; leaseId: string } })
   firstStore.close()
@@ -884,6 +971,7 @@ test('startup recovery blocks the exact active Goal revision owned by an interru
   assert.equal(blocked?.status, 'blocked')
   assert.equal(blocked?.revision, goal.revision + 1)
   assert.equal(blocked?.statusReason?.code, 'runtime_interrupted')
+  assert.equal(blocked?.automaticTurnsUsed, 1)
   assert.equal(recovered.listActiveGoals().length, 0)
   assert.equal(recovered.recoverInterruptedTurns(), 0)
   assert.equal(recovered.listGoalEvents(session.activeThreadId).filter((event) => event.type === 'goal_blocked').length, 1)
@@ -920,6 +1008,231 @@ test('startup recovery reports an unresolved mutating tool as an unknown outcome
   assert.equal(recovered.recoverInterruptedTurns(), 1)
   assert.equal(recovered.getTurn(started.turn.id)?.error?.code, 'unknown_mutation_outcome')
   assert.equal(recovered.getGoalById(goal.id)?.statusReason?.code, 'unknown_mutation_outcome')
+})
+
+test('unknown mutation reconciliation appends one durable result and preserves explicit Goal resume', (t) => {
+  const path = databasePath(t)
+  const options = deterministicOptions()
+  const first = new SqliteSessionStore(path, options)
+  const session = first.createSession({})
+  const goal = first.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'reconcile explicitly',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = first.beginTurn(beginInput(session.activeThreadId))
+  first.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'reconcile-call',
+    items: [{
+      kind: 'tool_call',
+      payload: {
+        callId: 'mutation-1', providerCallId: 'provider-mutation-1', name: 'write_file',
+        input: { path: 'x' }, sideEffect: 'workspace_mutation',
+      },
+    }],
+  })
+  first.close()
+
+  const recovered = new SqliteSessionStore(path, options)
+  assert.equal(recovered.recoverInterruptedTurns(), 1)
+  const eventCursor = recovered.listEvents(session.activeThreadId).at(-1)?.sequence ?? 0
+  const result = recovered.reconcileTool({
+    turnId: started.turn.id,
+    callId: 'mutation-1',
+    resolution: 'unknown_acknowledged',
+    note: 'workspace inspected',
+  })
+  assert.equal(result.duplicate, false)
+  assert.equal(result.item.kind, 'tool_result')
+  assert.equal(result.item.visibility, 'portable')
+  assert.deepEqual(result.item.payload.reconciliation, {
+    resolution: 'unknown_acknowledged', note: 'workspace inspected',
+  })
+  assert.equal((result.item.payload.result as { success: boolean }).success, false)
+  assert.deepEqual(recovered.listEvents(session.activeThreadId, eventCursor).map((event) => ({
+    type: event.type, turnId: event.turnId, payload: event.payload,
+  })), [{
+    type: 'items_appended',
+    turnId: started.turn.id,
+    payload: { itemIds: [result.item.id], reconciliation: true },
+  }])
+  assert.equal(recovered.getGoalById(goal.id)?.status, 'blocked')
+  assert.equal(recovered.getGoalById(goal.id)?.statusReason?.code, 'unknown_mutation_outcome')
+  recovered.close()
+
+  const reopened = new SqliteSessionStore(path, options)
+  t.after(() => reopened.close())
+  const duplicate = reopened.reconcileTool({
+    turnId: started.turn.id,
+    callId: 'mutation-1',
+    resolution: 'unknown_acknowledged',
+    note: 'workspace inspected',
+  })
+  assert.equal(duplicate.duplicate, true)
+  assert.equal(duplicate.item.id, result.item.id)
+  assert.equal(reopened.listEvents(session.activeThreadId, eventCursor).length, 1)
+  assert.throws(() => reopened.reconcileTool({
+    turnId: started.turn.id,
+    callId: 'mutation-1',
+    resolution: 'succeeded',
+    note: 'workspace inspected',
+  }), (error: unknown) => error instanceof SessionStoreError && error.code === 'reconciliation_conflict')
+})
+
+test('tool reconciliation rejects invalid state, call identity, and oversized notes', (t) => {
+  const path = databasePath(t)
+  const options = deterministicOptions()
+  const first = new SqliteSessionStore(path, options)
+  const session = first.createSession({})
+  const started = first.beginTurn(beginInput(session.activeThreadId))
+  first.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'read-call',
+    items: [
+      {
+        kind: 'tool_call',
+        payload: {
+          callId: 'mutation-1', providerCallId: 'provider-mutation-1', name: 'write_file',
+          input: { path: 'x' }, sideEffect: 'workspace_mutation',
+        },
+      },
+      {
+        kind: 'tool_call',
+        payload: {
+          callId: 'read-1', providerCallId: 'provider-read-1', name: 'read_file',
+          input: { path: 'x' }, sideEffect: 'read_only',
+        },
+      },
+    ],
+  })
+  first.close()
+
+  const recovered = new SqliteSessionStore(path, options)
+  t.after(() => recovered.close())
+  assert.equal(recovered.recoverInterruptedTurns(), 1)
+  for (const input of [
+    { turnId: started.turn.id, callId: 'read-1', resolution: 'failed' as const },
+    { turnId: started.turn.id, callId: 'missing', resolution: 'failed' as const },
+    { turnId: started.turn.id, callId: 'read-1', resolution: 'failed' as const, note: 'x'.repeat(501) },
+  ]) {
+    assert.throws(
+      () => recovered.reconcileTool(input),
+      (error: unknown) => error instanceof SessionStoreError && error.code === 'invalid_reconciliation',
+    )
+  }
+})
+
+test('startup recovery fail-closes terminal Goal turns with missing or partial terminal accounting', (t) => {
+  for (const checkpointed of [false, true]) {
+    const path = databasePath(t)
+    const options = deterministicOptions()
+    const first = new SqliteSessionStore(path, options)
+    const session = first.createSession({})
+    const goal = first.createGoal({
+      threadId: session.activeThreadId,
+      expected: { kind: 'none' },
+      objective: checkpointed ? 'partial accounting' : 'missing accounting',
+      provider: 'codex',
+      model: 'gpt-test',
+    })
+    const lease = first.claimGoalLease({ goalId: goal.id, goalRevision: goal.revision, ownerId: 'old-runtime' })
+    assert.ok(lease)
+    const started = first.beginTurn({
+      ...beginInput(session.activeThreadId),
+      budget: { goalAutomatic: true },
+      goalContext: { goalId: goal.id, goalRevision: goal.revision, leaseId: lease.leaseId },
+    })
+    if (checkpointed) {
+      first.checkpointGoalTurn({
+        turnId: started.turn.id,
+        goalId: goal.id,
+        goalRevision: goal.revision,
+        tokensUsed: 5,
+        timeUsedSeconds: 1,
+      })
+    }
+    first.finishTurn({ turnId: started.turn.id, status: 'completed' })
+    first.close()
+
+    const recovered = new SqliteSessionStore(path, options)
+    assert.equal(recovered.recoverInterruptedTurns(), 1)
+    const blocked = recovered.getGoalById(goal.id)
+    assert.equal(blocked?.status, 'blocked')
+    assert.equal(blocked?.statusReason?.code, 'goal_accounting_interrupted')
+    assert.equal(blocked?.tokensUsed, checkpointed ? 5 : 0)
+    assert.equal(blocked?.automaticTurnsUsed, 1)
+    assert.equal(recovered.recoverInterruptedTurns(), 0, 'terminal accounting recovery must be idempotent')
+    assert.equal(recovered.listEvents(session.activeThreadId).filter((event) => (
+      event.type === 'goal_changed' && event.payload.status === 'blocked'
+    )).length, 1)
+
+    const inspected = new DatabaseSync(path, { readOnly: true })
+    try {
+      const accounting = inspected.prepare(`
+        SELECT automatic,terminal,tokens_used,time_used_seconds FROM goal_turn_accounting WHERE turn_id=?
+      `).get(started.turn.id) as { automatic: number; terminal: number; tokens_used: number; time_used_seconds: number }
+      assert.deepEqual({ ...accounting }, {
+        automatic: 1,
+        terminal: 1,
+        tokens_used: checkpointed ? 5 : 0,
+        time_used_seconds: checkpointed ? 1 : 0,
+      })
+    } finally {
+      inspected.close()
+    }
+
+    assert.ok(blocked)
+    const resumed = recovered.updateGoalStatus({
+      goalId: blocked.id,
+      expectedRevision: blocked.revision,
+      status: 'active',
+    }).goal
+    assert.ok(resumed)
+    const nextLease = recovered.claimGoalLease({
+      goalId: resumed.id,
+      goalRevision: resumed.revision,
+      ownerId: 'new-runtime',
+    })
+    assert.ok(nextLease, 'explicit resume must not remain deadlocked behind recovered accounting')
+    recovered.close()
+  }
+})
+
+test('startup recovery leaves normally terminal-accounted Goal turns unchanged', (t) => {
+  const path = databasePath(t)
+  const options = deterministicOptions()
+  const first = new SqliteSessionStore(path, options)
+  const session = first.createSession({})
+  const goal = first.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'already accounted',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = first.beginTurn(beginInput(session.activeThreadId))
+  first.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  first.recordGoalTurn({
+    turnId: started.turn.id,
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    tokensUsed: 3,
+    timeUsedSeconds: 1,
+    automatic: false,
+    progressDigest: 'verified-progress',
+  })
+  first.close()
+
+  const recovered = new SqliteSessionStore(path, options)
+  t.after(() => recovered.close())
+  assert.equal(recovered.recoverInterruptedTurns(), 0)
+  assert.equal(recovered.getGoalById(goal.id)?.status, 'active')
+  assert.equal(recovered.listEvents(session.activeThreadId).filter((event) => (
+    event.type === 'goal_changed' && event.payload.status === 'blocked'
+  )).length, 0)
 })
 
 test('provider bindings reject plaintext opaque state and invalidate incompatible context', (t) => {

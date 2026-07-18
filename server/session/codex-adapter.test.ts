@@ -19,11 +19,14 @@ type Scenario =
   | 'duplicateTool'
   | 'duplicateRpc'
   | 'foreignTool'
+  | 'foreignProvider'
   | 'twoRounds'
+  | 'usageFallback'
   | 'reroute'
   | 'collab'
   | 'cancel'
   | 'hangInterrupt'
+  | 'usageLimit'
   | 'exit'
 
 class TestStream<T> implements AsyncIterable<T> {
@@ -162,7 +165,7 @@ function scriptedFactory(
           result: {
             thread: { id: 'native-thread', ephemeral: true, path: null },
             model: 'gpt-resolved',
-            modelProvider: 'baton',
+            modelProvider: scenario === 'foreignProvider' ? 'openai' : 'baton',
             runtimeWorkspaceRoots: [],
           },
         })
@@ -298,6 +301,24 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
     })
     return
   }
+  if (scenario === 'usageLimit') {
+    process.emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'native-thread',
+        turn: {
+          id: 'native-turn',
+          status: 'failed',
+          error: {
+            message: 'quota exhausted',
+            codexErrorInfo: 'usageLimitExceeded',
+            additionalDetails: 'preserved',
+          },
+        },
+      },
+    })
+    return
+  }
   if (scenario === 'cancel' || scenario === 'hangInterrupt') return
   if (scenario === 'twoRounds') {
     emitUsage(process, 1)
@@ -348,7 +369,8 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
       plan: [{ step: 'finish', status: 'completed' }],
     },
   })
-  if (scenario !== 'twoRounds') emitUsage(process, 5)
+  if (scenario === 'usageFallback') emitUsageFallback(process)
+  else if (scenario !== 'twoRounds') emitUsage(process, 5)
   process.emit({
     method: 'turn/completed',
     params: {
@@ -368,6 +390,17 @@ function emitUsage(process: FakeProcess, totalTokens: number): void {
         total: { totalTokens },
         last: { inputTokens: 3, outputTokens: 2 },
       },
+    },
+  })
+}
+
+function emitUsageFallback(process: FakeProcess): void {
+  process.emit({
+    method: 'thread/tokenUsage/updated',
+    params: {
+      threadId: 'native-thread',
+      turnId: 'native-turn',
+      tokenUsage: { last: { inputTokens: 3, outputTokens: 2 } },
     },
   })
 }
@@ -453,6 +486,22 @@ test('JSONL client parses fragmented frames and correlates out-of-order response
   await process.closeInput()
 })
 
+test('Codex preflight bounds a hung initialize request and terminates its process', async () => {
+  const created: FakeProcess[] = []
+  const adapter = new CodexCanonicalAdapter({
+    shutdownTimeoutMs: 5,
+    processFactory: () => {
+      const process = new FakeProcess()
+      created.push(process)
+      return process
+    },
+  })
+
+  await assert.rejects(adapter.initialize(), /initialize request timed out after 5ms/)
+  assert.equal(created.length, 1)
+  assert.deepEqual(await created[0]?.exited, { code: 0, signal: null })
+})
+
 test('preflight discovers inherited MCP servers and relaunches with each one disabled', async () => {
   const argsSeen: string[][] = []
   const factory: CodexProcessFactory = (_executable, args) => {
@@ -503,13 +552,20 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   const execution = await adapter.execute(materialized, context())
   const [events, terminal] = await Promise.all([collect(execution.events), execution.terminal])
   assert.equal(terminal.status, 'completed')
-  assert.deepEqual(terminal.usage, { inputTokens: 3, outputTokens: 2 })
+  assert.deepEqual(terminal.usage, { totalTokens: 5, usageSource: 'tokenUsage.total' })
   const normalized = events.flatMap((event) => adapter.normalize(event))
   assert.ok(normalized.some((item) => item.kind === 'assistant_message'))
   assert.ok(normalized.some((item) => item.kind === 'reasoning_summary'))
   assert.ok(normalized.some((item) => item.kind === 'plan'))
   assert.ok(normalized.some((item) => item.kind === 'task'))
-  assert.ok(normalized.some((item) => item.kind === 'usage'))
+  assert.deepEqual(normalized.find((item) => item.kind === 'usage')?.payload, {
+    totalTokens: 5,
+    usageSource: 'tokenUsage.total',
+    providerUsageSnapshot: {
+      total: { totalTokens: 5 },
+      last: { inputTokens: 3, outputTokens: 2 },
+    },
+  })
   for (const args of argsSeen) {
     assert.ok(args.includes('web_search="disabled"'))
     assert.ok(args.includes('features.multi_agent=false'))
@@ -556,6 +612,26 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.equal((threadStart.params as Record<string, unknown>).allowProviderModelFallback, false)
   assert.ok(turnProcess.writes.some((message) => message.method === 'thread/inject_items'))
   await adapter.shutdown()
+})
+
+test('adapter falls back to last usage only when Codex omits the cumulative total', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('usageFallback', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const [events, terminal] = await Promise.all([collect(execution.events), execution.terminal])
+
+  assert.deepEqual(terminal.usage, {
+    inputTokens: 3,
+    outputTokens: 2,
+    usageSource: 'tokenUsage.last',
+  })
+  assert.deepEqual(events.flatMap((event) => adapter.normalize(event))
+    .find((item) => item.kind === 'usage')?.payload, {
+      ...terminal.usage,
+      providerUsageSnapshot: { last: { inputTokens: 3, outputTokens: 2 } },
+    })
 })
 
 test('adapter exposes only Baton dynamic tools and returns their result through the provider call id', async () => {
@@ -721,6 +797,18 @@ test('adapter rejects foreign native ids', async () => {
   assert.match(String(terminal.error?.message), /foreign/)
 })
 
+test('adapter rejects a resolved provider that bypasses the configured Baton proxy', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('foreignProvider', [], []),
+    proxyConnection: async () => ({ baseUrl: 'http://127.0.0.1:8317', token: 'proxy-token' }),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.match(String(terminal.error?.message), /resolved model provider openai did not match baton/)
+})
+
 test('adapter rejects duplicate JSON-RPC tool request ids', async () => {
   const adapter = new CodexCanonicalAdapter({
     processFactory: scriptedFactory('duplicateRpc', [], []),
@@ -735,7 +823,7 @@ test('adapter rejects duplicate JSON-RPC tool request ids', async () => {
   assert.match(String(terminal.error?.message), /duplicate/)
 })
 
-test('adapter bounds an unresolved tool and ignores its late completion', async () => {
+test('adapter waits for the coordinator authoritative tool settlement', async () => {
   let resolveTool!: (value: Awaited<ReturnType<ProviderExecutionContext['executeTool']>>) => void
   const never = new Promise<Awaited<ReturnType<ProviderExecutionContext['executeTool']>>>((resolve) => {
     resolveTool = resolve
@@ -750,15 +838,22 @@ test('adapter bounds an unresolved tool and ignores its late completion', async 
     limits: { toolTimeoutMs: 5 },
     executeTool: () => never,
   }))
+  let terminalSettled = false
+  void execution.terminal.then(() => { terminalSettled = true })
+  await new Promise((resolve) => setTimeout(resolve, 15))
+  assert.equal(terminalSettled, false)
+  assert.equal(created[1].writes.some((message) => message.id === 60 && 'result' in message), false)
+
+  resolveTool({ success: true, content: { text: 'late' }, error: null })
   assert.equal((await execution.terminal).status, 'completed')
   const response = created[1].writes.find((message) => message.id === 60 && 'result' in message)
-  assert.ok(response)
-  const responseResult = response.result as Record<string, unknown>
-  assert.equal(responseResult.success, false)
-  assert.match(JSON.stringify(responseResult), /tool_timeout/)
-  resolveTool({ success: true, content: { text: 'late' }, error: null })
-  await Promise.resolve()
-  assert.equal((response.result as Record<string, unknown>).success, false)
+  assert.deepEqual(response?.result, {
+    contentItems: [{
+      type: 'inputText',
+      text: JSON.stringify({ success: true, content: { text: 'late' }, error: null }),
+    }],
+    success: true,
+  })
 })
 
 test('adapter counts observable model rounds from distinct cumulative usage updates', async () => {
@@ -863,4 +958,20 @@ test('process exit before turn completion produces a failed terminal result', as
   const terminal = await execution.terminal
   assert.equal(terminal.status, 'failed')
   assert.match(String(terminal.error?.message), /exited|closed/)
+})
+
+test('Codex usage-limit TurnError is normalized without discarding official fields', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('usageLimit', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.deepEqual(terminal.error, {
+    message: 'quota exhausted',
+    codexErrorInfo: 'usageLimitExceeded',
+    additionalDetails: 'preserved',
+    code: 'provider_usage_limit',
+  })
 })

@@ -207,6 +207,26 @@ test('lost lease aborts a pending launcher and never reports a turn start', asyn
   assert.equal(result[0]?.status, 'lease_lost')
 })
 
+test('a continuation lease cannot outlive the remaining Goal active-time budget', async () => {
+  const store = new FakeGoalStore(goal({ maxActiveSeconds: 1, timeUsedSeconds: 0 }))
+  const runtime = new GoalRuntime(store, {
+    ownerId: 'runtime-1',
+    leaseDurationMs: 5_000,
+    heartbeatIntervalMs: 100,
+    scanIntervalMs: 60_000,
+    launchContinuation: async ({ signal }) => {
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+      return { status: 'not_started', reason: 'cancelled' }
+    },
+  })
+
+  const result = await runtime.start()
+  runtime.stop()
+  assert.equal(result[0]?.status, 'limited')
+  assert.equal(store.current?.status, 'budget_limited')
+  assert.equal(store.current?.statusReason?.code, 'goal_time_limit')
+})
+
 test('limits are committed in token, turn, time, then no-progress order', async () => {
   const cases: Array<[Partial<CanonicalGoal>, string, string]> = [
     [{ tokenBudget: 10, tokensUsed: 10, automaticTurnsUsed: 24, timeUsedSeconds: 7_200, noProgressCount: 3 }, 'budget_limited', 'goal_token_limit'],

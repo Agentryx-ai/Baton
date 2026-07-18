@@ -74,6 +74,17 @@ interface ModelRoundProvenance {
   toolDecision: boolean
 }
 
+interface ProviderContinuationState {
+  assistant: ProviderMessage
+  toolResults: ProviderMessage[]
+}
+
+interface ModelRoundRecord extends ModelRoundProvenance {
+  usage: JsonObject
+  usageProvenance: 'provider_rounds_cumulative'
+  continuation?: ProviderContinuationState
+}
+
 interface RetryBudget {
   readonly maximum: number
   remaining: number
@@ -82,28 +93,53 @@ interface RetryBudget {
 type ProviderToolCall = Pick<AgentToolInvocation, 'providerCallId' | 'name' | 'input'>
 
 class EventQueue<T> implements AsyncIterable<T> {
-  private readonly values: T[] = []
+  private readonly values: Array<{ value: T; acknowledge: (() => void) | null }> = []
   private readonly waiters: Array<(result: IteratorResult<T>) => void> = []
+  private deliveredAcknowledge: (() => void) | null = null
   private ended = false
 
   push(value: T): void {
+    this.enqueue(value, null)
+  }
+
+  pushAndWait(value: T): Promise<void> {
+    if (this.ended) return Promise.resolve()
+    // The consumer requests the next item only after it has normalized and
+    // durably stored the current one. Continuation requests wait for that
+    // boundary so provider-private replay state cannot race ahead of storage.
+    return new Promise((resolve) => this.enqueue(value, resolve))
+  }
+
+  private enqueue(value: T, acknowledge: (() => void) | null): void {
     if (this.ended) return
     const waiter = this.waiters.shift()
-    if (waiter) waiter({ value, done: false })
-    else this.values.push(value)
+    if (waiter) {
+      this.deliveredAcknowledge = acknowledge
+      waiter({ value, done: false })
+    } else {
+      this.values.push({ value, acknowledge })
+    }
   }
 
   end(): void {
     if (this.ended) return
     this.ended = true
+    this.deliveredAcknowledge?.()
+    this.deliveredAcknowledge = null
+    for (const queued of this.values) queued.acknowledge?.()
     for (const waiter of this.waiters.splice(0)) waiter({ value: undefined, done: true })
   }
 
   [Symbol.asyncIterator](): AsyncIterator<T> {
     return {
       next: () => {
-        const value = this.values.shift()
-        if (value !== undefined) return Promise.resolve({ value, done: false })
+        this.deliveredAcknowledge?.()
+        this.deliveredAcknowledge = null
+        const queued = this.values.shift()
+        if (queued !== undefined) {
+          this.deliveredAcknowledge = queued.acknowledge
+          return Promise.resolve({ value: queued.value, done: false })
+        }
         if (this.ended) return Promise.resolve({ value: undefined, done: true })
         return new Promise((resolve) => this.waiters.push(resolve))
       },
@@ -222,14 +258,24 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       resolveTerminal = resolve
     })
 
-    const emitModelRound = (round: ModelRoundProvenance) => {
-      if (controller.signal.aborted) return
-      events.push({
+    const emitModelRound = (
+      round: ModelRoundProvenance,
+      usage: JsonObject,
+      continuation?: ProviderContinuationState,
+    ): Promise<void> => {
+      if (controller.signal.aborted) return Promise.resolve()
+      const event: NativeProviderEvent = {
         eventId: `${this.provider}:model-round:${body.turnId}:${round.round}`,
         type: 'response/model-round',
-        payload: round,
+        payload: {
+          ...round,
+          usage: { ...usage },
+          usageProvenance: 'provider_rounds_cumulative',
+          ...(continuation ? { continuation } : {}),
+        } satisfies ModelRoundRecord,
         durability: 'durable',
-      })
+      }
+      return events.pushAndWait(event)
     }
 
     const providerRequest = this.request(body, controller.signal, context, emitModelRound)
@@ -295,13 +341,42 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
   normalize(event: NativeProviderEvent): NewCanonicalItem[] {
     if (event.type === 'response/model-round') {
       const round = parseModelRoundProvenance(event.payload)
-      return [{
+      const items: NewCanonicalItem[] = [{
         kind: 'provider_event',
         visibility: 'baton_private',
         provider: this.provider,
         nativeId: round.responseId,
         payload: round,
       }]
+      const usage = objectValue(event.payload)?.usage
+      if (isObject(usage)) {
+        items.push({
+          kind: 'usage',
+          visibility: 'baton_private',
+          provider: this.provider,
+          payload: {
+            ...usage,
+            round: round.round,
+            usageProvenance: 'provider_rounds_cumulative',
+          },
+        })
+      }
+      const continuation = parseProviderContinuation(event.payload)
+      if (continuation) {
+        items.push({
+          kind: 'provider_event',
+          visibility: 'provider_private',
+          provider: this.provider,
+          nativeId: round.responseId,
+          payload: {
+            stateVersion: 1,
+            round: round.round,
+            assistant: continuation.assistant,
+            toolResults: continuation.toolResults,
+          },
+        })
+      }
+      return items
     }
     if (event.type !== 'response/completed') return []
     const response = parseNormalizedResponse(event.payload)
@@ -349,7 +424,11 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     body: MaterializedHttpTurn,
     signal: AbortSignal,
     context: ProviderExecutionContext,
-    onModelRound: (round: ModelRoundProvenance) => void,
+    onModelRound: (
+      round: ModelRoundProvenance,
+      usage: JsonObject,
+      continuation?: ProviderContinuationState,
+    ) => Promise<void>,
   ): Promise<NormalizedResponse> {
     if (!this.connection) throw new Error(`${this.provider} proxy connection is unavailable`)
     return this.provider === 'claude'
@@ -361,7 +440,11 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     body: MaterializedHttpTurn,
     signal: AbortSignal,
     context: ProviderExecutionContext,
-    onModelRound: (round: ModelRoundProvenance) => void,
+    onModelRound: (
+      round: ModelRoundProvenance,
+      usage: JsonObject,
+      continuation?: ProviderContinuationState,
+    ) => Promise<void>,
   ): Promise<NormalizedResponse> {
     const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
     const tools = context.toolDefinitions.map(toClaudeTool)
@@ -391,15 +474,21 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       const content = Array.isArray(payload.content) ? payload.content : []
       const hasToolDecision = content.some((part) => isObject(part) && part.type === 'tool_use')
       const rawStopReason = stringValue(payload.stop_reason)
-      const stopReason = rawStopReason ?? (hasToolDecision ? 'tool_use' : 'end_turn')
-      onModelRound({
+      if (!rawStopReason) {
+        throw new ProviderLoopError(
+          'provider_invalid_terminal',
+          'Claude response did not contain stop_reason',
+        )
+      }
+      const stopReason = rawStopReason
+      const roundRecord: ModelRoundProvenance = {
         round,
         responseId: stringValue(payload.id),
         requestedModel: body.model,
         reportedModel: stringValue(payload.model),
         stopReason,
         toolDecision: hasToolDecision,
-      })
+      }
       const toolUses = content.flatMap((part) => {
         if (!isObject(part) || part.type !== 'tool_use') return []
         return [{
@@ -412,7 +501,14 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         && typeof part.text === 'string' ? [part.text] : []).join('')
 
       if (stopReason === 'end_turn') {
+        if (toolUses.length > 0) {
+          throw new ProviderLoopError(
+            'provider_invalid_terminal',
+            'Claude end_turn response contained pending tool_use blocks',
+          )
+        }
         if (!text) throw new ProviderLoopError('provider_invalid_terminal', 'Claude end_turn response did not contain text')
+        await onModelRound(roundRecord, usage)
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
@@ -424,7 +520,9 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       }
       if (stopReason === 'pause_turn') {
         assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude pause_turn')
-        messages.push({ role: 'assistant', content })
+        const assistantMessage = { role: 'assistant', content }
+        await onModelRound(roundRecord, usage, { assistant: assistantMessage, toolResults: [] })
+        messages.push(assistantMessage)
         continue
       }
       if (stopReason !== 'tool_use') {
@@ -437,15 +535,20 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude tool_use')
       assertUniqueToolCallIds(toolUses, seenProviderCallIds, 'Claude')
       const results = await executeToolBatch(body.turnId, toolUses, context, signal)
-      messages.push({ role: 'assistant', content })
-      messages.push({
+      const assistantMessage = { role: 'assistant', content }
+      const toolResultMessage = {
         role: 'user',
         content: results.map((result, index) => claudeToolResult(
           toolUses[index]!.providerCallId,
           result,
           context.limits.toolOutputBytes,
         )),
+      }
+      await onModelRound(roundRecord, usage, {
+        assistant: assistantMessage,
+        toolResults: [toolResultMessage],
       })
+      messages.push(assistantMessage, toolResultMessage)
     }
     throw new ProviderLoopError(
       'model_round_limit',
@@ -457,7 +560,11 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     body: MaterializedHttpTurn,
     signal: AbortSignal,
     context: ProviderExecutionContext,
-    onModelRound: (round: ModelRoundProvenance) => void,
+    onModelRound: (
+      round: ModelRoundProvenance,
+      usage: JsonObject,
+      continuation?: ProviderContinuationState,
+    ) => Promise<void>,
   ): Promise<NormalizedResponse> {
     const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
     const tools = context.toolDefinitions.map(toOpenAiTool)
@@ -483,6 +590,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       }, retryBudget, signal)
       const payload = await responseJson(response, this.provider)
       mergeNumericUsage(usage, objectValue(payload.usage))
+      usage.input_tokens = numberValue(usage.prompt_tokens)
+      usage.output_tokens = numberValue(usage.completion_tokens)
       const choices = Array.isArray(payload.choices) ? payload.choices : []
       const first = isObject(choices[0]) ? choices[0] : null
       if (!first) throw new Error('Gemini response did not contain a choice')
@@ -491,22 +600,33 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       const text = stringValue(message.content)
       const hasToolDecision = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
       const rawFinishReason = stringValue(first.finish_reason)
-      const finishReason = rawFinishReason ?? (hasToolDecision ? 'tool_calls' : 'stop')
+      if (!rawFinishReason) {
+        throw new ProviderLoopError(
+          'provider_invalid_terminal',
+          'Gemini response did not contain finish_reason',
+        )
+      }
+      const finishReason = rawFinishReason
       const normalizedFinishReason = finishReason.toLowerCase()
-      onModelRound({
+      const roundRecord: ModelRoundProvenance = {
         round,
         responseId: stringValue(payload.id),
         requestedModel: body.model,
         reportedModel: stringValue(payload.model),
         stopReason: finishReason,
         toolDecision: hasToolDecision,
-      })
+      }
       const toolCalls = parseOpenAiToolCalls(message.tool_calls)
 
       if (normalizedFinishReason === 'stop') {
-        if (!text) throw new Error('Gemini stop response did not contain text')
-        usage.input_tokens = numberValue(usage.prompt_tokens)
-        usage.output_tokens = numberValue(usage.completion_tokens)
+        if (toolCalls.length > 0) {
+          throw new ProviderLoopError(
+            'provider_invalid_terminal',
+            'Gemini stop response contained pending tool calls',
+          )
+        }
+        if (!text) throw new ProviderLoopError('provider_invalid_terminal', 'Gemini stop response did not contain text')
+        await onModelRound(roundRecord, usage)
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
@@ -526,19 +646,25 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Gemini tool_calls')
       assertUniqueToolCallIds(toolCalls, seenProviderCallIds, 'Gemini')
       const results = await executeToolBatch(body.turnId, toolCalls, context, signal)
-      messages.push({
+      const assistantMessage = {
         role: 'assistant',
         content: message.content ?? null,
         tool_calls: message.tool_calls,
-      })
+      }
+      const toolResultMessages: ProviderMessage[] = []
       for (const [index, result] of results.entries()) {
-        messages.push({
+        toolResultMessages.push({
           role: 'tool',
           tool_call_id: toolCalls[index]!.providerCallId,
           name: toolCalls[index]!.name,
           content: serializeToolResult(result, context.limits.toolOutputBytes).content,
         })
       }
+      await onModelRound(roundRecord, usage, {
+        assistant: assistantMessage,
+        toolResults: toolResultMessages,
+      })
+      messages.push(assistantMessage, ...toolResultMessages)
     }
     throw new ProviderLoopError(
       'model_round_limit',
@@ -622,14 +748,19 @@ async function responseJson(response: Response, provider: SupportedProvider): Pr
   try {
     payload = await response.json()
   } catch {
-    throw new ProviderLoopError('provider_invalid_response', `${provider} proxy returned non-JSON HTTP ${response.status}`)
+    throw new ProviderLoopError(
+      response.status === 429 ? 'provider_usage_limit' : 'provider_invalid_response',
+      `${provider} proxy returned non-JSON HTTP ${response.status}`,
+    )
   }
   if (!response.ok) {
     const record = isObject(payload) ? payload : null
     const error = objectValue(record?.error)
     const detail = stringValue(error?.message) ?? stringValue(record?.message)
     throw new ProviderLoopError(
-      retryableStatus(response.status) ? 'provider_retry_exhausted' : 'provider_http_error',
+      response.status === 429
+        ? 'provider_usage_limit'
+        : retryableStatus(response.status) ? 'provider_retry_exhausted' : 'provider_http_error',
       `${provider} proxy returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`,
     )
   }
@@ -848,6 +979,19 @@ function parseModelRoundProvenance(value: unknown): ModelRoundProvenance & JsonO
     reportedModel: typeof value.reportedModel === 'string' ? value.reportedModel : null,
     stopReason: requiredString(value.stopReason, 'provider stop reason'),
     toolDecision: value.toolDecision === true,
+  }
+}
+
+function parseProviderContinuation(value: unknown): ProviderContinuationState | null {
+  if (!isObject(value) || value.continuation === undefined) return null
+  const continuation = requiredObject(value.continuation, 'provider continuation')
+  const assistant = requiredObject(continuation.assistant, 'provider continuation assistant')
+  if (!Array.isArray(continuation.toolResults) || continuation.toolResults.some((result) => !isObject(result))) {
+    throw new Error('Provider continuation tool results must be structured messages')
+  }
+  return {
+    assistant,
+    toolResults: continuation.toolResults as ProviderMessage[],
   }
 }
 

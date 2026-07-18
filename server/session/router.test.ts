@@ -23,7 +23,15 @@ import {
 } from './router.ts'
 import type { ConversationService, StartTurnInput, UserGoalStatusInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
-import type { ClearGoalInput, CreateGoalInput, EditGoalInput, ForkThreadInput, GoalCasResult } from './store.ts'
+import type {
+  ClearGoalInput,
+  CreateGoalInput,
+  EditGoalInput,
+  ForkThreadInput,
+  GoalCasResult,
+  ReconcileToolInput,
+  ReconcileToolResult,
+} from './store.ts'
 import type { SessionListScope } from './store.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 
@@ -143,6 +151,7 @@ class TestConversationService implements ConversationService {
   forkInput: ForkThreadInput | null = null
   startInput: StartTurnInput | null = null
   cancelledTurnId: string | null = null
+  reconciledInput: ReconcileToolInput | null = null
   listedScope: SessionListScope | null = null
   goal: CanonicalGoal | null = null
 
@@ -225,6 +234,11 @@ class TestConversationService implements ConversationService {
 
   async cancelTurn(turnId: string): Promise<void> {
     this.cancelledTurnId = turnId
+  }
+
+  reconcileTool(input: ReconcileToolInput): ReconcileToolResult {
+    this.reconciledInput = input
+    return { item: { ...item, kind: 'tool_result', payload: { callId: input.callId } }, duplicate: false }
   }
 
   subscribe(_threadId: string, listener: () => void): () => void {
@@ -574,6 +588,30 @@ test('fork, turn, item cursor, and cancellation routes pass validated contracts'
     assert.equal(cancelled.status, 204)
     assert.equal(service.cancelledTurnId, turn.id)
 
+    const reconciled = await fetch(`${baseUrl}/turns/${turn.id}/reconcile-tool`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ callId: 'call-1', resolution: 'unknown_acknowledged', note: 'checked' }),
+    })
+    assert.equal(reconciled.status, 201)
+    assert.deepEqual(service.reconciledInput, {
+      turnId: turn.id, callId: 'call-1', resolution: 'unknown_acknowledged', note: 'checked',
+    })
+
+    for (const body of [
+      { callId: 'call-1', resolution: 'maybe' },
+      { callId: 'call-1', resolution: 'failed', note: 'x'.repeat(501) },
+      { callId: 'call-1', resolution: 'failed', extra: true },
+    ]) {
+      const invalidReconciliation = await fetch(`${baseUrl}/turns/${turn.id}/reconcile-tool`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      assert.equal(invalidReconciliation.status, 400)
+      assert.equal((await json(invalidReconciliation)).code, 'invalid_request')
+    }
+
     const invalid = await fetch(`${baseUrl}/threads/${thread.id}/turns`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -599,6 +637,8 @@ test('SessionStoreError codes map to stable HTTP statuses', async () => {
     ['duplicate_request', 409],
     ['session_busy', 409],
     ['session_archived', 409],
+    ['invalid_reconciliation', 409],
+    ['reconciliation_conflict', 409],
   ] as const
 
   for (const [code, status] of cases) {

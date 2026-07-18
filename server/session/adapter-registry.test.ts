@@ -59,3 +59,16 @@ test('AdapterRegistry returns a canonical-safe adapter', async () => {
   assert.equal(ready.adapter.provider, 'codex')
   assert.equal(ready.handshake.capabilities.nativeChildExecution, 'disabled')
 })
+
+test('AdapterRegistry bounds readiness and never waits for a hung initialization during shutdown', async () => {
+  const hanging = adapter('disabled')
+  let shutdownCalled = false
+  hanging.initialize = async () => new Promise(() => undefined)
+  hanging.shutdown = async () => { shutdownCalled = true }
+  const registry = new AdapterRegistry({ initializationTimeoutMs: 5, shutdownTimeoutMs: 5 })
+  registry.register(hanging)
+
+  await assert.rejects(registry.getReady('codex'), /initialization timed out after 5ms/)
+  await registry.shutdownAll()
+  assert.equal(shutdownCalled, true)
+})

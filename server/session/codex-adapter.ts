@@ -323,7 +323,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     let disposed = false
     let nativeThreadId: string | null = null
     let nativeTurnId: string | null = null
-    let latestUsage: Record<string, unknown> | null = null
+    let cumulativeUsage: Record<string, unknown> | null = null
     let cancelPromise: Promise<void> | null = null
     let terminalOverride: ProviderTerminalResult | null = null
     let resolvedModel: string | null = null
@@ -488,6 +488,12 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       )
       resolvedModel = requiredString(start.model, 'Codex resolved model')
       resolvedProvider = requiredString(start.modelProvider, 'Codex resolved model provider')
+      const expectedProvider = 'baton'
+      if (resolvedProvider !== expectedProvider) {
+        throw capabilityViolation(
+          `resolved model provider ${resolvedProvider} did not match ${expectedProvider}`,
+        )
+      }
       const thread = asObject(start.thread, 'thread/start thread')
       if (thread.ephemeral !== true || thread.path !== null) {
         throw new Error('Codex canonical mode requires an ephemeral thread with no rollout path')
@@ -548,7 +554,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 }
                 let resultPromise = existing?.result
                 if (!resultPromise) {
-                  resultPromise = executeDynamicTool(context, {
+                  resultPromise = context.executeTool({
                     callId: `${body.turnId}:${toolCall.callId}`,
                     providerCallId: toolCall.callId,
                     name: toolCall.tool,
@@ -577,10 +583,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               throw capabilityViolation(`unexpected native execution event ${message.method}`)
             }
             if (message.method === 'thread/tokenUsage/updated') {
-              const usage = asOptionalObject(params?.tokenUsage)
-              latestUsage = asOptionalObject(usage?.last) ?? usage
-              const total = asOptionalObject(usage?.total)
-              const roundIdentity = canonicalJson(total ?? latestUsage ?? {})
+              const snapshot = codexUsageSnapshot(params)
+              cumulativeUsage = snapshot === null
+                ? null
+                : { ...snapshot.usage, usageSource: snapshot.source }
+              const roundIdentity = canonicalJson(cumulativeUsage ?? {})
               if (!seenUsageTotals.has(roundIdentity)) {
                 seenUsageTotals.add(roundIdentity)
                 modelRoundTrips += 1
@@ -598,9 +605,12 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               }
               resolvedModel = toModel
             }
+            const eventParams = message.method === 'thread/tokenUsage/updated' && cumulativeUsage !== null
+              ? { ...params, usage: cumulativeUsage }
+              : params
             const event = nativeEvent(
               message.method,
-              addModelProvenance(params, {
+              addModelProvenance(eventParams, {
                 requestedModel: body.model,
                 requestedEffort: body.effort,
                 resolvedModel: requiredString(resolvedModel, 'active Codex model'),
@@ -616,8 +626,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               const status = terminalStatus(turn.status)
               finish({
                 status,
-                usage: latestUsage,
-                error: asOptionalObject(turn.error),
+                usage: cumulativeUsage,
+                error: normalizeTurnError(turn.error),
               })
               return
             }
@@ -698,7 +708,20 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       }]
     }
     if (event.type === 'thread/tokenUsage/updated') {
-      return [{ kind: 'usage', visibility: 'baton_private', payload: payload ?? {}, provider: 'codex' }]
+      const snapshot = codexUsageSnapshot(payload)
+      const cumulative = asOptionalObject(payload?.usage)
+        ?? (snapshot === null ? null : { ...snapshot.usage, usageSource: snapshot.source })
+      return [{
+        kind: 'usage',
+        visibility: 'baton_private',
+        payload: cumulative === null
+          ? (payload ?? {})
+          : {
+              ...cumulative,
+              providerUsageSnapshot: asOptionalObject(payload?.tokenUsage),
+            },
+        provider: 'codex',
+      }]
     }
     if (event.type === 'adapter/error') {
       return [{ kind: 'error', payload: payload ?? {}, provider: 'codex' }]
@@ -761,14 +784,17 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     const client = new CodexJsonlRpcClient(process)
     try {
       const initialized = asObject(
-        await client.request('initialize', {
+        await withTimeout(client.request('initialize', {
           clientInfo: { name: 'baton', title: 'Baton', version: '0.1.0' },
           capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: false },
-        }),
+        }), this.shutdownTimeoutMs, 'Codex initialize request'),
         'initialize response',
       )
       await client.notify('initialized')
-      const configRead = asObject(await client.request('config/read', {}), 'config/read result')
+      const configRead = asObject(
+        await withTimeout(client.request('config/read', {}), this.shutdownTimeoutMs, 'Codex config/read request'),
+        'config/read result',
+      )
       return { initialized, configRead }
     } finally {
       await process.closeInput().catch(() => undefined)
@@ -938,6 +964,19 @@ function addModelProvenance(
   return { ...params, ...provenance }
 }
 
+function codexUsageSnapshot(params: JsonObject | null): {
+  usage: JsonObject
+  source: 'tokenUsage.total' | 'tokenUsage.last' | 'tokenUsage'
+} | null {
+  const tokenUsage = asOptionalObject(params?.tokenUsage)
+  if (!tokenUsage) return null
+  const total = asOptionalObject(tokenUsage.total)
+  if (total) return { usage: total, source: 'tokenUsage.total' }
+  const last = asOptionalObject(tokenUsage.last)
+  if (last) return { usage: last, source: 'tokenUsage.last' }
+  return { usage: tokenUsage, source: 'tokenUsage' }
+}
+
 function assertActiveNativeIds(
   params: JsonObject | null,
   threadId: string,
@@ -948,44 +987,6 @@ function assertActiveNativeIds(
   }
   if (typeof params?.turnId === 'string' && params.turnId !== turnId) {
     throw capabilityViolation('Codex event referenced a foreign native turn')
-  }
-}
-
-async function executeDynamicTool(
-  context: ProviderExecutionContext,
-  invocation: Parameters<ProviderExecutionContext['executeTool']>[0],
-): Promise<AgentToolResult> {
-  let timeout: NodeJS.Timeout | null = null
-  let abortListener: (() => void) | null = null
-  const timeoutResult = new Promise<AgentToolResult>((resolve) => {
-    timeout = setTimeout(() => resolve({
-      success: false,
-      content: null,
-      error: {
-        code: 'tool_timeout',
-        message: `Tool ${invocation.name} exceeded its execution timeout`,
-        retryable: false,
-      },
-    }), context.limits.toolTimeoutMs)
-  })
-  const abortResult = new Promise<AgentToolResult>((resolve) => {
-    abortListener = () => resolve({
-      success: false,
-      content: null,
-      error: {
-        code: 'tool_cancelled',
-        message: `Tool ${invocation.name} was cancelled`,
-        retryable: false,
-      },
-    })
-    context.signal.addEventListener('abort', abortListener, { once: true })
-    if (context.signal.aborted) abortListener()
-  })
-  try {
-    return await Promise.race([context.executeTool(invocation), timeoutResult, abortResult])
-  } finally {
-    if (timeout !== null) clearTimeout(timeout)
-    if (abortListener !== null) context.signal.removeEventListener('abort', abortListener)
   }
 }
 
@@ -1020,6 +1021,12 @@ function isApprovalRequest(method: string): boolean {
   return method.includes('requestApproval')
     || method === 'item/tool/requestUserInput'
     || method === 'mcpServer/elicitation/request'
+}
+
+function normalizeTurnError(value: unknown): JsonObject | null {
+  const error = asOptionalObject(value)
+  if (error?.codexErrorInfo !== 'usageLimitExceeded') return error
+  return { ...error, code: 'provider_usage_limit' }
 }
 
 function terminalStatus(value: unknown): ProviderTerminalResult['status'] {
@@ -1209,7 +1216,6 @@ async function withTimeout<T>(promise: Promise<T>, milliseconds: number, label: 
       promise,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds}ms`)), milliseconds)
-        timer.unref()
       }),
     ])
   } finally {

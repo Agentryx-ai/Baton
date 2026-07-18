@@ -20,7 +20,10 @@ Completion audit:
 - Identify authoritative evidence for each requirement and inspect that evidence at its proper scope.
 - Missing, indirect, stale, or uncertain evidence is not completion.
 - Mark the Goal complete only when every requirement is proven and no requested work remains.
-- Mark it blocked only after the same external blocker prevents meaningful progress for three consecutive Goal turns.
+- When calling update_goal with status complete, include one structured {requirement, proof} evidence
+  entry for every audited requirement. Baton rejects an empty completion audit.
+- Leave it active when blocked; Baton applies its host-owned three-turn no-progress audit and records
+  a blocked state only after the deterministic threshold is reached.
 - Difficulty, uncertainty, or partial progress is not a blocker.
 
 Budget:

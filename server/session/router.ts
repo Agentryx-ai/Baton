@@ -12,7 +12,7 @@ import type {
 } from './domain.ts'
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { GoalStoreError, SessionStoreError } from './store.ts'
-import type { CreateGoalInput, EditGoalInput } from './store.ts'
+import type { CreateGoalInput, EditGoalInput, ReconcileToolInput } from './store.ts'
 import type { ProviderModelDescriptor } from './model-catalog.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 import { NativeImportError } from './native-import/service.ts'
@@ -310,6 +310,27 @@ function parseStartTurnInput(threadId: string, value: unknown): StartTurnInput {
   }
 }
 
+function parseReconcileToolInput(turnId: string, value: unknown): ReconcileToolInput {
+  const body = bodyRecord(value)
+  requireOnlyKeys(body, ['callId', 'resolution', 'note'])
+  const resolution = requiredNonEmptyString(body, 'resolution')
+  if (resolution !== 'succeeded' && resolution !== 'failed' && resolution !== 'unknown_acknowledged') {
+    throw new RequestValidationError('resolution must be succeeded, failed, or unknown_acknowledged')
+  }
+  if (body.note !== undefined && typeof body.note !== 'string') {
+    throw new RequestValidationError('note must be a string')
+  }
+  if (typeof body.note === 'string' && [...body.note].length > 500) {
+    throw new RequestValidationError('note must not exceed 500 Unicode characters')
+  }
+  return {
+    turnId,
+    callId: requiredNonEmptyString(body, 'callId'),
+    resolution,
+    ...(typeof body.note === 'string' ? { note: body.note } : {}),
+  }
+}
+
 function parseOptionalCursor(value: unknown, label: string): number | undefined {
   if (value === undefined) return undefined
   if (typeof value !== 'string' || !/^\d+$/.test(value)) {
@@ -544,7 +565,12 @@ export function createConversationRouter(
   })
 
   router.get('/threads/:threadId/goal', (req, res) => {
-    res.json({ goal: service.getGoal(pathParam(req, 'threadId')) })
+    const threadId = pathParam(req, 'threadId')
+    if (!service.getSnapshot(threadId)) {
+      res.status(404).json({ code: 'not_found', error: 'thread not found' })
+      return
+    }
+    res.json({ goal: service.getGoal(threadId) })
   })
 
   router.post('/threads/:threadId/goal', route(async (req, res) => {
@@ -689,6 +715,14 @@ export function createConversationRouter(
   )
 
   router.post(
+    '/turns/:turnId/reconcile-tool',
+    route((req, res) => {
+      const result = service.reconcileTool(parseReconcileToolInput(pathParam(req, 'turnId'), req.body))
+      res.status(result.duplicate ? 200 : 201).json(result)
+    }),
+  )
+
+  router.post(
     '/turns/:turnId/cancel',
     route(async (req, res) => {
       await service.cancelTurn(pathParam(req, 'turnId'))
@@ -731,6 +765,8 @@ export function createConversationRouter(
         duplicate_request: 409,
         session_busy: 409,
         session_archived: 409,
+        invalid_reconciliation: 409,
+        reconciliation_conflict: 409,
       } as const
       res.status(statusByCode[error.code]).json({ code: error.code, error: error.message })
       return
@@ -739,6 +775,7 @@ export function createConversationRouter(
       const conflict = error.code === 'stale_goal_revision'
         || error.code === 'invalid_goal_transition'
         || error.code === 'goal_lease_lost'
+        || error.code === 'unfinished_goal_exists'
       const status = error.code === 'goal_not_found' ? 404 : conflict ? 409 : 400
       res.status(status).json({ code: error.code, error: error.message })
       return

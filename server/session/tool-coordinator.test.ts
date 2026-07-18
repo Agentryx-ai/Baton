@@ -143,23 +143,61 @@ test('never replays a durable unresolved call after process loss', async () => {
   assert.equal(store.items.filter((item) => item.kind === 'tool_result').length, 0)
 })
 
+test('a write-before-execute storage failure latches the turn fatal before mutation', async () => {
+  let executed = false
+  const runtime = new FakeRuntime([WRITE], async () => {
+    executed = true
+    return ok({ changed: true })
+  })
+  const store = new FakeStore()
+  store.appendError = new Error('durable call append failed')
+  const coordinator = makeCoordinator(store, runtime)
+
+  await assert.rejects(coordinator.execute(call('append-failure', 'write_file', {})), /append failed/)
+  await assert.rejects(coordinator.settle(), /append failed/)
+  assert.equal(executed, false)
+})
+
+test('a mutating call remains unknown until its result is durably appended', async () => {
+  const store = new FakeStore()
+  const coordinator = makeCoordinator(store, new FakeRuntime([WRITE], async () => ok({ changed: true })))
+  store.resultAppendError = new Error('durable result append failed')
+
+  await assert.rejects(coordinator.execute(call('result-failure', 'write_file', {})), /result append failed/)
+  await assert.rejects(coordinator.settle(), /result append failed/)
+  assert.equal(coordinator.hasUnknownMutationOutcome, true)
+  assert.deepEqual(store.items.map((item) => item.kind), ['tool_call'])
+})
+
 test('enforces total, repetition, and output limits before returning canonical results', async () => {
   const total = makeCoordinator(new FakeStore(), new FakeRuntime([READ]), {
     maxToolCalls: 1, maxIdenticalToolCalls: 3,
   })
   assert.equal((await total.execute(call('one', 'read_file', { path: 'a' }))).success, true)
   assert.equal((await total.execute(call('two', 'read_file', { path: 'b' }))).error?.code, 'tool_call_limit')
+  assert.deepEqual(total.terminalFailure, {
+    code: 'tool_call_limit', message: 'Turn exceeded 1 tool calls',
+  })
+  assert.equal(
+    (await total.execute(call('three', 'read_file', { path: 'b' }))).error?.code,
+    'tool_call_limit',
+    'the first terminal limit must remain authoritative',
+  )
 
   const repetition = makeCoordinator(new FakeStore(), new FakeRuntime([READ]), {
     maxToolCalls: 10, maxIdenticalToolCalls: 1,
   })
   assert.equal((await repetition.execute(call('a', 'read_file', { path: 'a' }))).success, true)
   assert.equal((await repetition.execute(call('b', 'read_file', { path: 'a' }))).error?.code, 'tool_repetition_limit')
+  assert.deepEqual(repetition.terminalFailure, {
+    code: 'tool_repetition_limit', message: 'Turn exceeded 1 identical tool calls',
+  })
 
   const output = makeCoordinator(new FakeStore(), new FakeRuntime([READ], async () => ok({ text: 'x'.repeat(500) })), {
     toolOutputBytes: 100,
   })
   assert.equal((await output.execute(call('large', 'read_file', {}))).error?.code, 'tool_output_limit')
+  assert.equal(output.terminalFailure, null)
 })
 
 test('mutation timeout waits for execution settlement before recording the failure', async () => {
@@ -183,6 +221,24 @@ test('mutation timeout waits for execution settlement before recording the failu
   assert.equal(store.items.at(-1)?.kind, 'tool_result')
 })
 
+test('settle waits for every accepted durable tool call', async () => {
+  const gate = deferred<AgentToolResult>()
+  const runtime = new FakeRuntime([WRITE], async () => gate.promise)
+  const store = new FakeStore()
+  const coordinator = makeCoordinator(store, runtime)
+  const pending = coordinator.execute(call('settle-mutation', 'write_file', {}))
+  let settled = false
+  const settlement = coordinator.settle().then(() => { settled = true })
+
+  await Promise.resolve()
+  assert.equal(settled, false)
+  gate.resolve(ok({ changed: true }))
+  await pending
+  await settlement
+  assert.equal(settled, true)
+  assert.equal(store.items.at(-1)?.kind, 'tool_result')
+})
+
 test('workspace commands are absent by default and require termination-safe opt-in', () => {
   const runtime = new FakeRuntime([READ, COMMAND])
   const coordinator = makeCoordinator(new FakeStore(), runtime)
@@ -201,7 +257,7 @@ test('Goal tools have exact schemas, refresh observation, and use revision CAS',
   assert.deepEqual(GOAL_TOOL_DEFINITIONS.map((tool) => tool.name), ['get_goal', 'create_goal', 'update_goal'])
   assert.equal(GOAL_TOOL_DEFINITIONS.every((tool) => tool.inputSchema.additionalProperties === false), true)
   const store = new FakeStore()
-  const current = goal({ revision: 3, tokenBudget: 100, tokensUsed: 40 })
+  const current = goal({ revision: 3, tokenBudget: 100, tokensUsed: 40, noProgressCount: 2 })
   store.goal = current
   let flushed = 0
   const coordinator = makeCoordinator(store, new FakeRuntime([]), {}, {
@@ -210,15 +266,32 @@ test('Goal tools have exact schemas, refresh observation, and use revision CAS',
     finalTokensUsed: () => 47,
   })
 
-  const stale = await coordinator.execute(call('stale', 'update_goal', { status: 'complete' }))
+  const stale = await coordinator.execute(call('stale', 'update_goal', {
+    status: 'complete', evidence: [{ requirement: 'old', proof: 'stale' }],
+  }))
   assert.equal(stale.error?.code, 'stale_goal_revision')
   const read = await coordinator.execute(call('read-goal', 'get_goal', {}))
   assert.deepEqual(read.success && read.content.remainingTokens, 60)
-  const complete = await coordinator.execute(call('complete', 'update_goal', { status: 'complete' }))
+  const missingAudit = await coordinator.execute(call('missing-audit', 'update_goal', { status: 'complete' }))
+  assert.equal(missingAudit.error?.code, 'invalid_tool_input')
+  const complete = await coordinator.execute(call('complete', 'update_goal', {
+    status: 'complete',
+    evidence: [{ requirement: 'ship it', proof: 'tests passed' }],
+  }))
   assert.equal(complete.success, true)
   assert.equal(complete.success && complete.content.finalTokensUsed, 47)
-  assert.equal(flushed, 2)
-  assert.equal(store.lastStatusUpdate?.expectedRevision, 3)
+  assert.equal(store.lastStatusUpdate, null)
+  assert.deepEqual(coordinator.goalTerminalIntent, {
+    goalId: current.id,
+    expectedRevision: 3,
+    status: 'complete',
+    completionEvidence: [{ requirement: 'ship it', proof: 'tests passed' }],
+  })
+  const conflict = await coordinator.execute(call('conflict', 'update_goal', {
+    status: 'complete', evidence: [{ requirement: 'ship it', proof: 'different proof' }],
+  }))
+  assert.equal(conflict.error?.code, 'goal_terminal_intent_conflict')
+  assert.equal(flushed, 3)
 })
 
 test('create_goal uses captured no_goal observation and rejects unknown input fields', async () => {
@@ -226,13 +299,15 @@ test('create_goal uses captured no_goal observation and rejects unknown input fi
   const denied = makeCoordinator(store, new FakeRuntime([]), {}, {
     initialGoalObservation: { kind: 'none' },
   })
+  assert.equal(denied.definitions.some((tool) => tool.name === 'create_goal'), false)
   assert.equal(
     (await denied.execute(call('denied', 'create_goal', { objective: 'ship it' }))).error?.code,
-    'goal_creation_not_requested',
+    'tool_not_found',
   )
   const coordinator = makeCoordinator(store, new FakeRuntime([]), {}, {
     initialGoalObservation: { kind: 'none' }, goalCreationRequested: true,
   })
+  assert.equal(coordinator.definitions.some((tool) => tool.name === 'create_goal'), true)
   const invalid = await coordinator.execute(call('invalid', 'create_goal', { objective: 'x', surprise: true }))
   assert.equal(invalid.error?.code, 'invalid_tool_input')
 
@@ -265,11 +340,17 @@ class FakeStore implements ToolCoordinatorStore {
   goal: CanonicalGoal | null = null
   lastCreate: CreateGoalInput | null = null
   lastStatusUpdate: UpdateGoalStatusInput | null = null
+  appendError: Error | null = null
+  resultAppendError: Error | null = null
   readonly trace: string[]
   #sequence = 0
   constructor(trace: string[] = []) { this.trace = trace }
 
   appendProviderEvent(input: { turnId: string; eventId: string; items: NewCanonicalItem[] }): CanonicalItem[] {
+    if (this.appendError) throw this.appendError
+    if (this.resultAppendError && input.items.some((item) => item.kind === 'tool_result')) {
+      throw this.resultAppendError
+    }
     const appended = input.items.map((item) => {
       this.trace.push(item.kind)
       return this.seed(item)

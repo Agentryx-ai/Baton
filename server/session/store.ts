@@ -33,6 +33,20 @@ export interface ForkThreadInput {
 
 export type SessionListScope = 'active' | 'trash' | 'all'
 
+export type ToolReconciliationResolution = 'succeeded' | 'failed' | 'unknown_acknowledged'
+
+export interface ReconcileToolInput {
+  turnId: TurnId
+  callId: string
+  resolution: ToolReconciliationResolution
+  note?: string
+}
+
+export interface ReconcileToolResult {
+  item: CanonicalItem
+  duplicate: boolean
+}
+
 export interface GoalEvent {
   sequence: number
   goalId: GoalId
@@ -151,6 +165,7 @@ export interface SessionStore extends NativeImportStore {
   getTurn(turnId: TurnId): CanonicalTurn | null
   setTurnActivity(turnId: TurnId, status: Extract<CanonicalTurn['status'], 'running' | 'waiting_tool'>): CanonicalTurn
   appendProviderEvent(input: AppendEventInput): CanonicalItem[]
+  reconcileTool(input: ReconcileToolInput): ReconcileToolResult
   finishTurn(input: FinishTurnInput): CanonicalTurn
   upsertProviderBinding(input: UpsertProviderBindingInput): ProviderBinding
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]
@@ -183,6 +198,8 @@ export class SessionStoreError extends Error {
     | 'duplicate_request'
     | 'session_busy'
     | 'session_archived'
+    | 'invalid_reconciliation'
+    | 'reconciliation_conflict'
 
   constructor(
     code:
@@ -192,7 +209,9 @@ export class SessionStoreError extends Error {
       | 'invalid_fork'
       | 'duplicate_request'
       | 'session_busy'
-      | 'session_archived',
+      | 'session_archived'
+      | 'invalid_reconciliation'
+      | 'reconciliation_conflict',
     message: string,
   ) {
     super(message)

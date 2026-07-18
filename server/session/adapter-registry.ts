@@ -13,6 +13,13 @@ interface ReadyAdapter {
 export class AdapterRegistry {
   private readonly adapters = new Map<CanonicalProvider, SessionProviderAdapter>()
   private readonly initialization = new Map<CanonicalProvider, Promise<ReadyAdapter>>()
+  private readonly initializationTimeoutMs: number
+  private readonly shutdownTimeoutMs: number
+
+  constructor(options: { initializationTimeoutMs?: number; shutdownTimeoutMs?: number } = {}) {
+    this.initializationTimeoutMs = positiveTimeout(options.initializationTimeoutMs ?? 30_000)
+    this.shutdownTimeoutMs = positiveTimeout(options.shutdownTimeoutMs ?? 10_000)
+  }
 
   register(adapter: SessionProviderAdapter): void {
     if (this.adapters.has(adapter.provider)) {
@@ -32,10 +39,14 @@ export class AdapterRegistry {
     const adapter = this.adapters.get(provider)
     if (!adapter) throw new Error(`No provider adapter registered: ${provider}`)
 
-    const pending = adapter.initialize().then((handshake) => {
-      assertCanonicalAdapterHandshake(handshake)
-      return { adapter, handshake }
-    })
+    const pending = registryTimeout(
+      adapter.initialize().then((handshake) => {
+        assertCanonicalAdapterHandshake(handshake)
+        return { adapter, handshake }
+      }),
+      this.initializationTimeoutMs,
+      `${provider} adapter initialization`,
+    )
     this.initialization.set(provider, pending)
     try {
       return await pending
@@ -46,10 +57,30 @@ export class AdapterRegistry {
   }
 
   async shutdownAll(): Promise<void> {
-    const initialized = await Promise.allSettled(this.initialization.values())
-    await Promise.allSettled(initialized.flatMap((result) =>
-      result.status === 'fulfilled' ? [result.value.adapter.shutdown()] : [],
-    ))
+    await Promise.allSettled([...this.adapters.values()].map((adapter) => registryTimeout(
+      adapter.shutdown(),
+      this.shutdownTimeoutMs,
+      `${adapter.provider} adapter shutdown`,
+    )))
     this.initialization.clear()
+  }
+}
+
+function positiveTimeout(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('Adapter timeout must be a positive integer')
+  return value
+}
+
+async function registryTimeout<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds}ms`)), milliseconds)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
