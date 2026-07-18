@@ -3,6 +3,8 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  Folder,
+  FolderOpen,
   ListFilter,
   Menu,
   MessageSquarePlus,
@@ -210,20 +212,28 @@ function SessionSidebar({
                 <SessionButton key={session.id} session={session} selected={session.id === selectedSessionId} onSelect={onSelect} />
               ))
             ) : (
-              <section key={group.id} className="pb-1">
+              <section key={group.id} className="pb-2 pt-1 first:pt-0">
                 <button
                   type="button"
-                  className="flex w-full items-center gap-1 rounded-md px-2 py-1.5 text-left text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
+                  className="sticky top-0 z-10 flex min-h-8 w-full items-center gap-2 rounded-lg border border-transparent bg-sidebar/95 px-2 py-1.5 text-left text-xs font-semibold text-sidebar-foreground backdrop-blur-sm hover:border-sidebar-border hover:bg-sidebar-accent"
                   aria-expanded={!collapsed.has(group.id)}
                   onClick={() => toggleGroup(group.id)}
+                  title={group.label}
                 >
                   {collapsed.has(group.id) ? <ChevronRight className="size-3" aria-hidden /> : <ChevronDown className="size-3" aria-hidden />}
+                  {collapsed.has(group.id) ? <Folder className="size-3.5 text-muted-foreground" aria-hidden /> : <FolderOpen className="size-3.5 text-muted-foreground" aria-hidden />}
                   <span className="min-w-0 flex-1 truncate">{group.label}</span>
-                  <span className="font-normal tabular-nums opacity-70">{group.sessions.length}</span>
+                  <span className="min-w-5 rounded-full bg-sidebar-accent px-1.5 py-0.5 text-center text-[0.625rem] font-medium tabular-nums text-muted-foreground">
+                    {group.sessions.length}
+                  </span>
                 </button>
-                {!collapsed.has(group.id) ? group.sessions.map((session) => (
-                  <SessionButton key={session.id} session={session} selected={session.id === selectedSessionId} onSelect={onSelect} />
-                )) : null}
+                {!collapsed.has(group.id) ? (
+                  <div className="ml-3 mt-0.5 space-y-0.5 border-l border-sidebar-border pl-1.5">
+                    {group.sessions.map((session) => (
+                      <SessionButton key={session.id} session={session} selected={session.id === selectedSessionId} onSelect={onSelect} nested />
+                    ))}
+                  </div>
+                ) : null}
               </section>
             ))
           )}
@@ -237,20 +247,23 @@ function SessionButton({
   session,
   selected,
   onSelect,
+  nested = false,
 }: {
   session: CanonicalSessionDto
   selected: boolean
   onSelect: (sessionId: string) => void
+  nested?: boolean
 }) {
   return (
     <button
       type="button"
       onClick={() => onSelect(session.id)}
       className={cn(
-        'w-full rounded-lg px-3 py-2.5 text-left text-sm transition-colors',
+        'w-full text-left text-sm transition-colors',
+        nested ? 'rounded-md px-2.5 py-2' : 'rounded-lg px-3 py-2.5',
         selected
-          ? 'bg-sidebar-accent text-sidebar-accent-foreground'
-          : 'text-muted-foreground hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground',
+          ? 'bg-sidebar-accent text-sidebar-accent-foreground shadow-sm ring-1 ring-sidebar-border/70'
+          : 'text-sidebar-foreground/75 hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground',
       )}
     >
       <span className="block truncate font-medium">
