@@ -30,7 +30,7 @@ const ACTION_STYLE: Record<SteerLogEntry['action'], string> = {
 }
 
 const ACTION_LABEL: Record<SteerLogEntry['action'], string> = {
-  target: '타깃',
+  target: '정책 1순위',
   pause: '일시정지',
   resume: '재개',
   info: '정보',
@@ -126,7 +126,7 @@ export function RotationPanel({ state, accounts, onToggle }: RotationPanelProps)
           <Collapsible>
             <CollapsibleTrigger className="group flex w-full items-center gap-1 text-sm text-muted-foreground transition-colors hover:text-foreground">
               <ChevronRight className="size-4 transition-transform group-data-[state=open]:rotate-90" aria-hidden />
-              조향 로그
+              정책 로그
               <span className="text-xs text-muted-foreground/70">
                 (최근 {Math.min(state.log.length, 20)}건)
               </span>
@@ -134,7 +134,7 @@ export function RotationPanel({ state, accounts, onToggle }: RotationPanelProps)
             <CollapsibleContent>
               <Separator className="my-2" />
               {state.log.length === 0 ? (
-                <p className="py-2 text-xs text-muted-foreground">기록된 조향 이벤트가 없습니다.</p>
+                <p className="py-2 text-xs text-muted-foreground">기록된 정책 이벤트가 없습니다.</p>
               ) : (
                 <ul className="max-h-64 space-y-1 overflow-y-auto pr-1">
                   {state.log

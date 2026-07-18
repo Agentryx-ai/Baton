@@ -27,10 +27,11 @@ import { QuotaBar } from '@/components/QuotaBar'
  *
  * - target        : engine's calculated first-ranked account (engine ON only;
  *                   CLIProxy request order is still determined by its strategy)
- * - reserve       : another account kept in the active pool (engine ON only)
- * - engine-paused : the engine removed it from rotation to preserve quota (engine ON only)
+ * - reserve       : engine's calculated second-ranked account (engine ON only;
+ *                   every non-manually-paused account remains in the pool)
+ * - engine-paused : a legacy engine-owned pause pending restoration
  * - user-paused   : the user manually removed it from rotation (either mode)
- * - active        : in the round-robin pool, not a distinguished role
+ * - active        : in the CLIProxy pool, not a distinguished policy rank
  */
 export type AccountStatus = 'target' | 'reserve' | 'engine-paused' | 'user-paused' | 'active'
 
@@ -53,8 +54,8 @@ const STATUS_BADGE: Record<
   { label: string; icon: React.ComponentType<{ className?: string }>; className: string } | null
 > = {
   target: { label: '정책 1순위', icon: Target, className: 'text-ok' },
-  reserve: { label: '활성 예비', icon: Shield, className: 'text-muted-foreground' },
-  'engine-paused': { label: '엔진 대기 · 쿼터 보존', icon: Moon, className: 'text-muted-foreground' },
+  reserve: { label: '정책 2순위', icon: Shield, className: 'text-muted-foreground' },
+  'engine-paused': { label: '과거 엔진 정지 · 복구 대기', icon: Moon, className: 'text-muted-foreground' },
   'user-paused': { label: '수동 정지', icon: Pause, className: 'text-warn' },
   active: null,
 }
@@ -106,9 +107,8 @@ export function AccountCard({
 
   const hasNickname = account.nickname && account.nickname !== account.email
   const badge = STATUS_BADGE[status]
-  // Engine ON: engine-paused accounts are engine-managed (resuming is futile — it
-  // re-pauses next tick), so no manual pause/resume on them. User-paused stays
-  // user-resumable in both modes.
+  // A legacy engine-owned pause is recovered by the policy journal. Keep manual
+  // controls out of that transition so ownership is not silently reassigned.
   const engineManaged = status === 'engine-paused'
 
   const handleConfirmRemove = () => {

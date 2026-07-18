@@ -13,30 +13,25 @@ export type PolicyId = 'reset-imminent-first'
 /** Canonical policy id value (single source for the string literal). */
 export const POLICY_ID: PolicyId = 'reset-imminent-first'
 
-/** One line in the steering ring buffer — the "what & why" of every action. */
+/** One line in the policy ring buffer — the "what & why" of every action. */
 export interface SteerLogEntry {
   /** epoch ms */
   ts: number
   provider: string
-  /**
-   * 'target' = engine picked this account as the one to spend first. Steering is
-   * enacted purely via pause/resume (removing others from CLIProxy rotation) —
-   * there is no "default account" routing lever (CLIProxy round-robins all
-   * non-paused credentials; the CCS `default` flag does not affect routing).
-   */
+  /** 'target' = calculated policy rank 1; it is not the actual request destination. */
   action: 'target' | 'pause' | 'resume' | 'info' | 'error'
   accountId?: string
   reason: string
 }
 
-/** Per-provider snapshot of the current steering decision. */
+/** Per-provider snapshot of the current observed policy ordering. */
 export interface PolicyProviderState {
   provider: string
-  /** account id the engine spends first (soonest reset), or null when not steering. */
+  /** calculated rank-1 account id (soonest reset), not an enforced destination. */
   target: string | null
-  /** account id kept active as 429 failover reserve, or null. */
+  /** calculated rank-2 account id; all non-manually-paused accounts remain active. */
   reserve: string | null
-  /** account ids the ENGINE paused this tick (distinguishes engine-pause from user-pause in the UI). */
+  /** legacy engine-owned pauses pending crash-safe restoration. */
   enginePaused: string[]
 }
 

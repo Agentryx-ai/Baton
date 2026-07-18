@@ -144,7 +144,7 @@ export interface SteerLogEntry {
   /** epoch ms */
   ts: number
   provider: string
-  /** 'target' = engine picked this account to spend first (enacted via pause/resume; no default routing lever). */
+  /** 'target' = calculated policy rank 1; it does not assert the actual request destination. */
   action: 'target' | 'pause' | 'resume' | 'info' | 'error'
   accountId?: string
   reason: string
@@ -152,11 +152,11 @@ export interface SteerLogEntry {
 
 export interface PolicyProviderState {
   provider: string
-  /** account id the engine spends first (soonest reset), or null when not steering. */
+  /** calculated rank-1 account id (soonest reset), not an enforced request destination. */
   target: string | null
-  /** account id kept active as failover reserve. */
+  /** calculated rank-2 account id; every non-manually-paused account remains in the failover pool. */
   reserve: string | null
-  /** account ids the ENGINE paused this tick (vs. user-paused) — drives card state badges. */
+  /** legacy engine-owned pauses pending restoration; new policy ticks do not add ids. */
   enginePaused: string[]
 }
 

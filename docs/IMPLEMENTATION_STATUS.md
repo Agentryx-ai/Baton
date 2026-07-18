@@ -21,8 +21,9 @@
 |---|---|---|---|
 | Account control plane | 구현됨 | 계정·quota·OAuth·pause/resume/delete UI와 API, 정책 엔진, 관련 테스트 | 없음 |
 | 수동 계정 고정 | 설계 변경 | CLIProxy의 `default`는 요청 라우팅 레버가 아님. 현재 UI의 **이 계정만**은 다른 활성 계정을 pause해 실제 단독 풀을 만듦 | `default` 중심의 과거 설명을 사용하지 않음 |
-| Smart rotation | **부분 구현·의미 불일치** | 60초 provider별 틱, ACTIVE/FRESH/BLIND/EXHAUSTED 분류, target/reserve, debounce, 엔진 장부 복원 | target과 reserve가 모두 활성이라 `round-robin`에서는 순환됨. “리셋 임박 우선 소진”을 실제 요청 라우팅에서 보장하지 못함 |
-| Smart rotation 타깃 표시 | **구현 결함** | UI와 로그가 계산상 1순위를 `현재 타깃`으로 표시 | 실제 트래픽 타깃으로 오해되지 않도록 `정책 1순위` 등으로 표시하거나, 프록시가 우선순위를 강제하도록 구현해야 함 |
+| Smart rotation | **안전 경계 구현·순위 적용 미지원** | enable/start 및 매 tick `fill-first` PUT fail-closed, 전환 직렬화, OFF crash-recovery journal, 60초 provider별 ACTIVE/FRESH/BLIND 관측, 95/100% 자동 pause 제거, 사용자 pause 불변, 전체 유효 풀 유지 | 실제 429/cooling/failover는 CLIProxy 권한. 계산한 리셋 임박 순위를 credential order에 적용할 관리 API는 없음 |
+| Smart rotation 순위 표시 | **관측값** | target/reserve는 쿼터 기반 계산 순위이며 UI도 `정책 1순위/2순위`로 실제 전송 대상과 구분 | credential ordering 관리 계약이 생기기 전까지 실제 요청 순위 적용은 미지원 |
+| Claude 403 eligibility | **외부 계약 차단** | 현재 accounts/quota API에 durable ineligible/last-403 상태가 없음. 사용량으로 추정하지 않고 수동 pause를 fail-safe로 사용 | CLIProxy가 계정별 durable eligibility 상태/API를 제공해야 자동 제외 가능 |
 | Quota freshness 표시 | 부분 구현 | `lastUpdated` 타입과 `useQuota`의 age 계산은 존재 | 현재 `App`의 quota 경로는 해당 hook을 사용하지 않아 설계의 “n초 전 기준” UI가 노출되지 않음 |
 | 클라이언트 프록시 통합 | **구현됨·native live 검증 대기** | Claude CLI/Desktop와 Codex CLI/Desktop의 적용·해제·충돌·프로세스·lock 검사, Codex `native-openai`와 격리 `custom-provider` 모드의 결정론적 round-trip 테스트 | 기존 OpenAI task 가시성을 유지하는 `openai_base_url` loopback bridge는 구현됐다. ChatGPT/API-key 인증별 실제 inference 경유와 proxy failure 시 no-direct-fallback은 live smoke 전 자동 배포하지 않으며, 적용/해제 후 대상 클라이언트 완전 재시작이 필요하다. |
 | Canonical domain과 SQLite | 구현됨 | session/thread/turn/item/execution/binding 스키마, WAL, transaction, idempotency, fork lineage, 재시작 recovery 테스트 | 없음 |

@@ -63,7 +63,7 @@ export function DashboardOverview({
         icon={RotateCw}
         label="스마트 로테이션"
         value={policy?.enabled ? 'ON' : 'OFF'}
-        detail={policy?.enabled ? `${targetedProviders}개 provider 조향 중` : 'CLIProxy 기본 전략 사용'}
+        detail={policy?.enabled ? `${targetedProviders}개 provider 정책 순위 관측` : 'CLIProxy 기본 전략 사용'}
       />
       <Metric
         icon={TriangleAlert}

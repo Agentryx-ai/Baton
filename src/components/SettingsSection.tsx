@@ -23,6 +23,7 @@ import type { AssistantLabelMode, SessionViewPreferences } from '@/features/conv
 
 interface SettingsSectionProps {
   routing: RoutingStrategy | null
+  policyEnabled: boolean
   affinity: SessionAffinity | null
   proxy: ProxyStatus | null
   connectionSnippet: string
@@ -90,6 +91,7 @@ function Row({
 
 export function SettingsSection({
   routing,
+  policyEnabled,
   affinity,
   proxy,
   connectionSnippet,
@@ -187,6 +189,7 @@ export function SettingsSection({
           <RadioGroup
             value={routing?.strategy}
             onValueChange={(v) => onSetStrategy(v as 'round-robin' | 'fill-first')}
+            disabled={policyEnabled}
             className="gap-2"
           >
             <div className="flex items-start gap-2">
@@ -206,7 +209,9 @@ export function SettingsSection({
           </RadioGroup>
           <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
             <Info className="size-3.5 shrink-0" aria-hidden />
-            스마트 로테이션 ON일 땐 엔진이 우선
+            {policyEnabled
+              ? '정책 ON 동안 fill-first가 필수입니다. 전략을 바꾸려면 정책을 먼저 끄세요.'
+              : 'round-robin은 균등 분산, fill-first는 계정별 순차 소진에 적합합니다.'}
           </p>
         </Row>
 

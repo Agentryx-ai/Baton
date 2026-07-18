@@ -141,7 +141,7 @@ function App() {
     refreshClientIntegration,
   ])
 
-  // Per-provider engine steering snapshot (target/reserve/enginePaused) for card state.
+  // Per-provider policy ordering and legacy pause-recovery snapshot for card state.
   const providerState = (prov: Provider): PolicyProviderState | null =>
     policy?.providers.find((p) => p.provider === prov) ?? null
   const engineEnabled = policy?.enabled ?? false
@@ -277,6 +277,7 @@ function App() {
             </div>
             <SettingsSection
               routing={routing}
+              policyEnabled={engineEnabled}
               affinity={affinity}
               proxy={proxy}
               connectionSnippet={connectionSnippet}

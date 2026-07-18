@@ -33,9 +33,13 @@ export interface AccountQuota {
   accountId: string
 }
 
+export function isSuccessfulHttpStatus(status: number): boolean {
+  return status >= 200 && status < 300
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetchGateway(path, { method: 'GET', headers: { accept: 'application/json' } })
-  if (res.status >= 400) throw new Error(`GET ${path} → HTTP ${res.status}`)
+  if (!isSuccessfulHttpStatus(res.status)) throw new Error(`GET ${path} → HTTP ${res.status}`)
   return JSON.parse(res.body.toString('utf8')) as T
 }
 
@@ -45,8 +49,17 @@ async function postJson<T>(path: string, body?: unknown): Promise<T> {
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: body === undefined ? undefined : Buffer.from(JSON.stringify(body)),
   })
-  if (res.status >= 400) throw new Error(`POST ${path} → HTTP ${res.status}`)
+  if (!isSuccessfulHttpStatus(res.status)) throw new Error(`POST ${path} → HTTP ${res.status}`)
   return JSON.parse(res.body.toString('utf8')) as T
+}
+
+async function putJson(path: string, body: unknown): Promise<void> {
+  const res = await fetchGateway(path, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', accept: 'application/json' },
+    body: Buffer.from(JSON.stringify(body)),
+  })
+  if (!isSuccessfulHttpStatus(res.status)) throw new Error(`PUT ${path} → HTTP ${res.status}`)
 }
 
 export async function getAccounts(provider: string): Promise<GatewayAccount[]> {
@@ -68,4 +81,15 @@ export async function pauseAccount(provider: string, accountId: string): Promise
 
 export async function resumeAccount(provider: string, accountId: string): Promise<void> {
   await postJson(`/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}/resume`)
+}
+
+/**
+ * Establish the routing prerequisite used by Baton policy mode.
+ *
+ * The installed CLIProxy management contract is PUT + `{value}`. A successful
+ * response is the acknowledgement boundary; the policy engine must not start
+ * when this call fails.
+ */
+export async function setFillFirstRouting(): Promise<void> {
+  await putJson('/api/cliproxy/routing/strategy', { value: 'fill-first' })
 }

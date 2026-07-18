@@ -23,10 +23,9 @@ function statusOf(
   ps: PolicyProviderState | null,
 ): AccountStatus {
   if (engineEnabled && ps) {
-    // enginePaused (from the engine's own ledger) is authoritative for the
-    // engine-vs-user distinction, even when the 30s accounts poll hasn't yet
-    // reflected account.paused — otherwise a just-engine-paused account briefly
-    // mislabels as active/user-paused.
+    // enginePaused is the crash-recovery ledger for pauses owned by an older
+    // policy version. It remains authoritative until the accounts poll reflects
+    // restoration, so the UI does not silently reclassify ownership.
     const enginePaused = ps.enginePaused.includes(account.id)
     if (account.paused || enginePaused) return enginePaused ? 'engine-paused' : 'user-paused'
     if (account.id === ps.target) return 'target'
@@ -43,7 +42,7 @@ export interface ProviderSectionProps {
   quotas: Record<string, AccountQuota | null>
   /** Smart-rotation engine on? Gates manual controls in the cards. */
   engineEnabled: boolean
-  /** This provider's engine steering snapshot (target/reserve/enginePaused), or null. */
+  /** This provider's policy ordering and legacy pause-recovery snapshot, or null. */
   providerState: PolicyProviderState | null
   onPause: (provider: Provider, accountId: string) => void
   onResume: (provider: Provider, accountId: string) => void
