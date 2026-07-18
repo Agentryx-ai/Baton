@@ -10,7 +10,7 @@ import {
 import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null }
-type Scenario = 'normal' | 'collab' | 'cancel' | 'exit'
+type Scenario = 'normal' | 'collab' | 'cancel' | 'hangInterrupt' | 'exit'
 
 class TestStream<T> implements AsyncIterable<T> {
   private readonly values: T[] = []
@@ -134,7 +134,13 @@ function scriptedFactory(scenario: Scenario, created: FakeProcess[], argsSeen: s
       } else if (method === 'config/read') {
         self.emit({ id: idOf(message), result: configResult() }, true)
       } else if (method === 'thread/start') {
-        self.emit({ id: idOf(message), result: { thread: { id: 'native-thread', ephemeral: true, path: null } } })
+        self.emit({
+          id: idOf(message),
+          result: {
+            thread: { id: 'native-thread', ephemeral: true, path: null },
+            runtimeWorkspaceRoots: [],
+          },
+        })
       } else if (method === 'experimentalFeature/list') {
         self.emit({ id: idOf(message), result: featureResult() })
       } else if (method === 'thread/inject_items') {
@@ -143,6 +149,7 @@ function scriptedFactory(scenario: Scenario, created: FakeProcess[], argsSeen: s
         self.emit({ id: idOf(message), result: { turn: { id: 'native-turn', status: 'inProgress', items: [] } } })
         queueMicrotask(() => emitScenario(self, scenario))
       } else if (method === 'turn/interrupt') {
+        if (scenario === 'hangInterrupt') return
         self.emit({ id: idOf(message), result: {} })
         queueMicrotask(() => {
           self.emit({ method: 'turn/completed', params: { threadId: 'native-thread', turn: { id: 'native-turn', status: 'interrupted', error: null } } })
@@ -170,7 +177,7 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
     })
     return
   }
-  if (scenario === 'cancel') return
+  if (scenario === 'cancel' || scenario === 'hangInterrupt') return
   process.emit({
     method: 'item/completed',
     params: {
@@ -341,6 +348,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.ok(threadStart)
   const params = threadStart.params as Record<string, unknown>
   assert.equal(params.ephemeral, true)
+  assert.deepEqual(params.environments, [])
   assert.equal(params.approvalsReviewer, 'user')
   assert.equal(params.approvalPolicy, 'never')
   assert.deepEqual(params.config, {
@@ -351,6 +359,9 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     'features.apps': false,
     'features.plugins': false,
   })
+  const turnStart = turnProcess.writes.find((message) => message.method === 'turn/start')
+  assert.ok(turnStart)
+  assert.deepEqual((turnStart.params as Record<string, unknown>).environments, [])
   assert.ok(turnProcess.writes.some((message) => message.method === 'thread/inject_items'))
   await adapter.shutdown()
 })
@@ -378,6 +389,20 @@ test('cancel sends turn/interrupt and waits for interrupted completion', async (
   await execution.cancel()
   assert.equal((await execution.terminal).status, 'interrupted')
   assert.ok(created[1].writes.some((message) => message.method === 'turn/interrupt'))
+})
+
+test('cancel hard-stops a Codex process when turn/interrupt never answers', async () => {
+  const created: FakeProcess[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('hangInterrupt', created, []),
+    shutdownTimeoutMs: 10,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  await execution.cancel()
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'interrupted')
+  assert.match(String(terminal.error?.message), /timed out/)
+  assert.deepEqual(await created[1].exited, { code: null, signal: 'SIGTERM' })
 })
 
 test('process exit before turn completion produces a failed terminal result', async () => {

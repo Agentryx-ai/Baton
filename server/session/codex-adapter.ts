@@ -1,5 +1,7 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
 import type {
   AdapterHandshake,
   CanonicalTurnRequest,
@@ -313,7 +315,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         })
       }
       finish({ status: 'failed', error: { message } })
-      void process.kill()
+      void process.kill().catch(() => undefined)
     }
 
     const dispose = async (): Promise<void> => {
@@ -324,7 +326,13 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         process.exited.then(() => true, () => true),
         delay(this.shutdownTimeoutMs).then(() => false),
       ])
-      if (!exited) await process.kill().catch(() => undefined)
+      if (!exited) {
+        await process.kill().catch(() => undefined)
+        await Promise.race([
+          process.exited.catch(() => undefined),
+          delay(this.shutdownTimeoutMs),
+        ])
+      }
     }
 
     const cancel = async (): Promise<void> => {
@@ -335,20 +343,28 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           return
         }
         try {
-          await client.request('turn/interrupt', {
+          await withTimeout(client.request('turn/interrupt', {
             threadId: nativeThreadId,
             turnId: nativeTurnId,
-          })
+          }), this.shutdownTimeoutMs, 'Codex turn/interrupt request')
         } catch (error) {
-          if (terminalResult === null) throw error
+          const message = error instanceof Error ? error.message : String(error)
+          finish({ status: 'interrupted', error: { message } })
+          await process.kill().catch(() => undefined)
+          return
         }
-        const result = await terminal
+        const result = await withTimeout(
+          terminal,
+          this.shutdownTimeoutMs,
+          'Codex interrupted terminal event',
+        )
         if (result.status !== 'interrupted' && result.status !== 'completed') {
           throw new Error(`Codex interruption ended as ${result.status}`)
         }
-      })().catch((error) => {
-        fail(error)
-        throw error
+      })().catch(async (error) => {
+        const message = error instanceof Error ? error.message : String(error)
+        finish({ status: 'interrupted', error: { message } })
+        await process.kill().catch(() => undefined)
       })
       return cancelPromise
     }
@@ -383,6 +399,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         await client.request('thread/start', {
           model: body.model,
           cwd: body.cwd,
+          environments: [],
           ephemeral: true,
           approvalPolicy: 'never',
           approvalsReviewer: 'user',
@@ -393,6 +410,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       const thread = asObject(start.thread, 'thread/start thread')
       if (thread.ephemeral !== true || thread.path !== null) {
         throw new Error('Codex canonical mode requires an ephemeral thread with no rollout path')
+      }
+      if (!Array.isArray(start.runtimeWorkspaceRoots) || start.runtimeWorkspaceRoots.length !== 0) {
+        throw new Error('Codex canonical mode requires zero execution environment roots')
       }
       nativeThreadId = requiredString(thread.id, 'Codex thread id')
       assertFeatureList(
@@ -413,6 +433,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           clientUserMessageId: body.turnId,
           input: body.input,
           model: body.model,
+          environments: [],
           approvalsReviewer: 'user',
           approvalPolicy: 'never',
         }),
@@ -468,8 +489,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         },
         fail,
       )
-      if (context.signal.aborted) void cancel()
-      else context.signal.addEventListener('abort', () => void cancel(), { once: true })
+      const cancelOnAbort = () => { void cancel().catch(() => undefined) }
+      if (context.signal.aborted) cancelOnAbort()
+      else context.signal.addEventListener('abort', cancelOnAbort, { once: true })
       return execution
     } catch (error) {
       fail(error)
@@ -734,11 +756,12 @@ function portableText(payload: JsonObject): string | null {
 }
 
 function spawnCodexProcess(executable: string, args: readonly string[]): CodexAppServerProcess {
-  const requiresCommandShell = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(executable)
-  const child = spawn(executable, [...args], {
+  const invocation = resolveCodexInvocation(executable, args)
+  const child = spawn(invocation.executable, invocation.args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
-    shell: requiresCommandShell,
+    shell: false,
+    detached: process.platform !== 'win32',
   })
   let stderr = ''
   child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk })
@@ -766,9 +789,73 @@ function spawnCodexProcess(executable: string, args: readonly string[]): CodexAp
       else child.stdin.end(resolve)
     }),
     kill: async () => {
-      if (child.exitCode === null && child.signalCode === null) child.kill()
+      if (child.exitCode !== null || child.signalCode !== null) return
+      if (process.platform === 'win32') {
+        await new Promise<void>((resolve) => {
+          const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+            stdio: 'ignore',
+            windowsHide: true,
+          })
+          killer.once('error', () => {
+            child.kill()
+            resolve()
+          })
+          killer.once('exit', () => resolve())
+        })
+      } else if (child.pid !== undefined) {
+        try { process.kill(-child.pid, 'SIGTERM') } catch { child.kill() }
+      }
     },
   }
+}
+
+interface CodexInvocation {
+  executable: string
+  args: string[]
+}
+
+/** Resolve the npm shim to the native Codex binary so Baton owns one OS process tree. */
+function resolveCodexInvocation(executable: string, args: readonly string[]): CodexInvocation {
+  if (process.platform !== 'win32') return { executable, args: [...args] }
+  if (/\.exe$/i.test(executable)) return { executable, args: [...args] }
+  if (!/^codex(?:\.cmd)?$/i.test(path.basename(executable))) {
+    throw new Error('Unsafe Codex command shim; configure the native codex executable')
+  }
+
+  const shim = resolveWindowsCommand(executable)
+  const architecture = process.arch === 'arm64' ? 'arm64' : 'x64'
+  const triple = process.arch === 'arm64'
+    ? 'aarch64-pc-windows-msvc'
+    : 'x86_64-pc-windows-msvc'
+  const native = path.join(
+    path.dirname(shim),
+    'node_modules',
+    '@openai',
+    'codex',
+    'node_modules',
+    '@openai',
+    `codex-win32-${architecture}`,
+    'vendor',
+    triple,
+    'bin',
+    'codex.exe',
+  )
+  if (!existsSync(native)) {
+    throw new Error(`Native Codex executable was not found next to ${shim}`)
+  }
+  return { executable: native, args: [...args] }
+}
+
+function resolveWindowsCommand(executable: string): string {
+  if (path.isAbsolute(executable) && existsSync(executable)) return executable
+  const requested = /\.cmd$/i.test(executable) ? executable : `${executable}.cmd`
+  const matches = execFileSync('where.exe', [requested], { encoding: 'utf8', windowsHide: true })
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  const match = matches.find((entry) => existsSync(entry))
+  if (!match) throw new Error(`Codex command was not found: ${requested}`)
+  return match
 }
 
 function capabilityViolation(message: string): Error {
@@ -813,4 +900,19 @@ function exitLabel(result: ExitResult): string {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
+}
+
+async function withTimeout<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds}ms`)), milliseconds)
+        timer.unref()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }

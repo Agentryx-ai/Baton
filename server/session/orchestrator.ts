@@ -28,6 +28,7 @@ export class TurnOrchestrator implements ConversationService {
   private readonly store: SessionStore
   private readonly adapters: AdapterRegistry
   private readonly events: ConversationEventHub
+  private readonly cancellationTimeoutMs: number
   private readonly active = new Map<TurnId, ActiveTurn>()
   private closed = false
 
@@ -35,10 +36,12 @@ export class TurnOrchestrator implements ConversationService {
     store: SessionStore,
     adapters: AdapterRegistry,
     events: ConversationEventHub,
+    cancellationTimeoutMs = 10_000,
   ) {
     this.store = store
     this.adapters = adapters
     this.events = events
+    this.cancellationTimeoutMs = cancellationTimeoutMs
   }
 
   createSession(input: CreateSessionInput): CanonicalSession {
@@ -116,7 +119,7 @@ export class TurnOrchestrator implements ConversationService {
     const active = this.active.get(turnId)
     if (active) {
       active.controller.abort(new Error('Turn cancelled by user'))
-      await active.completion
+      await withTimeout(active.completion, this.cancellationTimeoutMs, `Turn cancellation ${turnId}`)
       return
     }
     const turn = this.store.getTurn(turnId)
@@ -133,8 +136,14 @@ export class TurnOrchestrator implements ConversationService {
     this.closed = true
     const active = [...this.active.values()]
     for (const turn of active) turn.controller.abort(new Error('Baton is shutting down'))
-    await Promise.allSettled(active.map((turn) => turn.completion))
     await this.adapters.shutdownAll()
+    const completions = await Promise.allSettled(active.map((turn) => withTimeout(
+      turn.completion,
+      this.cancellationTimeoutMs,
+      'Turn shutdown',
+    )))
+    const timedOut = completions.find((result) => result.status === 'rejected')
+    if (timedOut?.status === 'rejected') throw timedOut.reason
     this.events.clear()
     this.store.close()
   }
@@ -161,7 +170,7 @@ export class TurnOrchestrator implements ConversationService {
         async denyApproval() { throw new Error('Provider approval requests are disabled in canonical MVP') },
         async denyToolCall() { throw new Error('Provider tool calls are disabled in canonical MVP') },
       })
-      const cancelOnAbort = () => { void execution.cancel() }
+      const cancelOnAbort = () => { void execution.cancel().catch(() => undefined) }
       signal.addEventListener('abort', cancelOnAbort, { once: true })
       try {
         for await (const event of execution.events) {
@@ -247,6 +256,21 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
   const object = value as Record<string, unknown>
   return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(',')}}`
+}
+
+async function withTimeout<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds}ms`)), milliseconds)
+        timer.unref()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 function instructionCwd(snapshot: Record<string, unknown> | undefined): string | null {
