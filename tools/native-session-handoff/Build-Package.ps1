@@ -5,7 +5,7 @@ param([string]$Destination)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if (-not $Destination) {
-    $Destination = Join-Path $PSScriptRoot 'output\baton-native-session-handoff-0.1.0.zip'
+    $Destination = Join-Path $PSScriptRoot 'output\baton-native-session-handoff-0.2.0.zip'
 }
 $resolvedDestination = [IO.Path]::GetFullPath($Destination)
 $destinationDirectory = Split-Path -Parent $resolvedDestination

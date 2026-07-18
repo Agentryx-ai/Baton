@@ -226,7 +226,7 @@ npm start              # http://localhost:4400
 - `src/hooks/` — visibility-aware polling
 - `src/components/` — account, rotation, settings UI와 shadcn primitives
 - `scripts/codex-adapter-smoke.ts` — 실제 Codex app-server handshake·hardening smoke test
-- `tools/native-session-handoff/` — Codex·Claude 로컬 세션의 일회성 inventory·승계 proposal·승인 기반 CLI context-ingest 패키지
+- `tools/native-session-handoff/` — Codex Desktop-visible interactive task와 Claude Desktop local Code/Cowork task의 일회성 inventory·승계 proposal·승인 기반 CLI context-ingest 패키지(원격 Claude 채팅 제외, `local-all` 호환 범위 제공)
 - `docs/DESIGN.md` — 현재 account control plane 설계와 정책
 - `docs/COMMON_SESSION_DESIGN.md` — canonical conversation runtime 설계
 - `docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md` — native task fork-copy import, 중복 방지와 대화 목록 그룹화 계약

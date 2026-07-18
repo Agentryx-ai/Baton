@@ -9,7 +9,12 @@ param(
 
     [string]$CodexHome,
     [string]$ClaudeHome,
+    [string]$ClaudeDesktopRoot,
     [string]$ProjectPath,
+    [ValidateSet('desktop-visible', 'local-all')]
+    [string]$SourceScope = 'desktop-visible',
+    [ValidateSet('current', 'all')]
+    [string]$CodexProviderScope = 'current',
     [string]$OutputRoot,
     [string]$ManifestPath,
     [ValidateRange(0, 36500)][int]$SinceDays = 365,
@@ -27,6 +32,7 @@ Import-Module (Join-Path $PSScriptRoot 'NativeSessionHandoff.psm1') -Force
 
 if (-not $CodexHome) { $CodexHome = Get-DefaultCodexHome }
 if (-not $ClaudeHome) { $ClaudeHome = Get-DefaultClaudeHome }
+if (-not $ClaudeDesktopRoot) { $ClaudeDesktopRoot = Get-DefaultClaudeDesktopRoot }
 if (-not $OutputRoot) { $OutputRoot = Join-Path $PSScriptRoot 'output' }
 
 function New-RunDirectory {
@@ -64,11 +70,16 @@ if ($Action -eq 'Apply') {
 
 $runDirectory = New-RunDirectory
 $inventory = New-HandoffInventory -CodexHome $CodexHome -ClaudeHome $ClaudeHome -SinceDays $SinceDays `
-    -ProjectPath $ProjectPath
+    -ProjectPath $ProjectPath -SourceScope $SourceScope -CodexProviderScope $CodexProviderScope `
+    -ClaudeDesktopRoot $ClaudeDesktopRoot
 $inventoryPath = Join-Path $runDirectory 'inventory.json'
 Write-JsonFile -Value $inventory -Path $inventoryPath
 Write-Host "Codex sessions: $(@($inventory.codex_sessions).Count)"
 Write-Host "Claude sessions: $(@($inventory.claude_sessions).Count)"
+Write-Host "Source scope: $($inventory.source_scope)"
+if ($inventory.source_scope -eq 'desktop-visible') {
+    Write-Warning 'Claude remote chats/Projects are not included; only local Claude Code/Cowork tasks linked by Desktop metadata are included.'
+}
 Write-Host "Inventory: $inventoryPath"
 
 if ($Action -eq 'Inventory') { exit 0 }
