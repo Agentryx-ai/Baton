@@ -344,7 +344,7 @@ export function SettingsSection({
                           <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
                             {status?.codexMode === 'native-openai'
                               ? '기존 OpenAI 세션 유지 모드'
-                              : '분리된 Baton provider 모드'}
+                              : 'Baton 전용 Provider · 기존 OpenAI 대화와 분리'}
                           </span>
                         ) : (
                           <RadioGroup
@@ -364,9 +364,9 @@ export function SettingsSection({
                             <div className="flex items-start gap-2">
                               <RadioGroupItem value="custom-provider" id="codex-custom-provider" className="mt-0.5" />
                               <Label htmlFor="codex-custom-provider" className="space-y-0.5 font-normal">
-                                <span className="block text-xs font-medium">분리된 Baton provider</span>
+                                <span className="block text-xs font-medium">Baton 전용 Provider (고급)</span>
                                 <span className="block text-[11px] leading-4 text-muted-foreground">
-                                  기존 OpenAI thread와 분리된 목록을 사용합니다.
+                                  model_provider=baton으로 새 대화를 별도 목록에 저장합니다. 기존 OpenAI 대화와 이어지지 않으므로 Provider 격리가 필요할 때만 사용하세요.
                                 </span>
                               </Label>
                             </div>
