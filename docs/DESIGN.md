@@ -10,7 +10,7 @@
 > 넘긴다. 어느 경우에도 provider 계정이나 native session이 대화의 소유자가 되지 않는다.
 
 - 작성: 2026-07-18 (v2 — 리뷰용 전면 개정)
-- 상태: **v1 구현됨, canonical conversation runtime 후속 구현 설계 확정**
+- 상태: **account control plane v1 구현됨(단, smart target 우선순위 갭 존재); canonical core/persistence + Codex Preview 부분 구현**
 - 전제 환경: the gateway Docker(:3000 관리 / :8317 프록시), Claude 2계정 + Codex 2계정 인증 완료
 
 ---
@@ -78,7 +78,7 @@
 | 엔드포인트 | 실측 응답 요약 |
 |---|---|
 | `GET /api/auth/check` | `{authenticated, username, ...}` |
-| `GET /api/cliproxy/accounts/:provider` | `{provider, accounts: [{id, provider, isDefault, email, nickname, paused?, createdAt, lastUsedAt}]}` |
+| `GET /api/cliproxy/auth/accounts/:provider` | `{provider, accounts: [{id, provider, isDefault, email, nickname, paused?, createdAt, lastUsedAt}]}` |
 | `GET /api/cliproxy/quota/:provider/:accountId` | `{success, windows: [{rateLimitType: 'five_hour'\|'seven_day', usedPercent, remainingPercent, resetAt, status}], lastUpdated, accountId}` — **쿼터 미제공 계정은 `windows: []`** (예: claude-reserve) |
 | `GET /api/cliproxy/routing/strategy` | `{strategy: 'round-robin'\|'fill-first', source, reachable}` |
 | `GET /api/cliproxy/routing/session-affinity` | `{enabled, ttl, ...}` |
@@ -89,9 +89,8 @@
 | 엔드포인트 | 요청 본문 (소스 확인) |
 |---|---|
 | `POST /api/auth/login` | `{username, password}` → `connect.sid` 쿠키. **레이트리밋 5회/15분** |
-| `POST /api/cliproxy/accounts/:provider/default` | `{accountId}` |
-| `POST /api/cliproxy/accounts/:provider/:id/pause` · `resume` | (본문 없음) → `{paused: true/false}` |
-| `DELETE /api/cliproxy/accounts/:provider/:id` | → `{deleted: true}` |
+| `POST /api/cliproxy/auth/accounts/:provider/:id/pause` · `resume` | (본문 없음) → `{paused: true/false}` |
+| `DELETE /api/cliproxy/auth/accounts/:provider/:id` | → `{deleted: true}` |
 | `POST /api/cliproxy/routing/strategy` | `{strategy}` (또는 `{value}`) |
 | `POST /api/cliproxy/routing/session-affinity` | `{enabled, ttl}` |
 | `POST /api/cliproxy/restart` | — |
@@ -99,7 +98,7 @@
 #### OAuth 계정 추가 (핵심 플로우)
 | 단계 | 엔드포인트 | 계약 |
 |---|---|---|
-| 시작 | `POST /api/cliproxy/auth/:provider/start-url` | 요청 `{nickname?}` → 응답 `{url \| auth_url, state}` |
+| 시작 | `POST /api/cliproxy/auth/:provider/start-url` | 요청 `{nickname?}` → 응답의 `authUrl` 사용, URL에서 `state` 파싱 폴백 |
 | 상태 | `GET /api/cliproxy/auth/:provider/status?state=` | `{status: 'wait'\|'success'\|'error', error?}` |
 | 콜백 | `POST /api/cliproxy/auth/:provider/submit-callback` | `{redirectUrl}` — code 파라미터 없으면 400 |
 | 취소 | `POST /api/cliproxy/auth/:provider/cancel` | — |
@@ -118,13 +117,16 @@ single-flight + 최소 간격 가드가 필수라는 것도 확인.
 ┌─ Baton (단일 npm 프로젝트) ────────────────────────────────┐
 │                                                            │
 │  SPA (React 19 + Vite + Tailwind v4 + shadcn/ui)           │
-│   └─ /api/* 호출 (자기 오리진)                             │
+│   └─ /api/* + /baton/* 호출 (자기 오리진)                  │
 │                                                            │
 │  BFF (Express · :4400)                                     │
 │   ├─ the gateway 세션 보관 (로그인 자동화, 401 재로그인)    │
 │   ├─ /api/* → the gateway :3000 패스스루 프록시             │
 │   ├─ 정책 엔진 (60s 틱 데몬) ← §5                          │
-│   └─ /baton/* (엔진 상태·토글·조향 로그)                   │
+│   ├─ /baton/* (엔진·클라이언트 통합 관리)                   │
+│   └─ /baton/v1/* → canonical runtime                       │
+│        ├─ SQLite/WAL (BATON_DATA_DIR)                       │
+│        └─ Codex app-server adapter (Preview)               │
 └────────────────────────────────────────────────────────────┘
                     │ .env: GATEWAY_URL 한 줄로 절연
                     ▼
@@ -153,9 +155,9 @@ single-flight + 최소 간격 가드가 필수라는 것도 확인.
 |---|---|
 | Baton이 8317 앞단 프록시가 되어 요청마다 계정 선택 | 계정 선택은 CLIProxy 내부 로직이라 외부 프록시가 요청 단위로 지정 불가. 전체 재구현 필요. **기각** |
 | CLIProxy(Go) 포크에 정책 추가 | Go 코드베이스 유지 부담 + 업스트림 추적. **기각** |
-| **pause/resume/default API로 활성 계정 집합을 틱 단위 조정** | 포크 없음. 코스 그레인(60s)이지만 리셋 타이밍은 시간 단위로 변하므로 충분. 엔진이 죽어도 CLIProxy 기본 동작으로 자연 퇴행. **채택** |
+| **pause/resume API로 활성 계정 집합을 틱 단위 조정** | 포크 없음. 코스 그레인(60s)이지만 리셋 타이밍은 시간 단위로 변하므로 충분. `default`는 CLIProxy 요청 라우팅 레버가 아니므로 사용하지 않음. 엔진이 죽어도 CLIProxy 기본 동작으로 자연 퇴행. **활성 풀 제어로 채택했으나 target 우선순위는 미해결** |
 
-### 3.3 프로젝트 구조 (구현 시)
+### 3.3 현재 프로젝트 구조 (핵심 경로)
 
 ```
 Baton/
@@ -165,13 +167,17 @@ Baton/
 │   ├─ gateway-session.ts   # 로그인 single-flight·쿠키 보관·401 재로그인·간격 가드
 │   ├─ gateway-client.ts    # 타입드 gateway 호출 (정책 엔진 전용)
 │   ├─ policy-engine.ts     # §5
-│   └─ config.ts            # .env (GATEWAY_URL, GATEWAY_USER, GATEWAY_PASS, BATON_PORT)
+│   ├─ client-integration.ts# Claude/Codex 프록시 설정의 적용·해제·검증
+│   ├─ session/             # canonical SQLite, REST/SSE, orchestrator, Codex adapter
+│   └─ config.ts            # .env + BATON_DATA_DIR
 ├─ src/
 │   ├─ api/                 # fetch 클라이언트 + §2.4 계약 타입
+│   ├─ features/conversations/ # canonical conversation Preview
 │   ├─ hooks/               # usePolling(visibility-aware), useAccounts, useQuota
 │   ├─ components/ui/       # shadcn 스타일 (button/card/badge/progress/dialog/switch)
 │   ├─ components/          # AccountCard, QuotaBar, PolicyPanel, ...
 │   └─ App.tsx              # 단일 페이지 (라우터 없음 — §4.1)
+├─ scripts/codex-adapter-smoke.ts
 └─ .env                     # gitignore 대상 (gateway 자격증명 포함)
 ```
 
@@ -179,7 +185,7 @@ Baton/
 
 ## 4. UI/UX 설계
 
-### 4.1 정보 구조 — 단일 페이지, 3개 섹션
+### 4.1 정보 구조 — 단일 페이지, 4개 영역
 
 라우터 없음. 이 도구의 사용 패턴은 "열고 → 훑고 → 닫기"이므로 페이지 전환은 마찰일 뿐이다.
 스크롤 한 번에 전부 보이는 세로 구성:
@@ -188,6 +194,9 @@ Baton/
 ┌────────────────────────────────────────────────────────────┐
 │ ⑂ Baton        [● Proxy :8317 · 42m]      [☾ theme] [⟳]   │ ← 헤더 (sticky)
 ├────────────────────────────────────────────────────────────┤
+│                                                            │
+│  ── Canonical conversation runtime ─────────── [Preview]   │
+│  Baton session 목록 │ 정본 transcript │ Codex 턴·취소      │
 │                                                            │
 │  ── 스마트 로테이션 ──────────────────────────── [ON ●]    │
 │  정책: 리셋 임박 우선 소진                                 │
@@ -201,7 +210,7 @@ Baton/
 │  │     2h 후 리셋       │  │ (구독 정보 없음)     │        │
 │  │ 7d  █████████░  88%⚠ │  │                      │        │
 │  │     1d 11h 후 리셋   │  │                      │        │
-│  │ [기본지정][일시정지] │  │ [일시정지] [삭제]    │        │
+│  │ [일시정지][이 계정만]│  │ [일시정지] [삭제]    │        │
 │  └──────────────────────┘  └──────────────────────┘        │
 │                                                            │
 │  ── Codex (2) ───────────────────────── [+ 계정 추가]      │
@@ -231,7 +240,7 @@ Baton은 **계정 카드에 모든 상태를 집약**:
 │ 7d   ██████████████░░  88%         │          >85% 경고 / 미제공 회색
 │      ↻ 1d 11h 후 리셋              │
 │                                    │
-│ [★ 기본지정] [⏸ 일시정지] [🗑]     │ ← 액션 (삭제는 확인 모달)
+│ [⏸ 일시정지] [◎ 이 계정만] [🗑]    │ ← 액션 (삭제는 확인 모달)
 └────────────────────────────────────┘
 ```
 
@@ -240,6 +249,8 @@ Baton은 **계정 카드에 모든 상태를 집약**:
 - "한도 정보 미제공"(claude-reserve 케이스)은 오류가 아닌 **1급 상태**로 디자인 (§2.4)
 - 데이터 신선도 명시: 헤더에 "쿼터 기준: 45초 전" 타임스탬프 (2분 캐시의 정직한 표기)
 - 정책 엔진이 pause한 계정은 배지로 **엔진에 의한 것임을 구분** (사용자 pause와 시각 분리)
+- `default` 표시는 라우팅 효과가 없으므로 액션에서 제거. 수동 고정은 다른 활성 계정을 pause하는
+  **이 계정만**으로만 제공
 
 ### 4.3 계정 추가 마법사 (다이얼로그, 3단계)
 
@@ -301,12 +312,17 @@ tick(provider):
         → EXHAUSTED는 순위 제외
 
   목표 상태:
-    target  = 순위 1위 → default 지정
+    target  = 순위 1위 → 우선 라우팅되어야 하는 계정
     reserve = 순위 2위 → 활성 유지 (429 페일오버 예비)
     나머지   → pause
 
   적용(멱등): 현재 상태와 목표 상태의 차이만 API 호출
 ```
+
+> **현재 구현 갭:** CLIProxy에는 target 우선순위를 지정하는 요청 라우팅 레버가 없고,
+> `default`도 라우팅에 효과가 없다. 현재 엔진은 target과 reserve를 모두 활성화하므로
+> `round-robin`에서는 두 계정이 순환한다. 따라서 순위 계산과 활성 풀 제어는 구현됐지만
+> “리셋 임박 계정 우선 소진”이라는 목표는 아직 실제 트래픽에서 보장되지 않는다.
 
 ### 5.3 엣지케이스 (설계 시점에 확정)
 
@@ -328,6 +344,9 @@ tick(provider):
 - **데이터 신선도 하한 2분**: the gateway 캐시(§2.3). 엔진 판단·UI 표기 모두 이 한계 위에서 동작
 - **관측성**: 모든 조향 행위는 링버퍼 로그(최근 50건)에 "무엇을 왜"와 함께 기록, UI 노출.
   블랙박스면 신뢰할 수 없는 기능이 됨
+- **target 의미 갭**: 현재 UI의 `현재 타깃`은 정책 순위 1위이며 실제 요청이 그 계정으로
+  우선 전송된다는 뜻이 아니다. 우선순위 지원, 단독 target+동적 failover, 또는 정책 명칭 변경 중
+  하나를 결정해야 한다.
 
 ### 5.5 확장 구조 (v2 대비)
 
@@ -392,13 +411,14 @@ SPA          BFF              gateway            Provider(브라우저 새탭)
 
 | 단계 | 내용 | 완료 기준 |
 |---|---|---|
-| M1 | BFF: 세션+프록시 | `curl :4400/api/cliproxy/accounts/claude` → 실계정 JSON (스파이크로 사전 검증됨) |
+| M1 | BFF: 세션+프록시 | `curl :4400/api/cliproxy/auth/accounts/claude` → 실계정 JSON (완료) |
 | M2 | SPA 골격 + Accounts 섹션 | 실데이터 4계정 카드 + 쿼터 바 + 카운트다운 렌더 |
 | M3 | 계정 액션 + 추가 마법사 | 실 OAuth 1왕복 E2E |
-| M4 | 정책 엔진 + 정책 패널 | 조향 로그에 의도된 pause/resume/default 기록 확인, ON→OFF 복원 확인 |
+| M4 | 정책 엔진 + 정책 패널 | 조향 로그에 의도된 target/pause/resume 기록 확인, ON→OFF 복원 확인 |
 | M5 | Settings + 테마 + 마감 | 빌드 산출물로 BFF 단독 서빙 |
 
-각 단계 끝에 실환경 검증 후 다음 단계 진행.
+M1~M5는 완료되었습니다. 이후 canonical runtime은
+[`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md)의 별도 단계로 진행합니다.
 
 ---
 
@@ -414,17 +434,16 @@ SPA          BFF              gateway            Provider(브라우저 새탭)
 
 ---
 
-## 10. 사용자 판단 필요 사항 (리뷰 포인트)
+## 10. 초기 리뷰 포인트와 현재 결정
 
-- **Q1. 소진 판정 임계값**: EXHAUSTED를 95%로 잡음(§5.2). 100%로 두면 429 직전까지 태우고,
-  90%로 두면 여유를 남김. **95%가 적절한가?**
-- **Q2. FRESH(미사용) 계정의 순위**: 현재 설계는 "윈도우를 새로 열지 않도록 후순위".
-  반대로 "빨리 열어서 리셋 사이클에 편입"시키는 선택지도 있음. **후순위가 맞는가?**
-- **Q3. 틱 주기 60s**: 쿼터 캐시가 2분이므로 60~120s가 합리 구간. **60s로 확정?**
-- **Q4. 엔진 ON일 때 CLIProxy 전략**: 조향과 겹치는 round-robin을 그대로 둘지,
-  엔진이 자동으로 fill-first로 전환할지(활성 2계정 내에서 타깃 우선 소진에 유리).
-  **엔진이 fill-first로 자동 전환하는 안을 제안** — 동의하는가?
-- **Q5. 대시보드 접근 보안**: BFF는 127.0.0.1 바인딩 + 무인증(로컬 단일 사용자 전제).
+- **Q1 소진 임계값**: 95%로 구현.
+- **Q2 FRESH 순위**: ACTIVE 뒤, BLIND 앞의 후순위로 구현.
+- **Q3 틱 주기**: 60초로 구현.
+- **Q4 CLIProxy 전략**: 현재 엔진은 전략을 강제 변경하지 않고 target/reserve 활성 풀만
+  pause/resume으로 조정한다. 이 상태는 엄밀한 target 우선 소진을 충족하지 못한다.
+  프록시 우선순위 지원, 단독 target 운용과 429 시 reserve 재개, 또는 정책을 “상위 2계정 풀”로
+  재정의하는 선택은 아직 미결이다.
+- **Q5 접근 보안**: BFF는 `127.0.0.1`에만 바인딩하고 gateway 자격 증명은 `.env`에 보관.
   LAN 공유 필요 시 인증 추가 필요. **로컬 전용으로 확정?**
 - **Q6. Codex Spark 쿼터**: Codex 계정에 별도 "Spark(5h)" 윈도우가 실측됨(현재 100%).
   v1 카드에 표기만 할지, 정책 판단에도 반영할지. **v1은 표기만을 제안** — 동의하는가?

@@ -1,6 +1,6 @@
 # Baton canonical conversation runtime
 
-> Status: proposed design, implementation requires approval  
+> Status: approved contract; Phase 0 core/persistence implemented, Phase 1 partially implemented as a Codex Preview
 > Reference baseline: `openai/codex` main at `5c0e582c59892dbec89af78ae62c784d3da6c9cb` (2026-07-18)
 
 ## 1. Product identity and goal
@@ -32,6 +32,23 @@ The following are not the same concept and must remain separate:
 | CLIProxy session affinity | Pin requests to an account for a TTL | No |
 | Provider account | Authentication and quota routing | No |
 | Baton session | Durable user task/conversation tree | **Yes** |
+
+### 1.1 Current implementation boundary
+
+The design in this document remains the target contract. Current conformance and defects are tracked in
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md); implementation gaps do not implicitly narrow this design.
+
+At the current Preview boundary:
+
+- the canonical domain, SQLite/WAL store, fork/replay/idempotency, REST/SSE surface, cancellation, and startup
+  interruption recovery are implemented;
+- a hardened Codex app-server adapter executes text-oriented turns by injecting portable Baton history into an
+  ephemeral native thread;
+- the minimal session UI is mounted, but only Codex has a registered adapter;
+- Claude/Gemini adapters, cross-provider continuation, general tool execution, native import/bridges, and
+  Baton-managed child execution remain incomplete;
+- the UI currently exposes unsupported Claude/Gemini selections. This is an implementation defect to fix with
+  capability-driven provider availability, not an intended part of the design.
 
 ## 2. Key decision
 
@@ -143,14 +160,16 @@ Large media and tool output live in an artifact store and are referenced by dige
 | Field | Meaning |
 |---|---|
 | `thread_id`, `provider` | Binding owner |
-| `native_conversation_id` | Optional remote/native continuation ID |
-| `last_turn_id` | Binding freshness |
+| `native_thread_id`, `native_response_id` | Optional remote/native continuation IDs |
+| `synced_revision`, `context_digest` | Exact canonical context freshness and compatibility |
 | `model_family` | Compatibility check |
 | `opaque_state_encrypted` | Signatures, response IDs, and other provider-private data |
 | `capabilities_json` | Snapshot used when the turn ran |
 | `updated_at`, `invalidated_at` | Lifecycle |
 
 An account ID may be recorded in execution telemetry, but never in the binding key. Account rotation must not split a conversation.
+Until at-rest encryption is configured, the implementation must reject non-null opaque state rather than storing it
+in plaintext. Native IDs and non-secret compatibility metadata may still be stored.
 
 ## 4. Portable vs provider-private state
 
@@ -188,10 +207,15 @@ The core never switches on native JSON field names. Provider-specific parsing li
 
 ### Codex adapter
 
-- Use Codex app-server `thread/start`, `thread/resume`, `thread/fork`, `turn/start`, and its streamed item notifications where possible.
+- Use Codex app-server as the native execution boundary. The current Preview creates an ephemeral `thread/start`,
+  replays portable Baton history with `thread/inject_items`, starts the turn with `turn/start`, and uses
+  `turn/interrupt` for cancellation. Baton, not the ephemeral native thread, implements durable resume and fork.
 - Map Codex Thread/Turn/Item into the canonical domain, retaining raw rollout/native IDs only in provenance or opaque binding state.
 - The latest Codex source separates storage behind `ThreadStore`, loads replay history for resume/fork, and keeps a fresh `ModelClientSession` per turn. Baton should copy these boundaries, not Codex's exact Rust schema.
 - `model_provider` and remote response IDs are execution details; Baton history remains reconstructable without them.
+- The Preview deliberately disables approval, shell, MCP, plugin, and native multi-agent surfaces and currently
+  normalizes text, plan, reasoning summary, usage, and error events only. This is a safe Phase 1 subset, not the
+  final ordinary-tool execution contract described below.
 
 ### Claude adapter
 
@@ -307,18 +331,23 @@ A compaction item records its covered item range, generating provider/model, pro
 
 ## 9. API surface
 
-Keep the domain independent of transport. The initial BFF surface can be REST plus SSE:
+Keep the domain independent of transport. The implemented BFF surface is REST plus SSE:
 
 ```text
 POST   /baton/v1/sessions
 GET    /baton/v1/sessions
 GET    /baton/v1/sessions/:sessionId
-POST   /baton/v1/sessions/:sessionId/threads
+GET    /baton/v1/threads/:threadId
 POST   /baton/v1/threads/:threadId/fork
 POST   /baton/v1/threads/:threadId/turns
 GET    /baton/v1/threads/:threadId/items?after=<cursor>
 GET    /baton/v1/threads/:threadId/events?after=<cursor>   (SSE)
 POST   /baton/v1/turns/:turnId/cancel
+```
+
+The following target APIs are not implemented yet:
+
+```text
 POST   /baton/v1/executions/:executionId/children
 GET    /baton/v1/executions/:executionId/children
 POST   /baton/v1/executions/:executionId/cancel
@@ -346,7 +375,7 @@ Native bridges must be optional. Unsupported native fields are stored only as ve
 
 ## 11. Delivery plan
 
-### Phase 0 — contract and persistence
+### Phase 0 — contract and persistence — **core implemented; Claude/Gemini fixtures pending**
 
 - Add common IDs, domain types, `SessionStore`, SQLite migrations, and repository tests.
 - Add Claude/Codex/Gemini adapter interfaces and capability fixtures.
@@ -355,7 +384,7 @@ Native bridges must be optional. Unsupported native fields are stored only as ve
 
 Exit: create/read/resume/fork/replay produces deterministic canonical history after restart.
 
-### Phase 1 — Codex vertical slice
+### Phase 1 — Codex vertical slice — **Preview implemented; live exit test pending**
 
 - Implement the Codex adapter through app-server.
 - Launch it with `multi_agent` disabled and verify collaboration tools are absent.
@@ -365,7 +394,11 @@ Exit: create/read/resume/fork/replay produces deterministic canonical history af
 
 Exit: a Codex conversation survives BFF restart and resumes from Baton storage.
 
-### Phase 2 — Claude and provider switching
+Current evidence covers store reopen/replay, orchestrator behavior, router/SSE contracts, adapter hardening and
+normalization, and a live app-server handshake smoke test. A real model turn followed by BFF restart and continued
+execution is still required to close this phase completely.
+
+### Phase 2 — Claude and provider switching — **not implemented**
 
 - Implement Messages rendering, tool loops, thinking-block binding, and context estimation.
 - Remove Claude `Agent`/team execution from the managed tool surface while preserving plan tasks.
@@ -373,7 +406,7 @@ Exit: a Codex conversation survives BFF restart and resumes from Baton storage.
 
 Exit: a completed Claude turn can continue in Codex and vice versa with identical portable history.
 
-### Phase 3 — Gemini-ready adapter
+### Phase 3 — Gemini-ready adapter — **not implemented**
 
 - Implement Interactions transport, thought-signature handling, function calls, and golden fixtures.
 - Keep Gemini native agents disabled in managed mode while preserving tracker/task metadata.
@@ -381,7 +414,7 @@ Exit: a completed Claude turn can continue in Codex and vice versa with identica
 
 Exit: offline contract tests cover Gemini switching, tools, signed parts, compaction, and replay; enabling an account requires configuration only.
 
-### Phase 4 — native bridges and migration
+### Phase 4 — native bridges and migration — **not implemented**
 
 - Add explicit CLI session wrappers/sidecars.
 - Add versioned, read-only importers for supported native session formats.
@@ -389,7 +422,7 @@ Exit: offline contract tests cover Gemini switching, tools, signed parts, compac
 
 Exit: native imports never mutate originals and produce a validation report.
 
-### Phase 5 — Baton-managed delegation
+### Phase 5 — Baton-managed delegation — **foundation only; execution disabled**
 
 - Implement provider-neutral child tools and bounded execution trees.
 - Add budget, depth, concurrency, approval, lease, join, and cancellation policies.
@@ -399,7 +432,13 @@ Exit: every child action replays from Baton storage, no provider-native child se
 
 ## 12. Verification matrix
 
-Required automated coverage:
+Current automated coverage includes SQLite reopen/replay, exact fork cuts, transactional rollback, idempotent turns
+and provider events, startup interruption recovery, binding invalidation, router validation/status mapping, resumable
+SSE cursors, orchestrator retry deduplication, Codex JSONL framing/normalization/hardening/cancellation, and native
+child-capability rejection.
+
+The full target matrix below contains both covered and pending cases; per-item status is tracked in
+[`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md):
 
 1. canonical append/replay is byte-stable after restart;
 2. fork lineage stops at the exact item cut;

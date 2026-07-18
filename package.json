@@ -9,9 +9,10 @@
     "dev:server": "tsx watch server/index.ts",
     "build": "tsc -b && vite build",
     "start": "tsx server/index.ts",
-    "test": "tsx --test server/*.test.ts",
+    "test": "tsx --test \"server/**/*.test.ts\"",
     "typecheck": "tsc -b --noEmit",
     "lint": "oxlint",
+    "smoke:codex-adapter": "tsx scripts/codex-adapter-smoke.ts",
     "preview": "vite preview"
   },
   "dependencies": {

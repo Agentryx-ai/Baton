@@ -1,4 +1,9 @@
-# Baton MVP — 빌드 DAG
+# Baton account control-plane MVP — 빌드 DAG (완료 기록)
+
+> 이 문서는 2026-07-18 account control-plane MVP를 병렬 구현할 때 사용한 **역사적 실행 기록**이다.
+> 최신 기능 상태나 현재 API 계약의 정본이 아니다. 이후 추가된 client integration과 canonical
+> runtime의 현황은 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md), 목표 계약은
+> [`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md)를 따른다.
 
 > DESIGN.md 구현을 독립 작업으로 분해. **가짜 종속성 제거 원칙**: 공유 계약(타입·시그니처·prop
 > 인터페이스)을 파운데이션에서 먼저 확정하면, 구현끼리는 서로를 기다릴 필요가 없다.
@@ -153,7 +158,7 @@ F가 `vite.config.ts` 프록시에 `/baton` 도 `:4400` 로 추가. PolicyState/
 2. **P1..P6** (에이전트 6개, 단일 메시지 병렬 스폰): 각자 계약대로 소유 파일만 구현. 앱 전체 컴파일은 이 시점 미보장(정상).
 3. **I** (메인): `App.tsx`로 전 컴포넌트 조립 + 콜백을 client에 배선 + `main.tsx`/테마 provider. 이후 검증:
    - `tsc -b` 타입 통과, `vite build` 성공
-   - BFF 기동 → `curl :4400/api/cliproxy/accounts/claude` 실계정 반환
+   - BFF 기동 → `curl :4400/api/cliproxy/auth/accounts/claude` 실계정 반환
    - `/baton/policy` 토글 → 조향 로그 확인 → OFF 복원 확인
    - dev 기동 → SPA가 실데이터 4계정 렌더(쿼터 바·카운트다운) 스크린샷
    - Add Account: start-url→(수동 승인)→submit-callback E2E 1회
@@ -171,3 +176,31 @@ F가 `vite.config.ts` 프록시에 `/baton` 도 `:4400` 로 추가. PolicyState/
 - start-url 응답 필드는 `authUrl` (문서의 `url`/`auth_url` 아님). client 정규화에 `authUrl` + URL에서 state 파싱 폴백 추가.
 - P3 client는 named export가 아니라 `client` 객체 — P5가 자동 적응.
 - AccountCard 쿼터 key: Codex 두 윈도우가 동일 rateLimitType이라 index 포함 key로 수정.
+
+## 6. Canonical conversation runtime DAG (2026-07-18)
+
+공통 계약 외에는 서로 기다리지 않도록 storage, orchestration, transport, adapter, UI를 분리했다.
+
+```text
+D0 기존 기능 원자적 커밋
+ └─ D1 domain/store/adapter/service 계약
+     ├─ D2 SQLite store + migration + replay/fork
+     ├─ D3 turn orchestrator + adapter registry + event hub
+     ├─ D4 REST/SSE router
+     ├─ D5 Codex app-server safe adapter
+     └─ D7 canonical workspace UI
+          └─ D6 composition root + 실제 binary smoke + 전체 검증
+```
+
+| 노드 | 배타적 소유 | 완료 조건 |
+|---|---|---|
+| D1 | `server/session/{domain,store,adapter,service}.ts` | turn+input 원자성, durable cursor, visibility, explicit adapter lifecycle |
+| D2 | `sqlite-store*` | reopen replay, idempotency, exact/nested fork, rollback, crash recovery |
+| D3 | `orchestrator*`, `adapter-registry*`, `event-hub.ts` | provider-private 격리, handshake fail-close, terminal persistence |
+| D4 | `router*` | 실제 service 계약, subscribe-before-replay SSE, revision endpoint |
+| D5 | `codex-adapter*` | 실제 config evidence, native child/shell/MCP 차단, plan 정규화 |
+| D7 | `src/features/conversations/**` | 실제 API/SSE만 사용, 추정 revision·production mock 없음 |
+| D6 | `runtime.ts`, `server/index.ts`, `src/App.tsx`, config/docs | 실제 Codex binary handshake와 전체 test/type/lint/build |
+
+가짜 종속성을 피한 핵심은 router/UI가 SQLite 구현이 아니라 고정된 service/JSON 계약만
+소비하고, SSE 메모리 hub는 알림만 담당하며 replay 정본은 항상 SQLite event log에서 읽는 것이다.

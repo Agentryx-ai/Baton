@@ -16,8 +16,13 @@ import { config } from './config.ts'
 import { fetchGateway, sessionStatus } from './gateway-session.ts'
 import { batonRouter } from './baton-routes.ts'
 import { policyEngine } from './policy-engine.ts'
+import { createConversationRuntime } from './session/runtime.ts'
 
 const app = express()
+const conversationRuntime = createConversationRuntime({ dataDir: config.dataDir })
+
+// Canonical JSON routes must consume their body before the raw gateway proxy middleware.
+app.use('/baton/v1', conversationRuntime.router)
 
 // Raw passthrough: bodies forwarded byte-for-byte (JSON stays JSON).
 app.use(express.raw({ type: () => true, limit: '10mb' }))
@@ -64,7 +69,22 @@ if (existsSync(distDir)) {
 }
 
 // Bind to loopback only — local single-user tool (DESIGN.md §7).
-app.listen(config.port, '127.0.0.1', () => {
+const server = app.listen(config.port, '127.0.0.1', () => {
   console.log(`[baton] BFF on http://127.0.0.1:${config.port} → gateway ${config.gatewayUrl}`)
+  const recovered = conversationRuntime.start()
+  if (recovered > 0) console.warn(`[baton] recovered ${recovered} interrupted canonical turns`)
   policyEngine.startIfEnabled()
 })
+
+let shuttingDown = false
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`[baton] ${signal}: shutting down`)
+  policyEngine.stop()
+  server.close()
+  await conversationRuntime.close()
+}
+
+process.once('SIGINT', () => { void shutdown('SIGINT') })
+process.once('SIGTERM', () => { void shutdown('SIGTERM') })

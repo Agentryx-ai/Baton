@@ -20,6 +20,7 @@ import { RotationPanel } from '@/components/RotationPanel'
 import { ProviderSection } from '@/components/ProviderSection'
 import { SettingsSection } from '@/components/SettingsSection'
 import AddAccountWizard from '@/components/AddAccountWizard'
+import { ConversationWorkspace } from '@/features/conversations'
 
 /** Nested quota map: provider → accountId → quota (null = loading/failed). */
 type QuotaMap = Record<string, Record<string, AccountQuota | null>>
@@ -164,6 +165,8 @@ function App() {
       <Header proxy={proxy} onRefresh={refreshAll} />
 
       <main className="mx-auto flex max-w-5xl flex-col gap-8 px-4 py-6">
+        <ConversationWorkspace />
+
         <RotationPanel
           state={policy}
           accounts={accounts}

@@ -88,11 +88,14 @@ interface ClaudeDesktopModel {
 }
 
 export class ClientIntegrationError extends Error {
+  public readonly status: number
+
   constructor(
-    public readonly status: number,
+    status: number,
     message: string,
   ) {
     super(message)
+    this.status = status
     this.name = 'ClientIntegrationError'
   }
 }

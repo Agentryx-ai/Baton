@@ -1,5 +1,8 @@
 /** Baton BFF configuration, loaded from .env (see DESIGN.md §3.1 / §7). */
 
+import { homedir } from 'node:os'
+import path from 'node:path'
+
 // Node 20.12+ loads .env natively; ignore if absent (env may be set externally).
 try {
   process.loadEnvFile()
@@ -22,4 +25,7 @@ export const config = {
   gatewayUser: required('GATEWAY_USER'),
   gatewayPass: required('GATEWAY_PASS'),
   port: Number(process.env.BATON_PORT ?? 4400),
+  /** Durable canonical state must live outside the source tree. */
+  dataDir: process.env.BATON_DATA_DIR
+    ?? path.join(process.env.LOCALAPPDATA ?? homedir(), 'Baton'),
 }
