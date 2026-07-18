@@ -1,11 +1,16 @@
-# Baton — 설계 문서 v2
+# Baton — Account control plane 설계 문서 v2
 
-> 여러 Claude/Codex 계정을 하나의 로컬 엔드포인트로 묶어 쓰는 gateway/CLIProxy 스택 위에 얹는
-> **관리·관측 웹 UI + 스마트 로테이션 조향 엔진**.
-> 이름: 릴레이 배턴 — 요청을 계정 간에 넘겨주는 로테이션의 은유.
+> Baton의 제품 정체성은 두 축이다. 첫째는 여러 provider·계정의 usage, quota, 상태와
+> 로테이션을 관리하는 **account control plane**이고, 둘째는 **Baton이 대화의 정본을
+> 소유하고 Claude·Codex·Gemini가 현재 턴만 실행하는 canonical conversation runtime**이다.
+> 이 문서는 첫 번째 축의 구현을 다루며, 두 번째 축은
+> [`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md)에 명세한다.
+>
+> 이름: 릴레이 배턴 — 계정 사이에는 요청을, provider 사이에는 동일한 대화의 다음 턴을
+> 넘긴다. 어느 경우에도 provider 계정이나 native session이 대화의 소유자가 되지 않는다.
 
 - 작성: 2026-07-18 (v2 — 리뷰용 전면 개정)
-- 상태: **사용자 리뷰 대기** (구현 착수 전. §10 판단 필요 사항 참조)
+- 상태: **v1 구현됨, canonical conversation runtime 후속 구현 설계 확정**
 - 전제 환경: the gateway Docker(:3000 관리 / :8317 프록시), Claude 2계정 + Codex 2계정 인증 완료
 
 ---
@@ -15,18 +20,21 @@
 ### 1.1 문제
 - the gateway's built-in dashboard의 UI/UX가 나쁨: 정보 위계 없음, 가독성 낮음, 핵심 동선(계정 추가·쿼터 확인)이 어렵고 숨겨져 있음.
 - CLIProxy의 로테이션 전략이 단순(round-robin/fill-first)해서 쿼터 윈도우 특성을 활용하지 못함.
+- Claude/Codex/Gemini의 native session이 서로 독립적이어서 provider를 바꾸면 같은 대화의 정본과 실행 이력을 이어가기 어려움.
 
 ### 1.2 목표
 1. **한눈 대시보드**: 4개 계정의 쿼터·리셋·상태를 첫 화면에서 즉시 파악
 2. **계정 추가를 3분 → 30초로**: OAuth 마법사로 동선 단축
 3. **스마트 로테이션 v1**: 리셋 임박 우선 소진 정책 (사용자 결정 2026-07-18)
 4. 백엔드 교체 내성: Docker gateway → 네이티브 gateway 이전 시 설정 1줄 변경
+5. **Canonical conversation runtime으로 확장**: Baton session은 계정·provider와 독립된 정체성을 가지며, provider는 turn adapter로만 동작
 
-### 1.3 비목표 (하지 않음)
-- 로테이션 프록시 자체 구현 (CLIProxy 소관 — 트래픽은 Baton을 경유하지 않음)
+### 1.3 이 문서의 비목표 (하지 않음)
+- 계정 로테이션 프록시 자체 구현 (CLIProxy 소관 — account routing 트래픽은 Baton을 경유하지 않음)
 - OAuth 토큰 저장·갱신 (the gateway 소관)
 - the gateway의 주변 기능(채널, 이미지 분석, IDE 확장, 카탈로그 편집 등) 재노출
 - 다중 사용자/원격 접속 (로컬 단일 사용자 전용)
+- canonical session 저장소·provider adapter·child execution 구현 상세 (별도 공통 세션 설계 문서의 범위)
 
 ---
 
@@ -257,6 +265,13 @@ CAPTCHA는 provider 페이지에서 사용자가 푸는 것 — 마법사 안내
 - 밀도: 카드 그리드 2열(≥900px) / 1열(모바일). 여백 우선, the gateway의 빽빽한 테이블 지양
 - 색: 쿼터 바에만 의미색 사용(기본/주의/경고), 나머지는 중립 톤 — 시선이 쿼터로 가게
 
+### 4.5 클라이언트 자동 설정
+
+- 대상별로 실제 설정 파일을 파싱해 `적용됨` / `미적용` / `설정 충돌` / `확인 불가`를 판정한다. Baton 내부 플래그만으로 판정하지 않는다.
+- 이미 `적용됨`인 대상은 재적용하지 않고, 정확히 Baton 값과 일치할 때만 해제할 수 있다.
+- 적용과 해제 모두 선택한 클라이언트의 종료 상태를 두 번 확인하고, 파일 독점 잠금 검사 후에만 원자적 교체한다.
+- 해제는 Baton 소유 키/테이블만 제거하고 관계없는 사용자 설정을 보존한다. 부분 적용이나 다른 값이 감지되면 파일을 수정하지 않고 충돌로 표시한다.
+
 ---
 
 ## 5. 스마트 로테이션 정책 엔진 (v1: 리셋 임박 우선 소진)
@@ -297,7 +312,8 @@ tick(provider):
 
 | 상황 | 처리 |
 |---|---|
-| 순위 가능 계정 < 2 | **조향 해제**: 엔진이 pause한 계정 전부 resume, 로그 남김 (예비 없는 단일 활성 금지 원칙) |
+| 순위 가능 계정 = 0 | **조향 해제**: 엔진이 pause한 계정 전부 resume, 로그 남김 |
+| 순위 가능 계정 = 1 | 해당 계정을 **단독 타깃**으로 지정, EXHAUSTED 계정은 pause, 상태에 `예비 없음` 표시 |
 | 쿼터 조회 실패(일시) | 해당 계정은 이번 틱에서 BLIND 취급. **연속 2틱 동일 판단일 때만 조향 변경** (플래핑 방지 디바운스) |
 | 타깃의 리셋 통과 | 다음 틱에서 자연 재순위 (앵커 이동으로 캐스케이드) |
 | 사용자가 수동 pause한 계정 | 엔진은 **자기가 pause한 계정만** resume (자체 장부로 구분) — 사용자 의사 존중 |
