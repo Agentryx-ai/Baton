@@ -90,7 +90,7 @@ batonRouter.get('/baton/client-integration', async (_req: Request, res: Response
 batonRouter.post('/baton/client-integration/apply', async (req: Request, res: Response) => {
   try {
     const body = parseBody(req.body)
-    res.json(await applyClientIntegration(body.targets))
+    res.json(await applyClientIntegration(body.targets, body.codexMode))
   } catch (error) {
     const status = error instanceof ClientIntegrationError ? error.status : 500
     const message = error instanceof Error ? error.message : String(error)

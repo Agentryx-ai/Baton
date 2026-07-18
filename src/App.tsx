@@ -4,6 +4,7 @@ import type {
   AccountQuota,
   ClientIntegrationApplyResult,
   ClientIntegrationTarget,
+  CodexIntegrationMode,
   PolicyProviderState,
   Provider,
   RoutingStrategy,
@@ -145,8 +146,9 @@ function App() {
   const onRestartProxy = () => void client.restartProxy()
   const onApplyClientIntegration = async (
     targets: ClientIntegrationTarget[],
+    codexMode?: CodexIntegrationMode,
   ): Promise<ClientIntegrationApplyResult> => {
-    const result = await client.applyClientIntegration(targets)
+    const result = await client.applyClientIntegration(targets, codexMode)
     refreshClientIntegration()
     return result
   }

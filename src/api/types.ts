@@ -79,6 +79,7 @@ export type ClientKind =
   | 'unknown-codex-desktop'
 
 export type ClientIntegrationTarget = 'claude-cli' | 'claude-desktop' | 'codex'
+export type CodexIntegrationMode = 'custom-provider' | 'native-openai'
 
 export interface ClientProcess {
   pid: number
@@ -103,6 +104,7 @@ export interface ClientIntegrationTargetStatus {
   running: ClientProcess[]
   configuration: ClientIntegrationConfigurationState
   configurationDetail?: string
+  codexMode?: CodexIntegrationMode
 }
 
 export type ClientIntegrationConfigurationState =

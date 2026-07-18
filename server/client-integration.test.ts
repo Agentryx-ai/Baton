@@ -9,12 +9,16 @@ import {
   inspectClaudeCliConfig,
   inspectClaudeDesktopConfig,
   inspectCodexConfig,
+  inspectCodexNativeConfig,
   patchCodexConfig,
+  patchCodexNativeConfig,
+  parseCodexIntegrationMode,
   parseIntegrationTargets,
   removeClaudeCliConfig,
   removeClaudeDesktopConfig,
   selectClaudeModels,
   unpatchCodexConfig,
+  unpatchCodexNativeConfig,
 } from './client-integration.ts'
 
 test('configuration conflicts are repairable but applied and unknown states are not', () => {
@@ -88,6 +92,41 @@ test('unpatchCodexConfig removes only Baton-owned settings', () => {
   assert.equal(parsed.model, 'gpt-5.6-sol')
   assert.equal(parsed.model_provider, undefined)
   assert.equal((parsed.model_providers as Record<string, unknown> | undefined)?.baton, undefined)
+})
+
+test('native Codex mode changes only openai_base_url and round-trips bytes safely', () => {
+  const original = [
+    '# keep provider identity and comments',
+    'model_provider = "openai"',
+    'model = "gpt-5.6-sol"',
+    '',
+    '[projects."C:\\\\work"]',
+    'trust_level = "trusted"',
+    '',
+  ].join('\r\n')
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  const applied = patchCodexNativeConfig(original, baseUrl)
+  const parsed = parseToml(applied) as Record<string, unknown>
+
+  assert.equal(patchCodexNativeConfig(applied, baseUrl), applied)
+  assert.equal(parsed.model_provider, 'openai')
+  assert.equal(parsed.openai_base_url, baseUrl)
+  assert.match(applied, /# keep provider identity and comments/)
+  assert.match(applied, /\[projects\."C:\\\\work"\]/)
+  assert.equal(unpatchCodexNativeConfig(applied, baseUrl), original)
+  assert.equal(inspectCodexNativeConfig(applied, baseUrl).configuration, 'applied')
+})
+
+test('native Codex mode refuses to overwrite user transport or another provider', () => {
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  assert.throws(
+    () => patchCodexNativeConfig('openai_base_url = "https://example.invalid/v1"\n', baseUrl),
+    /덮어쓰지 않았습니다/,
+  )
+  assert.throws(
+    () => patchCodexNativeConfig('model_provider = "custom"\n', baseUrl),
+    /openai가 아니므로/,
+  )
 })
 
 test('configuration inspection distinguishes applied, absent, and conflicting values', () => {
@@ -192,6 +231,12 @@ test('parseIntegrationTargets validates and canonicalizes partial selections', (
   assert.throws(() => parseIntegrationTargets([]), /하나 이상/)
   assert.throws(() => parseIntegrationTargets(['codex', 'codex']), /중복/)
   assert.throws(() => parseIntegrationTargets(['unknown']), /올바르지/)
+})
+
+test('parseCodexIntegrationMode accepts only declared modes', () => {
+  assert.equal(parseCodexIntegrationMode(undefined), 'custom-provider')
+  assert.equal(parseCodexIntegrationMode('native-openai'), 'native-openai')
+  assert.throws(() => parseCodexIntegrationMode('openai'), /올바르지 않은/)
 })
 
 test('blockedProcessesForTargets ignores running unselected clients', () => {

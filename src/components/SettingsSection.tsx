@@ -7,6 +7,7 @@ import type {
   ClientIntegrationRemoveResult,
   ClientIntegrationStatus,
   ClientIntegrationTarget,
+  CodexIntegrationMode,
   ProxyStatus,
   RoutingStrategy,
   SessionAffinity,
@@ -33,6 +34,7 @@ interface SettingsSectionProps {
   onRefreshClientIntegration: () => void
   onApplyClientIntegration: (
     targets: ClientIntegrationTarget[],
+    codexMode?: CodexIntegrationMode,
   ) => Promise<ClientIntegrationApplyResult>
   onRemoveClientIntegration: (
     targets: ClientIntegrationTarget[],
@@ -44,12 +46,20 @@ const INTEGRATION_TARGETS: ReadonlyArray<{
   label: string
   description?: string
 }> = [
-  { target: 'claude-cli', label: 'Claude CLI' },
-  { target: 'claude-desktop', label: 'Claude Desktop' },
+  {
+    target: 'claude-cli',
+    label: 'Claude CLI',
+    description: '로컬 --continue/--resume 세션은 gateway 설정과 분리되어 유지됩니다.',
+  },
+  {
+    target: 'claude-desktop',
+    label: 'Claude Desktop',
+    description: 'Gateway는 별도 inference provider입니다. Claude 계정의 기존 Chat/Cowork 목록 보존은 지원되지 않습니다.',
+  },
   {
     target: 'codex',
     label: 'Codex CLI/Desktop',
-    description: '공유 설정이므로 함께 종료해야 합니다.',
+    description: 'CLI와 Desktop은 같은 ~/.codex/config.toml을 사용하므로 함께 종료해야 합니다.',
   },
 ]
 
@@ -103,6 +113,13 @@ export function SettingsSection({
   const [changingIntegrationTarget, setChangingIntegrationTarget] = useState<
     ClientIntegrationTarget | null
   >(null)
+  const [codexMode, setCodexMode] = useState<CodexIntegrationMode>('native-openai')
+  useEffect(() => {
+    const appliedMode = clientIntegration?.targets.find(
+      (target) => target.target === 'codex',
+    )?.codexMode
+    if (appliedMode) setCodexMode(appliedMode)
+  }, [clientIntegration])
 
   const commitTtl = () => {
     if (!affinity) return
@@ -131,7 +148,10 @@ export function SettingsSection({
   const handleApplyIntegration = async (target: ClientIntegrationTarget) => {
     setChangingIntegrationTarget(target)
     try {
-      const result = await onApplyClientIntegration([target])
+      const result = await onApplyClientIntegration(
+        [target],
+        target === 'codex' ? codexMode : undefined,
+      )
       toast.success(`${result.updated.join(', ')} 설정을 적용했습니다. 이제 앱을 다시 실행하세요.`)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error))
@@ -323,6 +343,40 @@ export function SettingsSection({
                         <span className="block text-xs text-muted-foreground">
                           {option.description}
                         </span>
+                      ) : null}
+                      {option.target === 'codex' ? (
+                        isApplied ? (
+                          <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                            {status?.codexMode === 'native-openai'
+                              ? '기존 OpenAI 세션 유지 모드'
+                              : '분리된 Baton provider 모드'}
+                          </span>
+                        ) : (
+                          <RadioGroup
+                            value={codexMode}
+                            onValueChange={(value) => setCodexMode(value as CodexIntegrationMode)}
+                            className="mt-3 gap-2 rounded-md border bg-background/70 p-2"
+                          >
+                            <div className="flex items-start gap-2">
+                              <RadioGroupItem value="native-openai" id="codex-native-openai" className="mt-0.5" />
+                              <Label htmlFor="codex-native-openai" className="space-y-0.5 font-normal">
+                                <span className="block text-xs font-medium">기존 세션 유지 (권장 · Desktop)</span>
+                                <span className="block text-[11px] leading-4 text-muted-foreground">
+                                  model_provider=openai를 유지하고 전송 주소만 Baton으로 바꿉니다. Desktop과 CLI의 기존 OpenAI 목록을 유지합니다.
+                                </span>
+                              </Label>
+                            </div>
+                            <div className="flex items-start gap-2">
+                              <RadioGroupItem value="custom-provider" id="codex-custom-provider" className="mt-0.5" />
+                              <Label htmlFor="codex-custom-provider" className="space-y-0.5 font-normal">
+                                <span className="block text-xs font-medium">분리된 Baton provider</span>
+                                <span className="block text-[11px] leading-4 text-muted-foreground">
+                                  기존 OpenAI thread와 분리된 목록을 사용합니다.
+                                </span>
+                              </Label>
+                            </div>
+                          </RadioGroup>
+                        )
                       ) : null}
                     </div>
                     <Button

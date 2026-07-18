@@ -14,6 +14,7 @@ import type {
   ClientIntegrationRemoveResult,
   ClientIntegrationStatus,
   ClientIntegrationTarget,
+  CodexIntegrationMode,
   PolicyState,
   Provider,
   ProxyStatus,
@@ -169,10 +170,11 @@ export const client = {
 
   applyClientIntegration: (
     targets: ClientIntegrationTarget[],
+    codexMode?: CodexIntegrationMode,
   ): Promise<ClientIntegrationApplyResult> =>
     request<ClientIntegrationApplyResult>('/baton/client-integration/apply', {
       method: 'POST',
-      json: { targets },
+      json: { targets, ...(codexMode ? { codexMode } : {}) },
     }),
 
   removeClientIntegration: (

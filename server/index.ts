@@ -15,6 +15,8 @@ import path from 'node:path'
 import { config } from './config.ts'
 import { fetchGateway, sessionStatus } from './gateway-session.ts'
 import { batonRouter } from './baton-routes.ts'
+import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
+import { createOpenAiInferenceBridge } from './openai-inference-bridge.ts'
 import { policyEngine } from './policy-engine.ts'
 import { createConversationRuntime } from './session/runtime.ts'
 
@@ -30,6 +32,10 @@ app.use(express.raw({ type: () => true, limit: '10mb' }))
 app.get('/baton/health', (_req, res) => {
   res.json({ ok: true, gateway: config.gatewayUrl, session: sessionStatus() })
 })
+
+// Preserve Codex's built-in `openai` provider identity while routing inference
+// through Baton's loopback-only CLIProxy connection.
+app.use(CODEX_NATIVE_PROXY_PATH, createOpenAiInferenceBridge())
 
 // Policy engine control plane (/baton/policy ...).
 app.use(batonRouter)

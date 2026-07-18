@@ -87,7 +87,7 @@ ID는 바뀌지 않습니다.
 |---|---|---|
 | 여러 provider/계정 대시보드 | 구현됨 | Claude/Codex 계정, quota, reset, 상태 관리 |
 | Smart rotation | **부분 구현** | quota 기반 target/reserve 활성 풀 조향; 실제 target 우선 라우팅은 미보장 |
-| 클라이언트 프록시 자동 설정 | 구현됨 | Claude/Codex CLI·Desktop별 결정론적 적용/해제와 종료·lock 검사 |
+| 클라이언트 프록시 자동 설정 | 구현됨 | Claude/Codex CLI·Desktop별 결정론적 적용/해제, Codex 기존 세션 유지 모드, 종료·lock 검사 |
 | Canonical conversation runtime | **Preview 구현** | SQLite 정본 저장소, session/thread/turn/item, replay, fork, SSE, cancel, 시작 시 recovery |
 | Codex turn adapter | **Preview 구현** | app-server 기반 stateless replay, ephemeral native thread, fail-closed capability 검증 |
 | Canonical conversation UI | **Preview 구현** | 세션 생성·선택, Codex 턴 실행·스트리밍·취소 |
@@ -148,6 +148,8 @@ SPA (React + Vite + Tailwind + shadcn)
   - 앱이 확실히 종료된 경우에만 변경
   - 파일 lock과 설정 충돌을 fail-closed로 처리
   - 구조화된 parser, Baton 소유 값 확인, 원자적 교체
+  - Codex는 `model_provider=openai`를 유지하고 `openai_base_url`만 Baton loopback bridge로
+    설정하는 **기존 세션 유지 모드**와, 별도 `baton` provider 모드를 선택 가능
 - canonical session/thread/turn/item과 provider binding의 SQLite/WAL 영속화
 - `/baton/v1` REST API, cursor replay SSE, fork, idempotent retry, cancel, crash recovery
 - Codex app-server adapter
@@ -177,6 +179,18 @@ Baton이 선택하는 **CLIProxy 업스트림 계정**과 네이티브 클라이
 > Claude CLI 프록시 설정은 `ANTHROPIC_AUTH_TOKEN`을 사용하므로 claude.ai 조직
 > connectors가 비활성화된다는 경고는 정상입니다. connectors가 필요하면 해당
 > 클라이언트의 Baton 프록시 설정을 해제하고 재시작하세요.
+
+### 네이티브 클라이언트의 세션 목록
+
+- **Codex Desktop(ChatGPT 로그인 포함)과 CLI:** 기존 OpenAI thread 목록을 유지하려면 설정 UI에서
+  **기존 세션 유지**를 선택합니다. 두 클라이언트 모두 `~/.codex/config.toml`의 현재
+  `model_provider`를 기준으로 목록을 필터링하므로, 별도 `baton` provider 모드는 기존
+  `openai` 목록과 분리됩니다.
+- **Claude CLI:** gateway 설정은 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`만 바꾸며,
+  `--continue`/`--resume`이 사용하는 로컬 프로젝트 세션은 그대로 유지됩니다.
+- **Claude Desktop:** 지원되는 gateway 설정은 `inferenceProvider=gateway`라는 별도
+  provider로 전환합니다. Claude 계정에 저장된 기존 Chat/Cowork 목록을 그대로 유지하면서
+  base URL만 바꾸는 공식 설정은 없으므로, Baton은 세션 목록 보존을 약속하지 않습니다.
 
 ## Run
 
