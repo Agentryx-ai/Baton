@@ -37,7 +37,7 @@
 | Provider opaque state | 부분 구현 | binding 스키마와 invalidation은 구현됨 | at-rest encryption이 없어 non-null opaque state 저장을 fail-closed로 거부함 |
 | Provider binding freshness | 설계 변경 | 구현은 `last_turn_id` 대신 `synced_revision`과 `context_digest`로 exact context compatibility를 판정 | 공통 설계 문서의 binding 필드를 이 결정에 맞춰 갱신 |
 | Baton-managed child execution | 부분 구현·비활성 | execution 기록과 `delegationMode: disabled`, native child capability 검증이 있음 | child API, scheduler/executor, budget/depth/join/cancel 구현 필요 |
-| Native session bridge/import | 미구현 | 프록시 설정 자동화만 존재 | wrapper/sidecar와 versioned read-only importer 필요 |
+| Native session bridge/import | 미구현 | 프록시 설정 자동화만 존재 | [`NATIVE_SESSION_CONTINUITY_BRIDGE.md`](NATIVE_SESSION_CONTINUITY_BRIDGE.md)의 migration/recovery 경계에 따라 wrapper/sidecar, versioned read-only importer, canonical reconciliation과 승인된 compatibility export 필요 |
 | Live Codex 검증 | 검증 공백 | 단위·통합 테스트와 `smoke:codex-adapter` handshake는 존재 | 실제 model turn → BFF 재시작 → Baton history 재개 E2E를 추가해야 Phase 1 exit를 완전히 충족 |
 
 ## 현재 구현된 canonical API

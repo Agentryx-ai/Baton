@@ -421,11 +421,17 @@ Exit: offline contract tests cover Gemini switching, tools, signed parts, compac
 
 ### Phase 4 — native bridges and migration — **not implemented**
 
+- Follow the normative migration/recovery boundary in
+  [`NATIVE_SESSION_CONTINUITY_BRIDGE.md`](NATIVE_SESSION_CONTINUITY_BRIDGE.md).
 - Add explicit CLI session wrappers/sidecars.
 - Add versioned, read-only importers for supported native session formats.
 - Show provenance and portability loss before import/switch.
 
 Exit: native imports never mutate originals and produce a validation report.
+
+The exit also requires mutually exclusive canonical/native authority epochs, one steady-state writer per logical
+work, durable authority-transition/quiescence handling, canonical source-cut replay, approval-bound native mutation,
+manual-package evidence separation, stale-approval rejection, and uncertain/diverged-apply reconciliation.
 
 ### Phase 5 — Baton-managed delegation — **foundation only; execution disabled**
 
