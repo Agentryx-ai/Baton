@@ -14,7 +14,7 @@ import {
   payloadText,
   usageSummary,
 } from './conversation-presentation'
-import type { CanonicalItemDto } from './types'
+import type { CanonicalItemDto, CanonicalTurnDto } from './types'
 import type { AssistantLabelMode } from './session-view-preferences'
 
 const ICON = {
@@ -35,19 +35,22 @@ export function ConversationItem({
   toolResult = null,
   assistantLabelMode = 'provider',
   modelDisplayNames = {},
+  turn = null,
 }: {
   item: CanonicalItemDto
   toolResult?: CanonicalItemDto | null
   assistantLabelMode?: AssistantLabelMode
   modelDisplayNames?: Readonly<Record<string, string>>
+  turn?: Pick<CanonicalTurnDto, 'model' | 'effort'> | null
 }) {
   const isError = item.kind === 'error'
   const isReasoning = item.kind === 'reasoning_summary'
   const isUsage = item.kind === 'usage'
   const body = isUsage ? usageSummary(item.payload) : payloadText(item)
   const showRawDetail = isError || isReasoning || isUsage || item.kind === 'provider_event'
-  const requestedModel = typeof item.payload.requestedModel === 'string'
-    ? friendlyModel(item.payload.requestedModel, modelDisplayNames)
+  const metadata = assistantExecutionMetadata(item, turn)
+  const requestedModel = metadata.requestedModel
+    ? friendlyModel(metadata.requestedModel, modelDisplayNames)
     : null
   const observedModel = typeof item.payload.reportedModel === 'string'
     ? friendlyModel(item.payload.reportedModel, modelDisplayNames)
@@ -56,7 +59,8 @@ export function ConversationItem({
       : typeof item.payload.actualModel === 'string'
         ? friendlyModel(item.payload.actualModel, modelDisplayNames)
         : null
-  const effort = typeof item.payload.effort === 'string' ? item.payload.effort : null
+  const displayModel = requestedModel ?? observedModel
+  const effort = metadata.effort
   const modelFallback = requestedModel && observedModel && requestedModel !== observedModel
   const assistantHeader = item.kind === 'assistant_message'
     ? assistantLabel(item, assistantLabelMode)
@@ -130,9 +134,9 @@ export function ConversationItem({
         {item.provider && item.kind !== 'assistant_message' ? (
           <span>{PROVIDER_LABEL[item.provider]}</span>
         ) : null}
-        {requestedModel ? (
+        {displayModel ? (
           <span className={cn(modelFallback && 'font-medium text-warn')}>
-            {modelFallback ? `${requestedModel} → ${observedModel}` : requestedModel}
+            {modelFallback ? `${requestedModel} → ${observedModel}` : displayModel}
             {effort ? ` · ${effortLabel(effort)}` : ''}
           </span>
         ) : null}
@@ -159,6 +163,20 @@ export function ConversationItem({
       )}
     </article>
   )
+}
+
+export function assistantExecutionMetadata(
+  item: CanonicalItemDto,
+  turn: Pick<CanonicalTurnDto, 'model' | 'effort'> | null = null,
+): { requestedModel: string | null; effort: string | null } {
+  return {
+    requestedModel: typeof item.payload.requestedModel === 'string'
+      ? item.payload.requestedModel
+      : turn?.model ?? null,
+    effort: typeof item.payload.effort === 'string'
+      ? item.payload.effort
+      : turn?.effort ?? null,
+  }
 }
 
 function LongContent({

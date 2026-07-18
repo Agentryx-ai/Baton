@@ -125,6 +125,11 @@ function friendlyClaudeName(id: string): string {
 }
 
 function friendlyModelName(id: string): string {
+  const gpt = /^gpt-([^-]+)(?:-(.+))?$/i.exec(id)
+  if (gpt) {
+    const suffix = gpt[2] ? ` ${gpt[2].split('-').map(capitalize).join(' ')}` : ''
+    return `GPT-${gpt[1]}${suffix}`
+  }
   return id.split('-').map((part) => /^(gpt|ai)$/i.test(part)
     ? part.toUpperCase()
     : capitalize(part)).join(' ')

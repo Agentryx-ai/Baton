@@ -32,7 +32,12 @@ import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
 import { conversationEntries, latestUsageSummary } from './conversation-presentation'
-import { parseGoalComposerCommand, type GoalComposerCommand } from './goal-command'
+import {
+  GOAL_OBJECTIVE_MAX_CHARS,
+  limitGoalObjectiveDraft,
+  parseGoalComposerCommand,
+  type GoalComposerCommand,
+} from './goal-command'
 import { GoalControl, type GoalAction } from './GoalControl'
 import { NativeImportDialog } from './NativeImportDialog'
 import { ProviderAccountDisclosure } from './ProviderAccountDisclosure'
@@ -436,7 +441,7 @@ function SessionButton({
   )
 }
 
-const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: string; dot: string }> = {
+export const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: string; dot: string }> = {
   archived: { label: '휴지통', dot: 'bg-muted-foreground' },
   waiting_user: { label: '입력 대기', dot: 'bg-warning' },
   waiting_approval: { label: '승인 대기', dot: 'bg-warning' },
@@ -510,6 +515,7 @@ export function ConversationWorkspace({
   const [goalBusyAction, setGoalBusyAction] = useState<GoalAction | 'create' | null>(null)
   const [goalDialog, setGoalDialog] = useState<'create' | 'replace' | 'edit' | 'resume' | 'clear' | null>(null)
   const [goalDraft, setGoalDraft] = useState('')
+  const [goalComposerMode, setGoalComposerMode] = useState(false)
   const [goalPanelVersion, setGoalPanelVersion] = useState(0)
   const [reconcileTarget, setReconcileTarget] = useState<UnknownMutationCall | null>(null)
   const [reconcileResolution, setReconcileResolution] = useState<UnknownMutationResolution | null>(null)
@@ -665,8 +671,8 @@ export function ConversationWorkspace({
     }
   }
 
-  const saveGoalObjective = async (objective: string, replace = false) => {
-    if (!snapshot || !model.trim()) return
+  const saveGoalObjective = async (objective: string, replace = false): Promise<boolean> => {
+    if (!snapshot || !model.trim()) return false
     const current = snapshot.goal ?? null
     setGoalBusyAction(current ? 'edit' : 'create')
     try {
@@ -689,12 +695,13 @@ export function ConversationWorkspace({
       }
       setGoalDialog(null)
       setGoalDraft('')
-      setPrompt('')
       setError(null)
       await refreshThread()
+      return true
     } catch (cause) {
       await refreshThread()
       setError(errorMessage(cause))
+      return false
     } finally {
       setGoalBusyAction(null)
     }
@@ -714,7 +721,7 @@ export function ConversationWorkspace({
         setError('예산 제한 Goal은 먼저 다시 시작한 뒤 수정해 주세요.')
         return
       }
-      setGoalDraft(current.objective)
+      setGoalDraft(limitGoalObjectiveDraft(current.objective))
       setGoalDialog('edit')
       return
     }
@@ -755,12 +762,12 @@ export function ConversationWorkspace({
     }
     if (command.type === 'set') {
       if (current && current.status !== 'complete') {
-        setGoalDraft(command.objective)
+        setGoalDraft(limitGoalObjectiveDraft(command.objective))
         setGoalDialog('replace')
       } else {
-        await saveGoalObjective(command.objective, current !== null)
+        return saveGoalObjective(command.objective, current !== null)
       }
-      return
+      return true
     }
     if (command.type === 'edit') {
       await applyGoalAction('edit')
@@ -780,8 +787,23 @@ export function ConversationWorkspace({
   const startTurn = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!snapshot || !prompt.trim() || !model.trim()) return
+    if (goalComposerMode) {
+      const objective = prompt.trim()
+      const accepted = await handleGoalCommand({ type: 'set', objective })
+      if (accepted !== false) {
+        setGoalComposerMode(false)
+        setPrompt('')
+      }
+      return
+    }
     const goalCommand = parseGoalComposerCommand(prompt)
     if (goalCommand) {
+      if (goalCommand.type === 'open') {
+        setGoalComposerMode(true)
+        setPrompt('')
+        setError(null)
+        return
+      }
       await handleGoalCommand(goalCommand)
       return
     }
@@ -816,6 +838,10 @@ export function ConversationWorkspace({
   const latestTurn = snapshot?.turns.at(-1) ?? null
   const latestUsage = latestUsageSummary(snapshot?.turns ?? [])
   const visibleEntries = conversationEntries(snapshot?.items ?? [])
+  const turnsById = useMemo(
+    () => new Map((snapshot?.turns ?? []).map((turn) => [turn.id, turn] as const)),
+    [snapshot?.turns],
+  )
   const latestTurnError = latestTurn?.status === 'failed' && latestTurn.error
     ? typeof latestTurn.error.message === 'string'
       ? latestTurn.error.message
@@ -859,6 +885,7 @@ export function ConversationWorkspace({
     setSelectedSessionId(sessionId)
     setGoalPanelVersion(0)
     setGoalDialog(null)
+    setGoalComposerMode(false)
     setReconcileTarget(null)
     setReconcileResolution(null)
     setReconcileNote('')
@@ -873,6 +900,7 @@ export function ConversationWorkspace({
     setSelectedSessionId(null)
     setSnapshot(null)
     setGoalPanelVersion(0)
+    setGoalComposerMode(false)
     setGoalDialog(null)
     setReconcileTarget(null)
     setReconcileResolution(null)
@@ -1067,15 +1095,20 @@ export function ConversationWorkspace({
                 : 'Goal 상태만 지웁니다. 지금까지의 대화와 작업 기록은 남습니다.'}
           </DialogDescription>
           {goalDialog === 'create' || goalDialog === 'replace' || goalDialog === 'edit' ? (
-            <textarea
-              value={goalDraft}
-              onChange={(event) => setGoalDraft(event.target.value)}
-              rows={5}
-              autoFocus
-              aria-label="Goal 내용"
-              className="w-full resize-y rounded-xl border bg-background px-3 py-2 text-sm leading-6 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              placeholder="완료할 목표를 구체적으로 적어 주세요"
-            />
+            <div>
+              <textarea
+                value={goalDraft}
+                onChange={(event) => setGoalDraft(limitGoalObjectiveDraft(event.target.value))}
+                rows={5}
+                autoFocus
+                aria-label="Goal 내용"
+                className="w-full resize-y rounded-xl border bg-background px-3 py-2 text-sm leading-6 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                placeholder="완료할 목표를 구체적으로 적어 주세요"
+              />
+              <p className="mt-1 text-right text-xs tabular-nums text-muted-foreground">
+                {Array.from(goalDraft).length}/{GOAL_OBJECTIVE_MAX_CHARS}
+              </p>
+            </div>
           ) : null}
           <div className="flex justify-end gap-2">
             <Button type="button" variant="ghost" disabled={goalBusyAction !== null} onClick={() => setGoalDialog(null)}>취소</Button>
@@ -1178,14 +1211,9 @@ export function ConversationWorkspace({
             </h1>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <span
-              className={cn(
-                'size-1.5 rounded-full',
-                snapshot?.thread.status === 'running' ? 'animate-pulse bg-ok' : 'bg-muted-foreground/50',
-              )}
-              aria-hidden
-            />
-            <span>{sessionScope === 'trash' ? '읽기 전용' : snapshot?.thread.status === 'running' ? '응답 중' : '준비됨'}</span>
+            {sessionScope === 'trash'
+              ? <span>읽기 전용</span>
+              : snapshot ? <SessionStatus status={snapshot.session.workStatus} /> : <span>준비됨</span>}
             {sessionScope === 'active' ? <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge> : null}
           </div>
         </header>
@@ -1238,17 +1266,6 @@ export function ConversationWorkspace({
               </section>
             ) : null}
 
-            {snapshot?.goal ? (
-              <GoalControl
-                key={`${snapshot.goal.id}:${goalPanelVersion}`}
-                goal={snapshot.goal}
-                busyAction={goalBusyAction === 'create' ? null : goalBusyAction}
-                defaultExpanded={goalPanelVersion > 0}
-                className="mb-6"
-                onAction={(action) => { void applyGoalAction(action) }}
-              />
-            ) : null}
-
             {loadingThread && !snapshot ? (
               <p className="m-auto text-sm text-muted-foreground">대화를 불러오는 중…</p>
             ) : !snapshot ? (
@@ -1275,6 +1292,7 @@ export function ConversationWorkspace({
                         toolResult={toolResult}
                         assistantLabelMode={viewPreferences.assistantLabel}
                         modelDisplayNames={modelDisplayNames}
+                        turn={item.turnId ? turnsById.get(item.turnId) ?? null : null}
                       />
                     </div>
                   )
@@ -1301,13 +1319,42 @@ export function ConversationWorkspace({
           </div>
         ) : (
         <div className="shrink-0 bg-gradient-to-t from-background via-background to-background/0 px-3 pb-4 pt-2 sm:px-6 sm:pb-6">
+          {snapshot?.goal ? (
+            <GoalControl
+              key={`${snapshot.goal.id}:${goalPanelVersion}`}
+              goal={snapshot.goal}
+              busyAction={goalBusyAction === 'create' ? null : goalBusyAction}
+              defaultExpanded={goalPanelVersion > 0}
+              className="mx-auto mb-2 w-full max-w-3xl"
+              onAction={(action) => { void applyGoalAction(action) }}
+            />
+          ) : null}
           <form
             className="mx-auto w-full max-w-3xl rounded-2xl border bg-background p-2 shadow-lg shadow-black/5"
             onSubmit={(event) => void startTurn(event)}
           >
+            {goalComposerMode ? (
+              <div className="flex items-center gap-2 px-2 pt-1 text-xs">
+                <span className="rounded-md bg-info/10 px-2 py-1 font-medium text-info">Goal</span>
+                <span className="text-muted-foreground">완료할 목표를 입력하세요</span>
+                <span className="tabular-nums text-muted-foreground">
+                  {Array.from(prompt).length}/{GOAL_OBJECTIVE_MAX_CHARS}
+                </span>
+                <button
+                  type="button"
+                  className="ml-auto rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  aria-label="Goal 입력 취소"
+                  onClick={() => setGoalComposerMode(false)}
+                >
+                  ×
+                </button>
+              </div>
+            ) : null}
             <textarea
               value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
+              onChange={(event) => setPrompt(goalComposerMode
+                ? limitGoalObjectiveDraft(event.target.value)
+                : event.target.value)}
               onKeyDown={(event) => {
                 const action = composerKeyAction({
                   key: event.key,
@@ -1320,13 +1367,26 @@ export function ConversationWorkspace({
                 if (canSubmit) event.currentTarget.form?.requestSubmit()
               }}
               rows={2}
-              placeholder="메시지 보내기"
+              placeholder={goalComposerMode ? 'Goal 내용 입력' : '메시지 보내기'}
               aria-label="메시지"
               aria-keyshortcuts="Enter Shift+Enter"
               className="max-h-48 min-h-14 w-full resize-none bg-transparent px-2 py-2 text-[0.9375rem] leading-6 text-foreground outline-none placeholder:text-muted-foreground"
             />
 
             <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
+              {!snapshot?.goal && !goalComposerMode ? (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  onClick={() => {
+                    setPrompt((current) => limitGoalObjectiveDraft(current))
+                    setGoalComposerMode(true)
+                  }}
+                >
+                  Goal
+                </Button>
+              ) : null}
               <select
                 value={model ? `${provider}:${model}` : ''}
                 onChange={(event) => {

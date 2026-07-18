@@ -86,7 +86,7 @@ export function GoalControl({
           </span>
         </summary>
 
-        <div className="border-t px-3 py-3">
+        <div className="max-h-[min(24rem,45vh)] overflow-y-auto border-t px-3 py-3">
           <p className="whitespace-pre-wrap break-words text-sm leading-6">{goal.objective}</p>
 
           <dl className="mt-3 grid grid-cols-1 gap-x-5 gap-y-2 text-xs sm:grid-cols-3">

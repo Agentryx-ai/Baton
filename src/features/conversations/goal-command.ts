@@ -7,6 +7,14 @@ export type GoalComposerCommand =
   | { type: 'clear' }
 
 const CONTROL_COMMANDS = new Set(['edit', 'pause', 'resume', 'clear'])
+export const GOAL_OBJECTIVE_MAX_CHARS = 4_000
+
+export function limitGoalObjectiveDraft(value: string): string {
+  const characters = Array.from(value)
+  return characters.length <= GOAL_OBJECTIVE_MAX_CHARS
+    ? value
+    : characters.slice(0, GOAL_OBJECTIVE_MAX_CHARS).join('')
+}
 
 export function parseGoalComposerCommand(input: string): GoalComposerCommand | null {
   if (!input.startsWith('/goal')) return null
@@ -20,5 +28,5 @@ export function parseGoalComposerCommand(input: string): GoalComposerCommand | n
   if (CONTROL_COMMANDS.has(normalized)) {
     return { type: normalized as 'edit' | 'pause' | 'resume' | 'clear' }
   }
-  return { type: 'set', objective: argument }
+  return { type: 'set', objective: limitGoalObjectiveDraft(argument) }
 }

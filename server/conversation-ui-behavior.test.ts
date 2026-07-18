@@ -7,12 +7,37 @@ const itemModulePath: string = '../src/features/conversations/ConversationItem.t
 const workspaceModulePath: string = '../src/features/conversations/ConversationWorkspace.tsx'
 
 test('assistant model labels preserve catalog names and provider version punctuation', async () => {
-  const { friendlyModel } = await import(itemModulePath) as {
+  const { friendlyModel, assistantExecutionMetadata } = await import(itemModulePath) as {
     friendlyModel: (model: string, names?: Readonly<Record<string, string>>) => string
+    assistantExecutionMetadata: (
+      item: { payload: Record<string, unknown> },
+      turn: { model: string; effort: string | null } | null,
+    ) => { requestedModel: string | null; effort: string | null }
   }
   assert.equal(friendlyModel('gpt-5.6-sol'), 'GPT-5.6 Sol')
   assert.equal(friendlyModel('claude-opus-4-8-20260719'), 'Opus 4.8')
   assert.equal(friendlyModel('gpt-custom', { 'gpt-custom': 'GPT Custom Display' }), 'GPT Custom Display')
+  assert.deepEqual(assistantExecutionMetadata(
+    { payload: { text: 'legacy Codex response' } },
+    { model: 'gpt-5.6-sol', effort: 'high' },
+  ), { requestedModel: 'gpt-5.6-sol', effort: 'high' })
+  assert.deepEqual(assistantExecutionMetadata(
+    { payload: { requestedModel: 'gpt-live', effort: 'xhigh' } },
+    { model: 'gpt-fallback', effort: 'low' },
+  ), { requestedModel: 'gpt-live', effort: 'xhigh' })
+})
+
+test('conversation header and sidebar share every canonical work status presentation', async () => {
+  const { SESSION_STATUS } = await import(workspaceModulePath) as {
+    SESSION_STATUS: Record<string, { label: string; dot: string }>
+  }
+  for (const status of [
+    'idle', 'queued', 'running', 'waiting_tool', 'paused', 'blocked', 'usage_limited',
+    'budget_limited', 'failed', 'interrupted', 'cancelled', 'completed', 'complete', 'imported', 'archived',
+  ]) {
+    assert.ok(SESSION_STATUS[status]?.label)
+    assert.ok(SESSION_STATUS[status]?.dot)
+  }
 })
 
 test('stale Goal status mutations are surfaced as explicit conflicts', async () => {
