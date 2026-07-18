@@ -159,6 +159,14 @@ function App() {
   }
 
   const connectionSnippet = buildConnectionSnippet(proxy?.port ?? 8317, apiKey)
+  const codexTarget = policy?.providers.find((provider) => provider.provider === 'codex')?.target
+  const codexIntegration = clientIntegration?.targets.find((target) => target.target === 'codex')
+  const codexTargetIsBypassed = Boolean(
+    policy?.enabled
+      && codexTarget
+      && codexIntegration
+      && codexIntegration.configuration !== 'applied',
+  )
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -166,6 +174,17 @@ function App() {
 
       <main className="mx-auto flex max-w-5xl flex-col gap-8 px-4 py-6">
         <ConversationWorkspace />
+
+        {codexTargetIsBypassed && (
+          <div className="rounded-xl border border-danger/50 bg-danger/10 px-4 py-3 text-sm" role="alert">
+            <p className="font-semibold text-danger">Codex 타깃이 실제 요청에 적용되지 않고 있습니다.</p>
+            <p className="mt-1 text-muted-foreground">
+              현재 타깃은 {codexTarget}이지만 Codex 프록시 설정은 {codexIntegration?.configuration} 상태입니다.
+              이 상태에서 Codex Desktop은 자체 로그인 계정으로 직접 요청할 수 있습니다. 모든 Codex
+              CLI/Desktop을 종료한 뒤 클라이언트 자동 설정을 적용하고 다시 실행하세요.
+            </p>
+          </div>
+        )}
 
         <RotationPanel
           state={policy}
