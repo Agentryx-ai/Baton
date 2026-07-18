@@ -101,6 +101,8 @@ Codex와 Claude adapter는 실행 가능하며 Gemini도 같은 정본 계약으
 단, proxy가 Gemini 모델을 제공하지 않는 현재 인증 상태에서는 Gemini를 선택할 수 없습니다.
 구현 경계와 정합성 판정은
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md)에 있습니다.
+대화에서 요청된 항목별 완료·미완료·검증 상태는
+[`docs/USER_REQUEST_STATUS.md`](docs/USER_REQUEST_STATUS.md)에서 추적합니다.
 
 ## Architecture
 
