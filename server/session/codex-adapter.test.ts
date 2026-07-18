@@ -7,6 +7,7 @@ import {
   type CodexAppServerProcess,
   type CodexProcessFactory,
 } from './codex-adapter.ts'
+import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null }
@@ -237,6 +238,9 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
 function context(): ProviderExecutionContext {
   return {
     signal: new AbortController().signal,
+    toolDefinitions: [],
+    limits: DEFAULT_AGENT_LOOP_LIMITS,
+    async executeTool() { throw new Error('tool not registered') },
     async denyApproval(): Promise<never> { throw new Error('approval denied') },
     async denyToolCall(): Promise<never> { throw new Error('tool denied') },
   }

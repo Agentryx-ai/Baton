@@ -1,4 +1,8 @@
 import type {
+  AgentLoopLimits,
+  AgentToolDefinition,
+  AgentToolInvocation,
+  AgentToolResult,
   CanonicalProvider,
   NewCanonicalItem,
   ProviderCapabilities,
@@ -34,6 +38,9 @@ export interface NativeProviderEvent {
 
 export interface ProviderExecutionContext {
   signal: AbortSignal
+  toolDefinitions: readonly AgentToolDefinition[]
+  limits: Readonly<AgentLoopLimits>
+  executeTool(request: AgentToolInvocation): Promise<AgentToolResult>
   denyApproval(request: unknown): Promise<never>
   denyToolCall(request: unknown): Promise<never>
 }

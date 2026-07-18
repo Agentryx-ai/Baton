@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { AdapterRegistry } from './adapter-registry.ts'
 import type { ProviderBindingPatch } from './adapter.ts'
+import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type {
   BeginTurnResult,
   CanonicalItem,
@@ -175,6 +176,9 @@ export class TurnOrchestrator implements ConversationService {
 
       const execution = await adapter.execute(nativeRequest, {
         signal,
+        toolDefinitions: [],
+        limits: DEFAULT_AGENT_LOOP_LIMITS,
+        async executeTool() { throw new Error('Baton tool coordinator is not attached') },
         async denyApproval() { throw new Error('Provider approval requests are disabled in canonical MVP') },
         async denyToolCall() { throw new Error('Provider tool calls are disabled in canonical MVP') },
       })

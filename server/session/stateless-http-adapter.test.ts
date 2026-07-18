@@ -2,7 +2,20 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { StatelessHttpCanonicalAdapter } from './stateless-http-adapter.ts'
+import type { ProviderExecutionContext } from './adapter.ts'
+import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type { ThreadSnapshot } from './domain.ts'
+
+function executionContext(): ProviderExecutionContext {
+  return {
+    signal: new AbortController().signal,
+    toolDefinitions: [],
+    limits: DEFAULT_AGENT_LOOP_LIMITS,
+    async executeTool() { throw new Error('tool not registered') },
+    async denyApproval(): Promise<never> { throw new Error('not used') },
+    async denyToolCall(): Promise<never> { throw new Error('not used') },
+  }
+}
 
 const snapshot: ThreadSnapshot = {
   session: {
@@ -49,11 +62,7 @@ test('Claude adapter sends stateless history and records an actual-model fallbac
     effort: 'high',
     input: [{ kind: 'user_message', payload: { text: 'question' } }],
   }, snapshot)
-  const execution = await adapter.execute(request, {
-    signal: new AbortController().signal,
-    async denyApproval() { throw new Error('not used') },
-    async denyToolCall() { throw new Error('not used') },
-  })
+  const execution = await adapter.execute(request, executionContext())
   const events = []
   for await (const event of execution.events) events.push(event)
   const sentBody = sentBodies[0]
@@ -92,11 +101,7 @@ test('Gemini adapter uses the proxy compatibility route without native tools', a
   const execution = await adapter.execute(adapter.materialize({
     turnId: 'turn-2', model: 'gemini-3.1-pro', effort: null,
     input: [{ kind: 'user_message', payload: { text: 'question' } }],
-  }, snapshot), {
-    signal: new AbortController().signal,
-    async denyApproval() { throw new Error('not used') },
-    async denyToolCall() { throw new Error('not used') },
-  })
+  }, snapshot), executionContext())
   for await (const _event of execution.events) { /* drain */ }
   assert.equal(requestedUrl, 'http://proxy/v1/chat/completions')
   assert.equal((await execution.terminal).status, 'completed')

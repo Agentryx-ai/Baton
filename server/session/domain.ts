@@ -6,6 +6,7 @@ export type ThreadId = string
 export type TurnId = string
 export type ItemId = string
 export type ExecutionId = string
+export type GoalId = string
 
 export type ThreadStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'archived'
 export type TurnStatus =
@@ -24,6 +25,130 @@ export type ExecutionStatus =
   | 'cancelled'
   | 'failed'
   | 'interrupted'
+
+export type GoalStatus =
+  | 'active'
+  | 'paused'
+  | 'blocked'
+  | 'usage_limited'
+  | 'budget_limited'
+  | 'complete'
+
+export type GoalReasonSource = 'user' | 'host' | 'provider' | 'model'
+
+export interface GoalStatusReason {
+  code: string
+  source: GoalReasonSource
+  message: string | null
+  at: string
+}
+
+export interface CanonicalGoal {
+  id: GoalId
+  threadId: ThreadId
+  objective: string
+  status: GoalStatus
+  statusReason: GoalStatusReason | null
+  revision: number
+  provider: CanonicalProvider
+  model: string
+  effort: string | null
+  tokenBudget: number | null
+  tokensUsed: number
+  timeUsedSeconds: number
+  maxAutomaticTurns: number
+  automaticTurnsUsed: number
+  maxActiveSeconds: number
+  noProgressCount: number
+  lastProgressDigest: string | null
+  createdAt: string
+  updatedAt: string
+  startedAt: string
+  completedAt: string | null
+}
+
+export type GoalObservation =
+  | { kind: 'none' }
+  | { kind: 'goal'; goalId: GoalId; revision: number }
+
+export interface GoalSchedulerLease {
+  leaseId: string
+  goalId: GoalId
+  goalRevision: number
+  ownerId: string
+  acquiredAt: string
+  heartbeatAt: string
+  expiresAt: string
+}
+
+export type VisibleWorkStatus =
+  | 'archived'
+  | 'waiting_user'
+  | 'waiting_approval'
+  | 'waiting_tool'
+  | 'running'
+  | 'queued'
+  | 'usage_limited'
+  | 'budget_limited'
+  | 'blocked'
+  | 'paused'
+  | 'failed'
+  | 'interrupted'
+  | 'cancelled'
+  | 'complete'
+  | 'completed'
+  | 'imported'
+  | 'idle'
+
+export interface AgentLoopLimits {
+  maxModelRoundTrips: number
+  maxToolCalls: number
+  maxIdenticalToolCalls: number
+  toolTimeoutMs: number
+  toolOutputBytes: number
+  turnTimeoutMs: number
+  maxProviderRetries: number
+}
+
+export const DEFAULT_AGENT_LOOP_LIMITS: Readonly<AgentLoopLimits> = Object.freeze({
+  maxModelRoundTrips: 32,
+  maxToolCalls: 128,
+  maxIdenticalToolCalls: 3,
+  toolTimeoutMs: 120_000,
+  toolOutputBytes: 256 * 1_024,
+  turnTimeoutMs: 30 * 60_000,
+  maxProviderRetries: 3,
+})
+
+export type AgentToolSideEffect = 'read_only' | 'workspace_mutation' | 'workspace_command' | 'goal'
+
+export interface AgentToolDefinition {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+  sideEffect: AgentToolSideEffect
+}
+
+export interface AgentToolInvocation {
+  callId: string
+  providerCallId: string
+  name: string
+  input: Record<string, unknown>
+}
+
+export type AgentToolResult =
+  | {
+      success: true
+      content: Record<string, unknown>
+      metadata?: Record<string, unknown>
+      error: null
+    }
+  | {
+      success: false
+      content: null
+      metadata?: Record<string, unknown>
+      error: { code: string; message: string; retryable: boolean }
+    }
 
 export type CanonicalItemKind =
   | 'user_message'
