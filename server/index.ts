@@ -15,6 +15,7 @@ import path from 'node:path'
 import { config } from './config.ts'
 import { fetchGateway, sessionStatus } from './gateway-session.ts'
 import { batonRouter } from './baton-routes.ts'
+import { createHostRouter } from './host-routes.ts'
 import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
 import { createOpenAiInferenceBridge } from './openai-inference-bridge.ts'
 import { policyEngine } from './policy-engine.ts'
@@ -39,6 +40,7 @@ app.use(CODEX_NATIVE_PROXY_PATH, createOpenAiInferenceBridge())
 
 // Policy engine control plane (/baton/policy ...).
 app.use(batonRouter)
+app.use(createHostRouter())
 
 // Proxy every /api/* call to the gateway with the held session cookie.
 app.use('/api', async (req, res) => {
