@@ -13,7 +13,7 @@ import type {
 } from './adapter.ts'
 import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 import { ConversationEventHub } from './event-hub.ts'
-import { TurnOrchestrator } from './orchestrator.ts'
+import { chargeableGoalTokens, TurnOrchestrator } from './orchestrator.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
 
 function safeAdapter(
@@ -106,6 +106,16 @@ async function waitForTerminal(store: SqliteSessionStore, turnId: string): Promi
   }
   throw new Error(`turn did not finish: ${turnId}`)
 }
+
+test('Goal token accounting excludes cached reads without subtracting Claude uncached input', () => {
+  assert.equal(chargeableGoalTokens({ inputTokens: 100, cachedInputTokens: 60, outputTokens: 10 }), 50)
+  assert.equal(chargeableGoalTokens({
+    input_tokens: 40,
+    cache_creation_input_tokens: 5,
+    cache_read_input_tokens: 60,
+    output_tokens: 10,
+  }), 55)
+})
 
 test('TurnOrchestrator durably executes one canonical turn and deduplicates retries', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-'))

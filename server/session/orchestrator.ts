@@ -337,14 +337,14 @@ export class TurnOrchestrator implements ConversationService {
           }
           const patch = adapter.extractBinding(event)
           if (patch) this.persistBinding(input, capabilities, patch)
-          tokensUsed = Math.max(tokensUsed, usageTokens(event.payload))
+          tokensUsed = Math.max(tokensUsed, chargeableGoalTokens(event.payload))
           onTokensUsed(tokensUsed)
           this.checkpointGoalTurn(turn, tokensUsed)
           this.events.publish(input.threadId)
         }
         const result = await execution.terminal
         if (signal.aborted) throw signal.reason ?? new Error('Turn cancelled by user')
-        tokensUsed = Math.max(tokensUsed, usageTokens(result.usage))
+        tokensUsed = Math.max(tokensUsed, chargeableGoalTokens(result.usage))
         onTokensUsed(tokensUsed)
         terminal = {
           turnId: turn.id,
@@ -586,10 +586,16 @@ function validateTurnInput(input: StartTurnInput, internalGoalTurn = false): voi
   }
 }
 
-function usageTokens(value: unknown): number {
+export function chargeableGoalTokens(value: unknown): number {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return 0
   const object = value as Record<string, unknown>
-  if (object.usage && typeof object.usage === 'object') return usageTokens(object.usage)
+  if (object.usage && typeof object.usage === 'object') return chargeableGoalTokens(object.usage)
+  if ('cache_read_input_tokens' in object || 'cache_creation_input_tokens' in object) {
+    const uncachedInput = firstFinite(object, ['input_tokens'])
+    const cacheCreation = firstFinite(object, ['cache_creation_input_tokens'])
+    const output = firstFinite(object, ['output_tokens'])
+    return uncachedInput + cacheCreation + output
+  }
   const input = firstFinite(object, ['inputTokens', 'input_tokens', 'input'])
   const cached = firstFinite(object, [
     'cachedInputTokens', 'cached_input_tokens', 'cacheReadInputTokens', 'cache_read_input_tokens',
