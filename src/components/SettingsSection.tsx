@@ -19,6 +19,7 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
+import type { AssistantLabelMode, SessionViewPreferences } from '@/features/conversations/session-view-preferences'
 
 interface SettingsSectionProps {
   routing: RoutingStrategy | null
@@ -39,6 +40,8 @@ interface SettingsSectionProps {
   onRemoveClientIntegration: (
     targets: ClientIntegrationTarget[],
   ) => Promise<ClientIntegrationRemoveResult>
+  conversationPreferences: SessionViewPreferences
+  onConversationPreferencesChange: (preferences: SessionViewPreferences) => void
 }
 
 const INTEGRATION_TARGETS: ReadonlyArray<{
@@ -99,6 +102,8 @@ export function SettingsSection({
   onRefreshClientIntegration,
   onApplyClientIntegration,
   onRemoveClientIntegration,
+  conversationPreferences,
+  onConversationPreferencesChange,
 }: SettingsSectionProps) {
   const affinityManageable = affinity?.manageable ?? true
 
@@ -203,6 +208,33 @@ export function SettingsSection({
             <Info className="size-3.5 shrink-0" aria-hidden />
             스마트 로테이션 ON일 땐 엔진이 우선
           </p>
+        </Row>
+
+        <Separator />
+
+        <Row label="대화 표시">
+          <RadioGroup
+            value={conversationPreferences.assistantLabel}
+            onValueChange={(value) => onConversationPreferencesChange({
+              ...conversationPreferences,
+              assistantLabel: value as AssistantLabelMode,
+            })}
+            className="gap-2"
+          >
+            <div className="flex items-center gap-2">
+              <RadioGroupItem value="provider" id="assistant-label-provider" />
+              <Label htmlFor="assistant-label-provider" className="font-normal">Provider 이름</Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <RadioGroupItem value="assistant" id="assistant-label-assistant" />
+              <Label htmlFor="assistant-label-assistant" className="font-normal">Assistant</Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <RadioGroupItem value="both" id="assistant-label-both" />
+              <Label htmlFor="assistant-label-both" className="font-normal">Assistant · Provider</Label>
+            </div>
+          </RadioGroup>
+          <p className="mt-2 text-xs text-muted-foreground">대화에서 어시스턴트 응답 위에 표시할 이름입니다.</p>
         </Row>
 
         <Separator />

@@ -1,11 +1,13 @@
 import type { CanonicalSessionDto, NativeImportCandidateDto } from './types.ts'
 
 export type SessionGroupMode = 'project' | 'provider' | 'none'
+export type SessionSortMode = 'recent' | 'oldest' | 'name'
 export type AssistantLabelMode = 'provider' | 'assistant' | 'both'
 
 export interface SessionViewPreferences {
   version: 1
   groupBy: SessionGroupMode
+  sortBy: SessionSortMode
   assistantLabel: AssistantLabelMode
   collapsedGroups: string[]
 }
@@ -33,6 +35,7 @@ export const SESSION_VIEW_PREFERENCES_KEY = 'baton.conversations.view.v1'
 export const DEFAULT_SESSION_VIEW_PREFERENCES: SessionViewPreferences = {
   version: 1,
   groupBy: 'project',
+  sortBy: 'recent',
   assistantLabel: 'provider',
   collapsedGroups: [],
 }
@@ -46,6 +49,7 @@ export function loadSessionViewPreferences(storage: Pick<Storage, 'getItem'> | n
     return {
       version: 1,
       groupBy: isGroupMode(parsed.groupBy) ? parsed.groupBy : 'project',
+      sortBy: isSortMode(parsed.sortBy) ? parsed.sortBy : 'recent',
       assistantLabel: isAssistantLabelMode(parsed.assistantLabel) ? parsed.assistantLabel : 'provider',
       collapsedGroups: Array.isArray(parsed.collapsedGroups)
         ? parsed.collapsedGroups.filter((value): value is string => typeof value === 'string')
@@ -71,8 +75,9 @@ export function saveSessionViewPreferences(
 export function groupSessions(
   sessions: CanonicalSessionDto[],
   mode: SessionGroupMode,
+  sort: SessionSortMode = 'recent',
 ): SessionGroup[] {
-  const ordered = [...sessions].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+  const ordered = [...sessions].sort(sessionComparator(sort))
   if (mode === 'none') {
     return [{ id: 'none:all', label: '', sessions: ordered }]
   }
@@ -87,10 +92,29 @@ export function groupSessions(
   }
 
   return [...grouped.values()].sort((left, right) => {
+    if (sort === 'name') return left.label.localeCompare(right.label)
     const leftUpdatedAt = left.sessions[0]?.updatedAt ?? ''
     const rightUpdatedAt = right.sessions[0]?.updatedAt ?? ''
-    return rightUpdatedAt.localeCompare(leftUpdatedAt) || left.label.localeCompare(right.label)
+    const activityOrder = sort === 'oldest'
+      ? leftUpdatedAt.localeCompare(rightUpdatedAt)
+      : rightUpdatedAt.localeCompare(leftUpdatedAt)
+    return activityOrder || left.label.localeCompare(right.label)
   })
+}
+
+function sessionComparator(sort: SessionSortMode): (left: CanonicalSessionDto, right: CanonicalSessionDto) => number {
+  if (sort === 'name') {
+    return (left, right) => sessionLabel(left).localeCompare(sessionLabel(right))
+      || right.updatedAt.localeCompare(left.updatedAt)
+  }
+  if (sort === 'oldest') {
+    return (left, right) => left.updatedAt.localeCompare(right.updatedAt) || left.id.localeCompare(right.id)
+  }
+  return (left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id)
+}
+
+function sessionLabel(session: CanonicalSessionDto): string {
+  return session.title || session.source?.sourceAlias || session.preview || '새 대화'
 }
 
 export function isSelectableNativeCandidate(candidate: NativeImportCandidateDto): boolean {
@@ -183,6 +207,10 @@ function browserStorage(): Storage | null {
 
 function isGroupMode(value: unknown): value is SessionGroupMode {
   return value === 'project' || value === 'provider' || value === 'none'
+}
+
+function isSortMode(value: unknown): value is SessionSortMode {
+  return value === 'recent' || value === 'oldest' || value === 'name'
 }
 
 function isAssistantLabelMode(value: unknown): value is AssistantLabelMode {

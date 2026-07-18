@@ -95,6 +95,11 @@ test('ungrouped and grouped sessions are ordered by latest update without trusti
 
   assert.deepEqual(groupSessions(sessions, 'none')[0]?.sessions.map((item) => item.id), ['newer', 'older'])
   assert.deepEqual(groupSessions(sessions, 'project')[0]?.sessions.map((item) => item.id), ['newer', 'older'])
+  assert.deepEqual(groupSessions(sessions, 'none', 'oldest')[0]?.sessions.map((item) => item.id), ['older', 'newer'])
+  assert.deepEqual(groupSessions([
+    session('zebra', '2026-07-19T00:00:00.000Z'),
+    session('alpha', '2026-07-18T00:00:00.000Z'),
+  ], 'none', 'name')[0]?.sessions.map((item) => item.id), ['alpha', 'zebra'])
 })
 
 test('project grouping does not merge unrelated paths that share a basename', () => {
@@ -111,6 +116,7 @@ test('invalid persisted view preferences fail closed to documented defaults', ()
   const preferences = loadSessionViewPreferences({ getItem: () => '{bad json' })
 
   assert.equal(preferences.groupBy, 'project')
+  assert.equal(preferences.sortBy, 'recent')
   assert.equal(preferences.assistantLabel, 'provider')
   assert.deepEqual(preferences.collapsedGroups, [])
 })

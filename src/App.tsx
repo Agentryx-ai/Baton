@@ -24,6 +24,11 @@ import { ProviderSection } from '@/components/ProviderSection'
 import { SettingsSection } from '@/components/SettingsSection'
 import AddAccountWizard from '@/components/AddAccountWizard'
 import { ConversationWorkspace } from '@/features/conversations'
+import {
+  loadSessionViewPreferences,
+  saveSessionViewPreferences,
+  type SessionViewPreferences,
+} from '@/features/conversations/session-view-preferences'
 
 /** Nested quota map: provider → accountId → quota (null = loading/failed). */
 type QuotaMap = Record<string, Record<string, AccountQuota | null>>
@@ -40,6 +45,11 @@ function App() {
   const { status: proxy } = useProxyStatus()
   const [wizardOpen, setWizardOpen] = useState(false)
   const [apiKey, setApiKey] = useState<string | null>(null)
+  const [conversationPreferences, setConversationPreferences] = useState<SessionViewPreferences>(loadSessionViewPreferences)
+
+  useEffect(() => {
+    saveSessionViewPreferences(conversationPreferences)
+  }, [conversationPreferences])
 
   useEffect(() => {
     const onHashChange = () => setActiveView(viewFromHash())
@@ -255,6 +265,8 @@ function App() {
               accounts={accounts}
               policy={policy}
               routingStrategy={routing?.strategy ?? null}
+              viewPreferences={conversationPreferences}
+              onViewPreferencesChange={setConversationPreferences}
             />
           </section>
 
@@ -277,6 +289,8 @@ function App() {
               onRefreshClientIntegration={refreshClientIntegration}
               onApplyClientIntegration={onApplyClientIntegration}
               onRemoveClientIntegration={onRemoveClientIntegration}
+              conversationPreferences={conversationPreferences}
+              onConversationPreferencesChange={setConversationPreferences}
             />
           </section>
         </main>

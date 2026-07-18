@@ -98,13 +98,19 @@ export const conversationApi = {
     defaultModel: string | null
   }> => request(`/providers/${encodeURIComponent(provider)}/models`),
 
-  listSessions: async (): Promise<CanonicalSessionDto[]> => {
-    const result = await request<{ sessions: CanonicalSessionDto[] }>('/sessions')
+  listSessions: async (scope: 'active' | 'trash' = 'active'): Promise<CanonicalSessionDto[]> => {
+    const result = await request<{ sessions: CanonicalSessionDto[] }>(`/sessions?scope=${scope}`)
     return result.sessions
   },
 
   createSession: (input: CreateSessionDto): Promise<CanonicalSessionDto> =>
     request('/sessions', jsonRequest('POST', input)),
+
+  archiveSession: (sessionId: string): Promise<CanonicalSessionDto> =>
+    request(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
+
+  restoreSession: (sessionId: string): Promise<CanonicalSessionDto> =>
+    request(`/sessions/${encodeURIComponent(sessionId)}/restore`, jsonRequest('POST', {})),
 
   getThread: (threadId: string): Promise<ThreadSnapshotDto> =>
     request(`/threads/${encodeURIComponent(threadId)}`),

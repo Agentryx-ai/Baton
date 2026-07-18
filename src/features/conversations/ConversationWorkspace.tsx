@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ChevronDown,
   ChevronRight,
@@ -11,6 +11,8 @@ import {
   RefreshCw,
   Send,
   Square,
+  Trash2,
+  Undo2,
 } from 'lucide-react'
 
 import { AppNavigation, type AppView } from '@/components/AppNavigation'
@@ -28,17 +30,16 @@ import { cn } from '@/lib/utils'
 import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
-import { latestUsageSummary, transcriptItems } from './conversation-presentation'
+import { conversationEntries, latestUsageSummary } from './conversation-presentation'
 import { NativeImportDialog } from './NativeImportDialog'
 import { ProviderAccountDisclosure } from './ProviderAccountDisclosure'
 import {
   groupSessions,
-  loadSessionViewPreferences,
-  saveSessionViewPreferences,
-  type AssistantLabelMode,
   type SessionGroupMode,
+  type SessionSortMode,
   type SessionViewPreferences,
 } from './session-view-preferences'
+import { isNearScrollBottom } from './conversation-scroll'
 import type {
   CanonicalProvider,
   CanonicalSessionDto,
@@ -83,11 +84,15 @@ function SessionSidebar({
   selectedSessionId,
   loading,
   creating,
+  scope,
   preferences,
   onSelect,
   onCreate,
   onRefresh,
   onPreferencesChange,
+  onScopeChange,
+  onArchive,
+  onRestore,
   onOpenImport,
   onNavigate,
 }: {
@@ -95,21 +100,22 @@ function SessionSidebar({
   selectedSessionId: string | null
   loading: boolean
   creating: boolean
+  scope: 'active' | 'trash'
   preferences: SessionViewPreferences
   onSelect: (sessionId: string) => void
   onCreate: () => void
   onRefresh: () => void
   onPreferencesChange: (preferences: SessionViewPreferences) => void
+  onScopeChange: (scope: 'active' | 'trash') => void
+  onArchive: (session: CanonicalSessionDto) => void
+  onRestore: (session: CanonicalSessionDto) => void
   onOpenImport: () => void
   onNavigate: (view: AppView) => void
 }) {
-  const groups = sessions ? groupSessions(sessions, preferences.groupBy) : []
+  const groups = sessions ? groupSessions(sessions, preferences.groupBy, preferences.sortBy) : []
   const collapsed = new Set(preferences.collapsedGroups)
   const setGroupBy = (groupBy: SessionGroupMode) => onPreferencesChange({ ...preferences, groupBy })
-  const setAssistantLabel = (assistantLabel: AssistantLabelMode) => onPreferencesChange({
-    ...preferences,
-    assistantLabel,
-  })
+  const setSortBy = (sortBy: SessionSortMode) => onPreferencesChange({ ...preferences, sortBy })
   const toggleGroup = (groupId: string) => onPreferencesChange({
     ...preferences,
     collapsedGroups: collapsed.has(groupId)
@@ -129,17 +135,28 @@ function SessionSidebar({
           variant="outline"
           className="w-full justify-start bg-background/60"
           disabled={creating}
-          onClick={onCreate}
+          onClick={scope === 'trash' ? () => onScopeChange('active') : onCreate}
         >
-          <MessageSquarePlus aria-hidden />
-          새 대화
+          {scope === 'trash' ? <Undo2 aria-hidden /> : <MessageSquarePlus aria-hidden />}
+          {scope === 'trash' ? '대화로 돌아가기' : '새 대화'}
         </Button>
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col px-2 pb-2">
         <div className="flex shrink-0 items-center justify-between px-2 py-2">
-          <span className="text-xs font-medium text-muted-foreground">최근 대화</span>
+          <span className="text-xs font-medium text-muted-foreground">{scope === 'trash' ? '휴지통' : '최근 대화'}</span>
           <div className="flex items-center">
+            {scope === 'active' ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                onClick={onOpenImport}
+                aria-label="Native 작업 가져오기"
+              >
+                <Download aria-hidden />
+              </Button>
+            ) : null}
             <Button
               type="button"
               variant="ghost"
@@ -156,6 +173,24 @@ function SessionSidebar({
               </summary>
               <div className="absolute right-0 z-30 mt-1 w-56 rounded-lg border bg-popover p-2 text-popover-foreground shadow-lg">
                 <fieldset className="space-y-1">
+                  <legend className="px-2 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">보기</legend>
+                  {([['active', '대화'], ['trash', '휴지통']] as const).map(([value, label]) => (
+                    <label key={value} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent">
+                      <input
+                        type="radio"
+                        name="session-list-scope"
+                        checked={scope === value}
+                        onChange={(event) => {
+                          event.currentTarget.closest('details')?.removeAttribute('open')
+                          onScopeChange(value)
+                        }}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </fieldset>
+                <div className="my-2 border-t" />
+                <fieldset className="space-y-1">
                   <legend className="px-2 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">그룹화</legend>
                   {([
                     ['project', '프로젝트'],
@@ -170,30 +205,18 @@ function SessionSidebar({
                 </fieldset>
                 <div className="my-2 border-t" />
                 <fieldset className="space-y-1">
-                  <legend className="px-2 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">응답 이름</legend>
+                  <legend className="px-2 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wide text-muted-foreground">정렬</legend>
                   {([
-                    ['provider', 'Provider 이름'],
-                    ['assistant', 'Assistant'],
-                    ['both', '둘 다'],
-                  ] as Array<[AssistantLabelMode, string]>).map(([value, label]) => (
+                    ['recent', '최근 활동순'],
+                    ['oldest', '오래된 활동순'],
+                    ['name', '이름순'],
+                  ] as Array<[SessionSortMode, string]>).map(([value, label]) => (
                     <label key={value} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent">
-                      <input type="radio" name="assistant-label-mode" checked={preferences.assistantLabel === value} onChange={() => setAssistantLabel(value)} />
+                      <input type="radio" name="session-sort-mode" checked={preferences.sortBy === value} onChange={() => setSortBy(value)} />
                       {label}
                     </label>
                   ))}
                 </fieldset>
-                <div className="my-2 border-t" />
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-accent"
-                  onClick={(event) => {
-                    event.currentTarget.closest('details')?.removeAttribute('open')
-                    onOpenImport()
-                  }}
-                >
-                  <Download className="size-3.5" aria-hidden />
-                  Native 작업 가져오기
-                </button>
               </div>
             </details>
           </div>
@@ -204,12 +227,19 @@ function SessionSidebar({
             <p className="px-2 py-4 text-xs text-muted-foreground">불러오는 중…</p>
           ) : sessions.length === 0 ? (
             <p className="px-2 py-4 text-xs leading-relaxed text-muted-foreground">
-              아직 대화가 없습니다.
+              {scope === 'trash' ? '휴지통이 비어 있습니다.' : '아직 대화가 없습니다.'}
             </p>
           ) : (
             groups.map((group) => preferences.groupBy === 'none' ? (
               group.sessions.map((session) => (
-                <SessionButton key={session.id} session={session} selected={session.id === selectedSessionId} onSelect={onSelect} />
+                <SessionButton
+                  key={session.id}
+                  session={session}
+                  selected={session.id === selectedSessionId}
+                  onSelect={onSelect}
+                  onAction={scope === 'trash' ? onRestore : onArchive}
+                  action={scope === 'trash' ? 'restore' : 'archive'}
+                />
               ))
             ) : (
               <section key={group.id} className="pb-2 pt-1 first:pt-0">
@@ -230,7 +260,15 @@ function SessionSidebar({
                 {!collapsed.has(group.id) ? (
                   <div className="ml-3 mt-0.5 space-y-0.5 border-l border-sidebar-border pl-1.5">
                     {group.sessions.map((session) => (
-                      <SessionButton key={session.id} session={session} selected={session.id === selectedSessionId} onSelect={onSelect} nested />
+                      <SessionButton
+                        key={session.id}
+                        session={session}
+                        selected={session.id === selectedSessionId}
+                        onSelect={onSelect}
+                        onAction={scope === 'trash' ? onRestore : onArchive}
+                        action={scope === 'trash' ? 'restore' : 'archive'}
+                        nested
+                      />
                     ))}
                   </div>
                 ) : null}
@@ -247,33 +285,61 @@ function SessionButton({
   session,
   selected,
   onSelect,
+  onAction,
+  action,
   nested = false,
 }: {
   session: CanonicalSessionDto
   selected: boolean
   onSelect: (sessionId: string) => void
+  onAction: (session: CanonicalSessionDto) => void
+  action: 'archive' | 'restore'
   nested?: boolean
 }) {
   return (
-    <button
-      type="button"
-      onClick={() => onSelect(session.id)}
+    <div
       className={cn(
-        'w-full text-left text-sm transition-colors',
-        nested ? 'rounded-md px-2.5 py-2' : 'rounded-lg px-3 py-2.5',
+        'group/session relative flex w-full items-center text-sm transition-colors',
+        nested ? 'rounded-md' : 'rounded-lg',
         selected
           ? 'bg-sidebar-accent text-sidebar-accent-foreground shadow-sm ring-1 ring-sidebar-border/70'
           : 'text-sidebar-foreground/75 hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground',
       )}
     >
-      <span className="block truncate font-medium">
-        {session.title || session.source?.sourceAlias || session.preview || '새 대화'}
-      </span>
-      {session.title && session.preview ? (
-        <span className="mt-0.5 block truncate text-xs opacity-70">{session.preview}</span>
-      ) : null}
-    </button>
+      <button
+        type="button"
+        onClick={() => onSelect(session.id)}
+        className={cn('min-w-0 flex-1 text-left', nested ? 'px-2.5 py-2' : 'px-3 py-2.5')}
+      >
+        <span className="block truncate font-medium">
+          {session.title || session.source?.sourceAlias || session.preview || '새 대화'}
+        </span>
+        {action === 'restore' && session.archivedAt ? (
+          <span className="mt-0.5 block truncate text-[0.6875rem] opacity-65">
+            {trashExpiryLabel(session.archivedAt)}
+          </span>
+        ) : session.title && session.preview ? (
+          <span className="mt-0.5 block truncate text-xs opacity-70">{session.preview}</span>
+        ) : null}
+      </button>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        className="mr-1 shrink-0 opacity-100 md:opacity-0 md:focus-visible:opacity-100 md:group-hover/session:opacity-100"
+        onClick={() => onAction(session)}
+        aria-label={action === 'restore' ? '대화 복원' : '대화를 휴지통으로 이동'}
+        title={action === 'restore' ? '복원' : '휴지통으로 이동'}
+      >
+        {action === 'restore' ? <Undo2 aria-hidden /> : <Trash2 aria-hidden />}
+      </Button>
+    </div>
   )
+}
+
+function trashExpiryLabel(archivedAt: string): string {
+  const expires = new Date(Date.parse(archivedAt) + 30 * 24 * 60 * 60 * 1_000)
+  return `${expires.toLocaleDateString('ko-KR')} 자동 삭제`
 }
 
 export function ConversationWorkspace({
@@ -282,12 +348,16 @@ export function ConversationWorkspace({
   accounts,
   policy,
   routingStrategy,
+  viewPreferences,
+  onViewPreferencesChange,
 }: {
   onNavigateHome: () => void
   onNavigateSettings: () => void
   accounts: Record<string, Account[]> | null
   policy: PolicyState | null
   routingStrategy: RoutingStrategyName | null
+  viewPreferences: SessionViewPreferences
+  onViewPreferencesChange: (preferences: SessionViewPreferences) => void
 }) {
   const [sessions, setSessions] = useState<CanonicalSessionDto[] | null>(null)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
@@ -310,8 +380,13 @@ export function ConversationWorkspace({
   const [cancelling, setCancelling] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
-  const [viewPreferences, setViewPreferences] = useState(loadSessionViewPreferences)
+  const [sessionScope, setSessionScope] = useState<'active' | 'trash'>('active')
+  const [pendingArchive, setPendingArchive] = useState<CanonicalSessionDto | null>(null)
+  const [changingSessionId, setChangingSessionId] = useState<string | null>(null)
   const threadRequest = useRef(0)
+  const transcriptScroller = useRef<HTMLDivElement | null>(null)
+  const lastPositionedThread = useRef<string | null>(null)
+  const followOutput = useRef(true)
 
   const selectedSession = useMemo(
     () => sessions?.find((session) => session.id === selectedSessionId) ?? null,
@@ -325,7 +400,7 @@ export function ConversationWorkspace({
   const refreshSessions = useCallback(async () => {
     setLoadingSessions(true)
     try {
-      const result = await conversationApi.listSessions()
+      const result = await conversationApi.listSessions(sessionScope)
       setSessions(result)
       setSelectedSessionId((current) => {
         if (current && result.some((session) => session.id === current)) return current
@@ -337,7 +412,7 @@ export function ConversationWorkspace({
     } finally {
       setLoadingSessions(false)
     }
-  }, [])
+  }, [sessionScope])
 
   const refreshModels = useCallback(async () => {
     const results = await Promise.all(PROVIDERS.map(async (candidate) => {
@@ -398,10 +473,6 @@ export function ConversationWorkspace({
   useEffect(() => {
     void refreshSessions()
   }, [refreshSessions])
-
-  useEffect(() => {
-    saveSessionViewPreferences(viewPreferences)
-  }, [viewPreferences])
 
   useEffect(() => {
     void refreshModels()
@@ -467,12 +538,23 @@ export function ConversationWorkspace({
   const activeTurn = snapshot ? latestActiveTurn(snapshot.turns) : null
   const latestTurn = snapshot?.turns.at(-1) ?? null
   const latestUsage = latestUsageSummary(snapshot?.turns ?? [])
-  const visibleItems = transcriptItems(snapshot?.items ?? [])
+  const visibleEntries = conversationEntries(snapshot?.items ?? [])
   const latestTurnError = latestTurn?.status === 'failed' && latestTurn.error
     ? typeof latestTurn.error.message === 'string'
       ? latestTurn.error.message
       : JSON.stringify(latestTurn.error)
     : null
+
+  useLayoutEffect(() => {
+    const scroller = transcriptScroller.current
+    const renderedThreadId = snapshot?.thread.id ?? null
+    if (!scroller || !renderedThreadId) return
+    if (lastPositionedThread.current !== renderedThreadId || followOutput.current) {
+      scroller.scrollTop = scroller.scrollHeight
+      lastPositionedThread.current = renderedThreadId
+      followOutput.current = true
+    }
+  }, [snapshot?.thread.id, snapshot?.thread.revision, visibleEntries.length])
 
   const cancelTurn = async () => {
     if (!activeTurn) return
@@ -489,6 +571,7 @@ export function ConversationWorkspace({
 
   const canSubmit = Boolean(
     snapshot
+      && !selectedSession?.archivedAt
       && snapshot.thread.status === 'idle'
       && prompt.trim()
       && model.trim()
@@ -500,17 +583,58 @@ export function ConversationWorkspace({
     setMobileSidebarOpen(false)
   }
 
+  const changeScope = (scope: 'active' | 'trash') => {
+    if (scope === sessionScope) return
+    setSessionScope(scope)
+    setSessions(null)
+    setSelectedSessionId(null)
+    setSnapshot(null)
+    lastPositionedThread.current = null
+  }
+
+  const archivePendingSession = async () => {
+    if (!pendingArchive) return
+    setChangingSessionId(pendingArchive.id)
+    try {
+      await conversationApi.archiveSession(pendingArchive.id)
+      setPendingArchive(null)
+      await refreshSessions()
+      setError(null)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setChangingSessionId(null)
+    }
+  }
+
+  const restoreSession = async (session: CanonicalSessionDto) => {
+    setChangingSessionId(session.id)
+    try {
+      await conversationApi.restoreSession(session.id)
+      await refreshSessions()
+      setError(null)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setChangingSessionId(null)
+    }
+  }
+
   const sidebar = (
     <SessionSidebar
       sessions={sessions}
       selectedSessionId={selectedSessionId}
       loading={loadingSessions}
       creating={creating}
+      scope={sessionScope}
       preferences={viewPreferences}
       onSelect={selectSession}
       onCreate={() => void createSession()}
       onRefresh={() => void refreshSessions()}
-      onPreferencesChange={setViewPreferences}
+      onPreferencesChange={onViewPreferencesChange}
+      onScopeChange={changeScope}
+      onArchive={setPendingArchive}
+      onRestore={(session) => void restoreSession(session)}
       onOpenImport={() => {
         setMobileSidebarOpen(false)
         setNativeImportOpen(true)
@@ -549,6 +673,27 @@ export function ConversationWorkspace({
         onImported={refreshSessions}
       />
 
+      <Dialog open={pendingArchive !== null} onOpenChange={(open) => { if (!open) setPendingArchive(null) }}>
+        <DialogContent className="max-w-sm">
+          <DialogTitle>대화를 휴지통으로 이동할까요?</DialogTitle>
+          <DialogDescription>
+            30일 동안 휴지통에서 읽거나 복원할 수 있으며, 이후 자동으로 영구 삭제됩니다.
+          </DialogDescription>
+          <div className="mt-2 flex justify-end gap-2">
+            <Button type="button" variant="ghost" onClick={() => setPendingArchive(null)}>취소</Button>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={changingSessionId === pendingArchive?.id}
+              onClick={() => void archivePendingSession()}
+            >
+              <Trash2 aria-hidden />
+              {changingSessionId === pendingArchive?.id ? '이동 중…' : '휴지통으로 이동'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center gap-3 border-b px-3 sm:px-5">
           <Button
@@ -563,7 +708,7 @@ export function ConversationWorkspace({
           </Button>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-sm font-semibold">
-              {selectedSession?.title || selectedSession?.preview || '새 대화'}
+              {selectedSession?.title || selectedSession?.preview || (sessionScope === 'trash' ? '휴지통' : '새 대화')}
             </h1>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -574,12 +719,18 @@ export function ConversationWorkspace({
               )}
               aria-hidden
             />
-            <span>{snapshot?.thread.status === 'running' ? '응답 중' : '준비됨'}</span>
-            <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge>
+            <span>{sessionScope === 'trash' ? '읽기 전용' : snapshot?.thread.status === 'running' ? '응답 중' : '준비됨'}</span>
+            {sessionScope === 'active' ? <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge> : null}
           </div>
         </header>
 
-        <div className="min-h-0 flex-1 overflow-y-auto">
+        <div
+          ref={transcriptScroller}
+          className="min-h-0 flex-1 overflow-y-auto"
+          onScroll={(event) => {
+            followOutput.current = isNearScrollBottom(event.currentTarget)
+          }}
+        >
           <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-4 pb-8 pt-8 sm:px-6 sm:pt-12">
             {(error || latestTurnError) && (
               <div className="mb-6 space-y-2" aria-live="polite">
@@ -600,21 +751,31 @@ export function ConversationWorkspace({
               <p className="m-auto text-sm text-muted-foreground">대화를 불러오는 중…</p>
             ) : !snapshot ? (
               <div className="m-auto max-w-md py-16 text-center">
-                <h2 className="text-2xl font-semibold tracking-tight">무엇을 도와드릴까요?</h2>
+                <h2 className="text-2xl font-semibold tracking-tight">{sessionScope === 'trash' ? '휴지통이 비어 있습니다' : '무엇을 도와드릴까요?'}</h2>
                 <p className="mt-3 text-sm text-muted-foreground">
-                  왼쪽에서 대화를 선택하거나 새 대화를 시작하세요.
+                  {sessionScope === 'trash' ? '삭제한 대화는 30일 동안 여기에 보관됩니다.' : '왼쪽에서 대화를 선택하거나 새 대화를 시작하세요.'}
                 </p>
               </div>
-            ) : visibleItems.length === 0 ? (
+            ) : visibleEntries.length === 0 ? (
               <div className="m-auto max-w-md py-16 text-center">
                 <h2 className="text-2xl font-semibold tracking-tight">무엇을 도와드릴까요?</h2>
                 <p className="mt-3 text-sm text-muted-foreground">메시지를 입력해 대화를 시작하세요.</p>
               </div>
             ) : (
-              <div className="space-y-7">
-                {visibleItems.map((item) => (
-                  <ConversationItem key={item.id} item={item} assistantLabelMode={viewPreferences.assistantLabel} />
-                ))}
+              <div>
+                {visibleEntries.map(({ item, toolResult }, index) => {
+                  const compact = isCompactTranscriptItem(item)
+                  const previousCompact = index > 0 && isCompactTranscriptItem(visibleEntries[index - 1]!.item)
+                  return (
+                    <div key={item.id} className={cn(index > 0 && (compact && previousCompact ? 'mt-2' : 'mt-7'))}>
+                      <ConversationItem
+                        item={item}
+                        toolResult={toolResult}
+                        assistantLabelMode={viewPreferences.assistantLabel}
+                      />
+                    </div>
+                  )
+                })}
               </div>
             )}
 
@@ -629,6 +790,13 @@ export function ConversationWorkspace({
           </div>
         </div>
 
+        {sessionScope === 'trash' ? (
+          <div className="shrink-0 border-t bg-muted/20 px-4 py-3 text-center text-xs text-muted-foreground">
+            {selectedSession?.archivedAt
+              ? `이 대화는 읽기 전용입니다. ${trashExpiryLabel(selectedSession.archivedAt)}`
+              : '삭제한 대화는 30일 동안 복원할 수 있습니다.'}
+          </div>
+        ) : (
         <div className="shrink-0 bg-gradient-to-t from-background via-background to-background/0 px-3 pb-4 pt-2 sm:px-6 sm:pb-6">
           <form
             className="mx-auto w-full max-w-3xl rounded-2xl border bg-background p-2 shadow-lg shadow-black/5"
@@ -742,7 +910,16 @@ export function ConversationWorkspace({
             </p>
           ) : null}
         </div>
+        )}
       </div>
     </section>
   )
+}
+
+function isCompactTranscriptItem(item: { kind: string }): boolean {
+  return item.kind === 'tool_call'
+    || item.kind === 'tool_result'
+    || item.kind === 'file_change'
+    || item.kind === 'provider_event'
+    || item.kind === 'reasoning_summary'
 }

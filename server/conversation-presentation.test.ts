@@ -2,6 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  activitySummary,
+  conversationEntries,
+  isLongConversationText,
   latestUsageSummary,
   payloadText,
   transcriptItems,
@@ -65,4 +68,27 @@ test('usage stays canonical but is summarized once outside the transcript', () =
 
   assert.deepEqual(transcriptItems([assistant, usage]), [assistant])
   assert.equal(latestUsageSummary([turn]), '합계 12 · 입력 10 · 출력 2')
+})
+
+test('tool calls and results become one compact transcript entry', () => {
+  const call = {
+    ...item({ callId: 'tool-1', name: 'read_file', arguments: { path: 'src/App.tsx' } }),
+    id: 'call',
+    kind: 'tool_call' as const,
+  }
+  const result = {
+    ...item({ callId: 'tool-1', content: 'large raw output' }),
+    id: 'result',
+    kind: 'tool_result' as const,
+  }
+  const entries = conversationEntries([call, result])
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0]?.toolResult?.id, 'result')
+  assert.equal(activitySummary(call, result), '읽기 · src/App.tsx · 완료')
+})
+
+test('long message detection is deterministic by characters or lines', () => {
+  assert.equal(isLongConversationText('short'), false)
+  assert.equal(isLongConversationText('x'.repeat(2_401)), true)
+  assert.equal(isLongConversationText(Array.from({ length: 25 }, () => 'line').join('\n')), true)
 })

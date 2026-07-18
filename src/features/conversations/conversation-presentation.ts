@@ -80,6 +80,86 @@ export function transcriptItems(items: CanonicalItemDto[]): CanonicalItemDto[] {
   return items.filter((item) => item.kind !== 'usage')
 }
 
+export interface ConversationDisplayEntry {
+  item: CanonicalItemDto
+  toolResult: CanonicalItemDto | null
+}
+
+export function conversationEntries(items: CanonicalItemDto[]): ConversationDisplayEntry[] {
+  const entries: ConversationDisplayEntry[] = []
+  const toolCalls = new Map<string, number>()
+  for (const item of transcriptItems(items)) {
+    const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
+    if (item.kind === 'tool_result' && callId && toolCalls.has(callId)) {
+      const entry = entries[toolCalls.get(callId)!]
+      if (entry) entry.toolResult = item
+      continue
+    }
+    const index = entries.push({ item, toolResult: null }) - 1
+    if (item.kind === 'tool_call' && callId) toolCalls.set(callId, index)
+  }
+  return entries
+}
+
+export function isLongConversationText(text: string): boolean {
+  return text.length > 2_400 || text.split('\n', 25).length > 24
+}
+
+export function activitySummary(item: CanonicalItemDto, result: CanonicalItemDto | null = null): string {
+  if (item.kind === 'tool_result') return toolResultFailed(item) ? '도구 실행 실패' : '도구 실행 완료'
+  if (item.kind === 'file_change') {
+    const path = payloadValue(item.payload, ['path', 'filePath', 'file_path'])
+    return path ? `파일 변경 · ${path}` : '파일 변경'
+  }
+  if (item.kind !== 'tool_call') return ITEM_LABEL[item.kind]
+
+  const name = payloadValue(item.payload, ['name', 'toolName', 'tool']) ?? '도구'
+  const input = nestedPayload(item.payload)
+  const lower = name.toLocaleLowerCase()
+  const state = result && toolResultFailed(result) ? '실패' : result ? '완료' : '실행 중'
+  if (/read|open/.test(lower)) return semanticActivity('읽기', input, ['path', 'filePath', 'file_path'], state)
+  if (/edit|write|patch/.test(lower)) return semanticActivity('편집', input, ['path', 'filePath', 'file_path'], state)
+  if (/search|grep|find/.test(lower)) return semanticActivity('검색', input, ['query', 'pattern', 'path'], state)
+  if (/shell|bash|exec|command|run/.test(lower)) return semanticActivity('명령', input, ['command', 'cmd'], state)
+  return `${name} · ${state}`
+}
+
+function semanticActivity(label: string, payload: JsonObject, keys: string[], state: string): string {
+  const detail = payloadValue(payload, keys)
+  return detail ? `${label} · ${detail} · ${state}` : `${label} · ${state}`
+}
+
+function toolResultFailed(item: CanonicalItemDto): boolean {
+  return item.payload.isError === true
+    || item.payload.success === false
+    || item.payload.status === 'failed'
+    || item.payload.status === 'error'
+    || item.payload.error !== undefined
+}
+
+function nestedPayload(payload: JsonObject): JsonObject {
+  const direct = record(payload.arguments) ?? record(payload.input)
+  if (direct) return direct
+  const encoded = typeof payload.arguments === 'string' ? payload.arguments : null
+  if (encoded) {
+    try {
+      const parsed: unknown = JSON.parse(encoded)
+      if (parsed && !Array.isArray(parsed) && typeof parsed === 'object') return parsed as JsonObject
+    } catch {
+      // Non-JSON tool arguments remain available in the raw detail disclosure.
+    }
+  }
+  return payload
+}
+
+function payloadValue(payload: JsonObject, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = payload[key]
+    if (typeof value === 'string' && value.trim()) return value.trim().replace(/\s+/g, ' ').slice(0, 180)
+  }
+  return null
+}
+
 export function latestUsageSummary(turns: CanonicalTurnDto[]): string | null {
   const turn = [...turns].reverse().find((item) => item.usage !== null)
   return turn?.usage ? usageSummary(turn.usage) : null

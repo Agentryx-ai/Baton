@@ -1,9 +1,12 @@
-import { Bot, Brain, CircleAlert, Gauge, UserRound } from 'lucide-react'
+import { useState } from 'react'
+import { Bot, Brain, ChevronRight, CircleAlert, FilePenLine, Gauge, UserRound, Wrench } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 
 import {
+  activitySummary,
   ITEM_LABEL,
+  isLongConversationText,
   PROVIDER_LABEL,
   payloadDetail,
   payloadText,
@@ -27,9 +30,11 @@ function ItemIcon({ kind }: { kind: CanonicalItemDto['kind'] }) {
 
 export function ConversationItem({
   item,
+  toolResult = null,
   assistantLabelMode = 'provider',
 }: {
   item: CanonicalItemDto
+  toolResult?: CanonicalItemDto | null
   assistantLabelMode?: AssistantLabelMode
 }) {
   const isError = item.kind === 'error'
@@ -48,13 +53,33 @@ export function ConversationItem({
   const assistantHeader = item.kind === 'assistant_message'
     ? assistantLabel(item, assistantLabelMode)
     : null
+  const isToolActivity = item.kind === 'tool_call'
+    || item.kind === 'tool_result'
+    || item.kind === 'file_change'
+    || item.kind === 'provider_event'
+
+  if (isToolActivity) {
+    const failed = activityFailed(item) || (toolResult ? activityFailed(toolResult) : false)
+    const ActivityIcon = item.kind === 'file_change' ? FilePenLine : Wrench
+    return (
+      <details className={cn('group/activity text-sm text-muted-foreground', failed && 'text-destructive')}>
+        <summary className="flex cursor-pointer list-none items-center gap-2 rounded-md py-1 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+          <ActivityIcon className="size-3.5 shrink-0" aria-hidden />
+          <span className="min-w-0 truncate font-medium">{activitySummary(item, toolResult)}</span>
+          <ChevronRight className="ml-auto size-3.5 shrink-0 opacity-50 transition-transform group-open/activity:rotate-90" aria-hidden />
+        </summary>
+        <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border bg-muted/30 p-3 font-mono text-[0.6875rem] text-foreground">
+          {payloadDetail(item)}
+          {toolResult ? `\n\n결과\n${payloadDetail(toolResult)}` : ''}
+        </pre>
+      </details>
+    )
+  }
 
   if (item.kind === 'user_message') {
     return (
       <article className="ml-auto max-w-[88%] rounded-2xl bg-muted px-4 py-3 sm:max-w-[78%]">
-        <div className="whitespace-pre-wrap break-words text-[0.9375rem] leading-6 text-foreground">
-          {body}
-        </div>
+        <LongContent text={body} className="text-[0.9375rem] leading-6 text-foreground" fadeClassName="after:from-muted" />
       </article>
     )
   }
@@ -66,7 +91,7 @@ export function ConversationItem({
           <ItemIcon kind={item.kind} />
           <span className="font-medium">추론 요약</span>
         </summary>
-        <div className="mt-2 border-l-2 pl-4 italic leading-6">{body}</div>
+        <div className="mt-2 border-l-2 pl-4 italic leading-6"><LongContent text={body} /></div>
         <details className="mt-2 pl-4 text-xs">
           <summary className="cursor-pointer select-none hover:text-foreground">세부 정보</summary>
           <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted/50 p-3 font-mono text-[0.6875rem] text-foreground">
@@ -105,16 +130,14 @@ export function ConversationItem({
         ) : null}
       </header>
 
-      <div
+      <LongContent
+        text={body}
         className={cn(
-          'whitespace-pre-wrap break-words text-[0.9375rem] leading-7 text-foreground',
+          'text-[0.9375rem] leading-7 text-foreground',
           isUsage && 'font-mono text-xs text-muted-foreground',
           isError && 'font-medium text-destructive',
         )}
-      >
-        {isError && <span aria-hidden>■ </span>}
-        {body}
-      </div>
+      />
 
       {showRawDetail && (
         <details className="mt-2 text-xs text-muted-foreground">
@@ -128,6 +151,50 @@ export function ConversationItem({
       )}
     </article>
   )
+}
+
+function LongContent({
+  text,
+  className,
+  fadeClassName = 'after:from-background',
+}: {
+  text: string
+  className?: string
+  fadeClassName?: string
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const collapsible = isLongConversationText(text)
+  return (
+    <div>
+      <div
+        className={cn(
+          'relative whitespace-pre-wrap break-words',
+          collapsible && !expanded && 'max-h-72 overflow-hidden after:absolute after:inset-x-0 after:bottom-0 after:h-16 after:bg-gradient-to-t after:to-transparent',
+          collapsible && !expanded && fadeClassName,
+          className,
+        )}
+      >
+        {text}
+      </div>
+      {collapsible ? (
+        <button
+          type="button"
+          className="mt-2 rounded-md text-xs font-medium text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? '접기' : '더 보기'}
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
+function activityFailed(item: CanonicalItemDto): boolean {
+  return item.payload.isError === true
+    || item.payload.success === false
+    || item.payload.status === 'failed'
+    || item.payload.status === 'error'
+    || item.payload.error !== undefined
 }
 
 function assistantLabel(item: CanonicalItemDto, mode: AssistantLabelMode): string {
