@@ -417,7 +417,7 @@ export function ConversationWorkspace({
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [goalBusyAction, setGoalBusyAction] = useState<GoalAction | 'create' | null>(null)
-  const [goalDialog, setGoalDialog] = useState<'create' | 'edit' | 'resume' | 'clear' | null>(null)
+  const [goalDialog, setGoalDialog] = useState<'create' | 'replace' | 'edit' | 'resume' | 'clear' | null>(null)
   const [goalDraft, setGoalDraft] = useState('')
   const [goalPanelVersion, setGoalPanelVersion] = useState(0)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -547,23 +547,26 @@ export function ConversationWorkspace({
     }
   }
 
-  const saveGoalObjective = async (objective: string) => {
+  const saveGoalObjective = async (objective: string, replace = false) => {
     if (!snapshot || !model.trim()) return
     const current = snapshot.goal ?? null
     setGoalBusyAction(current ? 'edit' : 'create')
     try {
-      if (current) {
+      if (current && !replace) {
         await conversationApi.editGoal(current.id, {
           expectedRevision: current.revision,
           objective,
         })
       } else {
         await conversationApi.createGoal(snapshot.thread.id, {
-          expected: { kind: 'none' },
+          expected: current
+            ? { kind: 'goal', goalId: current.id, revision: current.revision }
+            : { kind: 'none' },
           objective,
           provider,
           model: model.trim(),
           effort,
+          replaceExisting: replace || undefined,
         })
       }
       setGoalDialog(null)
@@ -628,7 +631,12 @@ export function ConversationWorkspace({
       return
     }
     if (command.type === 'set') {
-      await saveGoalObjective(command.objective)
+      if (current && current.status !== 'complete') {
+        setGoalDraft(command.objective)
+        setGoalDialog('replace')
+      } else {
+        await saveGoalObjective(command.objective, current !== null)
+      }
       return
     }
     if (command.type === 'edit') {
@@ -778,9 +786,9 @@ export function ConversationWorkspace({
 
   const confirmGoalDialog = async () => {
     const current = snapshot?.goal ?? null
-    if (goalDialog === 'create' || goalDialog === 'edit') {
+    if (goalDialog === 'create' || goalDialog === 'replace' || goalDialog === 'edit') {
       const objective = goalDraft.trim()
-      if (objective) await saveGoalObjective(objective)
+      if (objective) await saveGoalObjective(objective, goalDialog === 'replace')
       return
     }
     if (!current || !goalDialog) return
@@ -885,6 +893,7 @@ export function ConversationWorkspace({
         <DialogContent className="max-w-md">
           <DialogTitle>
             {goalDialog === 'create' ? 'Goal 만들기'
+              : goalDialog === 'replace' ? '현재 Goal 바꾸기'
               : goalDialog === 'edit' ? 'Goal 수정'
                 : goalDialog === 'resume' ? 'Goal 다시 시작'
                   : 'Goal 지우기'}
@@ -892,11 +901,13 @@ export function ConversationWorkspace({
           <DialogDescription>
             {goalDialog === 'create' || goalDialog === 'edit'
               ? 'Baton이 이 목표를 대화의 정본으로 저장하고, 완료되거나 안전 한도에 도달할 때까지 이어서 실행합니다.'
+              : goalDialog === 'replace'
+                ? '현재 Goal을 종료하고 새 Goal ID와 새 실행 한도로 교체합니다. 대화 기록은 그대로 남습니다.'
               : goalDialog === 'resume'
                 ? '자동 실행 횟수와 활성 시간 카운터를 초기화하고 다시 진행합니다.'
                 : 'Goal 상태만 지웁니다. 지금까지의 대화와 작업 기록은 남습니다.'}
           </DialogDescription>
-          {goalDialog === 'create' || goalDialog === 'edit' ? (
+          {goalDialog === 'create' || goalDialog === 'replace' || goalDialog === 'edit' ? (
             <textarea
               value={goalDraft}
               onChange={(event) => setGoalDraft(event.target.value)}
@@ -912,10 +923,10 @@ export function ConversationWorkspace({
             <Button
               type="button"
               variant={goalDialog === 'clear' ? 'destructive' : 'default'}
-              disabled={goalBusyAction !== null || ((goalDialog === 'create' || goalDialog === 'edit') && !goalDraft.trim())}
+              disabled={goalBusyAction !== null || ((goalDialog === 'create' || goalDialog === 'replace' || goalDialog === 'edit') && !goalDraft.trim())}
               onClick={() => void confirmGoalDialog()}
             >
-              {goalBusyAction ? '처리 중…' : goalDialog === 'clear' ? 'Goal 지우기' : goalDialog === 'resume' ? '다시 시작' : '저장하고 시작'}
+              {goalBusyAction ? '처리 중…' : goalDialog === 'clear' ? 'Goal 지우기' : goalDialog === 'resume' ? '다시 시작' : goalDialog === 'replace' ? '교체하고 시작' : '저장하고 시작'}
             </Button>
           </div>
         </DialogContent>
