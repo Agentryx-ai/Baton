@@ -24,7 +24,7 @@
 | Smart rotation | **부분 구현·의미 불일치** | 60초 provider별 틱, ACTIVE/FRESH/BLIND/EXHAUSTED 분류, target/reserve, debounce, 엔진 장부 복원 | target과 reserve가 모두 활성이라 `round-robin`에서는 순환됨. “리셋 임박 우선 소진”을 실제 요청 라우팅에서 보장하지 못함 |
 | Smart rotation 타깃 표시 | **구현 결함** | UI와 로그가 계산상 1순위를 `현재 타깃`으로 표시 | 실제 트래픽 타깃으로 오해되지 않도록 `정책 1순위` 등으로 표시하거나, 프록시가 우선순위를 강제하도록 구현해야 함 |
 | Quota freshness 표시 | 부분 구현 | `lastUpdated` 타입과 `useQuota`의 age 계산은 존재 | 현재 `App`의 quota 경로는 해당 hook을 사용하지 않아 설계의 “n초 전 기준” UI가 노출되지 않음 |
-| 클라이언트 프록시 통합 | 구현됨 | Claude CLI/Desktop와 Codex CLI/Desktop의 적용·해제·충돌·프로세스·lock 검사 테스트 | 적용/해제 후 대상 클라이언트 재시작 필요 |
+| 클라이언트 프록시 통합 | **부분 구현·Codex SSOT 결함** | Claude CLI/Desktop와 Codex CLI/Desktop의 적용·해제·충돌·프로세스·lock 검사 테스트 | Codex에 `model_provider=baton`을 설치하면 기존 `openai` task가 provider-filtered Desktop 목록에서 숨겨진다. [`CODEX_NATIVE_PROXY_SSOT_DECISION.md`](CODEX_NATIVE_PROXY_SSOT_DECISION.md)의 `openai_base_url` + loopback bridge 제안을 구현하고 인증 호환성·no-fallback을 live 검증해야 하며 적용/해제 후 대상 클라이언트 완전 재시작이 필요하다. |
 | Canonical domain과 SQLite | 구현됨 | session/thread/turn/item/execution/binding 스키마, WAL, transaction, idempotency, fork lineage, 재시작 recovery 테스트 | 없음 |
 | Canonical item/content 계약 | 부분 구현 | Preview enum과 자유형 `payload` JSON은 존재 | 설계의 ordered content parts, artifact digest store, command/web/compaction/diagnostic 표현은 아직 없음 |
 | Context builder와 compaction | 부분 구현 | fork lineage와 portable text replay는 구현됨 | model context budget, immutable compaction range, artifact-aware materialization은 미구현 |

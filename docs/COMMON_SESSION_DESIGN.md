@@ -38,6 +38,11 @@ The following are not the same concept and must remain separate:
 The design in this document remains the target contract. Current conformance and defects are tracked in
 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md); implementation gaps do not implicitly narrow this design.
 
+Native Codex CLI/Desktop가 대화 UI와 SSOT를 계속 소유하고 Baton이 투명 프록시로만 동작하는 별도 모드는
+canonical runtime과 ownership 계약이 다르다. 해당 모드에서 발견된 provider namespace 결함과
+`model_provider=openai` + `openai_base_url=<Baton>` 제안은
+[`CODEX_NATIVE_PROXY_SSOT_DECISION.md`](CODEX_NATIVE_PROXY_SSOT_DECISION.md)에 기록한다.
+
 At the current Preview boundary:
 
 - the canonical domain, SQLite/WAL store, fork/replay/idempotency, REST/SSE surface, cancellation, and startup
