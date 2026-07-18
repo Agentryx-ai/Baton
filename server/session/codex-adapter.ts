@@ -552,6 +552,13 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 if (existing && existing.signature !== signature) {
                   throw capabilityViolation(`dynamic tool call id ${toolCall.callId} was reused with different input`)
                 }
+                if (!existing && modelRoundTrips + 1 >= context.limits.maxModelRoundTrips) {
+                  failLimit(
+                    'model_round_limit',
+                    'Codex requested a tool after the host model round-trip limit',
+                  )
+                  return
+                }
                 let resultPromise = existing?.result
                 if (!resultPromise) {
                   resultPromise = context.executeTool({
@@ -817,6 +824,10 @@ function launchArgs(
     'model_providers.baton.base_url': `${connection.baseUrl}/v1`,
     'model_providers.baton.env_key': 'BATON_PROXY_TOKEN',
     'model_providers.baton.wire_api': 'responses',
+    // Baton owns the retry budget. Hidden app-server retries are disabled so
+    // one provider request cannot multiply the host-authoritative turn limit.
+    'model_providers.baton.request_max_retries': 0,
+    'model_providers.baton.stream_max_retries': 0,
   } : {}
   const overrides = Object.entries({
     ...HARDENING_OVERRIDES,
@@ -831,6 +842,7 @@ function launchArgs(
 
 function valueAsToml(value: unknown): string {
   if (typeof value === 'boolean') return String(value)
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return String(value)
   if (typeof value === 'string') return JSON.stringify(value)
   if (value && typeof value === 'object' && Object.keys(value as JsonObject).length === 0) return '{}'
   throw new Error('Unsupported Codex hardening override')

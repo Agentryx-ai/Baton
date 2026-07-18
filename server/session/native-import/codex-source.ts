@@ -34,6 +34,7 @@ const CODEX_TOP_LEVEL_TYPES = new Set([
   // provider-private state and is therefore counted as loss rather than copied.
   'world_state', 'compacted', 'inter_agent_communication_metadata',
 ])
+const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-turn-context-v2`
 
 export class CodexLocalSourceReader implements NativeSourceReader {
   readonly sourceClient = 'codex_local' as const
@@ -179,7 +180,7 @@ export class CodexLocalSourceReader implements NativeSourceReader {
       sourceLocator: { path: canonicalRolloutPath },
       records: parsed?.records ?? [],
       skippedItemCount: parsed?.skipped ?? 0,
-      parserVersion: PARSER_VERSION,
+      parserVersion: CODEX_PARSER_VERSION,
       warnings: parsed?.warnings ?? [],
       identityKeys: [{ kind: 'native_session_id', value: nativeSessionId, scopeNamespaceKey: namespaceKey }],
       materialized: parsed !== null,
@@ -240,6 +241,8 @@ function codexOrigin(value: unknown): CodexNativeOrigin {
 function parseCodexRecords(text: string, sessionId: string, includeRecords: boolean): ParsedCodexRecords {
   const records = new NativeRecordAccumulator(includeRecords)
   const toolNames = new Map<string, string>()
+  let currentModel: string | null = null
+  let currentEffort: string | null = null
   let skipped = 0
   for (const [lineIndex, line] of nativePhysicalLines(text)) {
     if (!line.trim()) continue
@@ -255,6 +258,12 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
     if (!eventType || !CODEX_TOP_LEVEL_TYPES.has(eventType)) throw new Error('codex_top_level_type_unsupported')
     const payload = object(event.payload)
     if (!payload) throw new Error('codex_record_framing_invalid')
+    if (eventType === 'turn_context') {
+      currentModel = string(payload.model)
+      currentEffort = string(payload.effort)
+      skipped += 1
+      continue
+    }
     if (eventType !== 'response_item') { skipped += 1; continue }
     const payloadType = string(payload.type)
     if (!payloadType) throw new Error('codex_response_item_framing_invalid')
@@ -275,9 +284,14 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       }
       const textValue = messageText(portableContent)
       if (!textValue?.trim()) { skipped += 1; continue }
-      addRecord(records, baseId, role === 'user' ? 'user_message' : 'assistant_message', {
+      const legacyPayload = {
         text: textValue, nativeSourceClient: 'codex_local', nativeRecordType: payloadType, nativeTimestamp: timestamp,
-      }, timestamp)
+      }
+      addRecord(records, baseId, role === 'user' ? 'user_message' : 'assistant_message', {
+        ...legacyPayload,
+        ...(role === 'assistant' && currentModel ? { requestedModel: currentModel } : {}),
+        ...(role === 'assistant' && currentEffort ? { effort: currentEffort } : {}),
+      }, timestamp, 'portable', legacyPayload)
       continue
     }
     if (payloadType === 'function_call' || payloadType === 'custom_tool_call') {
@@ -327,8 +341,11 @@ function addRecord(
   records: NativeRecordAccumulator, key: string,
   kind: NativePortableRecord['item']['kind'], payload: Record<string, unknown>, createdAt: string | null,
   visibility: NativePortableRecord['item']['visibility'] = 'portable',
+  identityPayload: Record<string, unknown> = payload,
 ): void {
-  const normalized = { kind, payload, key }
+  // Additive display metadata must not rewrite the immutable native record identity. Codex
+  // turn_context was absent from parser v1, so hashing it would break existing append updates.
+  const normalized = { kind, payload: identityPayload, key }
   records.add({
     key, ordinal: records.count + 1, digest: sha256(stableJson(normalized)), createdAt,
     item: { kind, visibility, provider: 'codex', nativeId: key, payload },

@@ -1002,13 +1002,21 @@ function appendMessage(messages: PortableMessage[], role: PortableMessage['role'
 }
 
 function portableHistoryText(kind: string, payload: JsonObject): string | null {
-  if (kind !== 'user_message' && kind !== 'assistant_message' && kind !== 'summary') return null
-  return portableText(payload)
+  const text = portableText(payload)
+  if (kind === 'user_message' || kind === 'assistant_message' || kind === 'summary') return text
+  if (kind === 'reasoning_summary') return text === null ? null : `[Reasoning summary]\n${text}`
+  if (kind === 'plan' || kind === 'task') return text === null ? null : `[Plan]\n${text}`
+  return null
 }
 
 function portableText(payload: JsonObject): string | null {
   if (typeof payload.text === 'string' && payload.text.trim()) return payload.text
   if (typeof payload.content === 'string' && payload.content.trim()) return payload.content
+  if (Array.isArray(payload.summary)) {
+    const parts = payload.summary.filter((part): part is string => typeof part === 'string')
+    if (parts.length > 0) return parts.join('\n')
+  }
+  if (Array.isArray(payload.plan)) return JSON.stringify(payload.plan)
   return null
 }
 

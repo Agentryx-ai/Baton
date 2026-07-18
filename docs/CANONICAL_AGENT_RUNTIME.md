@@ -93,6 +93,9 @@ call ID and a documented replay policy.
 Provider-native tool IDs and structured continuation blocks are stored as provider-private data when
 the adapter protocol exposes them durably.
 The UI consumes a normalized projection and never reconstructs wire history from the projection.
+Portable user/assistant messages, summaries, reasoning summaries, plans, and tasks use the same
+ordered textual projection for every adapter; switching provider cannot silently discard those work
+state items.
 Provider assistant blocks that precede a tool call, including hidden/reasoning blocks, are replayed
 without structural edits. A server-requested continuation replays the exact assistant content and
 the same tool schema; it is bounded by the host's model-round limit.
@@ -113,6 +116,11 @@ the same tool schema; it is bounded by the host's model-round limit.
 
 Provider switching is forbidden while a tool result, server continuation, or provider-private state
 is pending. It is permitted only after a terminal turn boundary.
+
+For the app-server adapter, provider-internal request and stream retries are forced to zero. Baton is
+the only retry authority. After the configured number of completed model rounds is observed, a new
+dynamic tool-call ID is rejected before execution; exact replay of an already recorded call ID remains
+idempotent.
 
 Output truncation is not automatically retried as if it were a tool continuation. Context exhaustion
 may compact only portable history under a versioned compaction policy; provider-private pending

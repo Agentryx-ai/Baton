@@ -21,6 +21,7 @@ type Scenario =
   | 'foreignTool'
   | 'foreignProvider'
   | 'twoRounds'
+  | 'nextRoundTool'
   | 'usageFallback'
   | 'reroute'
   | 'collab'
@@ -181,6 +182,7 @@ function scriptedFactory(
             || scenario === 'twoTools'
             || scenario === 'twoIdentical'
             || scenario === 'duplicateTool'
+            || scenario === 'nextRoundTool'
           ) {
             emitToolCall(self)
           } else if (scenario === 'duplicateRpc') {
@@ -204,6 +206,7 @@ function scriptedFactory(
           || scenario === 'twoTools'
           || scenario === 'twoIdentical'
           || scenario === 'duplicateTool'
+          || scenario === 'nextRoundTool'
         )
         && message.id === 60
         && 'result' in message
@@ -230,6 +233,9 @@ function scriptedFactory(
           emitToolCall(self, { rpcId: 61, callId: 'provider-call-2' })
         } else if (scenario === 'duplicateTool') {
           emitToolCall(self, { rpcId: 61 })
+        } else if (scenario === 'nextRoundTool') {
+          emitUsage(self, 1)
+          emitToolCall(self, { rpcId: 61, callId: 'provider-call-2', path: 'package.json' })
         } else {
           emitScenario(self, 'normal')
         }
@@ -578,6 +584,8 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     assert.ok(args.includes('model_providers.baton.base_url="http://127.0.0.1:8317/v1"'))
     assert.ok(args.includes('model_providers.baton.env_key="BATON_PROXY_TOKEN"'))
     assert.ok(args.includes('model_providers.baton.wire_api="responses"'))
+    assert.ok(args.includes('model_providers.baton.request_max_retries=0'))
+    assert.ok(args.includes('model_providers.baton.stream_max_retries=0'))
     assert.ok(!args.some((argument) => argument.includes('proxy-token')))
   }
   assert.deepEqual(environmentsSeen, [
@@ -727,6 +735,48 @@ test('adapter forwards every unique call so the durable coordinator can enforce 
   assert.ok(secondResponse)
   assert.equal((secondResponse.result as Record<string, unknown>).success, false)
   assert.match(JSON.stringify(secondResponse.result), /tool_call_limit/)
+})
+
+test('adapter blocks a new-round tool before side effects after the host round limit', async () => {
+  const invocations: AgentToolInvocation[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('nextRoundTool', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    limits: { maxModelRoundTrips: 1 },
+    executeTool: async (invocation) => {
+      invocations.push(invocation)
+      return { success: true, content: { text: 'ok' }, error: null }
+    },
+  }))
+
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.equal(terminal.error?.code, 'model_round_limit')
+  assert.deepEqual(invocations, [])
+})
+
+test('adapter allows a tool with one follow-up round left and blocks the next tool before side effects', async () => {
+  const invocations: AgentToolInvocation[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('nextRoundTool', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    limits: { maxModelRoundTrips: 2 },
+    executeTool: async (invocation) => {
+      invocations.push(invocation)
+      return { success: true, content: { text: 'ok' }, error: null }
+    },
+  }))
+
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.equal(terminal.error?.code, 'model_round_limit')
+  assert.deepEqual(invocations.map((invocation) => invocation.providerCallId), ['provider-call-1'])
 })
 
 test('adapter delegates repetition policy but replays an exact duplicate provider call id once', async () => {

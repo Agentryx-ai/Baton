@@ -9,6 +9,7 @@ import { ClaudeLocalSourceReader } from './claude-source.ts'
 import { CodexLocalSourceReader } from './codex-source.ts'
 import {
   mapWithConcurrency, MAX_NATIVE_CANDIDATES, MAX_NATIVE_FILE_BYTES, MAX_NATIVE_PHYSICAL_LINES,
+  sha256, stableJson,
 } from './source-utils.ts'
 
 const NAMESPACE_SECRET = Buffer.alloc(32, 7)
@@ -27,6 +28,7 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
     JSON.stringify({ timestamp: '2026-07-18T00:00:02Z', type: 'response_item', payload: { type: 'custom_tool_call', call_id: 'call-1', name: 'Write', input: JSON.stringify({ file_path: 'C:\\work\\alpha\\a.ts', content: 'secret body', access_token: 'top-secret-token', password: 'hunter2' }) } }),
     JSON.stringify({ timestamp: '2026-07-18T00:00:03Z', type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'call-1', output: 'x'.repeat(20_000) } }),
     JSON.stringify({ timestamp: '2026-07-18T00:00:04Z', type: 'response_item', payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: 'Checked constraints access_token=reasoning-secret' }], encrypted_content: 'never-import' } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:04Z', type: 'turn_context', payload: { model: 'gpt-5.6-sol', effort: 'high', cwd: 'C:\\work\\alpha', secret: 'never-copy' } }),
     JSON.stringify({ timestamp: '2026-07-18T00:00:05Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Answer' }] } }),
   ].join('\n'))
   const corrupt = path.join(sessions, 'corrupt.jsonl')
@@ -57,8 +59,21 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   assert.match(String(reasoning?.item.payload.summary), /\[redacted\]/)
   const toolResult = candidates[0]?.records.find((record) => record.item.kind === 'tool_result')
   assert.ok(JSON.stringify(toolResult?.item.payload).length < 1_000)
-  // 4 metadata + 3 denied tool-input fields + 1 omitted output + 1 summary DLP + 1 encrypted reasoning.
-  assert.equal(candidates[0]?.skippedItemCount, 10)
+  const assistant = candidates[0]?.records.find((record) => record.item.kind === 'assistant_message')
+  assert.equal(assistant?.item.payload.requestedModel, 'gpt-5.6-sol')
+  assert.equal(assistant?.item.payload.effort, 'high')
+  assert.equal(assistant?.digest, sha256(stableJson({
+    key: assistant?.key,
+    kind: 'assistant_message',
+    payload: {
+      text: 'Answer', nativeSourceClient: 'codex_local', nativeRecordType: 'message',
+      nativeTimestamp: '2026-07-18T00:00:05Z',
+    },
+  })))
+  assert.equal(JSON.stringify(assistant?.item.payload).includes('never-copy'), false)
+  // 5 metadata + 3 denied tool-input fields + 1 omitted output + 1 summary DLP + 1 encrypted reasoning.
+  assert.equal(candidates[0]?.skippedItemCount, 11)
+  assert.match(String(candidates[0]?.parserVersion), /codex-turn-context-v2$/)
   assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'codex_json_corrupt'), true)
   assert.deepEqual(await fileHead(rollout), before)
 

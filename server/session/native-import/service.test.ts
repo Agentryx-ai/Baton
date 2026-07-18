@@ -226,6 +226,57 @@ test('preview and commit are idempotent and append only a valid native delta', a
   store.close()
 })
 
+test('additive parser metadata preserves a v1 prefix and permits an append update', async () => {
+  const store = await newStore()
+  const legacy = candidate(['question', 'answer'])
+  const reader = new MutableReader(legacy)
+  const service = new NativeSessionImportService(store, [reader], { secret: Buffer.alloc(32, 6) })
+
+  let preview = await service.preview()
+  await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const sessionId = store.listSessions()[0]!.id
+  const before = store.getSnapshot(store.getSession(sessionId)!.activeThreadId)!.items
+
+  const enrichedPrefix = legacy.records.map((record) => ({
+    key: record.key,
+    ordinal: record.ordinal,
+    digest: record.digest,
+    createdAt: record.createdAt,
+    item: record.item.kind === 'assistant_message'
+      ? { ...record.item, payload: { ...record.item.payload, requestedModel: 'gpt-5.6-sol', effort: 'high' } }
+      : record.item,
+  }))
+  const appended = finalizeRecords([
+    ...enrichedPrefix,
+    {
+      key: 'record-3', ordinal: 3, digest: sha256(stableJson({ text: 'follow-up' })), createdAt: null,
+      item: {
+        kind: 'assistant_message' as const,
+        provider: 'codex' as const,
+        payload: { text: 'follow-up', requestedModel: 'gpt-5.6-sol', effort: 'high' },
+      },
+    },
+  ])
+  reader.candidate = {
+    ...legacy,
+    parserVersion: 'test-v2',
+    sourceHead: { size: 3, mtimeMs: 3, finalRecordDigest: sha256('follow-up') },
+    records: appended,
+    portableItemCount: appended.length,
+    contentDigest: contentDigest(appended),
+    prefixDigest: contentDigest(appended),
+  }
+
+  preview = await service.preview()
+  const result = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  assert.equal(result.results[0]?.status, 'updated')
+  const after = store.getSnapshot(store.getSession(sessionId)!.activeThreadId)!.items
+  assert.deepEqual(after.slice(0, 2).map((item) => item.id), before.map((item) => item.id))
+  assert.equal(after[1]?.payload.requestedModel, undefined)
+  assert.equal(after[2]?.payload.requestedModel, 'gpt-5.6-sol')
+  store.close()
+})
+
 test('commit reports stale after source changes and rejects a rewritten prefix', async () => {
   const store = await newStore()
   const reader = new MutableReader(candidate(['one']))

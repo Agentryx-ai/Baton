@@ -114,6 +114,32 @@ test('Claude adapter sends stateless history and records a provider-reported mod
   assert.equal(adapter.extractBinding(completed)?.modelFamily, 'claude-opus-4-8')
 })
 
+test('stateless adapters preserve portable reasoning, plan, task, and summary history', () => {
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+  })
+  const projected = adapter.materialize({
+    turnId: 'turn-portable-history',
+    model: 'claude-opus-4-8',
+    effort: 'high',
+    input: [{ kind: 'user_message', payload: { text: 'next' } }],
+  }, {
+    ...snapshot,
+    items: [
+      { ...snapshot.items[0]!, id: 'reasoning', kind: 'reasoning_summary', payload: { summary: ['checked', 'verified'] } },
+      { ...snapshot.items[0]!, id: 'plan', sequence: 2, kind: 'plan', payload: { text: 'ship it' } },
+      { ...snapshot.items[0]!, id: 'task', sequence: 3, kind: 'task', payload: { plan: [{ step: 'test', status: 'completed' }] } },
+      { ...snapshot.items[0]!, id: 'summary', sequence: 4, kind: 'summary', payload: { text: 'prior summary' } },
+    ],
+  })
+
+  assert.deepEqual((projected.body as { messages: unknown }).messages, [
+    { role: 'assistant', content: '[Reasoning summary]\nchecked\nverified\n\n[Plan]\nship it\n\n[Plan]\n[{"step":"test","status":"completed"}]\n\nprior summary' },
+    { role: 'user', content: 'next' },
+  ])
+})
+
 test('Gemini adapter uses the proxy compatibility route without native tools', async () => {
   let requestedUrl = ''
   const adapter = new StatelessHttpCanonicalAdapter({
