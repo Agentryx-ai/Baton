@@ -10,6 +10,8 @@ import type {
   GoalObservation,
   NewCanonicalItem,
 } from './domain.ts'
+import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
+import { WorkspaceRootError } from './workspace-root.ts'
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { GoalStoreError, SessionStoreError } from './store.ts'
 import type { CreateGoalInput, EditGoalInput, ReconcileToolInput } from './store.ts'
@@ -142,6 +144,14 @@ function requiredPositiveInteger(body: Record<string, unknown>, key: string): nu
   return Number(value)
 }
 
+function requiredNonNegativeInteger(body: Record<string, unknown>, key: string): number {
+  const value = body[key]
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new RequestValidationError(`${key} must be a non-negative integer`)
+  }
+  return Number(value)
+}
+
 function optionalPositiveInteger(body: Record<string, unknown>, key: string): number | undefined {
   if (body[key] === undefined) return undefined
   return requiredPositiveInteger(body, key)
@@ -238,11 +248,20 @@ function optionalRecord(
 
 function parseCreateSessionInput(value: unknown): CreateSessionInput {
   const body = bodyRecord(value)
+  const instructionSnapshot = optionalRecord(body, 'instructionSnapshot')
+  let normalizedInstructions: ReturnType<typeof normalizeInstructionSnapshot> | undefined
+  try {
+    normalizedInstructions = instructionSnapshot === undefined
+      ? undefined
+      : normalizeInstructionSnapshot(instructionSnapshot)
+  } catch (error) {
+    throw new RequestValidationError(error instanceof Error ? error.message : String(error))
+  }
   return {
     title: optionalNullableString(body, 'title'),
     projectKey: optionalNullableString(body, 'projectKey'),
     cwd: optionalNullableString(body, 'cwd'),
-    instructionSnapshot: optionalRecord(body, 'instructionSnapshot'),
+    ...(normalizedInstructions === undefined ? {} : { instructionSnapshot: normalizedInstructions }),
   }
 }
 
@@ -429,6 +448,25 @@ export function createConversationRouter(
 
   router.post('/sessions/:sessionId/restore', route((req, res) => {
     res.json(service.restoreSession(pathParam(req, 'sessionId')))
+  }))
+
+  router.put('/sessions/:sessionId/workspace', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['cwd', 'expectedRevision'])
+    res.json(service.connectWorkspace({
+      sessionId: pathParam(req, 'sessionId'),
+      cwd: requiredNonEmptyString(body, 'cwd'),
+      expectedRevision: requiredNonNegativeInteger(body, 'expectedRevision'),
+    }))
+  }))
+
+  router.delete('/sessions/:sessionId/workspace', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['expectedRevision'])
+    res.json(service.disconnectWorkspace(
+      pathParam(req, 'sessionId'),
+      requiredNonNegativeInteger(body, 'expectedRevision'),
+    ))
   }))
 
   router.get(
@@ -737,6 +775,10 @@ export function createConversationRouter(
     }
     if (error instanceof RequestValidationError) {
       res.status(400).json({ code: 'invalid_request', error: error.message })
+      return
+    }
+    if (error instanceof WorkspaceRootError) {
+      res.status(error.code === 'workspace_disconnected' ? 409 : 400).json({ code: error.code, error: error.message })
       return
     }
     if (error instanceof NativeImportSecurityError) {

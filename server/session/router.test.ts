@@ -153,6 +153,7 @@ class TestConversationService implements ConversationService {
   cancelledTurnId: string | null = null
   reconciledInput: ReconcileToolInput | null = null
   listedScope: SessionListScope | null = null
+  workspaceInput: { sessionId: string; expectedRevision: number; cwd: string | null } | null = null
   goal: CanonicalGoal | null = null
 
   createSession(input: CreateSessionInput): CanonicalSession {
@@ -184,6 +185,20 @@ class TestConversationService implements ConversationService {
     const restored = { ...found, archivedAt: null }
     this.sessions = this.sessions.map((candidate) => candidate.id === sessionId ? restored : candidate)
     return restored
+  }
+
+  connectWorkspace(input: { sessionId: string; expectedRevision: number; cwd: string }): CanonicalSession {
+    this.workspaceInput = input
+    const found = this.getSession(input.sessionId)
+    if (!found) throw new SessionStoreError('not_found', 'session not found')
+    return { ...found, cwd: input.cwd }
+  }
+
+  disconnectWorkspace(sessionId: string, expectedRevision: number): CanonicalSession {
+    this.workspaceInput = { sessionId, expectedRevision, cwd: null }
+    const found = this.getSession(sessionId)
+    if (!found) throw new SessionStoreError('not_found', 'session not found')
+    return { ...found, cwd: null }
   }
 
   getSnapshot(threadId: string): ThreadSnapshot | null {
@@ -342,7 +357,7 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
     const created = await fetch(`${baseUrl}/sessions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ title: 'Session', cwd: 'C:\\repo', instructionSnapshot: { a: 1 } }),
+      body: JSON.stringify({ title: 'Session', cwd: 'C:\\repo', instructionSnapshot: { developerInstructions: 'verify' } }),
     })
     assert.equal(created.status, 201)
     assert.equal((await json(created)).id, session.id)
@@ -350,7 +365,7 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
       title: 'Session',
       projectKey: undefined,
       cwd: 'C:\\repo',
-      instructionSnapshot: { a: 1 },
+      instructionSnapshot: { schemaVersion: 1, developerInstructions: 'verify' },
     })
 
     const listed = await fetch(`${baseUrl}/sessions`)
@@ -370,6 +385,29 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
     const restored = await fetch(`${baseUrl}/sessions/${session.id}/restore`, { method: 'POST' })
     assert.equal(restored.status, 200)
     assert.equal((await json(restored)).archivedAt, null)
+
+    const connected = await fetch(`${baseUrl}/sessions/${session.id}/workspace`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cwd: 'C:\\repo', expectedRevision: 0 }),
+    })
+    assert.equal(connected.status, 200)
+    assert.deepEqual(service.workspaceInput, { sessionId: session.id, cwd: 'C:\\repo', expectedRevision: 0 })
+    const disconnected = await fetch(`${baseUrl}/sessions/${session.id}/workspace`, {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: 1 }),
+    })
+    assert.equal(disconnected.status, 200)
+    assert.deepEqual(service.workspaceInput, { sessionId: session.id, cwd: null, expectedRevision: 1 })
+
+    const invalidWorkspace = await fetch(`${baseUrl}/sessions/${session.id}/workspace`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cwd: '', expectedRevision: -1 }),
+    })
+    assert.equal(invalidWorkspace.status, 400)
+    assert.equal((await json(invalidWorkspace)).code, 'invalid_request')
 
     const missing = await fetch(`${baseUrl}/sessions/missing`)
     assert.equal(missing.status, 404)

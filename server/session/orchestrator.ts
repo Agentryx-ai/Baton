@@ -23,7 +23,7 @@ import type {
 import { ConversationEventHub } from './event-hub.ts'
 import { GoalRuntime, type GoalContinuationRequest } from './goal-runtime.ts'
 import { goalContinuationPrompt } from './goal-prompts.ts'
-import type { ConversationService, StartTurnInput, UserGoalStatusInput } from './service.ts'
+import type { ConversationService, StartTurnInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
 import type {
   ClearGoalInput,
   CreateGoalInput,
@@ -44,6 +44,7 @@ import {
   type ToolRuntime,
 } from './tool-coordinator.ts'
 import { LocalWorkspaceToolRuntime } from './tools/local-workspace-runtime.ts'
+import { assertWorkspaceRoot, resolveWorkspaceRoot } from './workspace-root.ts'
 
 interface ActiveTurn {
   controller: AbortController
@@ -89,7 +90,10 @@ export class TurnOrchestrator implements ConversationService {
   }
 
   createSession(input: CreateSessionInput): CanonicalSession {
-    const session = this.store.createSession(input)
+    const session = this.store.createSession({
+      ...input,
+      cwd: input.cwd == null ? null : resolveWorkspaceRoot(input.cwd),
+    })
     this.events.publish(session.activeThreadId)
     return session
   }
@@ -98,6 +102,25 @@ export class TurnOrchestrator implements ConversationService {
   getSession(sessionId: SessionId): CanonicalSession | null { return this.store.getSession(sessionId) }
   archiveSession(sessionId: SessionId): CanonicalSession { return this.store.archiveSession(sessionId) }
   restoreSession(sessionId: SessionId): CanonicalSession { return this.store.restoreSession(sessionId) }
+  connectWorkspace(input: WorkspaceMutationInput): CanonicalSession {
+    const session = this.store.updateWorkspace({
+      sessionId: input.sessionId,
+      expectedThreadRevision: input.expectedRevision,
+      cwd: resolveWorkspaceRoot(input.cwd),
+    })
+    this.events.publish(session.activeThreadId)
+    return session
+  }
+
+  disconnectWorkspace(sessionId: SessionId, expectedRevision: number): CanonicalSession {
+    const session = this.store.updateWorkspace({
+      sessionId,
+      expectedThreadRevision: expectedRevision,
+      cwd: null,
+    })
+    this.events.publish(session.activeThreadId)
+    return session
+  }
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null { return this.store.getSnapshot(threadId) }
 
   forkThread(input: ForkThreadInput): CanonicalThread {
@@ -185,7 +208,8 @@ export class TurnOrchestrator implements ConversationService {
 
     const ready = await this.adapters.getReady(input.provider)
     if (startSignal?.aborted) throw startSignal.reason ?? new Error('Goal continuation start was cancelled')
-    const workspaceRuntime = this.workspaceRuntime(input.threadId)
+    const workspaceCwd = this.workspaceCwd(input.threadId)
+    const workspaceRuntime = this.workspaceRuntime(workspaceCwd)
     const goalToolDefinitions = GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal')
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
@@ -205,7 +229,7 @@ export class TurnOrchestrator implements ConversationService {
         delegationMode: 'disabled',
         allowedTools: toolDefinitions.map((tool) => tool.name),
         approvalPolicy: 'never',
-        cwd: this.workspaceCwd(input.threadId),
+        cwd: workspaceCwd,
         maxDepth: 0,
         capabilityGrant: null,
       },
@@ -499,9 +523,7 @@ export class TurnOrchestrator implements ConversationService {
   private workspaceCwd(threadId: ThreadId): string | null {
     const snapshot = this.store.getSnapshot(threadId)
     if (!snapshot) return null
-    const instructed = instructionCwd(snapshot.thread.instructionSnapshot)
-    if (instructed) return instructed
-    if (snapshot.session.cwd) return snapshot.session.cwd
+    if (snapshot.session.cwd) return assertWorkspaceRoot(snapshot.session.cwd)
     return null
   }
 
@@ -512,8 +534,7 @@ export class TurnOrchestrator implements ConversationService {
     }
   }
 
-  private workspaceRuntime(threadId: ThreadId): ToolRuntime {
-    const cwd = this.workspaceCwd(threadId)
+  private workspaceRuntime(cwd: string | null): ToolRuntime {
     return cwd ? new LocalWorkspaceToolRuntime({ cwd }) : NO_WORKSPACE_RUNTIME
   }
 
@@ -743,10 +764,6 @@ async function withTimeout<T>(promise: Promise<T>, milliseconds: number, label: 
   } finally {
     if (timer) clearTimeout(timer)
   }
-}
-
-function instructionCwd(snapshot: Record<string, unknown> | undefined): string | null {
-  return typeof snapshot?.cwd === 'string' ? snapshot.cwd : null
 }
 
 function validateTurnInput(input: StartTurnInput, internalGoalTurn = false): void {

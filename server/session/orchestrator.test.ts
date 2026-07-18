@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { AdapterRegistry } from './adapter-registry.ts'
+import { WorkspaceRootError } from './workspace-root.ts'
 import type {
   NativeProviderEvent,
   NativeTurnRequest,
@@ -318,6 +319,41 @@ test('TurnOrchestrator connects provider calls to durable workspace tools', asyn
     store.listItems(session.activeThreadId).map((item) => item.kind),
     ['user_message', 'tool_call', 'tool_result', 'assistant_message'],
   )
+})
+
+test('workspace replacement fails before a turn or tool call is persisted', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-workspace-drift-'))
+  const workspace = join(directory, 'workspace')
+  const moved = join(directory, 'workspace-moved')
+  const replacement = join(directory, 'replacement')
+  mkdirSync(workspace)
+  mkdirSync(replacement)
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  registry.register(toolCallingAdapter({
+    name: 'write_file',
+    input: { path: 'must-not-exist.txt', content: 'unsafe', expectedSha256: null },
+  }))
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const session = orchestrator.createSession({ cwd: workspace })
+  renameSync(workspace, moved)
+  symlinkSync(replacement, workspace, process.platform === 'win32' ? 'junction' : 'dir')
+
+  await assert.rejects(orchestrator.startTurn({
+    threadId: session.activeThreadId,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'workspace-drift',
+    expectedRevision: 0,
+    input: [{ kind: 'user_message', payload: { text: 'write a file' } }],
+  }), (error: unknown) => error instanceof WorkspaceRootError && error.code === 'workspace_disconnected')
+  assert.deepEqual(store.getSnapshot(session.activeThreadId)?.turns, [])
+  assert.equal(existsSync(join(replacement, 'must-not-exist.txt')), false)
+  assert.equal(store.listItems(session.activeThreadId).length, 0)
 })
 
 test('a cancelled provider turn waits for an accepted mutation to settle durably', async (t) => {

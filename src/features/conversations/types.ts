@@ -78,6 +78,7 @@ export interface NativeSessionSourceSummaryDto {
   sourceAlias: string | null
   titleSource?: string | null
   projectAlias: string | null
+  cwd?: string | null
 }
 
 export type NativeImportCandidateStatus =
@@ -239,6 +240,7 @@ export type CanonicalStreamEventType =
   | 'turn_cancelled'
   | 'turn_failed'
   | 'turn_interrupted'
+  | 'workspace_changed'
   | 'goal_changed'
 
 export interface CanonicalStreamEventDto {

@@ -510,6 +510,13 @@ export function ConversationWorkspace({
   const [loadingSessions, setLoadingSessions] = useState(false)
   const [loadingThread, setLoadingThread] = useState(false)
   const [creating, setCreating] = useState(false)
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [createCwd, setCreateCwd] = useState('')
+  const [createInstructions, setCreateInstructions] = useState('')
+  const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false)
+  const [workspaceCwd, setWorkspaceCwd] = useState('')
+  const [workspaceBusy, setWorkspaceBusy] = useState(false)
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [goalBusyAction, setGoalBusyAction] = useState<GoalAction | 'create' | null>(null)
@@ -659,15 +666,59 @@ export function ConversationWorkspace({
   const createSession = async () => {
     setCreating(true)
     try {
-      const created = await conversationApi.createSession({ title: null })
+      const cwd = createCwd.trim()
+      const developerInstructions = createInstructions.trim()
+      const created = await conversationApi.createSession({
+        title: null,
+        cwd: cwd || null,
+        ...(developerInstructions ? { instructionSnapshot: { developerInstructions } } : {}),
+      })
       setSessions((current) => [created, ...(current ?? []).filter((item) => item.id !== created.id)])
       setSelectedSessionId(created.id)
       setMobileSidebarOpen(false)
+      setCreateDialogOpen(false)
+      setCreateCwd('')
+      setCreateInstructions('')
       setError(null)
     } catch (cause) {
       setError(errorMessage(cause))
     } finally {
       setCreating(false)
+    }
+  }
+
+  const openWorkspaceDialog = () => {
+    if (!snapshot) return
+    setWorkspaceCwd(snapshot.session.cwd ?? snapshot.session.source?.cwd ?? '')
+    setWorkspaceError(null)
+    setWorkspaceDialogOpen(true)
+  }
+
+  const connectWorkspace = async () => {
+    if (!snapshot || !workspaceCwd.trim()) return
+    setWorkspaceBusy(true)
+    try {
+      await conversationApi.connectWorkspace(snapshot.session.id, workspaceCwd.trim(), snapshot.thread.revision)
+      setWorkspaceDialogOpen(false)
+      await Promise.all([refreshThread(), refreshSessions(true)])
+    } catch (cause) {
+      setWorkspaceError(errorMessage(cause))
+    } finally {
+      setWorkspaceBusy(false)
+    }
+  }
+
+  const disconnectWorkspace = async () => {
+    if (!snapshot) return
+    setWorkspaceBusy(true)
+    try {
+      await conversationApi.disconnectWorkspace(snapshot.session.id, snapshot.thread.revision)
+      setWorkspaceDialogOpen(false)
+      await Promise.all([refreshThread(), refreshSessions(true)])
+    } catch (cause) {
+      setWorkspaceError(errorMessage(cause))
+    } finally {
+      setWorkspaceBusy(false)
     }
   }
 
@@ -1009,7 +1060,11 @@ export function ConversationWorkspace({
       scope={sessionScope}
       preferences={viewPreferences}
       onSelect={selectSession}
-      onCreate={() => void createSession()}
+      onCreate={() => {
+        setMobileSidebarOpen(false)
+        setError(null)
+        setCreateDialogOpen(true)
+      }}
       onRefresh={() => void refreshSessions()}
       onPreferencesChange={onViewPreferencesChange}
       onScopeChange={changeScope}
@@ -1052,6 +1107,74 @@ export function ConversationWorkspace({
         onOpenChange={setNativeImportOpen}
         onImported={refreshSessions}
       />
+
+      <Dialog open={createDialogOpen} onOpenChange={(open) => { if (!creating) setCreateDialogOpen(open) }}>
+        <DialogContent className="max-w-md">
+          <DialogTitle>새 대화</DialogTitle>
+          <DialogDescription>
+            프로젝트 폴더를 연결하면 Baton이 그 폴더 안에서만 파일 도구를 사용할 수 있습니다.
+          </DialogDescription>
+          {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+          <label className="space-y-1.5 text-sm">
+            <span className="font-medium">프로젝트 폴더 <span className="font-normal text-muted-foreground">선택</span></span>
+            <input
+              value={createCwd}
+              onChange={(event) => setCreateCwd(event.target.value)}
+              placeholder="C:\\projects\\my-app"
+              autoFocus
+              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <details className="rounded-xl border px-3 py-2 text-sm">
+            <summary className="cursor-pointer select-none font-medium">대화 지침</summary>
+            <textarea
+              value={createInstructions}
+              onChange={(event) => setCreateInstructions(event.target.value)}
+              rows={5}
+              className="mt-2 w-full resize-y bg-transparent text-sm leading-6 outline-none"
+              placeholder="이 대화에서 항상 따라야 할 지침"
+            />
+          </details>
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" disabled={creating} onClick={() => setCreateDialogOpen(false)}>취소</Button>
+            <Button type="button" disabled={creating} onClick={() => void createSession()}>
+              {creating ? '만드는 중…' : '대화 시작'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={workspaceDialogOpen} onOpenChange={(open) => { if (!workspaceBusy) setWorkspaceDialogOpen(open) }}>
+        <DialogContent className="max-w-md">
+          <DialogTitle>프로젝트 폴더 {snapshot?.session.cwd ? '변경' : '연결'}</DialogTitle>
+          <DialogDescription>
+            원본 대화의 폴더는 제안값일 뿐입니다. 이 경로를 직접 확인하고 연결해야 Baton 파일 도구가 접근할 수 있습니다.
+          </DialogDescription>
+          {workspaceError ? <p role="alert" className="text-sm text-destructive">{workspaceError}</p> : null}
+          <label className="space-y-1.5 text-sm">
+            <span className="font-medium">프로젝트 폴더</span>
+            <input
+              value={workspaceCwd}
+              onChange={(event) => setWorkspaceCwd(event.target.value)}
+              placeholder="C:\\projects\\my-app"
+              autoFocus
+              disabled={workspaceBusy}
+              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            />
+          </label>
+          <div className="flex items-center justify-end gap-2">
+            {snapshot?.session.cwd ? (
+              <Button type="button" variant="destructive" className="mr-auto" disabled={workspaceBusy} onClick={() => void disconnectWorkspace()}>
+                연결 해제
+              </Button>
+            ) : null}
+            <Button type="button" variant="ghost" disabled={workspaceBusy} onClick={() => setWorkspaceDialogOpen(false)}>취소</Button>
+            <Button type="button" disabled={workspaceBusy || !workspaceCwd.trim()} onClick={() => void connectWorkspace()}>
+              {workspaceBusy ? '적용 중…' : snapshot?.session.cwd ? '변경' : '연결'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={pendingArchive !== null} onOpenChange={(open) => { if (!open) setPendingArchive(null) }}>
         <DialogContent className="max-w-sm">
@@ -1215,6 +1338,12 @@ export function ConversationWorkspace({
               ? <span>읽기 전용</span>
               : snapshot ? <SessionStatus status={snapshot.session.workStatus} /> : <span>준비됨</span>}
             {sessionScope === 'active' ? <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge> : null}
+            {snapshot && sessionScope === 'active' ? (
+              <Button type="button" variant="ghost" size="xs" onClick={openWorkspaceDialog}>
+                <FolderOpen aria-hidden />
+                {snapshot.session.cwd ? '폴더 연결됨' : '폴더 연결'}
+              </Button>
+            ) : null}
           </div>
         </header>
 
@@ -1245,6 +1374,19 @@ export function ConversationWorkspace({
               <p className="mb-6 rounded-xl border border-ok/40 bg-ok/10 px-4 py-3 text-sm text-foreground" role="status">
                 {reconcileNotice}
               </p>
+            ) : null}
+
+            {snapshot?.session.source && !snapshot.session.cwd ? (
+              <section className="mb-6 flex items-center gap-3 rounded-xl border bg-muted/30 px-4 py-3">
+                <FolderOpen className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">가져온 대화에는 연결된 프로젝트 폴더가 없습니다.</p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {snapshot.session.source.cwd ?? '원본 폴더를 확인할 수 없습니다.'}
+                  </p>
+                </div>
+                <Button type="button" size="sm" variant="outline" onClick={openWorkspaceDialog}>폴더 연결</Button>
+              </section>
             ) : null}
 
             {unknownMutations.length > 0 ? (

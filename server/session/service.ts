@@ -41,12 +41,20 @@ export interface UserGoalStatusInput {
   resetLimitCounters?: boolean
 }
 
+export interface WorkspaceMutationInput {
+  sessionId: SessionId
+  expectedRevision: number
+  cwd: string
+}
+
 export interface ConversationService {
   createSession(input: CreateSessionInput): CanonicalSession
   listSessions(scope?: SessionListScope): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null
   archiveSession(sessionId: SessionId): CanonicalSession
   restoreSession(sessionId: SessionId): CanonicalSession
+  connectWorkspace(input: WorkspaceMutationInput): CanonicalSession
+  disconnectWorkspace(sessionId: SessionId, expectedRevision: number): CanonicalSession
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null
   forkThread(input: ForkThreadInput): CanonicalThread
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]

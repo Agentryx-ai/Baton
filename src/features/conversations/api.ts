@@ -60,7 +60,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return parsed as T
 }
 
-function jsonRequest(method: 'POST' | 'PATCH', body: unknown, headers: Record<string, string> = {}): RequestInit {
+function jsonRequest(method: 'POST' | 'PATCH' | 'PUT' | 'DELETE', body: unknown, headers: Record<string, string> = {}): RequestInit {
   return {
     method,
     headers: { 'Content-Type': 'application/json', ...headers },
@@ -116,6 +116,12 @@ export const conversationApi = {
 
   restoreSession: (sessionId: string): Promise<CanonicalSessionDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}/restore`, jsonRequest('POST', {})),
+
+  connectWorkspace: (sessionId: string, cwd: string, expectedRevision: number): Promise<CanonicalSessionDto> =>
+    request(`/sessions/${encodeURIComponent(sessionId)}/workspace`, jsonRequest('PUT', { cwd, expectedRevision })),
+
+  disconnectWorkspace: (sessionId: string, expectedRevision: number): Promise<CanonicalSessionDto> =>
+    request(`/sessions/${encodeURIComponent(sessionId)}/workspace`, jsonRequest('DELETE', { expectedRevision })),
 
   getThread: (threadId: string): Promise<ThreadSnapshotDto> =>
     request(`/threads/${encodeURIComponent(threadId)}`),
