@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 
 import { AppNavigation, type AppView } from '@/components/AppNavigation'
+import type { Account, PolicyState, RoutingStrategyName } from '@/api/types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -22,6 +23,7 @@ import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
 import { latestUsageSummary, transcriptItems } from './conversation-presentation'
+import { ProviderAccountDisclosure } from './ProviderAccountDisclosure'
 import type {
   CanonicalProvider,
   CanonicalSessionDto,
@@ -152,9 +154,15 @@ function SessionSidebar({
 export function ConversationWorkspace({
   onNavigateHome,
   onNavigateSettings,
+  accounts,
+  policy,
+  routingStrategy,
 }: {
   onNavigateHome: () => void
   onNavigateSettings: () => void
+  accounts: Record<string, Account[]> | null
+  policy: PolicyState | null
+  routingStrategy: RoutingStrategyName | null
 }) {
   const [sessions, setSessions] = useState<CanonicalSessionDto[] | null>(null)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
@@ -504,45 +512,42 @@ export function ConversationWorkspace({
 
             <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
               <select
-                value={provider}
-                onChange={(event) => setProvider(event.target.value as CanonicalProvider)}
-                aria-label="Provider"
-                className="rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs font-medium text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+                value={model ? `${provider}:${model}` : ''}
+                onChange={(event) => {
+                  const separator = event.target.value.indexOf(':')
+                  if (separator < 0) return
+                  const nextProvider = event.target.value.slice(0, separator) as CanonicalProvider
+                  if (!PROVIDERS.includes(nextProvider)) return
+                  const nextModel = event.target.value.slice(separator + 1)
+                  const next = catalogs[nextProvider]?.models.find((option) => option.id === nextModel) ?? null
+                  if (!next) return
+                  setProvider(nextProvider)
+                  setModel(next.id)
+                  setEffort(next.defaultEffort)
+                }}
+                disabled={PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
+                aria-label="모델"
+                title={selectedModel ? `${selectedModel.id} · ${selectedModel.description}` : undefined}
+                className="min-w-0 max-w-64 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs font-medium text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
               >
+                {!model ? <option value="">모델 불러오는 중…</option> : null}
                 {PROVIDERS.map((candidate) => {
                   const catalog = catalogs[candidate]
                   const unavailable = catalog !== null && catalog.models.length === 0
                   return (
-                    <option key={candidate} value={candidate} disabled={unavailable}>
-                      {PROVIDER_NAME[candidate]}{unavailable ? ' · 사용 불가' : ''}
-                    </option>
+                    <optgroup
+                      key={candidate}
+                      label={`${PROVIDER_NAME[candidate]}${unavailable ? ' · 사용 불가' : ''}`}
+                      disabled={catalog === null || unavailable}
+                    >
+                      {(catalog?.models ?? []).map((option) => (
+                        <option key={option.id} value={`${candidate}:${option.id}`}>
+                          {option.displayName} · {option.description}
+                        </option>
+                      ))}
+                    </optgroup>
                   )
                 })}
-              </select>
-
-              <select
-                value={model}
-                onChange={(event) => {
-                  const next = models?.find((option) => option.id === event.target.value) ?? null
-                  setModel(event.target.value)
-                  setEffort(next?.defaultEffort ?? null)
-                }}
-                disabled={models === null || models.length === 0}
-                aria-label={`${PROVIDER_NAME[provider]} 모델`}
-                title={selectedModel ? `${selectedModel.id} · ${selectedModel.description}` : undefined}
-                className="min-w-0 max-w-52 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {models === null ? (
-                  <option value="">모델 불러오는 중…</option>
-                ) : models.length === 0 ? (
-                  <option value="">사용 가능한 모델 없음</option>
-                ) : (
-                  models.map((option) => (
-                    <option key={option.id} value={option.id}>
-                      {option.displayName} · {option.description}
-                    </option>
-                  ))
-                )}
               </select>
 
               {selectedModel && selectedModel.effortLevels.length > 0 ? (
@@ -557,6 +562,13 @@ export function ConversationWorkspace({
                   ))}
                 </select>
               ) : null}
+
+              <ProviderAccountDisclosure
+                provider={provider}
+                accounts={accounts}
+                policy={policy}
+                strategy={routingStrategy}
+              />
 
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
                 {snapshot?.thread.status === 'running' ? '응답을 생성하고 있습니다' : ''}

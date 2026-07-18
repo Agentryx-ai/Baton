@@ -252,6 +252,9 @@ function App() {
             <ConversationWorkspace
               onNavigateHome={() => navigate('home')}
               onNavigateSettings={() => navigate('settings')}
+              accounts={accounts}
+              policy={policy}
+              routingStrategy={routing?.strategy ?? null}
             />
           </section>
 
