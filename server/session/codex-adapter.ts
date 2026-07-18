@@ -12,13 +12,15 @@ import type {
   ProviderTurnExecution,
   SessionProviderAdapter,
 } from './adapter.ts'
-import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import type { AgentToolResult, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
+  web_search: 'disabled',
   'features.multi_agent': false,
   'features.multi_agent_v2': false,
   'features.enable_fanout': false,
   'features.shell_tool': false,
+  'features.standalone_web_search': false,
   'features.apps': false,
   'features.plugins': false,
 })
@@ -28,6 +30,7 @@ const VERIFIED_FEATURES = [
   'multi_agent_v2',
   'enable_fanout',
   'shell_tool',
+  'standalone_web_search',
   'apps',
   'plugins',
 ] as const
@@ -322,26 +325,44 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     let nativeTurnId: string | null = null
     let latestUsage: Record<string, unknown> | null = null
     let cancelPromise: Promise<void> | null = null
+    let terminalOverride: ProviderTerminalResult | null = null
+    let resolvedModel: string | null = null
+    let resolvedProvider: string | null = null
+    let modelRoundTrips = 0
+    const seenUsageTotals = new Set<string>()
+    const providerCalls = new Map<string, { signature: string; result: Promise<AgentToolResult> }>()
+    const rpcRequestIds = new Set<string | number>()
+    let abortListener: (() => void) | null = null
+    let turnTimer: NodeJS.Timeout | null = null
 
     const finish = (result: ProviderTerminalResult): void => {
       if (terminalResult !== null) return
-      terminalResult = result
-      terminalResolve(result)
+      const effectiveResult = terminalOverride ?? result
+      terminalResult = effectiveResult
+      if (turnTimer !== null) clearTimeout(turnTimer)
+      if (abortListener !== null) context.signal.removeEventListener('abort', abortListener)
+      terminalResolve(effectiveResult)
       eventQueue.end()
     }
 
-    const fail = (error: unknown): void => {
+    const fail = (error: unknown, code?: string): void => {
       const message = error instanceof Error ? error.message : String(error)
       if (terminalResult === null) {
         eventQueue.push({
           eventId: `codex:error:${body.turnId}:${digest(message)}`,
           type: 'adapter/error',
-          payload: { message },
+          payload: { ...(code ? { code } : {}), message },
           durability: 'durable',
         })
       }
-      finish({ status: 'failed', error: { message } })
+      finish({ status: 'failed', error: { ...(code ? { code } : {}), message } })
       void process.kill().catch(() => undefined)
+    }
+
+    const failLimit = (code: string, message: string): void => {
+      if (terminalResult !== null || terminalOverride !== null) return
+      terminalOverride = { status: 'failed', error: { code, message } }
+      fail(new Error(message), code)
     }
 
     const dispose = async (): Promise<void> => {
@@ -361,11 +382,17 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       }
     }
 
-    const cancel = async (): Promise<void> => {
+    const cancel = async (code = 'user_cancelled', message = 'Codex turn was cancelled'): Promise<void> => {
+      if (terminalResult !== null) return
+      const priorCode = terminalOverride?.error?.code
+      if (terminalOverride === null || (code === 'user_cancelled' && priorCode !== 'user_cancelled')) {
+        terminalOverride = { status: 'cancelled', error: { code, message } }
+      }
       cancelPromise ??= (async () => {
         if (terminalResult !== null) return
         if (nativeThreadId === null || nativeTurnId === null) {
-          fail(new Error('Codex turn could not be interrupted before native ids were assigned'))
+          finish(terminalOverride as ProviderTerminalResult)
+          await process.kill().catch(() => undefined)
           return
         }
         try {
@@ -374,8 +401,14 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
             turnId: nativeTurnId,
           }), this.shutdownTimeoutMs, 'Codex turn/interrupt request')
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          finish({ status: 'interrupted', error: { message } })
+          const interruptMessage = error instanceof Error ? error.message : String(error)
+          if (terminalOverride?.error?.code === code) {
+            terminalOverride = {
+              status: 'cancelled',
+              error: { code, message: `${message}: ${interruptMessage}` },
+            }
+          }
+          finish(terminalOverride as ProviderTerminalResult)
           await process.kill().catch(() => undefined)
           return
         }
@@ -384,12 +417,18 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           this.shutdownTimeoutMs,
           'Codex interrupted terminal event',
         )
-        if (result.status !== 'interrupted' && result.status !== 'completed') {
+        if (result.status !== 'cancelled') {
           throw new Error(`Codex interruption ended as ${result.status}`)
         }
       })().catch(async (error) => {
-        const message = error instanceof Error ? error.message : String(error)
-        finish({ status: 'interrupted', error: { message } })
+        const interruptMessage = error instanceof Error ? error.message : String(error)
+        if (terminalOverride?.error?.code === code) {
+          terminalOverride = {
+            status: 'cancelled',
+            error: { code, message: `${message}: ${interruptMessage}` },
+          }
+        }
+        finish(terminalOverride as ProviderTerminalResult)
         await process.kill().catch(() => undefined)
       })
       return cancelPromise
@@ -401,6 +440,17 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       this.active.delete(execution)
       void dispose()
     })
+    abortListener = () => {
+      void cancel('user_cancelled', 'Codex turn was cancelled by the caller').catch(() => undefined)
+    }
+    context.signal.addEventListener('abort', abortListener, { once: true })
+    turnTimer = setTimeout(() => {
+      void cancel('turn_time_limit', 'Codex turn exceeded the wall-clock limit').catch(() => undefined)
+    }, context.limits.turnTimeoutMs)
+    if (context.signal.aborted) {
+      abortListener()
+      return execution
+    }
 
     try {
       const initialize = asObject(
@@ -424,7 +474,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       const start = asObject(
         await client.request('thread/start', {
           model: body.model,
-          effort: body.effort,
+          allowProviderModelFallback: false,
           cwd: body.cwd,
           environments: [],
           runtimeWorkspaceRoots: [],
@@ -436,6 +486,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         }),
         'thread/start result',
       )
+      resolvedModel = requiredString(start.model, 'Codex resolved model')
+      resolvedProvider = requiredString(start.modelProvider, 'Codex resolved model provider')
       const thread = asObject(start.thread, 'thread/start thread')
       if (thread.ephemeral !== true || thread.path !== null) {
         throw new Error('Codex canonical mode requires an ephemeral thread with no rollout path')
@@ -478,13 +530,34 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
             if (message.method === undefined) continue
             if (message.id !== undefined) {
               if (message.method === 'item/tool/call') {
+                if (rpcRequestIds.has(message.id)) {
+                  throw capabilityViolation(`duplicate JSON-RPC tool request id ${String(message.id)}`)
+                }
+                rpcRequestIds.add(message.id)
                 const toolCall = parseDynamicToolCall(message.params)
-                const result = await context.executeTool({
-                  callId: `${body.turnId}:${toolCall.callId}`,
-                  providerCallId: toolCall.callId,
-                  name: toolCall.tool,
-                  input: toolCall.arguments,
-                })
+                if (toolCall.threadId !== nativeThreadId || toolCall.turnId !== nativeTurnId) {
+                  throw capabilityViolation('dynamic tool call referenced a foreign thread or turn')
+                }
+                if (!context.toolDefinitions.some((definition) => definition.name === toolCall.tool)) {
+                  throw capabilityViolation(`dynamic tool call requested unregistered tool ${toolCall.tool}`)
+                }
+                const signature = canonicalJson([toolCall.tool, toolCall.arguments])
+                const existing = providerCalls.get(toolCall.callId)
+                if (existing && existing.signature !== signature) {
+                  throw capabilityViolation(`dynamic tool call id ${toolCall.callId} was reused with different input`)
+                }
+                let resultPromise = existing?.result
+                if (!resultPromise) {
+                  resultPromise = executeDynamicTool(context, {
+                    callId: `${body.turnId}:${toolCall.callId}`,
+                    providerCallId: toolCall.callId,
+                    name: toolCall.tool,
+                    input: toolCall.arguments,
+                  })
+                  providerCalls.set(toolCall.callId, { signature, result: resultPromise })
+                }
+                const result = await resultPromise
+                if (terminalResult !== null) return
                 await client.respond(message.id, {
                   contentItems: [{ type: 'inputText', text: JSON.stringify(result) }],
                   success: result.success,
@@ -499,21 +572,47 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               throw capabilityViolation(`unexpected server request ${message.method}`)
             }
             const params = asOptionalObject(message.params)
+            assertActiveNativeIds(params, nativeThreadId, nativeTurnId)
             if (isForbiddenNotification(message.method, params)) {
               throw capabilityViolation(`unexpected native execution event ${message.method}`)
             }
             if (message.method === 'thread/tokenUsage/updated') {
               const usage = asOptionalObject(params?.tokenUsage)
               latestUsage = asOptionalObject(usage?.last) ?? usage
+              const total = asOptionalObject(usage?.total)
+              const roundIdentity = canonicalJson(total ?? latestUsage ?? {})
+              if (!seenUsageTotals.has(roundIdentity)) {
+                seenUsageTotals.add(roundIdentity)
+                modelRoundTrips += 1
+                if (modelRoundTrips > context.limits.maxModelRoundTrips) {
+                  failLimit('model_round_limit', 'Codex exceeded the observable model round-trip limit')
+                  return
+                }
+              }
+            }
+            if (message.method === 'model/rerouted') {
+              const fromModel = requiredString(params?.fromModel, 'Codex reroute source model')
+              const toModel = requiredString(params?.toModel, 'Codex reroute target model')
+              if (fromModel !== resolvedModel) {
+                throw capabilityViolation('Codex model reroute did not originate from the active model')
+              }
+              resolvedModel = toModel
             }
             const event = nativeEvent(
               message.method,
-              addRequestedModelMetadata(params, body.model, body.effort),
+              addModelProvenance(params, {
+                requestedModel: body.model,
+                requestedEffort: body.effort,
+                resolvedModel: requiredString(resolvedModel, 'active Codex model'),
+                resolvedProvider: requiredString(resolvedProvider, 'active Codex model provider'),
+              }),
             )
             eventQueue.push(event)
             if (message.method === 'turn/completed') {
               const turn = asObject(params?.turn, 'turn/completed turn')
-              if (turn.id !== nativeTurnId) continue
+              if (turn.id !== nativeTurnId) {
+                throw capabilityViolation('turn completion referenced a foreign native turn')
+              }
               const status = terminalStatus(turn.status)
               finish({
                 status,
@@ -537,9 +636,6 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         },
         fail,
       )
-      const cancelOnAbort = () => { void cancel().catch(() => undefined) }
-      if (context.signal.aborted) cancelOnAbort()
-      else context.signal.addEventListener('abort', cancelOnAbort, { once: true })
       return execution
     } catch (error) {
       fail(error)
@@ -565,7 +661,15 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
             requestedModel: typeof payload?.requestedModel === 'string'
               ? payload.requestedModel
               : null,
-            effort: typeof payload?.effort === 'string' ? payload.effort : null,
+            resolvedModel: typeof payload?.resolvedModel === 'string'
+              ? payload.resolvedModel
+              : null,
+            resolvedProvider: typeof payload?.resolvedProvider === 'string'
+              ? payload.resolvedProvider
+              : null,
+            effort: typeof payload?.requestedEffort === 'string'
+              ? payload.requestedEffort
+              : null,
           },
           provider: 'codex',
           nativeId,
@@ -641,6 +745,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         ...evidence,
         mcpServersDisabled: Object.keys(this.mcpDisableOverrides).length,
         toolTransport: 'client-owned-dynamic-functions',
+        providerLocalMetadataTools: ['update_plan'],
       },
     }
   }
@@ -804,25 +909,95 @@ function dynamicToolSpec(definition: ProviderExecutionContext['toolDefinitions']
 }
 
 function parseDynamicToolCall(value: unknown): {
+  threadId: string
+  turnId: string
   callId: string
   tool: string
   arguments: JsonObject
 } {
   const params = asObject(value, 'item/tool/call params')
   return {
+    threadId: requiredString(params.threadId, 'dynamic tool thread id'),
+    turnId: requiredString(params.turnId, 'dynamic tool turn id'),
     callId: requiredString(params.callId, 'dynamic tool call id'),
     tool: requiredString(params.tool, 'dynamic tool name'),
     arguments: asObject(params.arguments, 'dynamic tool arguments'),
   }
 }
 
-function addRequestedModelMetadata(
+function addModelProvenance(
   params: JsonObject | null,
-  requestedModel: string,
-  effort: string | null,
+  provenance: {
+    requestedModel: string
+    requestedEffort: string | null
+    resolvedModel: string
+    resolvedProvider: string
+  },
 ): JsonObject | null {
   if (!params) return null
-  return { ...params, requestedModel, effort }
+  return { ...params, ...provenance }
+}
+
+function assertActiveNativeIds(
+  params: JsonObject | null,
+  threadId: string,
+  turnId: string,
+): void {
+  if (typeof params?.threadId === 'string' && params.threadId !== threadId) {
+    throw capabilityViolation('Codex event referenced a foreign native thread')
+  }
+  if (typeof params?.turnId === 'string' && params.turnId !== turnId) {
+    throw capabilityViolation('Codex event referenced a foreign native turn')
+  }
+}
+
+async function executeDynamicTool(
+  context: ProviderExecutionContext,
+  invocation: Parameters<ProviderExecutionContext['executeTool']>[0],
+): Promise<AgentToolResult> {
+  let timeout: NodeJS.Timeout | null = null
+  let abortListener: (() => void) | null = null
+  const timeoutResult = new Promise<AgentToolResult>((resolve) => {
+    timeout = setTimeout(() => resolve({
+      success: false,
+      content: null,
+      error: {
+        code: 'tool_timeout',
+        message: `Tool ${invocation.name} exceeded its execution timeout`,
+        retryable: false,
+      },
+    }), context.limits.toolTimeoutMs)
+  })
+  const abortResult = new Promise<AgentToolResult>((resolve) => {
+    abortListener = () => resolve({
+      success: false,
+      content: null,
+      error: {
+        code: 'tool_cancelled',
+        message: `Tool ${invocation.name} was cancelled`,
+        retryable: false,
+      },
+    })
+    context.signal.addEventListener('abort', abortListener, { once: true })
+    if (context.signal.aborted) abortListener()
+  })
+  try {
+    return await Promise.race([context.executeTool(invocation), timeoutResult, abortResult])
+  } finally {
+    if (timeout !== null) clearTimeout(timeout)
+    if (abortListener !== null) context.signal.removeEventListener('abort', abortListener)
+  }
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as JsonObject)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
 }
 
 function durableEventId(method: string, params: JsonObject | null): string {

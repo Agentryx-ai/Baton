@@ -11,7 +11,20 @@ import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type { AgentToolDefinition, AgentToolInvocation, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null }
-type Scenario = 'normal' | 'tool' | 'collab' | 'cancel' | 'hangInterrupt' | 'exit'
+type Scenario =
+  | 'normal'
+  | 'tool'
+  | 'twoTools'
+  | 'twoIdentical'
+  | 'duplicateTool'
+  | 'duplicateRpc'
+  | 'foreignTool'
+  | 'twoRounds'
+  | 'reroute'
+  | 'collab'
+  | 'cancel'
+  | 'hangInterrupt'
+  | 'exit'
 
 class TestStream<T> implements AsyncIterable<T> {
   private readonly values: T[] = []
@@ -99,11 +112,13 @@ function configResult(): Record<string, unknown> {
   return {
     config: {
       agents: { enabled: false },
+      web_search: 'disabled',
       features: {
         multi_agent: false,
         multi_agent_v2: false,
         enable_fanout: false,
         shell_tool: false,
+        standalone_web_search: false,
         apps: false,
         plugins: false,
       },
@@ -119,6 +134,7 @@ function featureResult(): Record<string, unknown> {
       'multi_agent_v2',
       'enable_fanout',
       'shell_tool',
+      'standalone_web_search',
       'apps',
       'plugins',
     ].map((name) => ({ name, enabled: false })),
@@ -145,6 +161,8 @@ function scriptedFactory(
           id: idOf(message),
           result: {
             thread: { id: 'native-thread', ephemeral: true, path: null },
+            model: 'gpt-resolved',
+            modelProvider: 'baton',
             runtimeWorkspaceRoots: [],
           },
         })
@@ -154,14 +172,39 @@ function scriptedFactory(
         self.emit({ id: idOf(message), result: {} })
       } else if (method === 'turn/start') {
         self.emit({ id: idOf(message), result: { turn: { id: 'native-turn', status: 'inProgress', items: [] } } })
-        queueMicrotask(() => scenario === 'tool' ? emitToolCall(self) : emitScenario(self, scenario))
+        queueMicrotask(() => {
+          if (
+            scenario === 'tool'
+            || scenario === 'twoTools'
+            || scenario === 'twoIdentical'
+            || scenario === 'duplicateTool'
+          ) {
+            emitToolCall(self)
+          } else if (scenario === 'duplicateRpc') {
+            emitToolCall(self)
+            emitToolCall(self)
+          } else if (scenario === 'foreignTool') {
+            emitToolCall(self, { turnId: 'foreign-turn' })
+          } else {
+            emitScenario(self, scenario)
+          }
+        })
       } else if (method === 'turn/interrupt') {
         if (scenario === 'hangInterrupt') return
         self.emit({ id: idOf(message), result: {} })
         queueMicrotask(() => {
           self.emit({ method: 'turn/completed', params: { threadId: 'native-thread', turn: { id: 'native-turn', status: 'interrupted', error: null } } })
         })
-      } else if (scenario === 'tool' && message.id === 60 && 'result' in message) {
+      } else if (
+        (
+          scenario === 'tool'
+          || scenario === 'twoTools'
+          || scenario === 'twoIdentical'
+          || scenario === 'duplicateTool'
+        )
+        && message.id === 60
+        && 'result' in message
+      ) {
         self.emit({
           method: 'item/completed',
           params: {
@@ -178,6 +221,20 @@ function scriptedFactory(
             },
           },
         })
+        if (scenario === 'twoTools') {
+          emitToolCall(self, { rpcId: 61, callId: 'provider-call-2', path: 'package.json' })
+        } else if (scenario === 'twoIdentical') {
+          emitToolCall(self, { rpcId: 61, callId: 'provider-call-2' })
+        } else if (scenario === 'duplicateTool') {
+          emitToolCall(self, { rpcId: 61 })
+        } else {
+          emitScenario(self, 'normal')
+        }
+      } else if (
+        (scenario === 'twoTools' || scenario === 'twoIdentical' || scenario === 'duplicateTool')
+        && message.id === 61
+        && 'result' in message
+      ) {
         emitScenario(self, 'normal')
       }
     })
@@ -186,30 +243,41 @@ function scriptedFactory(
   }
 }
 
-function emitToolCall(process: FakeProcess): void {
+function emitToolCall(process: FakeProcess, options: {
+  rpcId?: number
+  threadId?: string
+  turnId?: string
+  callId?: string
+  path?: string
+} = {}): void {
+  const rpcId = options.rpcId ?? 60
+  const threadId = options.threadId ?? 'native-thread'
+  const turnId = options.turnId ?? 'native-turn'
+  const callId = options.callId ?? 'provider-call-1'
+  const filePath = options.path ?? 'README.md'
   process.emit({
     method: 'item/started',
     params: {
-      threadId: 'native-thread',
-      turnId: 'native-turn',
+      threadId,
+      turnId,
       item: {
-        id: 'dynamic-1',
+        id: `dynamic-${callId}`,
         type: 'dynamicToolCall',
         tool: 'read_file',
-        arguments: { path: 'README.md' },
+        arguments: { path: filePath },
         status: 'inProgress',
       },
     },
   })
   process.emit({
     method: 'item/tool/call',
-    id: 60,
+    id: rpcId,
     params: {
-      threadId: 'native-thread',
-      turnId: 'native-turn',
-      callId: 'provider-call-1',
+      threadId,
+      turnId,
+      callId,
       tool: 'read_file',
-      arguments: { path: 'README.md' },
+      arguments: { path: filePath },
     },
   })
 }
@@ -231,6 +299,22 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
     return
   }
   if (scenario === 'cancel' || scenario === 'hangInterrupt') return
+  if (scenario === 'twoRounds') {
+    emitUsage(process, 1)
+    emitUsage(process, 2)
+  }
+  if (scenario === 'reroute') {
+    process.emit({
+      method: 'model/rerouted',
+      params: {
+        threadId: 'native-thread',
+        turnId: 'native-turn',
+        fromModel: 'gpt-resolved',
+        toModel: 'gpt-routed',
+        reason: 'serverReroute',
+      },
+    })
+  }
   process.emit({
     method: 'item/completed',
     params: {
@@ -264,14 +348,7 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
       plan: [{ step: 'finish', status: 'completed' }],
     },
   })
-  process.emit({
-    method: 'thread/tokenUsage/updated',
-    params: {
-      threadId: 'native-thread',
-      turnId: 'native-turn',
-      tokenUsage: { last: { inputTokens: 3, outputTokens: 2 } },
-    },
-  })
+  if (scenario !== 'twoRounds') emitUsage(process, 5)
   process.emit({
     method: 'turn/completed',
     params: {
@@ -281,14 +358,30 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
   })
 }
 
+function emitUsage(process: FakeProcess, totalTokens: number): void {
+  process.emit({
+    method: 'thread/tokenUsage/updated',
+    params: {
+      threadId: 'native-thread',
+      turnId: 'native-turn',
+      tokenUsage: {
+        total: { totalTokens },
+        last: { inputTokens: 3, outputTokens: 2 },
+      },
+    },
+  })
+}
+
 function context(options: {
   tools?: AgentToolDefinition[]
   executeTool?: (request: AgentToolInvocation) => Promise<Awaited<ReturnType<ProviderExecutionContext['executeTool']>>>
+  signal?: AbortSignal
+  limits?: Partial<typeof DEFAULT_AGENT_LOOP_LIMITS>
 } = {}): ProviderExecutionContext {
   return {
-    signal: new AbortController().signal,
+    signal: options.signal ?? new AbortController().signal,
     toolDefinitions: options.tools ?? [],
-    limits: DEFAULT_AGENT_LOOP_LIMITS,
+    limits: { ...DEFAULT_AGENT_LOOP_LIMITS, ...options.limits },
     executeTool: options.executeTool ?? (async () => { throw new Error('tool not registered') }),
     async denyApproval(): Promise<never> { throw new Error('approval denied') },
     async denyToolCall(): Promise<never> { throw new Error('tool denied') },
@@ -322,6 +415,20 @@ function request() {
     turnId: 'canonical-turn',
     model: 'gpt-test',
     input: [{ kind: 'user_message', payload: { text: 'hello' } }] satisfies NewCanonicalItem[],
+  }
+}
+
+function readFileTool(): AgentToolDefinition {
+  return {
+    name: 'read_file',
+    description: 'Read a workspace file',
+    inputSchema: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    sideEffect: 'read_only',
   }
 }
 
@@ -391,6 +498,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.equal(handshake.capabilities.nativeChildExecution, 'disabled')
   assert.equal(handshake.capabilities.toolCalling, true)
   assert.equal(handshake.enforcementEvidence.source, 'config/read')
+  assert.deepEqual(handshake.enforcementEvidence.providerLocalMetadataTools, ['update_plan'])
   const materialized = adapter.materialize(request(), snapshot())
   const execution = await adapter.execute(materialized, context())
   const [events, terminal] = await Promise.all([collect(execution.events), execution.terminal])
@@ -403,10 +511,12 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.ok(normalized.some((item) => item.kind === 'task'))
   assert.ok(normalized.some((item) => item.kind === 'usage'))
   for (const args of argsSeen) {
+    assert.ok(args.includes('web_search="disabled"'))
     assert.ok(args.includes('features.multi_agent=false'))
     assert.ok(args.includes('features.multi_agent_v2=false'))
     assert.ok(args.includes('features.enable_fanout=false'))
     assert.ok(args.includes('features.shell_tool=false'))
+    assert.ok(args.includes('features.standalone_web_search=false'))
     assert.ok(args.includes('model_provider="baton"'))
     assert.ok(args.includes('model_providers.baton.name="Baton CLIProxy"'))
     assert.ok(args.includes('model_providers.baton.base_url="http://127.0.0.1:8317/v1"'))
@@ -429,10 +539,12 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.equal(params.approvalPolicy, 'never')
   assert.deepEqual(params.dynamicTools, [])
   assert.deepEqual(params.config, {
+    web_search: 'disabled',
     'features.multi_agent': false,
     'features.multi_agent_v2': false,
     'features.enable_fanout': false,
     'features.shell_tool': false,
+    'features.standalone_web_search': false,
     'features.apps': false,
     'features.plugins': false,
   })
@@ -440,6 +552,8 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.ok(turnStart)
   assert.deepEqual((turnStart.params as Record<string, unknown>).environments, [])
   assert.deepEqual((turnStart.params as Record<string, unknown>).runtimeWorkspaceRoots, [])
+  assert.equal((turnStart.params as Record<string, unknown>).webSearch, undefined)
+  assert.equal((threadStart.params as Record<string, unknown>).allowProviderModelFallback, false)
   assert.ok(turnProcess.writes.some((message) => message.method === 'thread/inject_items'))
   await adapter.shutdown()
 })
@@ -451,17 +565,7 @@ test('adapter exposes only Baton dynamic tools and returns their result through 
     processFactory: scriptedFactory('tool', created, []),
     shutdownTimeoutMs: 20,
   })
-  const tool: AgentToolDefinition = {
-    name: 'read_file',
-    description: 'Read a workspace file',
-    inputSchema: {
-      type: 'object',
-      properties: { path: { type: 'string' } },
-      required: ['path'],
-      additionalProperties: false,
-    },
-    sideEffect: 'read_only',
-  }
+  const tool = readFileTool()
   const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
     tools: [tool],
     executeTool: async (invocation) => {
@@ -478,7 +582,8 @@ test('adapter exposes only Baton dynamic tools and returns their result through 
     input: { path: 'README.md' },
   }])
   const threadStart = created[1].writes.find((message) => message.method === 'thread/start')
-  assert.deepEqual((threadStart?.params as Record<string, unknown>).dynamicTools, [{
+  assert.ok(threadStart)
+  assert.deepEqual((threadStart.params as Record<string, unknown>).dynamicTools, [{
     type: 'function',
     name: 'read_file',
     description: 'Read a workspace file',
@@ -497,6 +602,8 @@ test('adapter exposes only Baton dynamic tools and returns their result through 
   assert.deepEqual(assistant?.payload, {
     text: 'done',
     requestedModel: 'gpt-test',
+    resolvedModel: 'gpt-resolved',
+    resolvedProvider: 'baton',
     effort: null,
   })
   await adapter.shutdown()
@@ -515,6 +622,177 @@ test('adapter treats native collaboration events as a fatal capability violation
   assert.ok(events.some((event) => event.type === 'adapter/error'))
 })
 
+test('adapter forwards every unique call so the durable coordinator can enforce total limits', async () => {
+  const created: FakeProcess[] = []
+  const invocations: AgentToolInvocation[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('twoTools', created, []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    limits: { maxToolCalls: 1 },
+    executeTool: async (invocation) => {
+      invocations.push(invocation)
+      if (invocations.length > 1) {
+        return {
+          success: false,
+          content: null,
+          error: { code: 'tool_call_limit', message: 'limit', retryable: false },
+        }
+      }
+      return { success: true, content: { text: 'ok' }, error: null }
+    },
+  }))
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'completed')
+  assert.equal(invocations.length, 2)
+  const secondResponse = created[1].writes.find((message) => message.id === 61 && 'result' in message)
+  assert.ok(secondResponse)
+  assert.equal((secondResponse.result as Record<string, unknown>).success, false)
+  assert.match(JSON.stringify(secondResponse.result), /tool_call_limit/)
+})
+
+test('adapter delegates repetition policy but replays an exact duplicate provider call id once', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('twoTools', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    limits: { maxIdenticalToolCalls: 1 },
+    executeTool: async () => ({ success: true, content: { text: 'ok' }, error: null }),
+  }))
+  // The scripted calls use different paths, so both are distinct and allowed.
+  assert.equal((await execution.terminal).status, 'completed')
+
+  const identicalAdapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('twoIdentical', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const identicalExecution = await identicalAdapter.execute(
+    identicalAdapter.materialize(request(), snapshot()),
+    context({
+      tools: [readFileTool()],
+      limits: { maxIdenticalToolCalls: 1 },
+      executeTool: async (invocation) => invocation.providerCallId === 'provider-call-2'
+        ? {
+            success: false,
+            content: null,
+            error: { code: 'tool_repetition_limit', message: 'limit', retryable: false },
+          }
+        : { success: true, content: { text: 'ok' }, error: null },
+    }),
+  )
+  assert.equal((await identicalExecution.terminal).status, 'completed')
+
+  const duplicateAdapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('duplicateTool', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  let executions = 0
+  const duplicateExecution = await duplicateAdapter.execute(
+    duplicateAdapter.materialize(request(), snapshot()),
+    context({
+      tools: [readFileTool()],
+      limits: { maxIdenticalToolCalls: 1 },
+      executeTool: async () => {
+        executions += 1
+        return { success: true, content: { text: 'ok' }, error: null }
+      },
+    }),
+  )
+  // An exact replay of the same provider call id reuses its completed result.
+  assert.equal((await duplicateExecution.terminal).status, 'completed')
+  assert.equal(executions, 1)
+})
+
+test('adapter rejects foreign native ids', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('foreignTool', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    executeTool: async () => ({ success: true, content: { text: 'ok' }, error: null }),
+  }))
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.match(String(terminal.error?.message), /foreign/)
+})
+
+test('adapter rejects duplicate JSON-RPC tool request ids', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('duplicateRpc', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    executeTool: async () => ({ success: true, content: { text: 'ok' }, error: null }),
+  }))
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.match(String(terminal.error?.message), /duplicate/)
+})
+
+test('adapter bounds an unresolved tool and ignores its late completion', async () => {
+  let resolveTool!: (value: Awaited<ReturnType<ProviderExecutionContext['executeTool']>>) => void
+  const never = new Promise<Awaited<ReturnType<ProviderExecutionContext['executeTool']>>>((resolve) => {
+    resolveTool = resolve
+  })
+  const created: FakeProcess[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('tool', created, []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    limits: { toolTimeoutMs: 5 },
+    executeTool: () => never,
+  }))
+  assert.equal((await execution.terminal).status, 'completed')
+  const response = created[1].writes.find((message) => message.id === 60 && 'result' in message)
+  assert.ok(response)
+  const responseResult = response.result as Record<string, unknown>
+  assert.equal(responseResult.success, false)
+  assert.match(JSON.stringify(responseResult), /tool_timeout/)
+  resolveTool({ success: true, content: { text: 'late' }, error: null })
+  await Promise.resolve()
+  assert.equal((response.result as Record<string, unknown>).success, false)
+})
+
+test('adapter counts observable model rounds from distinct cumulative usage updates', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('twoRounds', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    limits: { maxModelRoundTrips: 1 },
+  }))
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.equal(terminal.error?.code, 'model_round_limit')
+})
+
+test('thread response and reroute provenance are preserved without relabeling the request', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('reroute', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const events = await collect(execution.events)
+  assert.equal((await execution.terminal).status, 'completed')
+  const assistant = events.flatMap((event) => adapter.normalize(event))
+    .find((item) => item.kind === 'assistant_message')
+  assert.deepEqual(assistant?.payload, {
+    text: 'done',
+    requestedModel: 'gpt-test',
+    resolvedModel: 'gpt-routed',
+    resolvedProvider: 'baton',
+    effort: null,
+  })
+})
+
 test('cancel sends turn/interrupt and waits for interrupted completion', async () => {
   const created: FakeProcess[] = []
   const adapter = new CodexCanonicalAdapter({
@@ -523,7 +801,7 @@ test('cancel sends turn/interrupt and waits for interrupted completion', async (
   })
   const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
   await execution.cancel()
-  assert.equal((await execution.terminal).status, 'interrupted')
+  assert.equal((await execution.terminal).status, 'cancelled')
   assert.ok(created[1].writes.some((message) => message.method === 'turn/interrupt'))
 })
 
@@ -536,9 +814,44 @@ test('cancel hard-stops a Codex process when turn/interrupt never answers', asyn
   const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
   await execution.cancel()
   const terminal = await execution.terminal
-  assert.equal(terminal.status, 'interrupted')
+  assert.equal(terminal.status, 'cancelled')
   assert.match(String(terminal.error?.message), /timed out/)
   assert.deepEqual(await created[1].exited, { code: null, signal: 'SIGTERM' })
+})
+
+test('abort and turn timeout win over a late native completion', async () => {
+  const controller = new AbortController()
+  const created: FakeProcess[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('cancel', created, []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    signal: controller.signal,
+  }))
+  controller.abort()
+  created[1].emit({
+    method: 'turn/completed',
+    params: {
+      threadId: 'native-thread',
+      turn: { id: 'native-turn', status: 'completed', error: null },
+    },
+  })
+  const aborted = await execution.terminal
+  assert.equal(aborted.status, 'cancelled')
+  assert.equal(aborted.error?.code, 'user_cancelled')
+
+  const timeoutAdapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('cancel', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const timeoutExecution = await timeoutAdapter.execute(
+    timeoutAdapter.materialize(request(), snapshot()),
+    context({ limits: { turnTimeoutMs: 5 } }),
+  )
+  const timedOut = await timeoutExecution.terminal
+  assert.equal(timedOut.status, 'cancelled')
+  assert.equal(timedOut.error?.code, 'turn_time_limit')
 })
 
 test('process exit before turn completion produces a failed terminal result', async () => {
