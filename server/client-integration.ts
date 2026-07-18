@@ -14,6 +14,7 @@ import { parse as parseToml, stringify as stringifyToml } from 'smol-toml'
 export type ClientKind =
   | 'claude-cli'
   | 'claude-desktop'
+  | 'unknown-claude'
   | 'codex-cli'
   | 'codex-desktop'
   | 'unknown-codex-desktop'
@@ -41,10 +42,24 @@ export interface ClientIntegrationTargetStatus {
   label: string
   certainlyStopped: boolean
   running: ClientProcess[]
+  configuration: ClientIntegrationConfigurationState
+  configurationDetail?: string
 }
+
+export type ClientIntegrationConfigurationState =
+  | 'applied'
+  | 'not-applied'
+  | 'conflict'
+  | 'unknown'
 
 export interface ClientIntegrationApplyResult {
   applied: true
+  updated: string[]
+  restartRequired: true
+}
+
+export interface ClientIntegrationRemoveResult {
+  removed: true
   updated: string[]
   restartRequired: true
 }
@@ -89,8 +104,8 @@ const TARGET_DEFINITIONS: ReadonlyArray<{
   label: string
   clients: readonly ClientKind[]
 }> = [
-  { target: 'claude-cli', label: 'Claude CLI', clients: ['claude-cli'] },
-  { target: 'claude-desktop', label: 'Claude Desktop', clients: ['claude-desktop'] },
+  { target: 'claude-cli', label: 'Claude CLI', clients: ['claude-cli', 'unknown-claude'] },
+  { target: 'claude-desktop', label: 'Claude Desktop', clients: ['claude-desktop', 'unknown-claude'] },
   {
     target: 'codex',
     label: 'Codex CLI/Desktop',
@@ -114,13 +129,23 @@ export function classifyProcessRecords(records: ProcessRecord[]): ClientProcess[
     let label = ''
 
     if (name === 'claude.exe') {
-      const desktop = evidence.includes('claude-3p') || evidence.includes('windowsapps\\claude_')
-      client = desktop ? 'claude-desktop' : 'claude-cli'
-      label = desktop ? 'Claude Desktop' : 'Claude CLI'
+      if (!evidence.trim()) {
+        client = 'unknown-claude'
+        label = 'Claude CLI/Desktop 여부 확인 불가'
+      } else {
+        const desktop = evidence.includes('claude-3p') || evidence.includes('windowsapps\\claude_')
+        client = desktop ? 'claude-desktop' : 'claude-cli'
+        label = desktop ? 'Claude Desktop' : 'Claude CLI'
+      }
     } else if (name === 'codex.exe') {
-      const desktop = evidence.includes('openai.codex') || evidence.includes(' app-server')
-      client = desktop ? 'codex-desktop' : 'codex-cli'
-      label = desktop ? 'Codex Desktop' : 'Codex CLI'
+      if (!evidence.trim()) {
+        client = 'unknown-codex-desktop'
+        label = 'Codex CLI/Desktop 여부 확인 불가'
+      } else {
+        const desktop = evidence.includes('openai.codex') || evidence.includes(' app-server')
+        client = desktop ? 'codex-desktop' : 'codex-cli'
+        label = desktop ? 'Codex Desktop' : 'Codex CLI'
+      }
     } else if (name === 'chatgpt.exe') {
       if (evidence.includes('openai.codex')) {
         client = 'codex-desktop'
@@ -153,31 +178,65 @@ export async function getClientIntegrationStatus(): Promise<ClientIntegrationSta
     }
   }
 
+  let running: ClientProcess[] = []
+  let processError: string | undefined
   try {
-    const records = await runPowerShell<ProcessRecord[]>(
-      String.raw`$items = @(Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine)
-[Console]::Out.Write((ConvertTo-Json -InputObject $items -Compress))`,
-      null,
-    )
-    const running = classifyProcessRecords(Array.isArray(records) ? records : [])
-    const targets = buildTargetStatuses(running, true)
-    return {
-      supported: true,
-      certainlyStopped: targets.every((target) => target.certainlyStopped),
-      checkedAt,
-      running,
-      targets,
-    }
+    const records = await queryProcessRecords()
+    running = classifyProcessRecords(records)
   } catch (error) {
-    return {
-      supported: true,
-      certainlyStopped: false,
-      checkedAt,
-      running: [],
-      targets: buildTargetStatuses([], false),
-      error: `프로세스 상태를 확실히 확인하지 못했습니다: ${errorMessage(error)}`,
-    }
+    processError = `프로세스 상태를 확실히 확인하지 못했습니다: ${compactProcessError(error)}`
   }
+
+  let targets = buildTargetStatuses(running, processError === undefined)
+  try {
+    const proxy = await loadProxyConnection(false)
+    const configurations = await inspectTargetConfigurations(proxy.baseUrl, proxy.token)
+    targets = targets.map((target) => ({ ...target, ...configurations.get(target.target) }))
+  } catch (error) {
+    const detail = `실제 설정 상태를 확인하지 못했습니다: ${errorMessage(error)}`
+    targets = targets.map((target) => ({
+      ...target,
+      configuration: 'unknown',
+      configurationDetail: detail,
+    }))
+  }
+
+  return {
+    supported: true,
+    certainlyStopped: processError === undefined
+      && targets.every((target) => target.certainlyStopped),
+    checkedAt,
+    running,
+    targets,
+    ...(processError ? { error: processError } : {}),
+  }
+}
+
+async function queryProcessRecords(): Promise<ProcessRecord[]> {
+  const records = await runPowerShell<ProcessRecord[]>(
+    String.raw`$items = @(Get-Process -ErrorAction Stop | ForEach-Object {
+  $filePath = $null
+  try { $filePath = $_.Path } catch {}
+  [pscustomobject]@{
+    ProcessId = $_.Id
+    Name = if ($filePath) { [System.IO.Path]::GetFileName($filePath) } else { "$($_.ProcessName).exe" }
+    ExecutablePath = $filePath
+    CommandLine = $null
+  }
+})
+[Console]::Out.Write((ConvertTo-Json -InputObject $items -Compress))`,
+    null,
+  )
+  return Array.isArray(records) ? records : []
+}
+
+function compactProcessError(error: unknown): string {
+  const message = errorMessage(error)
+  const line = message
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .find((item) => item && !item.startsWith('#< CLIXML'))
+  return (line ?? '알 수 없는 프로세스 조회 오류').slice(0, 300)
 }
 
 export async function applyClientIntegration(
@@ -189,6 +248,7 @@ export async function applyClientIntegration(
   const needsClaudeModels = targets.includes('claude-desktop')
   const needsCodexEnvironment = targets.includes('codex')
   const proxy = await loadProxyConnection(needsClaudeModels)
+  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'not-applied')
   const models = needsClaudeModels ? selectClaudeModels(proxy.models) : []
   if (needsClaudeModels && models.length === 0) {
     throw new ClientIntegrationError(502, '프록시 모델 목록에서 Claude 모델을 찾지 못했습니다.')
@@ -238,6 +298,56 @@ export async function applyClientIntegration(
   }
 }
 
+export async function removeClientIntegration(
+  inputTargets?: unknown,
+): Promise<ClientIntegrationRemoveResult> {
+  const targets = parseIntegrationTargets(inputTargets)
+  await requireTargetsStopped(targets)
+
+  const proxy = await loadProxyConnection(false)
+  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'applied')
+  const files = await prepareRemovalFiles(targets, proxy.baseUrl, proxy.token)
+  await assertFilesUnlocked(files)
+  await requireTargetsStopped(targets)
+
+  const removeCodexEnvironment = targets.includes('codex')
+  const previousEnv = removeCodexEnvironment
+    ? await getUserEnvironmentVariable('BATON_PROXY_TOKEN')
+    : undefined
+  const committed: PreparedFile[] = []
+  let preserveBackups = false
+  try {
+    for (const file of files) {
+      await commitFile(file)
+      committed.push(file)
+    }
+    if (removeCodexEnvironment) {
+      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', null)
+    }
+  } catch (error) {
+    const rollbackErrors = await rollbackFiles(committed)
+    preserveBackups = rollbackErrors.length > 0
+    if (previousEnv !== undefined) {
+      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', previousEnv).catch(() => {})
+    }
+    const rollbackSuffix = rollbackErrors.length
+      ? ` 롤백 오류: ${rollbackErrors.join('; ')}`
+      : ''
+    const outcome = rollbackErrors.length
+      ? '설정 해제와 일부 파일 롤백에 실패했습니다. .baton-*.bak 파일을 보존했습니다.'
+      : '설정을 해제하지 못해 기존 파일로 되돌렸습니다.'
+    throw new ClientIntegrationError(500, `${outcome} ${errorMessage(error)}${rollbackSuffix}`)
+  } finally {
+    await Promise.all(files.map((file) => cleanupPreparedFile(file, !preserveBackups)))
+  }
+
+  return {
+    removed: true,
+    updated: files.map((file) => file.label),
+    restartRequired: true,
+  }
+}
+
 export function parseIntegrationTargets(input: unknown): ClientIntegrationTarget[] {
   if (input === undefined) return TARGET_DEFINITIONS.map((definition) => definition.target)
   if (!Array.isArray(input) || input.length === 0) {
@@ -279,6 +389,7 @@ function buildTargetStatuses(
       label: definition.label,
       certainlyStopped: processCheckSucceeded && targetRunning.length === 0,
       running: targetRunning,
+      configuration: 'unknown',
     }
   })
 }
@@ -361,6 +472,166 @@ function nestedString(object: Record<string, unknown>, keys: string[]): string |
     value = (value as Record<string, unknown>)[key]
   }
   return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+type ConfigurationInspection = Pick<
+  ClientIntegrationTargetStatus,
+  'configuration' | 'configurationDetail'
+>
+
+async function requireConfigurationState(
+  targets: ClientIntegrationTarget[],
+  baseUrl: string,
+  token: string,
+  expected: 'applied' | 'not-applied',
+): Promise<void> {
+  const inspections = await inspectTargetConfigurations(baseUrl, token)
+  const invalid = targets
+    .map((target) => ({ target, inspection: inspections.get(target)! }))
+    .filter(({ inspection }) => inspection.configuration !== expected)
+  if (invalid.length === 0) return
+
+  const expectedLabel = expected === 'applied' ? '적용된' : '미적용'
+  const detail = invalid.map(({ target, inspection }) => {
+    const label = TARGET_DEFINITIONS.find((item) => item.target === target)?.label ?? target
+    return `${label}: ${inspection.configurationDetail ?? inspection.configuration}`
+  }).join('; ')
+  throw new ClientIntegrationError(
+    409,
+    `선택 대상이 모두 ${expectedLabel} 상태여야 합니다. ${detail}`,
+  )
+}
+
+async function inspectTargetConfigurations(
+  baseUrl: string,
+  token: string,
+): Promise<Map<ClientIntegrationTarget, ConfigurationInspection>> {
+  const home = homedir()
+  const claudeCli = path.join(home, '.claude', 'settings.json')
+  const codex = path.join(home, '.codex', 'config.toml')
+  const result = new Map<ClientIntegrationTarget, ConfigurationInspection>()
+
+  const inspect = async (
+    target: ClientIntegrationTarget,
+    operation: () => Promise<ConfigurationInspection>,
+  ) => {
+    try {
+      result.set(target, await operation())
+    } catch (error) {
+      result.set(target, {
+        configuration: 'unknown',
+        configurationDetail: errorMessage(error),
+      })
+    }
+  }
+
+  await Promise.all([
+    inspect('claude-cli', async () => {
+      const source = await readOptional(claudeCli)
+      return source.existed
+        ? inspectClaudeCliConfig(source.content, baseUrl, token)
+        : { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
+    }),
+    inspect('claude-desktop', async () => {
+      const file = await findClaudeDesktopConfig()
+      const source = await readOptional(file)
+      return source.existed
+        ? inspectClaudeDesktopConfig(source.content, baseUrl, token)
+        : { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
+    }),
+    inspect('codex', async () => {
+      const source = await readOptional(codex)
+      if (!source.existed) {
+        return { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
+      }
+      const environmentToken = await getUserEnvironmentVariable('BATON_PROXY_TOKEN')
+      return inspectCodexConfig(source.content, `${baseUrl}/v1`, token, environmentToken)
+    }),
+  ])
+
+  return result
+}
+
+function inspection(
+  ownedValuesPresent: boolean,
+  exact: boolean,
+  conflictDetail: string,
+): ConfigurationInspection {
+  if (!ownedValuesPresent) return { configuration: 'not-applied' }
+  if (exact) return { configuration: 'applied', configurationDetail: '적용됨' }
+  return { configuration: 'conflict', configurationDetail: conflictDetail }
+}
+
+export function inspectClaudeCliConfig(
+  content: string,
+  baseUrl: string,
+  token: string,
+): ConfigurationInspection {
+  const config = parseJsonObject(content, 'Claude CLI 설정')
+  const env = config.env
+  if (env !== undefined && (!env || typeof env !== 'object' || Array.isArray(env))) {
+    return { configuration: 'conflict', configurationDetail: 'env가 객체가 아닙니다.' }
+  }
+  const values = (env ?? {}) as Record<string, unknown>
+  const present = 'ANTHROPIC_BASE_URL' in values || 'ANTHROPIC_AUTH_TOKEN' in values
+  return inspection(
+    present,
+    values.ANTHROPIC_BASE_URL === baseUrl && values.ANTHROPIC_AUTH_TOKEN === token,
+    'Baton 소유 항목이 부분 적용되었거나 현재 프록시와 다릅니다.',
+  )
+}
+
+export function inspectClaudeDesktopConfig(
+  content: string,
+  baseUrl: string,
+  token: string,
+): ConfigurationInspection {
+  const config = parseJsonObject(content, 'Claude Desktop 설정')
+  // `inferenceProvider`/`inferenceModels` can exist in a normal Desktop config.
+  // Treat only gateway-specific values as evidence of a Baton application.
+  const present = config.inferenceProvider === 'gateway'
+    || 'inferenceGatewayBaseUrl' in config
+    || 'inferenceGatewayApiKey' in config
+  return inspection(
+    present,
+    config.inferenceProvider === 'gateway'
+      && config.inferenceCredentialKind === 'static'
+      && config.inferenceGatewayBaseUrl === baseUrl
+      && config.inferenceGatewayApiKey === token
+      && Array.isArray(config.inferenceModels),
+    'Baton 소유 항목이 부분 적용되었거나 현재 프록시와 다릅니다.',
+  )
+}
+
+export function inspectCodexConfig(
+  content: string,
+  baseUrl: string,
+  token: string,
+  environmentToken: string | null,
+): ConfigurationInspection {
+  let parsed: Record<string, unknown>
+  try {
+    parsed = parseToml(content) as Record<string, unknown>
+  } catch (error) {
+    return { configuration: 'unknown', configurationDetail: `TOML 파싱 실패: ${errorMessage(error)}` }
+  }
+  const providers = parsed.model_providers
+  const baton = providers && typeof providers === 'object' && !Array.isArray(providers)
+    ? (providers as Record<string, unknown>).baton
+    : undefined
+  const provider = baton && typeof baton === 'object' && !Array.isArray(baton)
+    ? baton as Record<string, unknown>
+    : undefined
+  const present = parsed.model_provider === 'baton' || provider !== undefined
+  return inspection(
+    present,
+    parsed.model_provider === 'baton'
+      && provider?.base_url === baseUrl
+      && provider?.env_key === 'BATON_PROXY_TOKEN'
+      && provider?.wire_api === 'responses'
+      && environmentToken === token,
+    'Baton provider 항목이 부분 적용되었거나 현재 프록시/토큰과 다릅니다.',
+  )
 }
 
 /** Select exactly one newest model per supported family, independent of API order. */
@@ -466,6 +737,84 @@ async function prepareFiles(
   }
 
   return files
+}
+
+async function prepareRemovalFiles(
+  targets: ClientIntegrationTarget[],
+  baseUrl: string,
+  token: string,
+): Promise<PreparedFile[]> {
+  const home = homedir()
+  const claudeCli = path.join(home, '.claude', 'settings.json')
+  const codex = path.join(home, '.codex', 'config.toml')
+  const files: PreparedFile[] = []
+
+  if (targets.includes('claude-cli')) {
+    const source = await readOptional(claudeCli)
+    if (!source.existed) throw new ClientIntegrationError(409, 'Claude CLI 설정이 이미 없습니다.')
+    files.push({
+      label: 'Claude CLI',
+      target: claudeCli,
+      content: removeClaudeCliConfig(source.content, baseUrl, token),
+      existed: true,
+    })
+  }
+
+  if (targets.includes('claude-desktop')) {
+    const file = await findClaudeDesktopConfig()
+    const source = await readOptional(file)
+    if (!source.existed) throw new ClientIntegrationError(409, 'Claude Desktop 설정이 이미 없습니다.')
+    files.push({
+      label: 'Claude Desktop',
+      target: file,
+      content: removeClaudeDesktopConfig(source.content, baseUrl, token),
+      existed: true,
+    })
+  }
+
+  if (targets.includes('codex')) {
+    const source = await readOptional(codex)
+    if (!source.existed) throw new ClientIntegrationError(409, 'Codex 설정이 이미 없습니다.')
+    files.push({
+      label: 'Codex CLI/Desktop',
+      target: codex,
+      content: unpatchCodexConfig(source.content, `${baseUrl}/v1`),
+      existed: true,
+    })
+  }
+
+  return files
+}
+
+export function removeClaudeCliConfig(content: string, baseUrl: string, token: string): string {
+  const config = parseJsonObject(content, 'Claude CLI 설정')
+  const current = inspectClaudeCliConfig(content, baseUrl, token)
+  if (current.configuration !== 'applied') {
+    throw new ClientIntegrationError(409, `Claude CLI 설정을 안전하게 해제할 수 없습니다: ${current.configurationDetail ?? current.configuration}`)
+  }
+  const env = config.env as Record<string, unknown>
+  delete env.ANTHROPIC_BASE_URL
+  delete env.ANTHROPIC_AUTH_TOKEN
+  if (Object.keys(env).length === 0) delete config.env
+  const result = `${JSON.stringify(config, null, 2)}\n`
+  parseJsonObject(result, '변경된 Claude CLI 설정')
+  return result
+}
+
+export function removeClaudeDesktopConfig(content: string, baseUrl: string, token: string): string {
+  const config = parseJsonObject(content, 'Claude Desktop 설정')
+  const current = inspectClaudeDesktopConfig(content, baseUrl, token)
+  if (current.configuration !== 'applied') {
+    throw new ClientIntegrationError(409, `Claude Desktop 설정을 안전하게 해제할 수 없습니다: ${current.configurationDetail ?? current.configuration}`)
+  }
+  delete config.inferenceProvider
+  delete config.inferenceCredentialKind
+  delete config.inferenceGatewayBaseUrl
+  delete config.inferenceGatewayApiKey
+  delete config.inferenceModels
+  const result = `${JSON.stringify(config, null, 2)}\n`
+  parseJsonObject(result, '변경된 Claude Desktop 설정')
+  return result
 }
 
 async function findClaudeDesktopConfig(): Promise<string> {
@@ -602,6 +951,62 @@ export function patchCodexConfig(content: string, baseUrl: string): string {
     || baton?.wire_api !== 'responses'
   ) {
     throw new ClientIntegrationError(422, '변경된 Codex 설정의 검증 결과가 예상과 다릅니다.')
+  }
+  return result
+}
+
+/** Remove only Baton's canonical Codex root key and provider table. */
+export function unpatchCodexConfig(content: string, baseUrl: string): string {
+  let parsed: Record<string, unknown>
+  try {
+    parsed = parseToml(content) as Record<string, unknown>
+  } catch (error) {
+    throw new ClientIntegrationError(422, `Codex 설정 TOML을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
+  }
+  const providers = parsed.model_providers
+  const baton = providers && typeof providers === 'object' && !Array.isArray(providers)
+    ? (providers as Record<string, unknown>).baton
+    : undefined
+  const provider = baton && typeof baton === 'object' && !Array.isArray(baton)
+    ? baton as Record<string, unknown>
+    : undefined
+  if (
+    parsed.model_provider !== 'baton'
+    || provider?.base_url !== baseUrl
+    || provider?.env_key !== 'BATON_PROXY_TOKEN'
+    || provider?.wire_api !== 'responses'
+  ) {
+    throw new ClientIntegrationError(409, 'Codex Baton 설정이 부분 적용되었거나 현재 프록시와 달라 안전하게 해제할 수 없습니다.')
+  }
+
+  const newline = content.includes('\r\n') ? '\r\n' : '\n'
+  const endedWithNewline = content.endsWith('\n')
+  const lines = content.length ? content.replace(/\r\n/g, '\n').split('\n') : []
+  if (endedWithNewline) lines.pop()
+  const firstTable = lines.findIndex((line) => isTableHeader(line))
+  const preambleEnd = firstTable === -1 ? lines.length : firstTable
+  const rootMatches = lines
+    .slice(0, preambleEnd)
+    .filter((line) => canonicalRootModelProvider(line)).length
+  const ownedHeaders = lines.filter((line) => isOwnedProviderHeader(line)).length
+  if (rootMatches !== 1 || ownedHeaders === 0) {
+    throw new ClientIntegrationError(422, 'Codex Baton 설정이 비표준 표기라 안전하게 해제할 수 없습니다.')
+  }
+
+  const output: string[] = []
+  let skipOwnedTable = false
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (index < preambleEnd && canonicalRootModelProvider(line)) continue
+    if (isTableHeader(line)) skipOwnedTable = isOwnedProviderHeader(line)
+    if (!skipOwnedTable) output.push(line)
+  }
+  while (output.length > 0 && output[output.length - 1].trim() === '') output.pop()
+  const result = output.length > 0 ? `${output.join(newline)}${newline}` : ''
+  const next = parseToml(result) as Record<string, unknown>
+  const nextProviders = next.model_providers as Record<string, unknown> | undefined
+  if (next.model_provider === 'baton' || nextProviders?.baton !== undefined) {
+    throw new ClientIntegrationError(422, '해제한 Codex 설정의 검증 결과가 예상과 다릅니다.')
   }
   return result
 }

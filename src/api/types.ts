@@ -101,10 +101,24 @@ export interface ClientIntegrationTargetStatus {
   label: string
   certainlyStopped: boolean
   running: ClientProcess[]
+  configuration: ClientIntegrationConfigurationState
+  configurationDetail?: string
 }
+
+export type ClientIntegrationConfigurationState =
+  | 'applied'
+  | 'not-applied'
+  | 'conflict'
+  | 'unknown'
 
 export interface ClientIntegrationApplyResult {
   applied: true
+  updated: string[]
+  restartRequired: true
+}
+
+export interface ClientIntegrationRemoveResult {
+  removed: true
   updated: string[]
   restartRequired: true
 }

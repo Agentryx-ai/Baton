@@ -149,6 +149,13 @@ function App() {
     refreshClientIntegration()
     return result
   }
+  const onRemoveClientIntegration = async (
+    targets: ClientIntegrationTarget[],
+  ) => {
+    const result = await client.removeClientIntegration(targets)
+    refreshClientIntegration()
+    return result
+  }
 
   const connectionSnippet = buildConnectionSnippet(proxy?.port ?? 8317, apiKey)
 
@@ -192,6 +199,7 @@ function App() {
           onRestartProxy={onRestartProxy}
           onRefreshClientIntegration={refreshClientIntegration}
           onApplyClientIntegration={onApplyClientIntegration}
+          onRemoveClientIntegration={onRemoveClientIntegration}
         />
       </main>
 

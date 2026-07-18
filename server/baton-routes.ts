@@ -18,6 +18,7 @@ import {
   applyClientIntegration,
   ClientIntegrationError,
   getClientIntegrationStatus,
+  removeClientIntegration,
 } from './client-integration.ts'
 
 export const batonRouter: Router = Router()
@@ -90,6 +91,17 @@ batonRouter.post('/baton/client-integration/apply', async (req: Request, res: Re
   try {
     const body = parseBody(req.body)
     res.json(await applyClientIntegration(body.targets))
+  } catch (error) {
+    const status = error instanceof ClientIntegrationError ? error.status : 500
+    const message = error instanceof Error ? error.message : String(error)
+    res.status(status).json({ error: message })
+  }
+})
+
+batonRouter.post('/baton/client-integration/remove', async (req: Request, res: Response) => {
+  try {
+    const body = parseBody(req.body)
+    res.json(await removeClientIntegration(body.targets))
   } catch (error) {
     const status = error instanceof ClientIntegrationError ? error.status : 500
     const message = error instanceof Error ? error.message : String(error)

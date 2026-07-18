@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Check, Copy, Info, RefreshCw, RotateCw, ShieldCheck } from 'lucide-react'
+import { Check, Copy, Info, RefreshCw, RotateCw, ShieldCheck, ShieldOff } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type {
   ClientIntegrationApplyResult,
+  ClientIntegrationRemoveResult,
   ClientIntegrationStatus,
   ClientIntegrationTarget,
   ProxyStatus,
@@ -33,6 +34,9 @@ interface SettingsSectionProps {
   onApplyClientIntegration: (
     targets: ClientIntegrationTarget[],
   ) => Promise<ClientIntegrationApplyResult>
+  onRemoveClientIntegration: (
+    targets: ClientIntegrationTarget[],
+  ) => Promise<ClientIntegrationRemoveResult>
 }
 
 const INTEGRATION_TARGETS: ReadonlyArray<{
@@ -84,6 +88,7 @@ export function SettingsSection({
   onRestartProxy,
   onRefreshClientIntegration,
   onApplyClientIntegration,
+  onRemoveClientIntegration,
 }: SettingsSectionProps) {
   const affinityManageable = affinity?.manageable ?? true
 
@@ -95,10 +100,9 @@ export function SettingsSection({
 
   const [copied, setCopied] = useState(false)
   const [restarting, setRestarting] = useState(false)
-  const [applyingIntegration, setApplyingIntegration] = useState(false)
-  const [selectedIntegrationTargets, setSelectedIntegrationTargets] = useState<
-    ClientIntegrationTarget[]
-  >(INTEGRATION_TARGETS.map((item) => item.target))
+  const [changingIntegrationTarget, setChangingIntegrationTarget] = useState<
+    ClientIntegrationTarget | null
+  >(null)
 
   const commitTtl = () => {
     if (!affinity) return
@@ -124,38 +128,30 @@ export function SettingsSection({
     window.setTimeout(() => setRestarting(false), 1200)
   }
 
-  const handleApplyIntegration = async () => {
-    setApplyingIntegration(true)
+  const handleApplyIntegration = async (target: ClientIntegrationTarget) => {
+    setChangingIntegrationTarget(target)
     try {
-      const result = await onApplyClientIntegration(selectedIntegrationTargets)
+      const result = await onApplyClientIntegration([target])
       toast.success(`${result.updated.join(', ')} 설정을 적용했습니다. 이제 앱을 다시 실행하세요.`)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error))
     } finally {
-      setApplyingIntegration(false)
+      setChangingIntegrationTarget(null)
       onRefreshClientIntegration()
     }
   }
 
-  const selectedStatuses = clientIntegration?.targets.filter((status) =>
-    selectedIntegrationTargets.includes(status.target)
-  ) ?? []
-  const selectedTargetsReady = selectedIntegrationTargets.length > 0
-    && selectedStatuses.length === selectedIntegrationTargets.length
-    && selectedStatuses.every((status) => status.certainlyStopped)
-
-  const toggleIntegrationTarget = (
-    target: ClientIntegrationTarget,
-    checked: boolean,
-  ) => {
-    setSelectedIntegrationTargets((current) => {
-      const next = new Set(current)
-      if (checked) next.add(target)
-      else next.delete(target)
-      return INTEGRATION_TARGETS
-        .map((item) => item.target)
-        .filter((item) => next.has(item))
-    })
+  const handleRemoveIntegration = async (target: ClientIntegrationTarget) => {
+    setChangingIntegrationTarget(target)
+    try {
+      const result = await onRemoveClientIntegration([target])
+      toast.success(`${result.updated.join(', ')} 설정을 해제했습니다. 이제 앱을 다시 실행하세요.`)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setChangingIntegrationTarget(null)
+      onRefreshClientIntegration()
+    }
   }
 
   return (
@@ -270,79 +266,107 @@ export function SettingsSection({
                 const status = clientIntegration?.targets.find(
                   (item) => item.target === option.target,
                 )
+                const isApplied = status?.configuration === 'applied'
+                const isNotApplied = status?.configuration === 'not-applied'
+                const actionable = Boolean(
+                  status?.certainlyStopped && (isApplied || isNotApplied),
+                )
+                const changingThisTarget = changingIntegrationTarget === option.target
                 return (
-                  <label
+                  <div
                     key={option.target}
-                    className="flex cursor-pointer items-start gap-2 rounded-md border p-3"
+                    className={cn(
+                      'flex min-h-40 flex-col rounded-md border p-3',
+                      isApplied && 'border-emerald-500/40 bg-emerald-500/5',
+                    )}
                   >
-                    <input
-                      type="checkbox"
-                      checked={selectedIntegrationTargets.includes(option.target)}
-                      disabled={applyingIntegration}
-                      onChange={(event) =>
-                        toggleIntegrationTarget(option.target, event.target.checked)
-                      }
-                      className="mt-0.5 size-4 accent-primary"
-                    />
-                    <span className="min-w-0 space-y-0.5">
+                    <div className="min-w-0 flex-1 space-y-1">
                       <span className="block text-sm font-medium">{option.label}</span>
-                      <span
-                        className={cn(
-                          'block text-xs',
-                          status?.certainlyStopped
-                            ? 'text-emerald-600 dark:text-emerald-400'
+                      <span className={cn(
+                        'block text-xs font-medium',
+                        status?.configuration === 'applied'
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : status?.configuration === 'conflict'
+                            ? 'text-destructive'
                             : 'text-muted-foreground',
-                        )}
-                      >
-                        {status?.certainlyStopped
-                          ? '종료됨 · 적용 가능'
-                          : status
-                            ? `실행 중 ${status.running.length}개`
-                            : '상태 확인 중'}
+                      )}>
+                        {!status
+                          ? '설정 확인 중'
+                          : status.configuration === 'applied'
+                          ? '적용됨'
+                          : status.configuration === 'not-applied'
+                            ? '미적용'
+                            : status.configuration === 'conflict'
+                              ? '설정 충돌'
+                              : '설정 확인 불가'}
                       </span>
+                      <span className={cn(
+                        'block text-xs',
+                        status?.certainlyStopped
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-muted-foreground',
+                      )}>
+                        {!status
+                          ? '프로세스 확인 중'
+                          : status.certainlyStopped
+                          ? '종료됨'
+                          : `실행 중 ${status.running.length}개`}
+                      </span>
+                      {status?.configurationDetail
+                        && status.configuration !== 'applied' ? (
+                          <span className="block text-xs text-muted-foreground">
+                            {status.configurationDetail}
+                          </span>
+                        ) : null}
                       {option.description ? (
                         <span className="block text-xs text-muted-foreground">
                           {option.description}
                         </span>
                       ) : null}
-                    </span>
-                  </label>
+                    </div>
+                    <Button
+                      variant={isApplied ? 'outline' : 'default'}
+                      size="sm"
+                      className="mt-3 w-full"
+                      disabled={
+                        clientIntegrationLoading
+                        || changingIntegrationTarget !== null
+                        || !actionable
+                      }
+                      onClick={() => void (
+                        isApplied
+                          ? handleRemoveIntegration(option.target)
+                          : handleApplyIntegration(option.target)
+                      )}
+                    >
+                      {isApplied ? <ShieldOff /> : <ShieldCheck />}
+                      {changingThisTarget
+                        ? isApplied ? '해제 중…' : '적용 중…'
+                        : isApplied
+                          ? status?.certainlyStopped ? '설정 해제' : '종료 후 해제'
+                          : isNotApplied
+                            ? status?.certainlyStopped ? '설정 적용' : '종료 후 적용'
+                            : !status ? '확인 중…' : '조치 불가'}
+                    </Button>
+                  </div>
                 )
               })}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <Button
-                size="sm"
-                disabled={
-                  applyingIntegration
-                  || clientIntegrationLoading
-                  || !selectedTargetsReady
-                }
-                onClick={() => void handleApplyIntegration()}
-              >
-                <ShieldCheck />
-                {applyingIntegration ? '적용 중…' : '선택 설정 적용'}
-              </Button>
-              <Button
                 variant="outline"
                 size="icon-sm"
                 aria-label="클라이언트 종료 상태 새로고침"
                 title="종료 상태 새로고침"
-                disabled={clientIntegrationLoading || applyingIntegration}
+                disabled={clientIntegrationLoading || changingIntegrationTarget !== null}
                 onClick={onRefreshClientIntegration}
               >
                 <RefreshCw className={cn(clientIntegrationLoading && 'animate-spin')} />
               </Button>
-              {selectedTargetsReady ? (
-                <span className="text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                  선택 대상 종료됨 · 적용 가능
-                </span>
-              ) : (
-                <span className="text-xs font-medium text-destructive">
-                  선택 대상이 실행 중이거나 선택되지 않음
-                </span>
-              )}
+              <span className="text-xs text-muted-foreground">
+                각 클라이언트에서 현재 가능한 동작만 선택할 수 있습니다.
+              </span>
             </div>
 
             {clientIntegration?.error || clientIntegrationError ? (
@@ -351,8 +375,8 @@ export function SettingsSection({
               </p>
             ) : null}
             <p className="text-xs text-muted-foreground">
-              선택한 대상만 종료 여부와 파일 잠금을 검사해 적용합니다. 선택하지 않은 앱은
-              실행 중이어도 됩니다.
+              동작할 대상 하나만 종료 여부와 파일 잠금을 검사합니다. 다른 앱은 실행 중이어도
+              됩니다. 이미 적용된 대상은 재적용하지 않고 해제만 제공합니다.
             </p>
           </div>
         </Row>

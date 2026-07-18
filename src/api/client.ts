@@ -11,6 +11,7 @@ import type {
   AccountQuota,
   AddStatus,
   ClientIntegrationApplyResult,
+  ClientIntegrationRemoveResult,
   ClientIntegrationStatus,
   ClientIntegrationTarget,
   PolicyState,
@@ -170,6 +171,14 @@ export const client = {
     targets: ClientIntegrationTarget[],
   ): Promise<ClientIntegrationApplyResult> =>
     request<ClientIntegrationApplyResult>('/baton/client-integration/apply', {
+      method: 'POST',
+      json: { targets },
+    }),
+
+  removeClientIntegration: (
+    targets: ClientIntegrationTarget[],
+  ): Promise<ClientIntegrationRemoveResult> =>
+    request<ClientIntegrationRemoveResult>('/baton/client-integration/remove', {
       method: 'POST',
       json: { targets },
     }),
