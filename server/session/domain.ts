@@ -324,6 +324,8 @@ export interface ThreadSnapshot {
   turns: CanonicalTurn[]
   items: CanonicalItem[]
   bindings: ProviderBinding[]
+  /** Current Baton-owned Goal projection; absent only in legacy/in-memory adapters. */
+  goal?: CanonicalGoal | null
 }
 
 export interface CreateSessionInput {

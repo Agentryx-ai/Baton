@@ -54,6 +54,8 @@ test('usage stays canonical but is summarized once outside the transcript', () =
   const turn: CanonicalTurnDto = {
     id: 'turn-1',
     threadId: 'thread-1',
+    goalId: null,
+    goalRevision: null,
     sequence: 1,
     provider: 'codex',
     model: 'gpt-test',

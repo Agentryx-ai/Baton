@@ -791,7 +791,14 @@ export class SqliteSessionStore implements SessionStore {
        WHERE thread_id = ? AND invalidated_at IS NULL AND synced_revision = ?
        ORDER BY provider`,
     ), threadId, thread.revision)
-    return { session, thread, turns, items, bindings: bindingRows.map((row) => this.#binding(row)) }
+    return {
+      session,
+      thread,
+      turns,
+      items,
+      bindings: bindingRows.map((row) => this.#binding(row)),
+      goal: this.getGoal(thread.id),
+    }
   }
 
   forkThread(input: ForkThreadInput): CanonicalThread {

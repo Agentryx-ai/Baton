@@ -164,6 +164,8 @@ export interface CanonicalThreadDto {
 export interface CanonicalTurnDto {
   id: string
   threadId: string
+  goalId: string | null
+  goalRevision: number | null
   sequence: number
   provider: CanonicalProvider
   model: string
@@ -196,6 +198,36 @@ export interface ThreadSnapshotDto {
   turns: CanonicalTurnDto[]
   items: CanonicalItemDto[]
   bindings: JsonValue[]
+  goal?: CanonicalGoalDto | null
+}
+
+export interface CanonicalGoalDto {
+  id: string
+  threadId: string
+  objective: string
+  status: 'active' | 'paused' | 'blocked' | 'usage_limited' | 'budget_limited' | 'complete'
+  statusReason: {
+    code: string
+    source: 'user' | 'host' | 'provider' | 'model'
+    message: string | null
+    at: string
+  } | null
+  revision: number
+  provider: CanonicalProvider
+  model: string
+  effort: string | null
+  tokenBudget: number | null
+  tokensUsed: number
+  timeUsedSeconds: number
+  maxAutomaticTurns: number
+  automaticTurnsUsed: number
+  maxActiveSeconds: number
+  noProgressCount: number
+  lastProgressDigest: string | null
+  createdAt: string
+  updatedAt: string
+  startedAt: string
+  completedAt: string | null
 }
 
 export type CanonicalStreamEventType =
