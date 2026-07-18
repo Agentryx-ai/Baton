@@ -224,7 +224,7 @@ function SessionSidebar({
 
         <div className={cn(
           'min-h-0 flex-1 overflow-y-auto',
-          preferences.groupBy === 'none' ? 'space-y-1' : 'space-y-3',
+          preferences.groupBy === 'none' ? 'space-y-1' : 'space-y-5',
         )}>
           {sessions === null ? (
             <p className="px-2 py-4 text-xs text-muted-foreground">불러오는 중…</p>
@@ -261,7 +261,7 @@ function SessionSidebar({
                   </span>
                 </button>
                 {!collapsed.has(group.id) ? (
-                  <div className="ml-3 mt-1 space-y-1 border-l border-sidebar-border pl-1.5">
+                  <div className="ml-3 mt-1.5 space-y-0.5 border-l border-sidebar-border pl-1.5">
                     {group.sessions.map((session) => (
                       <SessionButton
                         key={session.id}
@@ -314,8 +314,11 @@ function SessionButton({
         onClick={() => onSelect(session.id)}
         className={cn('min-w-0 flex-1 text-left', nested ? 'px-2.5 py-2' : 'px-3 py-2.5')}
       >
-        <span className="block truncate font-medium">
-          {session.title || session.source?.sourceAlias || session.preview || '새 대화'}
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="min-w-0 flex-1 truncate font-medium">
+            {session.title || session.source?.sourceAlias || session.preview || '새 대화'}
+          </span>
+          <SessionStatus status={session.workStatus} />
         </span>
         {action === 'restore' && session.archivedAt ? (
           <span className="mt-0.5 block truncate text-[0.6875rem] opacity-65">
@@ -337,6 +340,36 @@ function SessionButton({
         {action === 'restore' ? <Undo2 aria-hidden /> : <Trash2 aria-hidden />}
       </Button>
     </div>
+  )
+}
+
+const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: string; dot: string }> = {
+  archived: { label: '휴지통', dot: 'bg-muted-foreground' },
+  waiting_user: { label: '입력 대기', dot: 'bg-warning' },
+  waiting_approval: { label: '승인 대기', dot: 'bg-warning' },
+  waiting_tool: { label: '도구 실행', dot: 'bg-info' },
+  running: { label: '진행 중', dot: 'bg-ok' },
+  queued: { label: '대기 중', dot: 'bg-info' },
+  usage_limited: { label: '사용량 제한', dot: 'bg-warning' },
+  budget_limited: { label: '실행 제한', dot: 'bg-warning' },
+  blocked: { label: '차단됨', dot: 'bg-destructive' },
+  paused: { label: '일시정지', dot: 'bg-muted-foreground' },
+  failed: { label: '실패', dot: 'bg-destructive' },
+  interrupted: { label: '중단됨', dot: 'bg-warning' },
+  cancelled: { label: '취소됨', dot: 'bg-muted-foreground' },
+  complete: { label: '목표 완료', dot: 'bg-ok' },
+  completed: { label: '완료', dot: 'bg-ok' },
+  imported: { label: '가져옴', dot: 'bg-muted-foreground' },
+  idle: { label: '준비됨', dot: 'bg-muted-foreground' },
+}
+
+function SessionStatus({ status }: { status: CanonicalSessionDto['workStatus'] }) {
+  const presentation = SESSION_STATUS[status]
+  return (
+    <span className="inline-flex shrink-0 items-center gap-1 text-[0.625rem] font-normal text-muted-foreground">
+      <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
+      {presentation.label}
+    </span>
   )
 }
 

@@ -1978,6 +1978,7 @@ export class SqliteSessionStore implements SessionStore {
       createdAt: text(row, 'created_at'),
       updatedAt: text(row, 'updated_at'),
       archivedAt: nullableText(row, 'archived_at'),
+      workStatus: visibleWorkStatus(row, sourceProvider !== null),
       source: sourceProvider ? {
         provider: sourceProvider as CanonicalProvider,
         sourceClient: publicSourceClient(text(row, 'source_client')),
@@ -2219,6 +2220,8 @@ function isValidGoalTransition(current: GoalStatus, next: GoalStatus, resetLimit
 function sessionSelect(): string {
   return `
     SELECT s.*,
+      (SELECT t.status FROM turns t WHERE t.thread_id=s.active_thread_id ORDER BY t.sequence DESC LIMIT 1) AS latest_turn_status,
+      (SELECT g.status FROM goals g WHERE g.thread_id=s.active_thread_id) AS current_goal_status,
       (SELECT ns.provider FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_provider,
       (SELECT ns.source_client FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_client,
       (SELECT ns.source_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_alias,
@@ -2226,4 +2229,17 @@ function sessionSelect(): string {
       (SELECT ns.project_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_project_alias
     FROM sessions s
   `
+}
+
+function visibleWorkStatus(row: SqlRow, imported: boolean): CanonicalSession['workStatus'] {
+  if (nullableText(row, 'archived_at') !== null) return 'archived'
+  const turn = nullableText(row, 'latest_turn_status')
+  if (turn === 'waiting_tool' || turn === 'running' || turn === 'queued') return turn
+  const goal = nullableText(row, 'current_goal_status')
+  if (goal === 'usage_limited' || goal === 'budget_limited' || goal === 'blocked' || goal === 'paused') return goal
+  if (turn === 'failed' || turn === 'interrupted' || turn === 'cancelled') return turn
+  if (goal === 'complete') return 'complete'
+  if (turn === 'completed') return 'completed'
+  if (imported) return 'imported'
+  return 'idle'
 }

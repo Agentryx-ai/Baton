@@ -15,6 +15,25 @@ export type TurnStatus =
   | 'failed'
   | 'interrupted'
 
+export type VisibleWorkStatus =
+  | 'archived'
+  | 'waiting_user'
+  | 'waiting_approval'
+  | 'waiting_tool'
+  | 'running'
+  | 'queued'
+  | 'usage_limited'
+  | 'budget_limited'
+  | 'blocked'
+  | 'paused'
+  | 'failed'
+  | 'interrupted'
+  | 'cancelled'
+  | 'complete'
+  | 'completed'
+  | 'imported'
+  | 'idle'
+
 export type CanonicalItemKind =
   | 'user_message'
   | 'assistant_message'
@@ -41,6 +60,7 @@ export interface CanonicalSessionDto {
   createdAt: string
   updatedAt: string
   archivedAt: string | null
+  workStatus: VisibleWorkStatus
   source?: NativeSessionSourceSummaryDto | null
 }
 

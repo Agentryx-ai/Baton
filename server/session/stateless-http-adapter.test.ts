@@ -42,6 +42,7 @@ const snapshot: ThreadSnapshot = {
     id: 'session-1', title: null, preview: null, activeThreadId: 'thread-1',
     projectKey: null, cwd: null, schemaVersion: 1,
     createdAt: '2026-07-18T00:00:00.000Z', updatedAt: '2026-07-18T00:00:00.000Z', archivedAt: null,
+    workStatus: 'running',
   },
   thread: {
     id: 'thread-1', sessionId: 'session-1', parentThreadId: null, forkTurnId: null,

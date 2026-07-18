@@ -29,6 +29,7 @@ function session(
     updatedAt,
     archivedAt: null,
     ...overrides,
+    workStatus: overrides.workStatus ?? 'idle',
   }
 }
 

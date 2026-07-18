@@ -52,6 +52,7 @@ const session: CanonicalSession = {
   createdAt: now,
   updatedAt: now,
   archivedAt: null,
+  workStatus: 'idle',
 }
 
 const turn: CanonicalTurn = {

@@ -301,6 +301,7 @@ function snapshot(): ThreadSnapshot {
     session: {
       id: 'session', title: null, preview: null, activeThreadId: 'thread', projectKey: null,
       cwd: 'C:/workspace', schemaVersion: 1, createdAt: now, updatedAt: now, archivedAt: null,
+      workStatus: 'idle',
     },
     thread: {
       id: 'thread', sessionId: 'session', parentThreadId: null, forkTurnId: null, forkItemId: null,

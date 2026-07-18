@@ -749,8 +749,11 @@ test('turn activity keeps turn, execution, and thread status synchronized and is
   const store = new SqliteSessionStore(path, deterministicOptions())
   t.after(() => store.close())
   const session = store.createSession({})
+  assert.equal(session.workStatus, 'idle')
   const started = store.beginTurn(beginInput(session.activeThreadId))
+  assert.equal(store.getSession(session.id)?.workStatus, 'running')
   assert.equal(store.setTurnActivity(started.turn.id, 'waiting_tool').status, 'waiting_tool')
+  assert.equal(store.getSession(session.id)?.workStatus, 'waiting_tool')
   assert.equal(store.setTurnActivity(started.turn.id, 'waiting_tool').status, 'waiting_tool')
   assert.equal(store.getThread(session.activeThreadId)?.status, 'running')
   const inspected = new DatabaseSync(path, { readOnly: true })
@@ -763,6 +766,7 @@ test('turn activity keeps turn, execution, and thread status synchronized and is
     status: string
   }).status, 'running')
   store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  assert.equal(store.getSession(session.id)?.workStatus, 'completed')
   assert.throws(
     () => store.setTurnActivity(started.turn.id, 'waiting_tool'),
     (error: unknown) => error instanceof SessionStoreError && error.code === 'turn_not_running',

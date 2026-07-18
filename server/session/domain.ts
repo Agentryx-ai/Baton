@@ -176,6 +176,8 @@ export interface CanonicalSession {
   createdAt: string
   updatedAt: string
   archivedAt: string | null
+  /** Derived display state; it does not own or mutate execution state. */
+  workStatus: VisibleWorkStatus
   source?: {
     provider: CanonicalProvider
     sourceClient: 'codex_local' | 'claude_desktop' | 'claude_code'
