@@ -67,9 +67,9 @@ function codexModels(models: string[]): ProviderModelDescriptor[] {
       id,
       displayName: friendlyModelName(id),
       description: id.includes('-sol')
-        ? '균형 잡힌 기본 모델'
+        ? '깊은 작업'
         : id.includes('-terra')
-          ? '깊은 작업'
+          ? '균형 잡힌 기본 모델'
           : id.includes('-luna')
             ? '빠른 작업'
             : 'Codex 모델',

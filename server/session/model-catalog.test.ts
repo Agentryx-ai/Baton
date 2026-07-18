@@ -37,6 +37,10 @@ test('Codex catalog is deterministic and preserves a configured default', () => 
     'gpt-5.6-luna',
     'gpt-5.4-mini',
   ])
+  assert.deepEqual(catalog.models.slice(0, 2).map((model) => model.description), [
+    '깊은 작업',
+    '균형 잡힌 기본 모델',
+  ])
   assert.equal(catalog.defaultModel, 'gpt-5.6-terra')
 })
 
