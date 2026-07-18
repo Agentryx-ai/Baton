@@ -28,8 +28,9 @@ test('assistant model labels preserve catalog names and provider version punctua
 })
 
 test('conversation header and sidebar share every canonical work status presentation', async () => {
-  const { SESSION_STATUS } = await import(workspaceModulePath) as {
+  const { SESSION_STATUS, sessionStatusPresentation } = await import(workspaceModulePath) as {
     SESSION_STATUS: Record<string, { label: string; dot: string }>
+    sessionStatusPresentation: (status: unknown) => { label: string; dot: string }
   }
   for (const status of [
     'idle', 'queued', 'running', 'waiting_tool', 'paused', 'blocked', 'usage_limited',
@@ -38,6 +39,8 @@ test('conversation header and sidebar share every canonical work status presenta
     assert.ok(SESSION_STATUS[status]?.label)
     assert.ok(SESSION_STATUS[status]?.dot)
   }
+  assert.deepEqual(sessionStatusPresentation(undefined), SESSION_STATUS.idle)
+  assert.deepEqual(sessionStatusPresentation('future_status'), SESSION_STATUS.idle)
 })
 
 test('stale Goal status mutations are surfaced as explicit conflicts', async () => {

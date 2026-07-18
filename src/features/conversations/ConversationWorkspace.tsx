@@ -461,8 +461,14 @@ export const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: 
   idle: { label: '준비됨', dot: 'bg-muted-foreground' },
 }
 
-function SessionStatus({ status }: { status: CanonicalSessionDto['workStatus'] }) {
-  const presentation = SESSION_STATUS[status]
+export function sessionStatusPresentation(status: unknown): { label: string; dot: string } {
+  return typeof status === 'string' && status in SESSION_STATUS
+    ? SESSION_STATUS[status as CanonicalSessionDto['workStatus']]
+    : SESSION_STATUS.idle
+}
+
+function SessionStatus({ status }: { status: CanonicalSessionDto['workStatus'] | undefined }) {
+  const presentation = sessionStatusPresentation(status)
   return (
     <span className="inline-flex shrink-0 items-center gap-1 text-[0.625rem] font-normal text-muted-foreground">
       <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
