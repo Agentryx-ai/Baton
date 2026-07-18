@@ -32,7 +32,13 @@ const VERIFIED_FEATURES = [
   'plugins',
 ] as const
 
-const ALLOWED_ITEM_TYPES = new Set(['userMessage', 'agentMessage', 'reasoning', 'plan'])
+const ALLOWED_ITEM_TYPES = new Set([
+  'userMessage',
+  'agentMessage',
+  'reasoning',
+  'plan',
+  'dynamicToolCall',
+])
 
 type JsonObject = Record<string, unknown>
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null; stderr?: string }
@@ -162,6 +168,10 @@ export class CodexJsonlRpcClient {
     await this.process.write(
       `${JSON.stringify({ method, ...(params === undefined ? {} : { params }) })}\n`,
     )
+  }
+
+  async respond(id: string | number, result: unknown): Promise<void> {
+    await this.process.write(`${JSON.stringify({ id, result })}\n`)
   }
 
   incoming(): AsyncIterable<RpcMessage> {
@@ -421,6 +431,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           ephemeral: true,
           approvalPolicy: 'never',
           approvalsReviewer: 'user',
+          dynamicTools: context.toolDefinitions.map(dynamicToolSpec),
           config: { ...HARDENING_OVERRIDES, ...this.mcpDisableOverrides },
         }),
         'thread/start result',
@@ -466,6 +477,20 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           for await (const message of client.incoming()) {
             if (message.method === undefined) continue
             if (message.id !== undefined) {
+              if (message.method === 'item/tool/call') {
+                const toolCall = parseDynamicToolCall(message.params)
+                const result = await context.executeTool({
+                  callId: `${body.turnId}:${toolCall.callId}`,
+                  providerCallId: toolCall.callId,
+                  name: toolCall.tool,
+                  input: toolCall.arguments,
+                })
+                await client.respond(message.id, {
+                  contentItems: [{ type: 'inputText', text: JSON.stringify(result) }],
+                  success: result.success,
+                })
+                continue
+              }
               if (isApprovalRequest(message.method)) {
                 await context.denyApproval(message).catch(() => undefined)
               } else {
@@ -481,7 +506,10 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               const usage = asOptionalObject(params?.tokenUsage)
               latestUsage = asOptionalObject(usage?.last) ?? usage
             }
-            const event = nativeEvent(message.method, params)
+            const event = nativeEvent(
+              message.method,
+              addRequestedModelMetadata(params, body.model, body.effort),
+            )
             eventQueue.push(event)
             if (message.method === 'turn/completed') {
               const turn = asObject(params?.turn, 'turn/completed turn')
@@ -530,7 +558,18 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       // The canonical input item is committed before provider execution. Ignore Codex's echo.
       if (type === 'userMessage') return []
       if (type === 'agentMessage' && typeof item.text === 'string') {
-        return [{ kind: 'assistant_message', payload: { text: item.text }, provider: 'codex', nativeId }]
+        return [{
+          kind: 'assistant_message',
+          payload: {
+            text: item.text,
+            requestedModel: typeof payload?.requestedModel === 'string'
+              ? payload.requestedModel
+              : null,
+            effort: typeof payload?.effort === 'string' ? payload.effort : null,
+          },
+          provider: 'codex',
+          nativeId,
+        }]
       }
       if (type === 'reasoning') {
         return [{
@@ -589,8 +628,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       capabilities: {
         roles: ['user', 'assistant'],
         contentTypes: ['text'],
-        toolCalling: false,
-        parallelTools: false,
+        toolCalling: true,
+        parallelTools: true,
         contextWindow: null,
         continuation: 'stateless',
         reasoningState: 'portable-summary',
@@ -601,6 +640,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       enforcementEvidence: {
         ...evidence,
         mcpServersDisabled: Object.keys(this.mcpDisableOverrides).length,
+        toolTransport: 'client-owned-dynamic-functions',
       },
     }
   }
@@ -754,6 +794,37 @@ function nativeEvent(method: string, params: JsonObject | null): NativeProviderE
   }
 }
 
+function dynamicToolSpec(definition: ProviderExecutionContext['toolDefinitions'][number]): JsonObject {
+  return {
+    type: 'function',
+    name: definition.name,
+    description: definition.description,
+    inputSchema: definition.inputSchema,
+  }
+}
+
+function parseDynamicToolCall(value: unknown): {
+  callId: string
+  tool: string
+  arguments: JsonObject
+} {
+  const params = asObject(value, 'item/tool/call params')
+  return {
+    callId: requiredString(params.callId, 'dynamic tool call id'),
+    tool: requiredString(params.tool, 'dynamic tool name'),
+    arguments: asObject(params.arguments, 'dynamic tool arguments'),
+  }
+}
+
+function addRequestedModelMetadata(
+  params: JsonObject | null,
+  requestedModel: string,
+  effort: string | null,
+): JsonObject | null {
+  if (!params) return null
+  return { ...params, requestedModel, effort }
+}
+
 function durableEventId(method: string, params: JsonObject | null): string {
   const item = asOptionalObject(params?.item)
   const identity = typeof item?.id === 'string'
@@ -764,7 +835,7 @@ function durableEventId(method: string, params: JsonObject | null): string {
 
 function isForbiddenNotification(method: string, params: JsonObject | null): boolean {
   if (method.startsWith('item/autoApprovalReview/')) return true
-  if (method === 'rawResponseItem/completed') return true
+  if (method === 'rawResponseItem/completed') return false
   if (method !== 'item/started' && method !== 'item/completed') return false
   const item = asOptionalObject(params?.item)
   return typeof item?.type !== 'string' || !ALLOWED_ITEM_TYPES.has(item.type)

@@ -8,10 +8,10 @@ import {
   type CodexProcessFactory,
 } from './codex-adapter.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
-import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import type { AgentToolDefinition, AgentToolInvocation, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null }
-type Scenario = 'normal' | 'collab' | 'cancel' | 'hangInterrupt' | 'exit'
+type Scenario = 'normal' | 'tool' | 'collab' | 'cancel' | 'hangInterrupt' | 'exit'
 
 class TestStream<T> implements AsyncIterable<T> {
   private readonly values: T[] = []
@@ -154,18 +154,64 @@ function scriptedFactory(
         self.emit({ id: idOf(message), result: {} })
       } else if (method === 'turn/start') {
         self.emit({ id: idOf(message), result: { turn: { id: 'native-turn', status: 'inProgress', items: [] } } })
-        queueMicrotask(() => emitScenario(self, scenario))
+        queueMicrotask(() => scenario === 'tool' ? emitToolCall(self) : emitScenario(self, scenario))
       } else if (method === 'turn/interrupt') {
         if (scenario === 'hangInterrupt') return
         self.emit({ id: idOf(message), result: {} })
         queueMicrotask(() => {
           self.emit({ method: 'turn/completed', params: { threadId: 'native-thread', turn: { id: 'native-turn', status: 'interrupted', error: null } } })
         })
+      } else if (scenario === 'tool' && message.id === 60 && 'result' in message) {
+        self.emit({
+          method: 'item/completed',
+          params: {
+            threadId: 'native-thread',
+            turnId: 'native-turn',
+            item: {
+              id: 'dynamic-1',
+              type: 'dynamicToolCall',
+              tool: 'read_file',
+              arguments: { path: 'README.md' },
+              status: 'completed',
+              contentItems: [{ type: 'inputText', text: 'ok' }],
+              success: true,
+            },
+          },
+        })
+        emitScenario(self, 'normal')
       }
     })
     created.push(process)
     return process
   }
+}
+
+function emitToolCall(process: FakeProcess): void {
+  process.emit({
+    method: 'item/started',
+    params: {
+      threadId: 'native-thread',
+      turnId: 'native-turn',
+      item: {
+        id: 'dynamic-1',
+        type: 'dynamicToolCall',
+        tool: 'read_file',
+        arguments: { path: 'README.md' },
+        status: 'inProgress',
+      },
+    },
+  })
+  process.emit({
+    method: 'item/tool/call',
+    id: 60,
+    params: {
+      threadId: 'native-thread',
+      turnId: 'native-turn',
+      callId: 'provider-call-1',
+      tool: 'read_file',
+      arguments: { path: 'README.md' },
+    },
+  })
 }
 
 function emitScenario(process: FakeProcess, scenario: Scenario): void {
@@ -235,12 +281,15 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
   })
 }
 
-function context(): ProviderExecutionContext {
+function context(options: {
+  tools?: AgentToolDefinition[]
+  executeTool?: (request: AgentToolInvocation) => Promise<Awaited<ReturnType<ProviderExecutionContext['executeTool']>>>
+} = {}): ProviderExecutionContext {
   return {
     signal: new AbortController().signal,
-    toolDefinitions: [],
+    toolDefinitions: options.tools ?? [],
     limits: DEFAULT_AGENT_LOOP_LIMITS,
-    async executeTool() { throw new Error('tool not registered') },
+    executeTool: options.executeTool ?? (async () => { throw new Error('tool not registered') }),
     async denyApproval(): Promise<never> { throw new Error('approval denied') },
     async denyToolCall(): Promise<never> { throw new Error('tool denied') },
   }
@@ -339,7 +388,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   })
   const handshake = await adapter.initialize()
   assert.equal(handshake.capabilities.nativeChildExecution, 'disabled')
-  assert.equal(handshake.capabilities.toolCalling, false)
+  assert.equal(handshake.capabilities.toolCalling, true)
   assert.equal(handshake.enforcementEvidence.source, 'config/read')
   const materialized = adapter.materialize(request(), snapshot())
   const execution = await adapter.execute(materialized, context())
@@ -377,6 +426,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.deepEqual(params.runtimeWorkspaceRoots, [])
   assert.equal(params.approvalsReviewer, 'user')
   assert.equal(params.approvalPolicy, 'never')
+  assert.deepEqual(params.dynamicTools, [])
   assert.deepEqual(params.config, {
     'features.multi_agent': false,
     'features.multi_agent_v2': false,
@@ -390,6 +440,64 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.deepEqual((turnStart.params as Record<string, unknown>).environments, [])
   assert.deepEqual((turnStart.params as Record<string, unknown>).runtimeWorkspaceRoots, [])
   assert.ok(turnProcess.writes.some((message) => message.method === 'thread/inject_items'))
+  await adapter.shutdown()
+})
+
+test('adapter exposes only Baton dynamic tools and returns their result through the provider call id', async () => {
+  const created: FakeProcess[] = []
+  const invocations: AgentToolInvocation[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('tool', created, []),
+    shutdownTimeoutMs: 20,
+  })
+  const tool: AgentToolDefinition = {
+    name: 'read_file',
+    description: 'Read a workspace file',
+    inputSchema: {
+      type: 'object',
+      properties: { path: { type: 'string' } },
+      required: ['path'],
+      additionalProperties: false,
+    },
+    sideEffect: 'read_only',
+  }
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [tool],
+    executeTool: async (invocation) => {
+      invocations.push(invocation)
+      return { success: true, content: { text: 'contents' }, error: null }
+    },
+  }))
+  const events = await collect(execution.events)
+  assert.equal((await execution.terminal).status, 'completed')
+  assert.deepEqual(invocations, [{
+    callId: 'canonical-turn:provider-call-1',
+    providerCallId: 'provider-call-1',
+    name: 'read_file',
+    input: { path: 'README.md' },
+  }])
+  const threadStart = created[1].writes.find((message) => message.method === 'thread/start')
+  assert.deepEqual((threadStart?.params as Record<string, unknown>).dynamicTools, [{
+    type: 'function',
+    name: 'read_file',
+    description: 'Read a workspace file',
+    inputSchema: tool.inputSchema,
+  }])
+  const response = created[1].writes.find((message) => message.id === 60 && 'result' in message)
+  assert.deepEqual(response?.result, {
+    contentItems: [{
+      type: 'inputText',
+      text: JSON.stringify({ success: true, content: { text: 'contents' }, error: null }),
+    }],
+    success: true,
+  })
+  const assistant = events.flatMap((event) => adapter.normalize(event))
+    .find((item) => item.kind === 'assistant_message')
+  assert.deepEqual(assistant?.payload, {
+    text: 'done',
+    requestedModel: 'gpt-test',
+    effort: null,
+  })
   await adapter.shutdown()
 })
 
