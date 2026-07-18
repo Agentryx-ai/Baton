@@ -31,41 +31,64 @@ export function ConversationItem({ item }: { item: CanonicalItemDto }) {
   const body = isUsage ? usageSummary(item.payload) : payloadText(item)
   const showRawDetail = isError || isReasoning || isUsage || item.kind === 'provider_event'
 
+  if (item.kind === 'user_message') {
+    return (
+      <article className="ml-auto max-w-[88%] rounded-2xl bg-muted px-4 py-3 sm:max-w-[78%]">
+        <div className="whitespace-pre-wrap break-words text-[0.9375rem] leading-6 text-foreground">
+          {body}
+        </div>
+      </article>
+    )
+  }
+
+  if (isReasoning) {
+    return (
+      <details className="text-sm text-muted-foreground">
+        <summary className="flex cursor-pointer select-none items-center gap-2 rounded-md py-1 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
+          <ItemIcon kind={item.kind} />
+          <span className="font-medium">추론 요약</span>
+        </summary>
+        <div className="mt-2 border-l-2 pl-4 italic leading-6">{body}</div>
+        <details className="mt-2 pl-4 text-xs">
+          <summary className="cursor-pointer select-none hover:text-foreground">세부 정보</summary>
+          <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-muted/50 p-3 font-mono text-[0.6875rem] text-foreground">
+            {payloadDetail(item)}
+          </pre>
+        </details>
+      </details>
+    )
+  }
+
   return (
     <article
       role={isError ? 'alert' : undefined}
       className={cn(
-        'rounded-md border px-3 py-2',
-        item.kind === 'user_message' && 'ml-auto max-w-[92%] border-primary/25 bg-primary/5',
-        item.kind === 'assistant_message' && 'border-border bg-background',
-        isReasoning && 'border-dashed bg-muted/30',
+        item.kind === 'assistant_message' ? 'py-1' : 'rounded-xl border px-4 py-3',
         isUsage && 'border-dashed bg-muted/20',
         isError && 'border-destructive/40 bg-destructive/10',
       )}
     >
       <header
         className={cn(
-          'mb-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground',
+          'mb-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground',
           isError && 'text-destructive',
         )}
       >
         <ItemIcon kind={item.kind} />
         <span className="font-medium text-foreground">{ITEM_LABEL[item.kind]}</span>
-        {item.provider && item.kind !== 'user_message' ? (
+        {item.provider ? (
           <span>{PROVIDER_LABEL[item.provider]}</span>
         ) : null}
       </header>
 
       <div
         className={cn(
-          'whitespace-pre-wrap break-words text-sm text-foreground',
-          isReasoning && 'italic text-muted-foreground',
+          'whitespace-pre-wrap break-words text-[0.9375rem] leading-7 text-foreground',
           isUsage && 'font-mono text-xs text-muted-foreground',
           isError && 'font-medium text-destructive',
         )}
       >
         {isError && <span aria-hidden>■ </span>}
-        {isReasoning && <span aria-hidden>• </span>}
         {body}
       </div>
 

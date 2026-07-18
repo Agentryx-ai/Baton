@@ -1,16 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Plus, RefreshCw, Send, Square } from 'lucide-react'
+import {
+  Home,
+  Menu,
+  MessageSquarePlus,
+  RefreshCw,
+  Send,
+  Settings,
+  Square,
+} from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { cn } from '@/lib/utils'
 
 import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
@@ -35,11 +42,112 @@ function latestActiveTurn(turns: CanonicalTurnDto[]): CanonicalTurnDto | null {
     .find((turn) => ['queued', 'running', 'waiting_tool'].includes(turn.status)) ?? null
 }
 
-export function ConversationWorkspace() {
+function SessionSidebar({
+  sessions,
+  selectedSessionId,
+  loading,
+  creating,
+  onSelect,
+  onCreate,
+  onRefresh,
+  onNavigateHome,
+  onNavigateSettings,
+}: {
+  sessions: CanonicalSessionDto[] | null
+  selectedSessionId: string | null
+  loading: boolean
+  creating: boolean
+  onSelect: (sessionId: string) => void
+  onCreate: () => void
+  onRefresh: () => void
+  onNavigateHome: () => void
+  onNavigateSettings: () => void
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-sidebar text-sidebar-foreground">
+      <div className="flex h-14 shrink-0 items-center gap-1 border-b border-sidebar-border px-3">
+        <Button type="button" variant="ghost" size="icon-sm" onClick={onNavigateHome} aria-label="대시보드">
+          <Home aria-hidden />
+        </Button>
+        <span className="ml-1 min-w-0 flex-1 truncate text-sm font-semibold">대화</span>
+        <Button type="button" variant="ghost" size="icon-sm" onClick={onNavigateSettings} aria-label="설정">
+          <Settings aria-hidden />
+        </Button>
+      </div>
+
+      <div className="shrink-0 p-3 pb-2">
+        <Button
+          type="button"
+          variant="outline"
+          className="w-full justify-start bg-background/60"
+          disabled={creating}
+          onClick={onCreate}
+        >
+          <MessageSquarePlus aria-hidden />
+          새 대화
+        </Button>
+      </div>
+
+      <div className="flex min-h-0 flex-1 flex-col px-2 pb-2">
+        <div className="flex shrink-0 items-center justify-between px-2 py-2">
+          <span className="text-xs font-medium text-muted-foreground">최근 대화</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            disabled={loading}
+            onClick={onRefresh}
+            aria-label="대화 목록 새로고침"
+          >
+            <RefreshCw className={cn(loading && 'animate-spin')} aria-hidden />
+          </Button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
+          {sessions === null ? (
+            <p className="px-2 py-4 text-xs text-muted-foreground">불러오는 중…</p>
+          ) : sessions.length === 0 ? (
+            <p className="px-2 py-4 text-xs leading-relaxed text-muted-foreground">
+              아직 대화가 없습니다.
+            </p>
+          ) : (
+            sessions.map((session) => (
+              <button
+                key={session.id}
+                type="button"
+                onClick={() => onSelect(session.id)}
+                className={cn(
+                  'w-full rounded-lg px-3 py-2.5 text-left text-sm transition-colors',
+                  session.id === selectedSessionId
+                    ? 'bg-sidebar-accent text-sidebar-accent-foreground'
+                    : 'text-muted-foreground hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground',
+                )}
+              >
+                <span className="block truncate font-medium">
+                  {session.title || session.preview || '새 대화'}
+                </span>
+                {session.title && session.preview ? (
+                  <span className="mt-0.5 block truncate text-xs opacity-70">{session.preview}</span>
+                ) : null}
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function ConversationWorkspace({
+  onNavigateHome,
+  onNavigateSettings,
+}: {
+  onNavigateHome: () => void
+  onNavigateSettings: () => void
+}) {
   const [sessions, setSessions] = useState<CanonicalSessionDto[] | null>(null)
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const [snapshot, setSnapshot] = useState<ThreadSnapshotDto | null>(null)
-  const [title, setTitle] = useState('')
   const provider: CanonicalProvider = 'codex'
   const [model, setModel] = useState('')
   const [models, setModels] = useState<string[] | null>(null)
@@ -51,6 +159,7 @@ export function ConversationWorkspace() {
   const [creating, setCreating] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const threadRequest = useRef(0)
 
   const selectedSession = useMemo(
@@ -132,14 +241,13 @@ export function ConversationWorkspace() {
   }, [refreshThread])
   useConversationEvents(threadId, onStreamEvent)
 
-  const createSession = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
+  const createSession = async () => {
     setCreating(true)
     try {
-      const created = await conversationApi.createSession({ title: title.trim() || null })
+      const created = await conversationApi.createSession({ title: null })
       setSessions((current) => [created, ...(current ?? []).filter((item) => item.id !== created.id)])
       setSelectedSessionId(created.id)
-      setTitle('')
+      setMobileSidebarOpen(false)
       setError(null)
     } catch (cause) {
       setError(errorMessage(cause))
@@ -186,6 +294,7 @@ export function ConversationWorkspace() {
       ? latestTurn.error.message
       : JSON.stringify(latestTurn.error)
     : null
+
   const cancelTurn = async () => {
     if (!activeTurn) return
     setCancelling(true)
@@ -200,208 +309,201 @@ export function ConversationWorkspace() {
   }
 
   const canSubmit = Boolean(
-    snapshot &&
-      snapshot.thread.status === 'idle' &&
-      prompt.trim() &&
-      model.trim() &&
-      !submitting,
+    snapshot
+      && snapshot.thread.status === 'idle'
+      && prompt.trim()
+      && model.trim()
+      && !submitting,
+  )
+
+  const selectSession = (sessionId: string) => {
+    setSelectedSessionId(sessionId)
+    setMobileSidebarOpen(false)
+  }
+
+  const sidebar = (
+    <SessionSidebar
+      sessions={sessions}
+      selectedSessionId={selectedSessionId}
+      loading={loadingSessions}
+      creating={creating}
+      onSelect={selectSession}
+      onCreate={() => void createSession()}
+      onRefresh={() => void refreshSessions()}
+      onNavigateHome={onNavigateHome}
+      onNavigateSettings={onNavigateSettings}
+    />
   )
 
   return (
-    <section className="space-y-4" aria-labelledby="canonical-runtime-title">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="flex items-center gap-2">
-          <h1 id="canonical-runtime-title" className="text-xl font-semibold tracking-tight">
-            대화
-          </h1>
-          <Badge variant="outline">Preview</Badge>
-        </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={loadingSessions}
-          onClick={() => void refreshSessions()}
+    <section
+      className="flex h-[calc(100vh-3.5rem-2px)] min-h-[32rem] overflow-hidden bg-background"
+      aria-label="Baton 대화"
+    >
+      <aside className="hidden w-72 shrink-0 border-r border-sidebar-border md:block">
+        {sidebar}
+      </aside>
+
+      <Dialog open={mobileSidebarOpen} onOpenChange={setMobileSidebarOpen}>
+        <DialogContent
+          showCloseButton={false}
+          className="left-0 top-0 h-dvh w-[min(20rem,88vw)] max-w-none translate-x-0 translate-y-0 gap-0 rounded-none border-y-0 border-l-0 p-0 md:hidden"
         >
-          <RefreshCw className={loadingSessions ? 'animate-spin' : ''} aria-hidden />
-          새로고침
-        </Button>
-      </div>
+          <DialogTitle className="sr-only">대화 목록</DialogTitle>
+          <DialogDescription className="sr-only">Baton 세션을 선택하거나 새 대화를 시작합니다.</DialogDescription>
+          {sidebar}
+        </DialogContent>
+      </Dialog>
 
-      {error && (
-        <p role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
-        </p>
-      )}
-
-      {latestTurnError && (
-        <p role="alert" className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          마지막 턴 실패: {latestTurnError}
-        </p>
-      )}
-
-      <div className="grid gap-4 min-[800px]:grid-cols-[15rem_minmax(0,1fr)]">
-        <Card className="gap-4 py-4">
-          <CardHeader className="px-4">
-            <CardTitle className="text-sm">대화 목록</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3 px-4">
-            <form className="flex gap-2" onSubmit={(event) => void createSession(event)}>
-              <Input
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                placeholder="새 세션 제목"
-                aria-label="새 세션 제목"
-              />
-              <Button type="submit" size="icon-sm" disabled={creating} aria-label="세션 만들기">
-                <Plus aria-hidden />
-              </Button>
-            </form>
-
-            <div className="space-y-1">
-              {sessions === null ? (
-                <p className="py-4 text-center text-xs text-muted-foreground">세션을 불러오는 중입니다.</p>
-              ) : sessions.length === 0 ? (
-                <p className="rounded-md border border-dashed px-2 py-4 text-center text-xs text-muted-foreground">
-                  아직 Baton 세션이 없습니다.
-                </p>
-              ) : (
-                sessions.map((session) => (
-                  <button
-                    key={session.id}
-                    type="button"
-                    onClick={() => setSelectedSessionId(session.id)}
-                    className={`w-full rounded-md border px-3 py-2 text-left text-sm transition-colors ${
-                      session.id === selectedSessionId
-                        ? 'border-primary bg-primary/10 text-foreground'
-                        : 'border-transparent text-muted-foreground hover:border-border hover:bg-accent'
-                    }`}
-                  >
-                    <span className="block truncate font-medium">
-                      {session.title || session.preview || '제목 없는 세션'}
-                    </span>
-                    {session.title && session.preview ? (
-                      <span className="block truncate text-xs opacity-70">{session.preview}</span>
-                    ) : null}
-                  </button>
-                ))
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="flex h-14 shrink-0 items-center gap-3 border-b px-3 sm:px-5">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            className="md:hidden"
+            onClick={() => setMobileSidebarOpen(true)}
+            aria-label="대화 목록 열기"
+          >
+            <Menu aria-hidden />
+          </Button>
+          <div className="min-w-0 flex-1">
+            <h1 className="truncate text-sm font-semibold">
+              {selectedSession?.title || selectedSession?.preview || '새 대화'}
+            </h1>
+          </div>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <span
+              className={cn(
+                'size-1.5 rounded-full',
+                snapshot?.thread.status === 'running' ? 'animate-pulse bg-ok' : 'bg-muted-foreground/50',
               )}
-            </div>
-          </CardContent>
-        </Card>
+              aria-hidden
+            />
+            <span>{snapshot?.thread.status === 'running' ? '응답 중' : '준비됨'}</span>
+            <Badge variant="secondary" className="hidden sm:inline-flex">Codex</Badge>
+          </div>
+        </header>
 
-        <Card className="min-w-0 gap-4 py-4">
-          <CardHeader className="px-4">
-            <div className="flex flex-wrap items-start justify-between gap-2">
-              <div>
-                <CardTitle className="text-sm">
-                  {selectedSession?.title || selectedSession?.preview || '대화를 선택하세요'}
-                </CardTitle>
-                <CardDescription className="mt-1">
-                  {snapshot
-                    ? snapshot.thread.status === 'running' ? '응답 생성 중' : '준비됨'
-                    : '대화를 불러오는 중'}
-                </CardDescription>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-4 pb-8 pt-8 sm:px-6 sm:pt-12">
+            {(error || latestTurnError) && (
+              <div className="mb-6 space-y-2" aria-live="polite">
+                {error && (
+                  <p role="alert" className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                    {error}
+                  </p>
+                )}
+                {latestTurnError && (
+                  <p role="alert" className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                    {latestTurnError}
+                  </p>
+                )}
               </div>
-              <Badge variant="secondary">Codex</Badge>
-            </div>
-          </CardHeader>
+            )}
 
-          <CardContent className="space-y-4 px-4">
+            {loadingThread && !snapshot ? (
+              <p className="m-auto text-sm text-muted-foreground">대화를 불러오는 중…</p>
+            ) : !snapshot ? (
+              <div className="m-auto max-w-md py-16 text-center">
+                <h2 className="text-2xl font-semibold tracking-tight">무엇을 도와드릴까요?</h2>
+                <p className="mt-3 text-sm text-muted-foreground">
+                  왼쪽에서 대화를 선택하거나 새 대화를 시작하세요.
+                </p>
+              </div>
+            ) : visibleItems.length === 0 ? (
+              <div className="m-auto max-w-md py-16 text-center">
+                <h2 className="text-2xl font-semibold tracking-tight">무엇을 도와드릴까요?</h2>
+                <p className="mt-3 text-sm text-muted-foreground">메시지를 입력해 대화를 시작하세요.</p>
+              </div>
+            ) : (
+              <div className="space-y-7">
+                {visibleItems.map((item) => <ConversationItem key={item.id} item={item} />)}
+              </div>
+            )}
+
             {latestUsage ? (
-              <details className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                <summary className="cursor-pointer select-none font-medium text-foreground">
+              <details className="mt-6 self-start text-xs text-muted-foreground">
+                <summary className="cursor-pointer select-none rounded-md px-1 py-1 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
                   최근 턴 사용량
                 </summary>
-                <p className="mt-2 font-mono">{latestUsage}</p>
+                <p className="mt-1 px-1 font-mono">{latestUsage}</p>
               </details>
             ) : null}
-            <div className="min-h-72 max-h-[calc(100vh-23rem)] space-y-2 overflow-y-auto rounded-md border bg-muted/20 p-3">
-              {loadingThread && !snapshot ? (
-                <p className="py-8 text-center text-sm text-muted-foreground">정본 기록을 재생하는 중입니다.</p>
-              ) : !snapshot ? (
-                <p className="py-8 text-center text-sm text-muted-foreground">표시할 대화를 선택하세요.</p>
-              ) : visibleItems.length === 0 ? (
-                <p className="py-8 text-center text-sm text-muted-foreground">첫 메시지를 입력해 대화를 시작하세요.</p>
+          </div>
+        </div>
+
+        <div className="shrink-0 bg-gradient-to-t from-background via-background to-background/0 px-3 pb-4 pt-2 sm:px-6 sm:pb-6">
+          <form
+            className="mx-auto w-full max-w-3xl rounded-2xl border bg-background p-2 shadow-lg shadow-black/5"
+            onSubmit={(event) => void startTurn(event)}
+          >
+            <textarea
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                const action = composerKeyAction({
+                  key: event.key,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                  keyCode: event.keyCode,
+                })
+                if (action !== 'submit') return
+                event.preventDefault()
+                if (canSubmit) event.currentTarget.form?.requestSubmit()
+              }}
+              rows={2}
+              placeholder="메시지 보내기"
+              aria-label="메시지"
+              aria-keyshortcuts="Enter Shift+Enter"
+              className="max-h-48 min-h-14 w-full resize-none bg-transparent px-2 py-2 text-[0.9375rem] leading-6 text-foreground outline-none placeholder:text-muted-foreground"
+            />
+
+            <div className="flex items-center gap-2 px-1 pb-1">
+              <select
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                disabled={models === null || models.length === 0}
+                aria-label="Codex 모델"
+                className="min-w-0 max-w-56 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {models === null ? (
+                  <option value="">모델 불러오는 중…</option>
+                ) : models.length === 0 ? (
+                  <option value="">사용 가능한 모델 없음</option>
+                ) : (
+                  models.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)
+                )}
+              </select>
+
+              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                {snapshot?.thread.status === 'running' ? '응답을 생성하고 있습니다' : ''}
+              </span>
+
+              {activeTurn ? (
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon-sm"
+                  disabled={cancelling}
+                  onClick={() => void cancelTurn()}
+                  aria-label="응답 중지"
+                >
+                  <Square className="size-3 fill-current" aria-hidden />
+                </Button>
               ) : (
-                visibleItems.map((item) => <ConversationItem key={item.id} item={item} />)
+                <Button type="submit" size="icon-sm" disabled={!canSubmit} aria-label="메시지 보내기">
+                  <Send aria-hidden />
+                </Button>
               )}
             </div>
-
-            <form className="space-y-3" onSubmit={(event) => void startTurn(event)}>
-              <div>
-                <label className="space-y-1 text-xs text-muted-foreground">
-                  모델
-                  <select
-                    value={model}
-                    onChange={(event) => setModel(event.target.value)}
-                    disabled={models === null || models.length === 0}
-                    className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                  >
-                    {models === null ? (
-                      <option value="">모델 목록을 불러오는 중…</option>
-                    ) : models.length === 0 ? (
-                      <option value="">사용 가능한 모델 없음</option>
-                    ) : (
-                      models.map((modelId) => <option key={modelId} value={modelId}>{modelId}</option>)
-                    )}
-                  </select>
-                  {modelCatalogError ? (
-                    <span className="block text-destructive">목록 조회 실패: {modelCatalogError}</span>
-                  ) : null}
-                </label>
-              </div>
-
-              <label className="block space-y-1 text-xs text-muted-foreground">
-                메시지
-                <textarea
-                  value={prompt}
-                  onChange={(event) => setPrompt(event.target.value)}
-                  onKeyDown={(event) => {
-                    const action = composerKeyAction({
-                      key: event.key,
-                      shiftKey: event.shiftKey,
-                      isComposing: event.nativeEvent.isComposing,
-                      keyCode: event.keyCode,
-                    })
-                    if (action !== 'submit') return
-                    event.preventDefault()
-                    if (canSubmit) event.currentTarget.form?.requestSubmit()
-                  }}
-                  rows={4}
-                  placeholder="메시지를 입력하세요"
-                  aria-keyshortcuts="Enter Shift+Enter"
-                  className="w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                />
-                <span className="block">Enter 전송 · Shift+Enter 줄바꿈</span>
-              </label>
-
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                {snapshot?.thread.status === 'running' ? (
-                  <p className="text-xs text-muted-foreground">응답을 생성하고 있습니다.</p>
-                ) : <span />}
-                <div className="flex gap-2">
-                  {activeTurn && (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={cancelling}
-                      onClick={() => void cancelTurn()}
-                    >
-                      <Square aria-hidden />
-                      턴 취소
-                    </Button>
-                  )}
-                  <Button type="submit" size="sm" disabled={!canSubmit}>
-                    <Send aria-hidden />
-                    {submitting ? '시작 중' : '턴 실행'}
-                  </Button>
-                </div>
-              </div>
-            </form>
-          </CardContent>
-        </Card>
+          </form>
+          {modelCatalogError ? (
+            <p className="mx-auto mt-2 max-w-3xl px-2 text-xs text-destructive">
+              모델 목록을 불러오지 못했습니다: {modelCatalogError}
+            </p>
+          ) : null}
+        </div>
       </div>
     </section>
   )

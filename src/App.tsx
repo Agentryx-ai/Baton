@@ -193,10 +193,20 @@ function App() {
     <div className="min-h-screen bg-background text-foreground">
       <Header proxy={proxy} onRefresh={refreshAll} />
 
-      <AppNavigation active={activeView} onNavigate={navigate} variant="mobile" />
+      {activeView !== 'conversations' && (
+        <AppNavigation active={activeView} onNavigate={navigate} variant="mobile" />
+      )}
 
-      <div className="mx-auto flex max-w-7xl gap-6 px-4 py-6">
-        <AppNavigation active={activeView} onNavigate={navigate} variant="desktop" />
+      <div
+        className={
+          activeView === 'conversations'
+            ? 'w-full'
+            : 'mx-auto flex max-w-7xl gap-6 px-4 py-6'
+        }
+      >
+        {activeView !== 'conversations' && (
+          <AppNavigation active={activeView} onNavigate={navigate} variant="desktop" />
+        )}
 
         <main className="min-w-0 flex-1">
           <section hidden={activeView !== 'home'} className="space-y-8">
@@ -245,7 +255,10 @@ function App() {
           </section>
 
           <section hidden={activeView !== 'conversations'}>
-            <ConversationWorkspace />
+            <ConversationWorkspace
+              onNavigateHome={() => navigate('home')}
+              onNavigateSettings={() => navigate('settings')}
+            />
           </section>
 
           <section hidden={activeView !== 'settings'} className="space-y-6">
