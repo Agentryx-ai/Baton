@@ -72,7 +72,7 @@
 | ACCOUNT-05 | quota 95%를 실제 소진으로 간주하지 않고 실제 429까지 사용 | 미착수(영구 수정) | 현재 라이브 완화로 엔진만 OFF. 95%는 경고 전용으로 낮추고 429 cooldown/403 ineligible을 분리해야 한다. |
 | ACCOUNT-06 | 실제 429에서 같은 요청을 다음 유효 계정으로 재시도 | 검증 필요 | CLIProxy의 `quota-exceeded.switch-project` 책임이지만 현재 설치의 실제 failover E2E가 없음. |
 | ACCOUNT-07 | 403 OAuth/구독 불가 계정을 INELIGIBLE로 제외 | 미착수 | 현재는 수동 pause로만 격리. 자격 상태와 UI/로그 모델 필요. |
-| ACCOUNT-08 | Claude Fable 5 전용 usage 게이지 표시 | 부분 완료 | `QuotaBar`는 `seven_day_fable5`/additional sub-quota 라벨을 렌더할 수 있다. 실제 Claude quota 응답에 해당 window가 안 오는 경우의 discovery/별도 조회 경로가 미구현. |
+| ACCOUNT-08 | Claude Fable 5 전용 usage 게이지 표시 | 완료(코드)·4400 재시작 대기 | CCS 8.1.4가 새 Claude OAuth `limits[]`를 버리는 원인을 확인했다. BFF가 local management API에서 `weekly_scoped(Fable)`만 안전 보강해 `seven_day_fable5`/`Fable 5` window로 합치며 2분 cache·single-flight·fail-open을 적용했다. 테스트와 live 원문 discovery는 통과했고 현재 4400 프로세스 재시작 후 화면 검증이 남았다. |
 | ACCOUNT-09 | usage freshness를 “n초 전 기준”으로 표시 | 부분 완료 | `useQuota`에는 age 계산이 있으나 현재 App의 quota fan-out에 연결되지 않음. |
 | ACCOUNT-10 | usage를 대화 응답마다 반복 표시하지 않음 | 완료 | transcript 안의 매 usage 이벤트 대신 대화 단위 최신 요약으로 표시하도록 개선. |
 
@@ -227,7 +227,7 @@
 
 - [ ] 실제 429 전까지 정상 Claude 계정을 유지하고 429에서 같은 요청을 failover
 - [ ] 403/만료 Claude 계정을 자동 INELIGIBLE 처리
-- [ ] Claude Fable 5 전용 usage 게이지 live 표시
+- [ ] Claude Fable 5 전용 usage 게이지 4400 재시작 후 시각 검증
 - [ ] `prompt_cache_key` 또는 provider별 동등 cache identity의 Baton thread별 적용과 적대적 검수
 - [ ] 실행 중 follow-up의 durable FIFO/steer/next-turn/Goal-priority 통합
 - [ ] OS native 폴더 선택·권한 허용 UX

@@ -18,11 +18,13 @@ import { batonRouter } from './baton-routes.ts'
 import { createHostRouter } from './host-routes.ts'
 import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
 import { createOpenAiInferenceBridge } from './openai-inference-bridge.ts'
+import { createClaudeQuotaEnricher } from './claude-quota-enrichment.ts'
 import { policyEngine } from './policy-engine.ts'
 import { createConversationRuntime } from './session/runtime.ts'
 
 const app = express()
 const conversationRuntime = createConversationRuntime({ dataDir: config.dataDir })
+const enrichClaudeQuota = createClaudeQuotaEnricher({ fetchGateway })
 
 // Canonical JSON routes must consume their body before the raw gateway proxy middleware.
 app.use('/baton/v1', conversationRuntime.router)
@@ -56,10 +58,16 @@ app.use('/api', async (req, res) => {
       },
       body: Buffer.isBuffer(req.body) ? req.body : undefined,
     })
+    const claudeQuotaMatch = req.method === 'GET'
+      ? /^\/api\/cliproxy\/quota\/claude\/([^/?]+)(?:\?.*)?$/.exec(targetPath)
+      : null
+    const responseBody = claudeQuotaMatch && upstream.status >= 200 && upstream.status < 300
+      ? await enrichClaudeQuota(decodeURIComponent(claudeQuotaMatch[1]), upstream.body)
+      : upstream.body
     res.status(upstream.status)
     const contentType = upstream.headers.get('content-type')
     if (contentType) res.setHeader('content-type', contentType)
-    res.send(upstream.body)
+    res.send(responseBody)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     console.error(`[baton] proxy error ${req.method} ${targetPath}: ${message}`)
