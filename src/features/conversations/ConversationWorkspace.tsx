@@ -14,57 +14,18 @@ import { Input } from '@/components/ui/input'
 
 import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
+import { ConversationItem } from './ConversationItem'
 import type {
-  CanonicalItemDto,
   CanonicalProvider,
   CanonicalSessionDto,
   CanonicalTurnDto,
-  JsonValue,
   ThreadSnapshotDto,
 } from './types'
 import { useConversationEvents } from './useConversationEvents'
 
-const PROVIDER_LABEL: Record<CanonicalProvider, string> = {
-  claude: 'Claude',
-  codex: 'Codex',
-  gemini: 'Gemini',
-}
-
-const ITEM_LABEL: Record<CanonicalItemDto['kind'], string> = {
-  user_message: '사용자',
-  assistant_message: '어시스턴트',
-  reasoning_summary: '추론 요약',
-  tool_call: '도구 호출',
-  tool_result: '도구 결과',
-  file_change: '파일 변경',
-  approval: '승인',
-  plan: '계획',
-  task: '작업',
-  usage: '사용량',
-  error: '오류',
-  summary: '요약',
-  provider_event: 'Provider 이벤트',
-}
-
 function errorMessage(error: unknown): string {
   if (error instanceof ConversationApiError) return error.message
   return error instanceof Error ? error.message : String(error)
-}
-
-function payloadText(item: CanonicalItemDto): string {
-  if (typeof item.payload.text === 'string') return item.payload.text
-  if (typeof item.payload.content === 'string') return item.payload.content
-  if (Array.isArray(item.payload.content)) {
-    const text = item.payload.content
-      .map((part: JsonValue) => {
-        if (!part || Array.isArray(part) || typeof part !== 'object') return ''
-        return typeof part.text === 'string' ? part.text : ''
-      })
-      .filter(Boolean)
-      .join('\n')
-    if (text) return text
-  }
-  return JSON.stringify(item.payload, null, 2)
 }
 
 function latestActiveTurn(turns: CanonicalTurnDto[]): CanonicalTurnDto | null {
@@ -358,19 +319,7 @@ export function ConversationWorkspace() {
               ) : snapshot.items.length === 0 ? (
                 <p className="py-8 text-center text-sm text-muted-foreground">첫 메시지를 입력해 대화를 시작하세요.</p>
               ) : (
-                snapshot.items.map((item) => (
-                  <article key={item.id} className="rounded-md border bg-background px-3 py-2">
-                    <header className="mb-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                      <span className="font-medium text-foreground">{ITEM_LABEL[item.kind]}</span>
-                      {item.provider && <span>{PROVIDER_LABEL[item.provider]}</span>}
-                      <span>#{item.sequence}</span>
-                      {item.visibility !== 'portable' && <Badge variant="outline">{item.visibility}</Badge>}
-                    </header>
-                    <pre className="whitespace-pre-wrap break-words font-sans text-sm text-foreground">
-                      {payloadText(item)}
-                    </pre>
-                  </article>
-                ))
+                snapshot.items.map((item) => <ConversationItem key={item.id} item={item} />)
               )}
             </div>
 
