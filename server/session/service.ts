@@ -12,7 +12,7 @@ import type {
   ThreadSnapshot,
   TurnId,
 } from './domain.ts'
-import type { ForkThreadInput } from './store.ts'
+import type { ForkThreadInput, SessionListScope } from './store.ts'
 
 export interface StartTurnInput {
   threadId: ThreadId
@@ -26,8 +26,10 @@ export interface StartTurnInput {
 
 export interface ConversationService {
   createSession(input: CreateSessionInput): CanonicalSession
-  listSessions(): CanonicalSession[]
+  listSessions(scope?: SessionListScope): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null
+  archiveSession(sessionId: SessionId): CanonicalSession
+  restoreSession(sessionId: SessionId): CanonicalSession
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null
   forkThread(input: ForkThreadInput): CanonicalThread
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]

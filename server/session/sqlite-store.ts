@@ -27,7 +27,7 @@ import type {
   UpsertProviderBindingInput,
 } from './domain.ts'
 import { uuidV7 } from './domain.ts'
-import type { ForkThreadInput, SessionStore } from './store.ts'
+import type { ForkThreadInput, SessionListScope, SessionStore } from './store.ts'
 import { SessionStoreError } from './store.ts'
 import type {
   CommitNativeImportInput,
@@ -40,7 +40,7 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 5
+const SCHEMA_VERSION = 6
 const ACTIVE_TURN_STATUSES = new Set(['queued', 'running', 'waiting_tool'])
 const TERMINAL_TURN_STATUSES = new Set(['completed', 'cancelled', 'failed', 'interrupted'])
 
@@ -453,6 +453,33 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 5')
         appliedVersion = 5
       }
+      if (appliedVersion < 6) {
+        this.#db.exec(`
+          CREATE INDEX sessions_archived_expiry
+            ON sessions(archived_at, id) WHERE archived_at IS NOT NULL;
+          CREATE TABLE session_purge_context (
+            session_id TEXT PRIMARY KEY
+          ) STRICT;
+          DROP TRIGGER items_no_delete;
+          CREATE TRIGGER items_no_delete BEFORE DELETE ON items
+          WHEN NOT EXISTS (
+            SELECT 1 FROM session_purge_context WHERE session_id = OLD.session_id
+          ) BEGIN
+            SELECT RAISE(ABORT, 'canonical items are append-only');
+          END;
+          DROP TRIGGER stream_events_no_delete;
+          CREATE TRIGGER stream_events_no_delete BEFORE DELETE ON stream_events
+          WHEN NOT EXISTS (
+            SELECT 1 FROM session_purge_context WHERE session_id = OLD.session_id
+          ) BEGIN
+            SELECT RAISE(ABORT, 'canonical events are append-only');
+          END;
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(6, 'session-trash-retention', this.#now())
+        this.#db.exec('PRAGMA user_version = 6')
+        appliedVersion = 6
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
@@ -504,13 +531,109 @@ export class SqliteSessionStore implements SessionStore {
     return this.getSession(sessionId) as CanonicalSession
   }
 
-  listSessions(): CanonicalSession[] {
-    return this.#all(this.#db.prepare(`${sessionSelect()} ORDER BY s.updated_at DESC, s.id`)).map((row) => this.#session(row))
+  listSessions(scope: SessionListScope = 'active'): CanonicalSession[] {
+    const filter = scope === 'active'
+      ? ' WHERE s.archived_at IS NULL'
+      : scope === 'trash'
+        ? ' WHERE s.archived_at IS NOT NULL'
+        : ''
+    const orderBy = scope === 'trash' ? 's.archived_at DESC, s.id' : 's.updated_at DESC, s.id'
+    return this.#all(this.#db.prepare(`${sessionSelect()}${filter} ORDER BY ${orderBy}`))
+      .map((row) => this.#session(row))
   }
 
   getSession(sessionId: SessionId): CanonicalSession | null {
     const row = this.#optional(this.#db.prepare(`${sessionSelect()} WHERE s.id = ?`), sessionId)
     return row ? this.#session(row) : null
+  }
+
+  archiveSession(sessionId: SessionId): CanonicalSession {
+    return this.#transaction('IMMEDIATE', () => {
+      const session = this.getSession(sessionId)
+      if (!session) throw new SessionStoreError('not_found', `Session not found: ${sessionId}`)
+      if (session.archivedAt) return session
+      const activeTurn = this.#optional(this.#db.prepare(`
+        SELECT t.id FROM turns t
+        JOIN threads th ON th.id = t.thread_id
+        WHERE th.session_id = ? AND t.status IN ('queued','running','waiting_tool')
+        LIMIT 1
+      `), sessionId)
+      if (activeTurn) {
+        throw new SessionStoreError('session_busy', '실행 중인 응답이 끝난 뒤 대화를 삭제하세요.')
+      }
+      this.#db.prepare('UPDATE sessions SET archived_at = ? WHERE id = ?').run(this.#now(), sessionId)
+      return this.getSession(sessionId) as CanonicalSession
+    })
+  }
+
+  restoreSession(sessionId: SessionId): CanonicalSession {
+    return this.#transaction('IMMEDIATE', () => {
+      const session = this.getSession(sessionId)
+      if (!session) throw new SessionStoreError('not_found', `Session not found: ${sessionId}`)
+      if (!session.archivedAt) return session
+      this.#db.prepare('UPDATE sessions SET archived_at = NULL WHERE id = ?').run(sessionId)
+      return this.getSession(sessionId) as CanonicalSession
+    })
+  }
+
+  purgeExpiredSessions(cutoffIso: string, batchSize = 100): number {
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1_000) {
+      throw new RangeError('batchSize must be an integer between 1 and 1000')
+    }
+    return this.#transaction('IMMEDIATE', () => {
+      this.#db.exec('PRAGMA defer_foreign_keys = ON')
+      const candidates = this.#all(this.#db.prepare(`
+        SELECT id FROM sessions
+        WHERE archived_at IS NOT NULL AND archived_at <= ?
+        ORDER BY archived_at, id
+        LIMIT ?
+      `), cutoffIso, batchSize).map((row) => text(row, 'id'))
+      if (candidates.length === 0) return 0
+      const contextCount = integer(this.#one(this.#db.prepare(
+        'SELECT COUNT(*) AS count FROM session_purge_context',
+      )), 'count')
+      if (contextCount !== 0) throw new Error('Session purge context is unexpectedly occupied')
+      const insertContext = this.#db.prepare('INSERT INTO session_purge_context(session_id) VALUES (?)')
+      for (const sessionId of candidates) insertContext.run(sessionId)
+
+      const sourceIds = `SELECT ns.id FROM native_session_sources ns
+        JOIN session_purge_context pc ON pc.session_id = ns.session_id`
+      this.#db.exec(`
+        DELETE FROM native_imported_records WHERE source_id IN (${sourceIds});
+        DELETE FROM native_session_revisions WHERE source_id IN (${sourceIds});
+        DELETE FROM native_session_identity_keys WHERE source_id IN (${sourceIds});
+        DELETE FROM native_session_source_provenance WHERE source_id IN (${sourceIds});
+        DELETE FROM native_session_sources
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM provider_events WHERE turn_id IN (
+          SELECT t.id FROM turns t
+          JOIN threads th ON th.id = t.thread_id
+          JOIN session_purge_context pc ON pc.session_id = th.session_id
+        );
+        DELETE FROM provider_bindings WHERE thread_id IN (
+          SELECT th.id FROM threads th
+          JOIN session_purge_context pc ON pc.session_id = th.session_id
+        );
+        DELETE FROM executions
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM stream_events
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM items
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM turns WHERE thread_id IN (
+          SELECT th.id FROM threads th
+          JOIN session_purge_context pc ON pc.session_id = th.session_id
+        );
+        DELETE FROM threads
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM sessions
+          WHERE id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM session_purge_context;
+      `)
+      const violations = this.#all(this.#db.prepare('PRAGMA foreign_key_check'))
+      if (violations.length > 0) throw new Error('Session purge would violate foreign key integrity')
+      return candidates.length
+    })
   }
 
   getThread(threadId: ThreadId): CanonicalThread | null {
@@ -546,6 +669,9 @@ export class SqliteSessionStore implements SessionStore {
     return this.#transaction('IMMEDIATE', () => {
       const parent = this.getThread(input.threadId)
       if (!parent) throw new SessionStoreError('not_found', `Thread not found: ${input.threadId}`)
+      if (this.getSession(parent.sessionId)?.archivedAt) {
+        throw new SessionStoreError('session_archived', '휴지통의 대화는 분기할 수 없습니다.')
+      }
       let forkTurnId: string | null = null
       if (input.forkItemId !== null) {
         const item = this.listItems(parent.id).find((candidate) => candidate.id === input.forkItemId)
@@ -589,6 +715,9 @@ export class SqliteSessionStore implements SessionStore {
 
       const thread = this.getThread(input.threadId)
       if (!thread) throw new SessionStoreError('not_found', `Thread not found: ${input.threadId}`)
+      if (this.getSession(thread.sessionId)?.archivedAt) {
+        throw new SessionStoreError('session_archived', '휴지통의 대화에는 메시지를 보낼 수 없습니다.')
+      }
       if (thread.revision !== input.expectedRevision) {
         throw new SessionStoreError('revision_conflict', `Expected revision ${input.expectedRevision}, got ${thread.revision}`)
       }

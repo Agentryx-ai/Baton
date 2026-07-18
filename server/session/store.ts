@@ -24,10 +24,15 @@ export interface ForkThreadInput {
   forkItemId: ItemId | null
 }
 
+export type SessionListScope = 'active' | 'trash' | 'all'
+
 export interface SessionStore extends NativeImportStore {
   createSession(input: CreateSessionInput): CanonicalSession
-  listSessions(): CanonicalSession[]
+  listSessions(scope?: SessionListScope): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null
+  archiveSession(sessionId: SessionId): CanonicalSession
+  restoreSession(sessionId: SessionId): CanonicalSession
+  purgeExpiredSessions(cutoffIso: string, batchSize?: number): number
   getThread(threadId: ThreadId): CanonicalThread | null
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null
   forkThread(input: ForkThreadInput): CanonicalThread
@@ -51,6 +56,8 @@ export class SessionStoreError extends Error {
     | 'turn_not_running'
     | 'invalid_fork'
     | 'duplicate_request'
+    | 'session_busy'
+    | 'session_archived'
 
   constructor(
     code:
@@ -58,7 +65,9 @@ export class SessionStoreError extends Error {
       | 'revision_conflict'
       | 'turn_not_running'
       | 'invalid_fork'
-      | 'duplicate_request',
+      | 'duplicate_request'
+      | 'session_busy'
+      | 'session_archived',
     message: string,
   ) {
     super(message)

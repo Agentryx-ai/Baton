@@ -17,7 +17,7 @@ import type {
 } from './domain.ts'
 import { ConversationEventHub } from './event-hub.ts'
 import type { ConversationService, StartTurnInput } from './service.ts'
-import type { ForkThreadInput, SessionStore } from './store.ts'
+import type { ForkThreadInput, SessionListScope, SessionStore } from './store.ts'
 
 interface ActiveTurn {
   controller: AbortController
@@ -50,8 +50,10 @@ export class TurnOrchestrator implements ConversationService {
     return session
   }
 
-  listSessions(): CanonicalSession[] { return this.store.listSessions() }
+  listSessions(scope: SessionListScope = 'active'): CanonicalSession[] { return this.store.listSessions(scope) }
   getSession(sessionId: SessionId): CanonicalSession | null { return this.store.getSession(sessionId) }
+  archiveSession(sessionId: SessionId): CanonicalSession { return this.store.archiveSession(sessionId) }
+  restoreSession(sessionId: SessionId): CanonicalSession { return this.store.restoreSession(sessionId) }
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null { return this.store.getSnapshot(threadId) }
 
   forkThread(input: ForkThreadInput): CanonicalThread {

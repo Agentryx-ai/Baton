@@ -13,6 +13,7 @@ import { ConversationEventHub } from './event-hub.ts'
 import { TurnOrchestrator } from './orchestrator.ts'
 import { createConversationRouter } from './router.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
+import { runSessionRetentionSweep, SESSION_RETENTION_INTERVAL_MS } from './retention.ts'
 import { CodexLocalSourceReader } from './native-import/codex-source.ts'
 import { ClaudeLocalSourceReader } from './native-import/claude-source.ts'
 import { NativeSessionImportService } from './native-import/service.ts'
@@ -71,13 +72,35 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
       return { models: catalog.models, defaultModel: catalog.defaultModel }
     },
   })
+  let retentionTimer: ReturnType<typeof setInterval> | null = null
+
+  const sweepTrash = (): void => {
+    try {
+      const purged = runSessionRetentionSweep(store)
+      if (purged > 0) console.info(`[baton] permanently removed ${purged} expired conversations`)
+    } catch (error) {
+      console.error(`[baton] conversation retention failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
 
   return {
     router,
     service,
-    start: () => service.recoverInterruptedTurns(),
+    start: () => {
+      const recovered = service.recoverInterruptedTurns()
+      sweepTrash()
+      if (!retentionTimer) {
+        retentionTimer = setInterval(sweepTrash, SESSION_RETENTION_INTERVAL_MS)
+        retentionTimer.unref()
+      }
+      return recovered
+    },
     closeStreams: () => router.closeStreams(),
-    close: () => service.close(),
+    close: () => {
+      if (retentionTimer) clearInterval(retentionTimer)
+      retentionTimer = null
+      return service.close()
+    },
   }
 }
 

@@ -23,6 +23,7 @@ import {
 import type { ConversationService, StartTurnInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type { ForkThreadInput } from './store.ts'
+import type { SessionListScope } from './store.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 
 const now = '2026-07-18T00:00:00.000Z'
@@ -138,18 +139,37 @@ class TestConversationService implements ConversationService {
   forkInput: ForkThreadInput | null = null
   startInput: StartTurnInput | null = null
   cancelledTurnId: string | null = null
+  listedScope: SessionListScope | null = null
 
   createSession(input: CreateSessionInput): CanonicalSession {
     this.createdInput = input
     return session
   }
 
-  listSessions(): CanonicalSession[] {
-    return this.sessions
+  listSessions(scope: SessionListScope = 'active'): CanonicalSession[] {
+    this.listedScope = scope
+    return this.sessions.filter((candidate) => scope === 'all'
+      || (scope === 'trash' ? candidate.archivedAt !== null : candidate.archivedAt === null))
   }
 
   getSession(sessionId: string): CanonicalSession | null {
     return this.sessions.find((candidate) => candidate.id === sessionId) ?? null
+  }
+
+  archiveSession(sessionId: string): CanonicalSession {
+    const found = this.getSession(sessionId)
+    if (!found) throw new SessionStoreError('not_found', 'session not found')
+    const archived = { ...found, archivedAt: now }
+    this.sessions = this.sessions.map((candidate) => candidate.id === sessionId ? archived : candidate)
+    return archived
+  }
+
+  restoreSession(sessionId: string): CanonicalSession {
+    const found = this.getSession(sessionId)
+    if (!found) throw new SessionStoreError('not_found', 'session not found')
+    const restored = { ...found, archivedAt: null }
+    this.sessions = this.sessions.map((candidate) => candidate.id === sessionId ? restored : candidate)
+    return restored
   }
 
   getSnapshot(threadId: string): ThreadSnapshot | null {
@@ -285,6 +305,20 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
     const listed = await fetch(`${baseUrl}/sessions`)
     assert.equal(listed.status, 200)
     assert.deepEqual((await json(listed)).sessions, [session])
+    assert.equal(service.listedScope, 'active')
+
+    const invalidScope = await fetch(`${baseUrl}/sessions?scope=everything`)
+    assert.equal(invalidScope.status, 400)
+    assert.equal((await json(invalidScope)).code, 'invalid_request')
+
+    const archived = await fetch(`${baseUrl}/sessions/${session.id}`, { method: 'DELETE' })
+    assert.equal(archived.status, 200)
+    assert.equal((await json(archived)).archivedAt, now)
+    const trashed = await fetch(`${baseUrl}/sessions?scope=trash`)
+    assert.deepEqual((await json(trashed)).sessions, [{ ...session, archivedAt: now }])
+    const restored = await fetch(`${baseUrl}/sessions/${session.id}/restore`, { method: 'POST' })
+    assert.equal(restored.status, 200)
+    assert.equal((await json(restored)).archivedAt, null)
 
     const missing = await fetch(`${baseUrl}/sessions/missing`)
     assert.equal(missing.status, 404)
@@ -480,6 +514,8 @@ test('SessionStoreError codes map to stable HTTP statuses', async () => {
     ['turn_not_running', 409],
     ['invalid_fork', 400],
     ['duplicate_request', 409],
+    ['session_busy', 409],
+    ['session_archived', 409],
   ] as const
 
   for (const [code, status] of cases) {

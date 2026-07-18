@@ -290,9 +290,22 @@ export function createConversationRouter(
     }),
   )
 
-  router.get('/sessions', (_req, res) => {
-    res.json({ sessions: service.listSessions() })
-  })
+  router.get('/sessions', route((req, res) => {
+    const value = req.query.scope
+    const scope = value === undefined ? 'active' : value
+    if (scope !== 'active' && scope !== 'trash' && scope !== 'all') {
+      throw new RequestValidationError('scope must be active, trash, or all')
+    }
+    res.json({ sessions: service.listSessions(scope) })
+  }))
+
+  router.delete('/sessions/:sessionId', route((req, res) => {
+    res.json(service.archiveSession(pathParam(req, 'sessionId')))
+  }))
+
+  router.post('/sessions/:sessionId/restore', route((req, res) => {
+    res.json(service.restoreSession(pathParam(req, 'sessionId')))
+  }))
 
   router.get(
     '/native-import/csrf',
@@ -577,6 +590,8 @@ export function createConversationRouter(
         turn_not_running: 409,
         invalid_fork: 400,
         duplicate_request: 409,
+        session_busy: 409,
+        session_archived: 409,
       } as const
       res.status(statusByCode[error.code]).json({ code: error.code, error: error.message })
       return
