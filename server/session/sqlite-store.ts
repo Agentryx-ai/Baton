@@ -4,6 +4,7 @@ import { DatabaseSync, type StatementSync } from 'node:sqlite'
 import type {
   AppendEventInput,
   BeginTurnResult,
+  CanonicalFollowUp,
   CanonicalExecution,
   CanonicalGoal,
   CanonicalItem,
@@ -33,10 +34,16 @@ import type {
 import { uuidV7 } from './domain.ts'
 import type {
   ClaimGoalLeaseInput,
+  ClaimFollowUpInput,
+  CloseFollowUpWindowResult,
   CheckpointGoalTurnInput,
   ClearGoalInput,
   CreateGoalInput,
+  ConsumeFollowUpInput,
+  ConsumeFollowUpResult,
   EditGoalInput,
+  EnqueueFollowUpInput,
+  EnqueueFollowUpResult,
   ForkThreadInput,
   GoalCasResult,
   GoalAwareBeginTurnInput,
@@ -45,12 +52,14 @@ import type {
   RecordGoalTurnInput,
   ReconcileToolInput,
   ReconcileToolResult,
+  RequeueFollowUpInput,
   ReleaseGoalLeaseInput,
   SessionListScope,
   SessionStore,
+  UpdateWorkspaceInput,
   UpdateGoalStatusInput,
 } from './store.ts'
-import { GoalStoreError, SessionStoreError } from './store.ts'
+import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
 import type {
   CommitNativeImportInput,
   NativeImportCommitCheckpoint,
@@ -62,10 +71,11 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 7
+const SCHEMA_VERSION = 10
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
 const DEFAULT_GOAL_LEASE_MS = 30_000
+const DEFAULT_FOLLOW_UP_LEASE_MS = 30_000
 const ACTIVE_TURN_STATUSES = new Set(['queued', 'running', 'waiting_tool'])
 const TERMINAL_TURN_STATUSES = new Set(['completed', 'cancelled', 'failed', 'interrupted'])
 
@@ -117,6 +127,13 @@ function parseNullableObject(
   value: string | number | bigint | null | Uint8Array,
 ): Record<string, unknown> | null {
   return value === null ? null : parseObject(value)
+}
+
+function parseArray(value: string | number | bigint | null | Uint8Array): unknown[] {
+  if (typeof value !== 'string') throw new Error('Corrupt database: expected JSON text')
+  const parsed: unknown = JSON.parse(value)
+  if (!Array.isArray(parsed)) throw new Error('Corrupt database: expected JSON array')
+  return parsed
 }
 
 function objectValue(value: unknown): Record<string, unknown> | null {
@@ -602,6 +619,95 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 7')
         appliedVersion = 7
       }
+      if (appliedVersion < 8) {
+        this.#db.exec(`
+          ALTER TABLE turns ADD COLUMN follow_up_window TEXT NOT NULL DEFAULT 'accepting'
+            CHECK(follow_up_window IN ('accepting','closed'));
+          UPDATE turns SET follow_up_window='closed'
+            WHERE status IN ('completed','cancelled','failed','interrupted');
+
+          CREATE TABLE follow_ups (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            client_request_id TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK(sequence >= 1),
+            delivery TEXT NOT NULL CHECK(delivery IN ('steer_or_queue','next_turn')),
+            status TEXT NOT NULL CHECK(status IN ('queued','dispatching','consumed','cancelled','stale_goal')),
+            target_turn_id TEXT REFERENCES turns(id) ON DELETE RESTRICT,
+            consumed_turn_id TEXT REFERENCES turns(id) ON DELETE RESTRICT,
+            consumed_item_ids_json TEXT NOT NULL DEFAULT '[]'
+              CHECK(json_valid(consumed_item_ids_json) AND json_type(consumed_item_ids_json)='array'),
+            goal_id TEXT,
+            goal_revision INTEGER CHECK(goal_revision IS NULL OR goal_revision >= 1),
+            input_json TEXT NOT NULL CHECK(json_valid(input_json) AND json_type(input_json)='array'),
+            dispatch_owner TEXT,
+            lease_expires_at TEXT,
+            revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            consumed_at TEXT,
+            UNIQUE(thread_id, client_request_id),
+            UNIQUE(thread_id, sequence),
+            CHECK((goal_id IS NULL) = (goal_revision IS NULL)),
+            CHECK(
+              (status='dispatching' AND dispatch_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+              OR (status!='dispatching' AND dispatch_owner IS NULL AND lease_expires_at IS NULL)
+            ),
+            CHECK(
+              (status='consumed' AND consumed_turn_id IS NOT NULL AND consumed_at IS NOT NULL
+                AND json_array_length(consumed_item_ids_json) > 0)
+              OR (status!='consumed' AND consumed_turn_id IS NULL AND consumed_at IS NULL
+                AND json_array_length(consumed_item_ids_json) = 0)
+            )
+          ) STRICT;
+          CREATE INDEX follow_ups_thread_state_sequence ON follow_ups(thread_id,status,sequence);
+          CREATE INDEX follow_ups_target_state_sequence ON follow_ups(target_turn_id,status,sequence);
+          CREATE INDEX follow_ups_expired_dispatch ON follow_ups(lease_expires_at,id)
+            WHERE status='dispatching';
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(8, 'durable-follow-up-queue', this.#now())
+        this.#db.exec('PRAGMA user_version = 8')
+        appliedVersion = 8
+      }
+      if (appliedVersion < 9) {
+        // Older imports copied native metadata into the authoritative workspace column.
+        // Native cwd remains in native_session_sources as a user-visible suggestion only.
+        const sessionHasCwd = this.#all(this.#db.prepare('PRAGMA table_info(sessions)'))
+          .some((row) => text(row, 'name') === 'cwd')
+        const nativeSourcesExist = this.#optional(this.#db.prepare(`
+          SELECT name FROM sqlite_schema WHERE type='table' AND name='native_session_sources'
+        `)) !== null
+        if (sessionHasCwd && nativeSourcesExist) {
+          this.#db.exec(`
+            UPDATE sessions SET cwd=NULL
+            WHERE EXISTS (SELECT 1 FROM native_session_sources ns WHERE ns.session_id=sessions.id);
+          `)
+        }
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(9, 'verified-session-workspace-authority', this.#now())
+        this.#db.exec('PRAGMA user_version = 9')
+        appliedVersion = 9
+      }
+      if (appliedVersion < 10) {
+        this.#db.exec(`
+          ALTER TABLE follow_ups ADD COLUMN after_turn_sequence INTEGER NOT NULL DEFAULT 0
+            CHECK(after_turn_sequence >= 0);
+          UPDATE follow_ups SET after_turn_sequence=COALESCE(
+            (SELECT t.sequence FROM turns t WHERE t.id=follow_ups.target_turn_id),
+            (SELECT MAX(t.sequence) FROM turns t
+              WHERE t.thread_id=follow_ups.thread_id
+                AND t.started_at IS NOT NULL AND t.started_at<=follow_ups.created_at),
+            0
+          );
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(10, 'follow-up-turn-boundary', this.#now())
+        this.#db.exec('PRAGMA user_version = 10')
+        appliedVersion = 10
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
@@ -703,6 +809,47 @@ export class SqliteSessionStore implements SessionStore {
     })
   }
 
+  updateWorkspace(input: UpdateWorkspaceInput): CanonicalSession {
+    return this.#transaction('IMMEDIATE', () => {
+      const session = this.getSession(input.sessionId)
+      if (!session) throw new SessionStoreError('not_found', `Session not found: ${input.sessionId}`)
+      if (session.archivedAt) throw new SessionStoreError('session_archived', 'Cannot change an archived session workspace')
+      const thread = this.getThread(session.activeThreadId)
+      if (!thread) throw new Error('Corrupt database: active thread is missing')
+      if (thread.revision !== input.expectedThreadRevision) {
+        throw new SessionStoreError('revision_conflict', 'Thread revision changed after the workspace was observed')
+      }
+      if (thread.status !== 'idle') {
+        throw new SessionStoreError('session_busy', 'Workspace can only change while the session is idle')
+      }
+      const activeGoal = this.#optional(this.#db.prepare(
+        "SELECT id FROM goals WHERE thread_id=? AND status='active' LIMIT 1",
+      ), thread.id)
+      if (activeGoal) throw new SessionStoreError('session_busy', 'Pause or finish the active Goal before changing the workspace')
+      if (session.cwd === input.cwd) return session
+
+      const now = this.#now()
+      const updated = this.#db.prepare(`
+        UPDATE threads SET revision=revision+1,updated_at=? WHERE id=? AND revision=? AND status='idle'
+      `).run(now, thread.id, input.expectedThreadRevision)
+      if (updated.changes !== 1) {
+        throw new SessionStoreError('revision_conflict', 'Thread changed while the workspace was being updated')
+      }
+      this.#db.prepare('UPDATE sessions SET cwd=?,updated_at=? WHERE id=?')
+        .run(input.cwd, now, session.id)
+      this.#db.prepare(`
+        UPDATE provider_bindings SET invalidated_at=?,updated_at=?
+        WHERE thread_id=? AND invalidated_at IS NULL
+      `).run(now, now, thread.id)
+      this.#appendStreamEvent(session.id, thread.id, null, 'workspace_changed', {
+        connected: input.cwd !== null,
+        previousConnected: session.cwd !== null,
+        revision: thread.revision + 1,
+      }, now)
+      return this.getSession(session.id) as CanonicalSession
+    })
+  }
+
   purgeExpiredSessions(cutoffIso: string, batchSize = 100): number {
     if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 1_000) {
       throw new RangeError('batchSize must be an integer between 1 and 1000')
@@ -756,6 +903,8 @@ export class SqliteSessionStore implements SessionStore {
           WHERE session_id IN (SELECT session_id FROM session_purge_context);
         DELETE FROM stream_events
           WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM follow_ups
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
         DELETE FROM items
           WHERE session_id IN (SELECT session_id FROM session_purge_context);
         DELETE FROM turns WHERE thread_id IN (
@@ -806,6 +955,7 @@ export class SqliteSessionStore implements SessionStore {
       turns,
       items,
       bindings: bindingRows.map((row) => this.#binding(row)),
+      followUps: this.listFollowUps(thread.id),
       goal: this.getGoal(thread.id),
     }
   }
@@ -1115,6 +1265,7 @@ export class SqliteSessionStore implements SessionStore {
       if (!ACTIVE_TURN_STATUSES.has(status)) throw new SessionStoreError('turn_not_running', 'Turn is not active')
 
       const now = this.#now()
+      this.#closeFollowUpWindow(input.turnId, now)
       this.#db.prepare('UPDATE turns SET status=?,completed_at=?,usage_json=?,error_json=? WHERE id=?')
         .run(input.status, now, desiredUsage === null ? null : canonicalJson(desiredUsage),
           desiredError === null ? null : canonicalJson(desiredError), input.turnId)
@@ -1140,6 +1291,231 @@ export class SqliteSessionStore implements SessionStore {
         error: desiredError,
       }, now)
       return this.getTurn(input.turnId) as CanonicalTurn
+    })
+  }
+
+  enqueueFollowUp(input: EnqueueFollowUpInput): EnqueueFollowUpResult {
+    validateFollowUpInput(input)
+    return this.#transaction('IMMEDIATE', () => {
+      const duplicateRow = this.#optional(this.#db.prepare(`
+        SELECT * FROM follow_ups WHERE thread_id=? AND client_request_id=?
+      `), input.threadId, input.clientRequestId)
+      if (duplicateRow) {
+        if (text(duplicateRow, 'request_hash') !== input.requestHash) {
+          throw new SessionStoreError('duplicate_request', 'Follow-up request ID was reused with different content')
+        }
+        return { followUp: this.#followUp(duplicateRow), duplicate: true }
+      }
+
+      const thread = this.getThread(input.threadId)
+      if (!thread) throw new SessionStoreError('not_found', `Thread not found: ${input.threadId}`)
+      const session = this.getSession(thread.sessionId)
+      if (!session) throw new SessionStoreError('not_found', `Session not found: ${thread.sessionId}`)
+      if (session.archivedAt) throw new SessionStoreError('session_archived', 'Archived sessions cannot accept follow-ups')
+
+      if (input.targetTurnId !== null) {
+        const target = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), input.targetTurnId)
+        if (!target || text(target, 'thread_id') !== thread.id) {
+          throw new FollowUpStoreError('invalid_follow_up', 'Follow-up target turn is not in the thread')
+        }
+        if (!ACTIVE_TURN_STATUSES.has(text(target, 'status')) || text(target, 'follow_up_window') !== 'accepting') {
+          throw new FollowUpStoreError('invalid_follow_up', 'Follow-up target turn is not accepting input')
+        }
+      }
+
+      const goalMatches = input.scope.kind === 'conversation'
+        || this.#goalScopeMatches(thread.id, input.scope.goalId, input.scope.revision)
+      const status: CanonicalFollowUp['status'] = goalMatches ? 'queued' : 'stale_goal'
+      const sequence = integer(this.#one(this.#db.prepare(`
+        SELECT COALESCE(MAX(sequence),0)+1 AS next_sequence FROM follow_ups WHERE thread_id=?
+      `), thread.id), 'next_sequence')
+      const afterTurnSequence = integer(this.#one(this.#db.prepare(`
+        SELECT COALESCE(MAX(sequence),0) AS current_sequence FROM turns WHERE thread_id=?
+      `), thread.id), 'current_sequence')
+      const id = this.#idFactory()
+      const now = this.#now()
+      const goalId = input.scope.kind === 'goal' ? input.scope.goalId : null
+      const goalRevision = input.scope.kind === 'goal' ? input.scope.revision : null
+      this.#db.prepare(`
+        INSERT INTO follow_ups(
+          id,session_id,thread_id,client_request_id,request_hash,sequence,after_turn_sequence,delivery,status,
+          target_turn_id,goal_id,goal_revision,input_json,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(id, thread.sessionId, thread.id, input.clientRequestId, input.requestHash, sequence, afterTurnSequence,
+        input.delivery, status, input.targetTurnId, goalId, goalRevision, canonicalJson(input.input), now, now)
+      this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, thread.sessionId)
+      const followUp = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), id))
+      this.#appendFollowUpChanged(followUp, now)
+      return { followUp, duplicate: false }
+    })
+  }
+
+  listFollowUps(threadId: ThreadId): CanonicalFollowUp[] {
+    return this.#all(this.#db.prepare('SELECT * FROM follow_ups WHERE thread_id=? ORDER BY sequence'), threadId)
+      .map((row) => this.#followUp(row))
+  }
+
+  claimFollowUp(input: ClaimFollowUpInput): CanonicalFollowUp | null {
+    const duration = validateFollowUpLeaseDuration(input.leaseDurationMs ?? DEFAULT_FOLLOW_UP_LEASE_MS)
+    if (!input.ownerId) throw new FollowUpStoreError('invalid_follow_up', 'Follow-up lease owner must not be empty')
+    if (input.purpose === 'steer' && !input.targetTurnId) {
+      throw new FollowUpStoreError('invalid_follow_up', 'A steer claim requires a target turn')
+    }
+    return this.#transaction('IMMEDIATE', () => {
+      const thread = this.getThread(input.threadId)
+      if (!thread) throw new SessionStoreError('not_found', `Thread not found: ${input.threadId}`)
+      this.#markStaleGoalFollowUps(thread.id, this.#now())
+      const row = this.#optional(this.#db.prepare(`
+        SELECT * FROM follow_ups WHERE thread_id=? AND status IN ('queued','dispatching')
+        ORDER BY sequence LIMIT 1
+      `), thread.id)
+      if (!row) return null
+      if (text(row, 'status') === 'dispatching') return null
+      const targetTurnId = nullableText(row, 'target_turn_id')
+      if (input.purpose === 'steer') {
+        if (text(row, 'delivery') !== 'steer_or_queue' || targetTurnId !== input.targetTurnId) return null
+        const target = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), input.targetTurnId as string)
+        if (!target || !ACTIVE_TURN_STATUSES.has(text(target, 'status'))
+          || text(target, 'follow_up_window') !== 'accepting') return null
+      } else if (targetTurnId !== null) {
+        return null
+      }
+      const now = this.#now()
+      const expiresAt = new Date(Date.parse(now) + duration).toISOString()
+      const changed = this.#db.prepare(`
+        UPDATE follow_ups SET status='dispatching',dispatch_owner=?,lease_expires_at=?,
+          revision=revision+1,updated_at=? WHERE id=? AND status='queued'
+      `).run(input.ownerId, expiresAt, now, text(row, 'id')).changes
+      if (changed !== 1) return null
+      const claimed = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
+      this.#appendFollowUpChanged(claimed, now)
+      return claimed
+    })
+  }
+
+  consumeFollowUp(input: ConsumeFollowUpInput): ConsumeFollowUpResult {
+    if (!input.ownerId) throw new FollowUpStoreError('invalid_follow_up', 'Follow-up lease owner must not be empty')
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), input.followUpId)
+      if (!row) throw new SessionStoreError('not_found', `Follow-up not found: ${input.followUpId}`)
+      if (text(row, 'status') === 'consumed') {
+        const followUp = this.#followUp(row)
+        if (followUp.consumedTurnId !== input.turnId) {
+          throw new FollowUpStoreError('invalid_follow_up', 'Follow-up was consumed by a different turn')
+        }
+        return { status: 'consumed', followUp, items: this.#itemsByIds(followUp.consumedItemIds) }
+      }
+      const now = this.#now()
+      if (text(row, 'status') !== 'dispatching' || nullableText(row, 'dispatch_owner') !== input.ownerId
+        || (nullableText(row, 'lease_expires_at') ?? '') <= now) {
+        throw new FollowUpStoreError('follow_up_lease_lost', 'Follow-up claim is missing, expired, or owned elsewhere')
+      }
+
+      const turn = this.#optional(this.#db.prepare(`
+        SELECT turns.*,threads.session_id AS session_id FROM turns
+        JOIN threads ON threads.id=turns.thread_id WHERE turns.id=?
+      `), input.turnId)
+      if (!turn || text(turn, 'thread_id') !== text(row, 'thread_id')) {
+        throw new FollowUpStoreError('invalid_follow_up', 'Consume turn is not in the follow-up thread')
+      }
+      const targetTurnId = nullableText(row, 'target_turn_id')
+      if (targetTurnId !== null && targetTurnId !== input.turnId) {
+        throw new FollowUpStoreError('invalid_follow_up', 'Claimed follow-up targets a different turn')
+      }
+
+      const goalId = nullableText(row, 'goal_id')
+      const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
+      if (goalId !== null && goalRevision !== null
+        && (!this.#goalScopeMatches(text(row, 'thread_id'), goalId, goalRevision)
+          || nullableText(turn, 'goal_id') !== goalId || turn.goal_revision !== goalRevision)) {
+        const stale = this.#setFollowUpTerminal(row, 'stale_goal', now)
+        return { status: 'stale_goal', followUp: stale, items: [] }
+      }
+      if (!ACTIVE_TURN_STATUSES.has(text(turn, 'status'))) {
+        const queued = this.#requeueClaimedFollowUp(row, input.ownerId, null, now)
+        return { status: 'queued', followUp: queued, items: [] }
+      }
+      if (targetTurnId === null && integer(turn, 'sequence') <= integer(row, 'after_turn_sequence')) {
+        const queued = this.#requeueClaimedFollowUp(row, input.ownerId, null, now)
+        return { status: 'queued', followUp: queued, items: [] }
+      }
+
+      const followUp = this.#followUp(row)
+      const items = this.#appendItems(text(turn, 'session_id'), text(row, 'thread_id'), input.turnId,
+        null, followUp.input, null, now)
+      this.#db.prepare(`
+        UPDATE follow_ups SET status='consumed',consumed_turn_id=?,consumed_item_ids_json=?,
+          dispatch_owner=NULL,lease_expires_at=NULL,revision=revision+1,updated_at=?,consumed_at=?
+        WHERE id=? AND status='dispatching' AND dispatch_owner=?
+      `).run(input.turnId, canonicalJson(items.map((item) => item.id)), now, now, followUp.id, input.ownerId)
+      const consumed = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), followUp.id))
+      this.#appendStreamEvent(text(turn, 'session_id'), text(row, 'thread_id'), input.turnId, 'items_appended', {
+        followUpId: followUp.id,
+        itemIds: items.map((item) => item.id),
+      }, now)
+      this.#appendFollowUpChanged(consumed, now)
+      return { status: 'consumed', followUp: consumed, items }
+    })
+  }
+
+  requeueFollowUp(input: RequeueFollowUpInput): CanonicalFollowUp {
+    if (!input.ownerId) throw new FollowUpStoreError('invalid_follow_up', 'Follow-up lease owner must not be empty')
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), input.followUpId)
+      if (!row) throw new SessionStoreError('not_found', `Follow-up not found: ${input.followUpId}`)
+      const now = this.#now()
+      return this.#requeueClaimedFollowUp(row, input.ownerId, input.targetTurnId ?? null, now)
+    })
+  }
+
+  closeFollowUpWindow(turnId: TurnId): CloseFollowUpWindowResult {
+    return this.#transaction('IMMEDIATE', () => {
+      const turn = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), turnId)
+      if (!turn) throw new SessionStoreError('not_found', `Turn not found: ${turnId}`)
+      return this.#closeFollowUpWindow(turnId, this.#now())
+    })
+  }
+
+  markStaleGoalFollowUps(threadId: ThreadId): number {
+    return this.#transaction('IMMEDIATE', () => {
+      if (!this.getThread(threadId)) throw new SessionStoreError('not_found', `Thread not found: ${threadId}`)
+      return this.#markStaleGoalFollowUps(threadId, this.#now())
+    })
+  }
+
+  recoverExpiredFollowUpClaims(cutoffIso = this.#now()): number {
+    if (!Number.isFinite(Date.parse(cutoffIso))) {
+      throw new FollowUpStoreError('invalid_follow_up', 'Follow-up recovery cutoff must be an ISO timestamp')
+    }
+    return this.#transaction('IMMEDIATE', () => {
+      const rows = this.#all(this.#db.prepare(`
+        SELECT * FROM follow_ups WHERE status='dispatching' AND lease_expires_at<=?
+        ORDER BY thread_id,sequence
+      `), cutoffIso)
+      let recovered = 0
+      for (const row of rows) {
+        const now = this.#now()
+        const goalId = nullableText(row, 'goal_id')
+        const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
+        if (goalId !== null && goalRevision !== null
+          && !this.#goalScopeMatches(text(row, 'thread_id'), goalId, goalRevision)) {
+          this.#setFollowUpTerminal(row, 'stale_goal', now)
+        } else {
+          const targetId = nullableText(row, 'target_turn_id')
+          const target = targetId === null ? null
+            : this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), targetId)
+          const retainedTarget = target && ACTIVE_TURN_STATUSES.has(text(target, 'status'))
+            && text(target, 'follow_up_window') === 'accepting' ? targetId : null
+          this.#db.prepare(`
+            UPDATE follow_ups SET status='queued',target_turn_id=?,dispatch_owner=NULL,lease_expires_at=NULL,
+              revision=revision+1,updated_at=? WHERE id=? AND status='dispatching'
+          `).run(retainedTarget, now, text(row, 'id'))
+          const queued = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
+          this.#appendFollowUpChanged(queued, now)
+        }
+        recovered += 1
+      }
+      return recovered
     })
   }
 
@@ -1659,6 +2035,8 @@ export class SqliteSessionStore implements SessionStore {
       for (const row of rows) {
         const turnId = text(row, 'id')
         recoveredTurnIds.add(turnId)
+        this.#closeFollowUpWindow(turnId, now)
+        this.#recoverFollowUpClaimsForTurn(turnId, now)
         const unknownMutation = this.#hasUnresolvedMutatingToolCall(turnId)
         const recoveryCode = unknownMutation ? 'unknown_mutation_outcome' : 'runtime_interrupted'
         const goalId = nullableText(row, 'goal_id')
@@ -1900,7 +2278,7 @@ export class SqliteSessionStore implements SessionStore {
     this.#db.prepare(`
       INSERT INTO sessions(id,title,preview,active_thread_id,project_key,cwd,schema_version,next_item_sequence,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,1,?,?)
-    `).run(sessionId, candidate.sourceAlias, null, threadId, candidate.projectGroupKey, candidate.cwd, SCHEMA_VERSION, now, now)
+    `).run(sessionId, candidate.sourceAlias, null, threadId, candidate.projectGroupKey, null, SCHEMA_VERSION, now, now)
     this.#db.prepare(`
       INSERT INTO threads(id,session_id,parent_thread_id,fork_turn_id,fork_item_id,revision,status,instruction_snapshot_json,created_at,updated_at)
       VALUES (?,?,NULL,NULL,NULL,0,'idle',?,?,?)
@@ -1945,7 +2323,7 @@ export class SqliteSessionStore implements SessionStore {
       FROM sessions s JOIN threads t ON t.session_id=s.id AND t.parent_thread_id IS NULL WHERE s.id=?
     `), current.sessionId)
     if (text(sessionRow, 'active_thread_id') !== text(sessionRow, 'root_thread_id')
-      || integer(sessionRow, 'revision') !== 0 || integer(sessionRow, 'fork_count') !== 0
+      || integer(sessionRow, 'fork_count') !== 0
       || integer(sessionRow, 'turn_count') !== 0 || integer(sessionRow, 'item_count') !== current.importedItemSequence
       || integer(sessionRow, 'next_item_sequence') !== current.importedItemSequence + 1) {
       throw new Error('update_conflict_after_fork: imported session is no longer an untouched root thread')
@@ -2177,6 +2555,118 @@ export class SqliteSessionStore implements SessionStore {
     return ids.map((id) => this.#item(this.#one(statement, id)))
   }
 
+  #goalScopeMatches(threadId: string, goalId: string, goalRevision: number): boolean {
+    return this.#optional(this.#db.prepare(`
+      SELECT id FROM goals WHERE thread_id=? AND id=? AND revision=? AND status='active'
+    `), threadId, goalId, goalRevision) !== null
+  }
+
+  #markStaleGoalFollowUps(threadId: string, now: string): number {
+    const rows = this.#all(this.#db.prepare(`
+      SELECT * FROM follow_ups WHERE thread_id=? AND status='queued' AND goal_id IS NOT NULL
+      ORDER BY sequence
+    `), threadId)
+    let changed = 0
+    for (const row of rows) {
+      if (this.#goalScopeMatches(threadId, text(row, 'goal_id'), integer(row, 'goal_revision'))) continue
+      this.#setFollowUpTerminal(row, 'stale_goal', now)
+      changed += 1
+    }
+    return changed
+  }
+
+  #setFollowUpTerminal(
+    row: SqlRow,
+    status: Extract<CanonicalFollowUp['status'], 'cancelled' | 'stale_goal'>,
+    now: string,
+  ): CanonicalFollowUp {
+    this.#db.prepare(`
+      UPDATE follow_ups SET status=?,target_turn_id=NULL,dispatch_owner=NULL,lease_expires_at=NULL,
+        revision=revision+1,updated_at=? WHERE id=?
+    `).run(status, now, text(row, 'id'))
+    const followUp = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
+    this.#appendFollowUpChanged(followUp, now)
+    return followUp
+  }
+
+  #requeueClaimedFollowUp(
+    row: SqlRow,
+    ownerId: string,
+    targetTurnId: string | null,
+    now: string,
+  ): CanonicalFollowUp {
+    if (text(row, 'status') !== 'dispatching' || nullableText(row, 'dispatch_owner') !== ownerId) {
+      throw new FollowUpStoreError('follow_up_lease_lost', 'Follow-up claim is missing or owned elsewhere')
+    }
+    if (targetTurnId !== null) {
+      const target = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), targetTurnId)
+      if (!target || text(target, 'thread_id') !== text(row, 'thread_id')
+        || !ACTIVE_TURN_STATUSES.has(text(target, 'status'))
+        || text(target, 'follow_up_window') !== 'accepting') {
+        throw new FollowUpStoreError('invalid_follow_up', 'Requeue target turn is not accepting input')
+      }
+    }
+    this.#db.prepare(`
+      UPDATE follow_ups SET status='queued',target_turn_id=?,dispatch_owner=NULL,lease_expires_at=NULL,
+        revision=revision+1,updated_at=? WHERE id=? AND status='dispatching' AND dispatch_owner=?
+    `).run(targetTurnId, now, text(row, 'id'), ownerId)
+    const queued = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
+    this.#appendFollowUpChanged(queued, now)
+    return queued
+  }
+
+  #closeFollowUpWindow(turnId: string, now: string): CloseFollowUpWindowResult {
+    this.#db.prepare("UPDATE turns SET follow_up_window='closed' WHERE id=?").run(turnId)
+    const rows = this.#all(this.#db.prepare(`
+      SELECT * FROM follow_ups WHERE target_turn_id=? AND status='queued' ORDER BY sequence
+    `), turnId)
+    for (const row of rows) {
+      this.#db.prepare(`
+        UPDATE follow_ups SET target_turn_id=NULL,revision=revision+1,updated_at=? WHERE id=? AND status='queued'
+      `).run(now, text(row, 'id'))
+      const queued = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
+      this.#appendFollowUpChanged(queued, now)
+    }
+    const inFlight = integer(this.#one(this.#db.prepare(`
+      SELECT COUNT(*) AS count FROM follow_ups WHERE target_turn_id=? AND status='dispatching'
+    `), turnId), 'count')
+    return { requeued: rows.length, inFlight }
+  }
+
+  #recoverFollowUpClaimsForTurn(turnId: string, now: string): number {
+    const rows = this.#all(this.#db.prepare(`
+      SELECT * FROM follow_ups WHERE target_turn_id=? AND status='dispatching' ORDER BY sequence
+    `), turnId)
+    for (const row of rows) {
+      const goalId = nullableText(row, 'goal_id')
+      const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
+      if (goalId !== null && goalRevision !== null
+        && !this.#goalScopeMatches(text(row, 'thread_id'), goalId, goalRevision)) {
+        this.#setFollowUpTerminal(row, 'stale_goal', now)
+        continue
+      }
+      this.#db.prepare(`
+        UPDATE follow_ups SET status='queued',target_turn_id=NULL,dispatch_owner=NULL,lease_expires_at=NULL,
+          revision=revision+1,updated_at=? WHERE id=? AND status='dispatching'
+      `).run(now, text(row, 'id'))
+      const queued = this.#followUp(this.#one(this.#db.prepare('SELECT * FROM follow_ups WHERE id=?'), text(row, 'id')))
+      this.#appendFollowUpChanged(queued, now)
+    }
+    return rows.length
+  }
+
+  #appendFollowUpChanged(followUp: CanonicalFollowUp, now: string): void {
+    this.#appendStreamEvent(followUp.sessionId, followUp.threadId, followUp.targetTurnId,
+      'follow_up_changed', {
+        followUpId: followUp.id,
+        revision: followUp.revision,
+        sequence: followUp.sequence,
+        status: followUp.status,
+        targetTurnId: followUp.targetTurnId,
+        consumedTurnId: followUp.consumedTurnId,
+      }, now)
+  }
+
   #appendStreamEvent(
     sessionId: string,
     threadId: string,
@@ -2198,7 +2688,7 @@ export class SqliteSessionStore implements SessionStore {
       preview: nullableText(row, 'preview'),
       activeThreadId: text(row, 'active_thread_id'),
       projectKey: nullableText(row, 'project_key'),
-      cwd: sourceProvider ? null : nullableText(row, 'cwd'),
+      cwd: nullableText(row, 'cwd'),
       schemaVersion: integer(row, 'schema_version'),
       createdAt: text(row, 'created_at'),
       updatedAt: text(row, 'updated_at'),
@@ -2210,6 +2700,7 @@ export class SqliteSessionStore implements SessionStore {
         sourceAlias: nullableText(row, 'source_alias'),
         titleSource: nullableText(row, 'source_title_source'),
         projectAlias: nullableText(row, 'source_project_alias'),
+        cwd: nullableText(row, 'source_cwd'),
       } : null,
     }
   }
@@ -2261,6 +2752,39 @@ export class SqliteSessionStore implements SessionStore {
       provider: nullableText(row, 'provider') as CanonicalProvider | null,
       nativeId: nullableText(row, 'native_id'),
       createdAt: text(row, 'created_at'),
+    }
+  }
+
+  #followUp(row: SqlRow): CanonicalFollowUp {
+    const goalId = nullableText(row, 'goal_id')
+    const goalRevision = row.goal_revision === null ? null : integer(row, 'goal_revision')
+    const input = parseArray(row.input_json) as CanonicalFollowUp['input']
+    return {
+      id: text(row, 'id'),
+      sessionId: text(row, 'session_id'),
+      threadId: text(row, 'thread_id'),
+      clientRequestId: text(row, 'client_request_id'),
+      requestHash: text(row, 'request_hash'),
+      sequence: integer(row, 'sequence'),
+      afterTurnSequence: integer(row, 'after_turn_sequence'),
+      delivery: text(row, 'delivery') as CanonicalFollowUp['delivery'],
+      status: text(row, 'status') as CanonicalFollowUp['status'],
+      targetTurnId: nullableText(row, 'target_turn_id'),
+      consumedTurnId: nullableText(row, 'consumed_turn_id'),
+      consumedItemIds: parseArray(row.consumed_item_ids_json).map((id) => {
+        if (typeof id !== 'string') throw new Error('Corrupt database: consumed item ID is not text')
+        return id
+      }),
+      scope: goalId === null
+        ? { kind: 'conversation' }
+        : { kind: 'goal', goalId, revision: goalRevision as number },
+      input,
+      dispatchOwner: nullableText(row, 'dispatch_owner'),
+      leaseExpiresAt: nullableText(row, 'lease_expires_at'),
+      revision: integer(row, 'revision'),
+      createdAt: text(row, 'created_at'),
+      updatedAt: text(row, 'updated_at'),
+      consumedAt: nullableText(row, 'consumed_at'),
     }
   }
 
@@ -2398,6 +2922,42 @@ export class SqliteSessionStore implements SessionStore {
   }
 }
 
+function validateFollowUpInput(input: EnqueueFollowUpInput): void {
+  if (!input.clientRequestId || !input.requestHash) {
+    throw new FollowUpStoreError('invalid_follow_up', 'Follow-up request identity must not be empty')
+  }
+  if (input.delivery !== 'steer_or_queue' && input.delivery !== 'next_turn') {
+    throw new FollowUpStoreError('invalid_follow_up', 'Follow-up delivery mode is invalid')
+  }
+  if (input.delivery === 'next_turn' && input.targetTurnId !== null) {
+    throw new FollowUpStoreError('invalid_follow_up', 'Next-turn follow-ups cannot target the active turn')
+  }
+  if (input.scope.kind === 'goal'
+    && (!input.scope.goalId || !Number.isSafeInteger(input.scope.revision) || input.scope.revision < 1)) {
+    throw new FollowUpStoreError('invalid_follow_up', 'Goal-scoped follow-up requires a positive Goal revision')
+  }
+  if (!Array.isArray(input.input) || input.input.length === 0) {
+    throw new FollowUpStoreError('invalid_follow_up', 'Follow-up must contain at least one user message')
+  }
+  for (const item of input.input) {
+    if (item.kind !== 'user_message' || (item.visibility !== undefined && item.visibility !== 'portable')
+      || (item.provider !== undefined && item.provider !== null)
+      || (item.nativeId !== undefined && item.nativeId !== null)) {
+      throw new FollowUpStoreError(
+        'invalid_follow_up',
+        'Follow-up input may contain only portable provider-neutral user messages',
+      )
+    }
+  }
+}
+
+function validateFollowUpLeaseDuration(duration: number): number {
+  if (!Number.isSafeInteger(duration) || duration < 1 || duration > 300_000) {
+    throw new FollowUpStoreError('invalid_follow_up', 'Follow-up lease duration must be between 1 and 300000 milliseconds')
+  }
+  return duration
+}
+
 function validateGoalObjective(objective: string): void {
   const length = [...objective].length
   if (length < 1 || length > 4_000) {
@@ -2509,7 +3069,8 @@ function sessionSelect(): string {
       (SELECT ns.source_client FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_client,
       (SELECT ns.source_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_alias,
       (SELECT ns.title_source FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_title_source,
-      (SELECT ns.project_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_project_alias
+      (SELECT ns.project_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_project_alias,
+      (SELECT ns.cwd FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_cwd
     FROM sessions s
   `
 }

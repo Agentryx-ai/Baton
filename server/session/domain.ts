@@ -7,6 +7,7 @@ export type TurnId = string
 export type ItemId = string
 export type ExecutionId = string
 export type GoalId = string
+export type FollowUpId = string
 
 export type ThreadStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'archived'
 export type TurnStatus =
@@ -184,6 +185,8 @@ export interface CanonicalSession {
     sourceAlias: string | null
     titleSource: string | null
     projectAlias: string | null
+    /** Native metadata only. It is never an authorized tool root until the user connects it. */
+    cwd: string | null
   } | null
 }
 
@@ -233,6 +236,37 @@ export interface CanonicalItem {
   createdAt: string
 }
 
+export type FollowUpDelivery = 'steer_or_queue' | 'next_turn'
+export type FollowUpStatus = 'queued' | 'dispatching' | 'consumed' | 'cancelled' | 'stale_goal'
+export type FollowUpScope =
+  | { kind: 'conversation' }
+  | { kind: 'goal'; goalId: GoalId; revision: number }
+
+/** Baton-owned user intent awaiting deterministic delivery to a canonical turn. */
+export interface CanonicalFollowUp {
+  id: FollowUpId
+  sessionId: SessionId
+  threadId: ThreadId
+  clientRequestId: string
+  requestHash: string
+  sequence: number
+  /** Greatest canonical turn sequence that existed when this intent was enqueued. */
+  afterTurnSequence: number
+  delivery: FollowUpDelivery
+  status: FollowUpStatus
+  targetTurnId: TurnId | null
+  consumedTurnId: TurnId | null
+  consumedItemIds: ItemId[]
+  scope: FollowUpScope
+  input: NewCanonicalItem[]
+  dispatchOwner: string | null
+  leaseExpiresAt: string | null
+  revision: number
+  createdAt: string
+  updatedAt: string
+  consumedAt: string | null
+}
+
 export type CanonicalStreamEventType =
   | 'session_created'
   | 'thread_forked'
@@ -242,6 +276,8 @@ export type CanonicalStreamEventType =
   | 'turn_cancelled'
   | 'turn_failed'
   | 'turn_interrupted'
+  | 'follow_up_changed'
+  | 'workspace_changed'
   | 'goal_changed'
 
 export interface CanonicalStreamEvent {
@@ -325,6 +361,8 @@ export interface ThreadSnapshot {
   turns: CanonicalTurn[]
   items: CanonicalItem[]
   bindings: ProviderBinding[]
+  /** Durable pending/delivered user intents; optional for legacy/in-memory stores. */
+  followUps?: CanonicalFollowUp[]
   /** Current Baton-owned Goal projection; absent only in legacy/in-memory adapters. */
   goal?: CanonicalGoal | null
 }

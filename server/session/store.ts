@@ -3,6 +3,7 @@ import type {
   BeginTurnInput,
   BeginTurnResult,
   CanonicalItem,
+  CanonicalFollowUp,
   CanonicalGoal,
   CanonicalProvider,
   CanonicalSession,
@@ -11,6 +12,9 @@ import type {
   CanonicalTurn,
   CreateSessionInput,
   FinishTurnInput,
+  FollowUpDelivery,
+  FollowUpId,
+  FollowUpScope,
   GoalId,
   GoalObservation,
   GoalSchedulerLease,
@@ -146,8 +150,60 @@ export interface GoalTurnContext {
   leaseId: string
 }
 
+export interface EnqueueFollowUpInput {
+  threadId: ThreadId
+  clientRequestId: string
+  requestHash: string
+  delivery: FollowUpDelivery
+  /** Active turn to steer; null means the intent is waiting for a later canonical turn. */
+  targetTurnId: TurnId | null
+  scope: FollowUpScope
+  input: CanonicalFollowUp['input']
+}
+
+export interface EnqueueFollowUpResult {
+  followUp: CanonicalFollowUp
+  duplicate: boolean
+}
+
+export interface ClaimFollowUpInput {
+  threadId: ThreadId
+  ownerId: string
+  purpose: 'steer' | 'next_turn'
+  targetTurnId?: TurnId
+  leaseDurationMs?: number
+}
+
+export interface ConsumeFollowUpInput {
+  followUpId: FollowUpId
+  ownerId: string
+  turnId: TurnId
+}
+
+export type ConsumeFollowUpResult =
+  | { status: 'consumed'; followUp: CanonicalFollowUp; items: CanonicalItem[] }
+  | { status: 'queued' | 'stale_goal'; followUp: CanonicalFollowUp; items: [] }
+
+export interface RequeueFollowUpInput {
+  followUpId: FollowUpId
+  ownerId: string
+  targetTurnId?: TurnId | null
+}
+
+export interface CloseFollowUpWindowResult {
+  requeued: number
+  inFlight: number
+}
+
 export type GoalAwareBeginTurnInput = BeginTurnInput & {
   goalContext?: GoalTurnContext | null
+}
+
+export interface UpdateWorkspaceInput {
+  sessionId: SessionId
+  expectedThreadRevision: number
+  /** Already canonicalized by the service boundary; null disconnects the workspace. */
+  cwd: string | null
 }
 
 export interface SessionStore extends NativeImportStore {
@@ -156,6 +212,7 @@ export interface SessionStore extends NativeImportStore {
   getSession(sessionId: SessionId): CanonicalSession | null
   archiveSession(sessionId: SessionId): CanonicalSession
   restoreSession(sessionId: SessionId): CanonicalSession
+  updateWorkspace(input: UpdateWorkspaceInput): CanonicalSession
   purgeExpiredSessions(cutoffIso: string, batchSize?: number): number
   getThread(threadId: ThreadId): CanonicalThread | null
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null
@@ -167,6 +224,14 @@ export interface SessionStore extends NativeImportStore {
   appendProviderEvent(input: AppendEventInput): CanonicalItem[]
   reconcileTool(input: ReconcileToolInput): ReconcileToolResult
   finishTurn(input: FinishTurnInput): CanonicalTurn
+  enqueueFollowUp(input: EnqueueFollowUpInput): EnqueueFollowUpResult
+  listFollowUps(threadId: ThreadId): CanonicalFollowUp[]
+  claimFollowUp(input: ClaimFollowUpInput): CanonicalFollowUp | null
+  consumeFollowUp(input: ConsumeFollowUpInput): ConsumeFollowUpResult
+  requeueFollowUp(input: RequeueFollowUpInput): CanonicalFollowUp
+  closeFollowUpWindow(turnId: TurnId): CloseFollowUpWindowResult
+  markStaleGoalFollowUps(threadId: ThreadId): number
+  recoverExpiredFollowUpClaims(cutoffIso?: string): number
   upsertProviderBinding(input: UpsertProviderBindingInput): ProviderBinding
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]
   listEvents(threadId: ThreadId, afterSequence?: number): CanonicalStreamEvent[]
@@ -217,6 +282,19 @@ export class SessionStoreError extends Error {
     super(message)
     this.code = code
     this.name = 'SessionStoreError'
+  }
+}
+
+export class FollowUpStoreError extends Error {
+  public readonly code: 'invalid_follow_up' | 'follow_up_lease_lost'
+
+  constructor(
+    code: 'invalid_follow_up' | 'follow_up_lease_lost',
+    message: string,
+  ) {
+    super(message)
+    this.code = code
+    this.name = 'FollowUpStoreError'
   }
 }
 

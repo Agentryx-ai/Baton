@@ -11,7 +11,8 @@ import type {
   ProviderCapabilities,
 } from './domain.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
-import { GoalStoreError, SessionStoreError } from './store.ts'
+import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
+import type { NativeSessionCandidate } from './native-import/contracts.ts'
 
 const policy: ExecutionPolicySnapshot = {
   delegationMode: 'disabled',
@@ -70,7 +71,44 @@ function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): B
   }
 }
 
-test('schema v1 migrates through v7 with Goal storage and retention guards without rewriting turns', (t) => {
+function nativeCandidate(contents: string[], cwd: string, contentDigest: string): NativeSessionCandidate {
+  return {
+    candidateId: 'candidate-1',
+    sourceClient: 'codex_local',
+    provider: 'codex',
+    namespaceKey: 'native-test',
+    nativeSessionId: 'native-session-1',
+    identityKeys: [],
+    sourceAlias: 'Imported task',
+    aliasSource: 'native',
+    titleSource: 'metadata:user',
+    projectAlias: 'Source project',
+    projectGroupKey: 'source-project',
+    cwd,
+    createdAt: '2026-07-18T00:00:00.000Z',
+    updatedAt: '2026-07-18T00:00:00.000Z',
+    nativeOrigin: 'cli',
+    nativeArchived: false,
+    sourceHead: { size: contents.length, mtimeMs: contents.length, finalRecordDigest: `digest-${contents.length}` },
+    contentDigest,
+    prefixDigest: `prefix-${contents.length}`,
+    portableItemCount: contents.length,
+    records: contents.map((text, index) => ({
+      key: `record-${index + 1}`,
+      ordinal: index + 1,
+      digest: `digest-${index + 1}`,
+      prefixDigest: `prefix-${index + 1}`,
+      item: { kind: 'user_message', payload: { text } },
+      createdAt: '2026-07-18T00:00:00.000Z',
+    })),
+    skippedItemCount: 0,
+    parserVersion: 'test/1',
+    warnings: [],
+    materialized: true,
+  }
+}
+
+test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -110,10 +148,10 @@ test('schema v1 migrates through v7 with Goal storage and retention guards witho
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 7)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -129,9 +167,18 @@ test('schema v1 migrates through v7 with Goal storage and retention guards witho
     'goal_turn_accounting',
     'goals',
   ])
+  assert.equal((inspected.prepare(`
+    SELECT COUNT(*) AS count FROM sqlite_schema WHERE type='table' AND name='follow_ups'
+  `).get() as { count: number }).count, 1)
+  assert.equal((inspected.prepare(`
+    SELECT COUNT(*) AS count FROM pragma_table_info('follow_ups') WHERE name='after_turn_sequence'
+  `).get() as { count: number }).count, 1)
+  assert.equal((inspected.prepare('SELECT follow_up_window FROM turns WHERE id=?').get('turn-1') as {
+    follow_up_window: string
+  }).follow_up_window, 'closed')
 })
 
-test('schema v6 migrates to v7 in place and reopens without replaying the migration', (t) => {
+test('schema v6 migrates to v10 in place and reopens without replaying migrations', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -184,13 +231,19 @@ test('schema v6 migrates to v7 in place and reopens without replaying the migrat
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 7)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
+    .get() as { count: number }).count, 1)
+  assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=8")
+    .get() as { count: number }).count, 1)
+  assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=9")
+    .get() as { count: number }).count, 1)
+  assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=10")
     .get() as { count: number }).count, 1)
 })
 
@@ -252,6 +305,92 @@ test('archiving an active session is rejected and does not interrupt its turn', 
   )
   assert.equal(store.getTurn(started.turn.id)?.status, 'running')
   assert.equal(store.getSession(session.id)?.archivedAt, null)
+})
+
+test('workspace mutation uses thread CAS, invalidates bindings, and blocks active Goals', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  store.upsertProviderBinding({
+    threadId: session.activeThreadId,
+    provider: 'codex',
+    modelFamily: 'gpt-test',
+    nativeThreadId: 'native-thread',
+    nativeResponseId: null,
+    opaqueStateEncrypted: null,
+    capabilities,
+    syncedRevision: 0,
+    contextDigest: 'context-0',
+  })
+
+  const connected = store.updateWorkspace({
+    sessionId: session.id,
+    expectedThreadRevision: 0,
+    cwd: 'C:\\verified',
+  })
+  assert.equal(connected.cwd, 'C:\\verified')
+  assert.equal(store.getThread(session.activeThreadId)?.revision, 1)
+  assert.deepEqual(store.getSnapshot(session.activeThreadId)?.bindings, [])
+  assert.deepEqual(store.listEvents(session.activeThreadId).at(-1)?.payload, {
+    connected: true,
+    previousConnected: false,
+    revision: 1,
+  })
+  assert.throws(
+    () => store.updateWorkspace({ sessionId: session.id, expectedThreadRevision: 0, cwd: null }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict',
+  )
+
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'keep workspace stable',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  assert.throws(
+    () => store.updateWorkspace({ sessionId: session.id, expectedThreadRevision: 1, cwd: null }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'session_busy',
+  )
+  store.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: goal.revision,
+    status: 'paused',
+    reason: { code: 'user_paused', source: 'user', message: null, at: '2026-07-18T00:00:00.000Z' },
+  })
+  assert.equal(store.updateWorkspace({
+    sessionId: session.id,
+    expectedThreadRevision: 1,
+    cwd: null,
+  }).cwd, null)
+  assert.equal(store.getThread(session.activeThreadId)?.revision, 2)
+})
+
+test('native cwd remains a suggestion and refresh never overwrites the authorized workspace', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const first = nativeCandidate(['one'], 'C:\\source-old', 'content-1')
+  const imported = store.commitNativeImport({ candidate: first, previewedState: null })
+  assert.equal(imported.status, 'imported')
+  assert.ok(imported.sessionId)
+  const importedSession = store.getSession(imported.sessionId)
+  assert.equal(importedSession?.cwd, null)
+  assert.equal(importedSession?.source?.cwd, 'C:\\source-old')
+
+  store.updateWorkspace({
+    sessionId: imported.sessionId,
+    expectedThreadRevision: 0,
+    cwd: 'C:\\authorized',
+  })
+  const previewedState = store.getNativeImportState(first)
+  assert.ok(previewedState)
+  const refreshed = store.commitNativeImport({
+    candidate: nativeCandidate(['one', 'two'], 'C:\\source-new', 'content-2'),
+    previewedState,
+  })
+  assert.equal(refreshed.status, 'updated')
+  assert.equal(store.getSession(imported.sessionId)?.cwd, 'C:\\authorized')
+  assert.equal(store.getSession(imported.sessionId)?.source?.cwd, 'C:\\source-new')
 })
 
 test('expired trash purge is batched, scoped, and preserves append-only guards', (t) => {
@@ -830,6 +969,261 @@ test('turn requests, provider events, and terminal updates are idempotent', (t) 
   )
 })
 
+test('follow-up enqueue is idempotent, claims strict FIFO, and atomically appends accepted user messages', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({ title: 'follow-up' })
+  const started = store.beginTurn(beginInput(session.activeThreadId))
+  const firstInput = {
+    threadId: session.activeThreadId,
+    clientRequestId: 'follow-up-1',
+    requestHash: 'follow-up-hash-1',
+    delivery: 'steer_or_queue' as const,
+    targetTurnId: started.turn.id,
+    scope: { kind: 'conversation' as const },
+    input: [{ kind: 'user_message' as const, payload: { text: 'first follow-up' } }],
+  }
+  const first = store.enqueueFollowUp(firstInput)
+  assert.equal(first.duplicate, false)
+  assert.equal(store.enqueueFollowUp(firstInput).duplicate, true)
+  assert.throws(
+    () => store.enqueueFollowUp({ ...firstInput, requestHash: 'different-hash' }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'duplicate_request',
+  )
+  const second = store.enqueueFollowUp({
+    ...firstInput,
+    clientRequestId: 'follow-up-2',
+    requestHash: 'follow-up-hash-2',
+    input: [{ kind: 'user_message', payload: { text: 'second follow-up' } }],
+  }).followUp
+  assert.deepEqual(store.listFollowUps(session.activeThreadId).map((followUp) => followUp.sequence), [1, 2])
+
+  const claimedFirst = store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'dispatcher-a',
+    purpose: 'steer',
+    targetTurnId: started.turn.id,
+  })
+  assert.equal(claimedFirst?.id, first.followUp.id)
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'dispatcher-b',
+    purpose: 'steer',
+    targetTurnId: started.turn.id,
+  }), null, 'an in-flight head must block later sequence claims')
+  const consumedFirst = store.consumeFollowUp({
+    followUpId: first.followUp.id,
+    ownerId: 'dispatcher-a',
+    turnId: started.turn.id,
+  })
+  assert.equal(consumedFirst.status, 'consumed')
+  assert.equal(consumedFirst.items.length, 1)
+  assert.equal(consumedFirst.items[0]?.kind, 'user_message')
+  assert.equal(consumedFirst.items[0]?.provider, null)
+  assert.equal(consumedFirst.items[0]?.turnId, started.turn.id)
+  assert.deepEqual(consumedFirst.items[0]?.payload, { text: 'first follow-up' })
+  assert.deepEqual(store.consumeFollowUp({
+    followUpId: first.followUp.id,
+    ownerId: 'dispatcher-a',
+    turnId: started.turn.id,
+  }), consumedFirst, 'consume replay must return the same canonical items')
+
+  const claimedSecond = store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'dispatcher-b',
+    purpose: 'steer',
+    targetTurnId: started.turn.id,
+  })
+  assert.equal(claimedSecond?.id, second.id)
+  const itemCountBefore = store.listItems(session.activeThreadId).length
+  assert.throws(
+    () => store.consumeFollowUp({ followUpId: second.id, ownerId: 'wrong-owner', turnId: started.turn.id }),
+    (error: unknown) => error instanceof FollowUpStoreError && error.code === 'follow_up_lease_lost',
+  )
+  assert.equal(store.listItems(session.activeThreadId).length, itemCountBefore)
+  assert.deepEqual(store.getSnapshot(session.activeThreadId)?.followUps?.map((followUp) => followUp.status), [
+    'consumed',
+    'dispatching',
+  ])
+})
+
+test('follow-up closing and expired-lease recovery preserve FIFO intent for the next turn', (t) => {
+  let now = '2026-07-18T00:00:00.000Z'
+  const store = new SqliteSessionStore(databasePath(t), { ...deterministicOptions(), now: () => now })
+  t.after(() => store.close())
+  const session = store.createSession({ title: 'follow-up recovery' })
+  const started = store.beginTurn(beginInput(session.activeThreadId))
+  const enqueue = (number: number) => store.enqueueFollowUp({
+    threadId: session.activeThreadId,
+    clientRequestId: `follow-up-${number}`,
+    requestHash: `follow-up-hash-${number}`,
+    delivery: 'steer_or_queue',
+    targetTurnId: started.turn.id,
+    scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: `follow-up ${number}` } }],
+  }).followUp
+  const first = enqueue(1)
+  const second = enqueue(2)
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'dispatcher',
+    purpose: 'steer',
+    targetTurnId: started.turn.id,
+    leaseDurationMs: 1_000,
+  })?.id, first.id)
+  assert.deepEqual(store.closeFollowUpWindow(started.turn.id), { requeued: 1, inFlight: 1 })
+  assert.equal(store.listFollowUps(session.activeThreadId)[1]?.targetTurnId, null)
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'blocked-steer',
+    purpose: 'steer',
+    targetTurnId: started.turn.id,
+  }), null)
+
+  now = '2026-07-18T00:00:02.000Z'
+  assert.equal(store.recoverExpiredFollowUpClaims(), 1)
+  assert.deepEqual(store.listFollowUps(session.activeThreadId).map((followUp) => ({
+    id: followUp.id,
+    status: followUp.status,
+    targetTurnId: followUp.targetTurnId,
+  })), [
+    { id: first.id, status: 'queued', targetTurnId: null },
+    { id: second.id, status: 'queued', targetTurnId: null },
+  ])
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'next-turn-dispatcher',
+    purpose: 'next_turn',
+  })?.id, first.id)
+})
+
+test('next-turn follow-ups reject the existing turn and survive lease recovery for a later turn', (t) => {
+  let now = '2026-07-18T00:00:00.000Z'
+  const store = new SqliteSessionStore(databasePath(t), { ...deterministicOptions(), now: () => now })
+  t.after(() => store.close())
+  const session = store.createSession({ title: 'next-turn boundary' })
+  const existing = store.beginTurn(beginInput(session.activeThreadId, 'existing-turn', 'existing-hash'))
+  const followUp = store.enqueueFollowUp({
+    threadId: session.activeThreadId,
+    clientRequestId: 'next-turn-follow-up',
+    requestHash: 'next-turn-follow-up-hash',
+    delivery: 'next_turn',
+    targetTurnId: null,
+    scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'deliver only later' } }],
+  }).followUp
+  assert.equal(followUp.afterTurnSequence, existing.turn.sequence)
+
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'wrong-turn-dispatcher',
+    purpose: 'next_turn',
+  })?.id, followUp.id)
+  const itemCountBefore = store.listItems(session.activeThreadId).length
+  const rejected = store.consumeFollowUp({
+    followUpId: followUp.id,
+    ownerId: 'wrong-turn-dispatcher',
+    turnId: existing.turn.id,
+  })
+  assert.equal(rejected.status, 'queued')
+  assert.equal(store.listItems(session.activeThreadId).length, itemCountBefore)
+
+  store.finishTurn({ turnId: existing.turn.id, status: 'completed' })
+  const later = store.beginTurn({
+    ...beginInput(session.activeThreadId, 'later-turn', 'later-hash'),
+    expectedRevision: store.getThread(session.activeThreadId)?.revision ?? -1,
+  })
+  assert.ok(later.turn.sequence > followUp.afterTurnSequence)
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'crashed-dispatcher',
+    purpose: 'next_turn',
+    leaseDurationMs: 1_000,
+  })?.id, followUp.id)
+
+  now = '2026-07-18T00:00:02.000Z'
+  assert.equal(store.recoverExpiredFollowUpClaims(), 1)
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'recovered-dispatcher',
+    purpose: 'next_turn',
+  })?.id, followUp.id)
+  const consumed = store.consumeFollowUp({
+    followUpId: followUp.id,
+    ownerId: 'recovered-dispatcher',
+    turnId: later.turn.id,
+  })
+  assert.equal(consumed.status, 'consumed')
+  assert.deepEqual(consumed.items.map((item) => item.payload), [{ text: 'deliver only later' }])
+  assert.equal(consumed.followUp.consumedTurnId, later.turn.id)
+})
+
+test('Goal-scoped follow-ups become stale deterministically without appending unseen input', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({ title: 'Goal follow-up' })
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'original objective',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = store.beginTurn(beginInput(session.activeThreadId))
+  const scoped = store.enqueueFollowUp({
+    threadId: session.activeThreadId,
+    clientRequestId: 'goal-follow-up',
+    requestHash: 'goal-follow-up-hash',
+    delivery: 'steer_or_queue',
+    targetTurnId: started.turn.id,
+    scope: { kind: 'goal', goalId: goal.id, revision: goal.revision },
+    input: [{ kind: 'user_message', payload: { text: 'only for the observed Goal' } }],
+  }).followUp
+  assert.equal(store.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'goal-dispatcher',
+    purpose: 'steer',
+    targetTurnId: started.turn.id,
+  })?.id, scoped.id)
+  store.editGoal({ goalId: goal.id, expectedRevision: goal.revision, objective: 'replacement objective' })
+  const itemCountBefore = store.listItems(session.activeThreadId).length
+  const stale = store.consumeFollowUp({
+    followUpId: scoped.id,
+    ownerId: 'goal-dispatcher',
+    turnId: started.turn.id,
+  })
+  assert.equal(stale.status, 'stale_goal')
+  assert.deepEqual(stale.items, [])
+  assert.equal(store.listItems(session.activeThreadId).length, itemCountBefore)
+
+  const staleOnArrival = store.enqueueFollowUp({
+    threadId: session.activeThreadId,
+    clientRequestId: 'already-stale',
+    requestHash: 'already-stale-hash',
+    delivery: 'steer_or_queue',
+    targetTurnId: started.turn.id,
+    scope: { kind: 'goal', goalId: goal.id, revision: goal.revision },
+    input: [{ kind: 'user_message', payload: { text: 'stale at enqueue' } }],
+  }).followUp
+  assert.equal(staleOnArrival.status, 'stale_goal')
+  assert.equal(store.markStaleGoalFollowUps(session.activeThreadId), 0)
+})
+
+test('follow-up input rejects provider-private or provider-authored canonical records', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({ title: 'follow-up validation' })
+  assert.throws(() => store.enqueueFollowUp({
+    threadId: session.activeThreadId,
+    clientRequestId: 'invalid-follow-up',
+    requestHash: 'invalid-follow-up-hash',
+    delivery: 'next_turn',
+    targetTurnId: null,
+    scope: { kind: 'conversation' },
+    input: [{ kind: 'assistant_message', visibility: 'provider_private', provider: 'codex', payload: { text: 'no' } }],
+  }), (error: unknown) => error instanceof FollowUpStoreError && error.code === 'invalid_follow_up')
+})
+
 test('turn activity keeps turn, execution, and thread status synchronized and is idempotent', (t) => {
   const path = databasePath(t)
   const store = new SqliteSessionStore(path, deterministicOptions())
@@ -926,6 +1320,21 @@ test('startup recovery deterministically interrupts durable active turns once', 
   const firstStore = new SqliteSessionStore(path, options)
   const session = firstStore.createSession({})
   const started = firstStore.beginTurn(beginInput(session.activeThreadId))
+  const followUp = firstStore.enqueueFollowUp({
+    threadId: session.activeThreadId,
+    clientRequestId: 'recover-follow-up',
+    requestHash: 'recover-follow-up-hash',
+    delivery: 'steer_or_queue',
+    targetTurnId: started.turn.id,
+    scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'do not lose me' } }],
+  }).followUp
+  assert.equal(firstStore.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'dead-runtime',
+    purpose: 'steer',
+    targetTurnId: started.turn.id,
+  })?.id, followUp.id)
   firstStore.close()
 
   const recoveredStore = new SqliteSessionStore(path, options)
@@ -934,6 +1343,11 @@ test('startup recovery deterministically interrupts durable active turns once', 
   assert.equal(recoveredStore.recoverInterruptedTurns(), 0)
   assert.equal(recoveredStore.getTurn(started.turn.id)?.status, 'interrupted')
   assert.equal(recoveredStore.getThread(session.activeThreadId)?.status, 'idle')
+  assert.deepEqual(recoveredStore.listFollowUps(session.activeThreadId).map((candidate) => ({
+    status: candidate.status,
+    targetTurnId: candidate.targetTurnId,
+    dispatchOwner: candidate.dispatchOwner,
+  })), [{ status: 'queued', targetTurnId: null, dispatchOwner: null }])
   assert.equal(
     recoveredStore.listEvents(session.activeThreadId).filter((event) => event.type === 'turn_interrupted').length,
     1,
