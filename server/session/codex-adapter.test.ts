@@ -23,6 +23,7 @@ type Scenario =
   | 'duplicateTool'
   | 'duplicateRpc'
   | 'foreignTool'
+  | 'foreignStatus'
   | 'foreignProvider'
   | 'twoRounds'
   | 'nextRoundTool'
@@ -350,6 +351,12 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
     return
   }
   if (scenario === 'cancel' || scenario === 'hangInterrupt' || scenario.startsWith('steer')) return
+  if (scenario === 'foreignStatus') {
+    process.emit({
+      method: 'thread/status/changed',
+      params: { threadId: 'detached-internal-thread', status: { type: 'idle' } },
+    })
+  }
   if (scenario === 'twoRounds') {
     emitUsage(process, 1)
     emitUsage(process, 2)
@@ -647,6 +654,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     },
   })
   for (const args of argsSeen) {
+    assert.ok(args.includes('agents.enabled=false'))
     assert.ok(args.includes('web_search="disabled"'))
     assert.ok(args.includes('project_doc_max_bytes=0'))
     assert.ok(args.includes('features.multi_agent=false'))
@@ -669,6 +677,12 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     assert.equal(environment?.CODEX_HOME, path.join(tmpdir(), 'baton-codex-test-home'))
   }
   const turnProcess = created[1]
+  const initialize = turnProcess.writes.find((message) => message.method === 'initialize')
+  assert.ok(initialize)
+  assert.deepEqual(
+    (initialize.params as Record<string, Record<string, unknown>>).capabilities.optOutNotificationMethods,
+    ['thread/started', 'thread/status/changed'],
+  )
   const threadStart = turnProcess.writes.find((message) => message.method === 'thread/start')
   assert.ok(threadStart)
   const params = threadStart.params as Record<string, unknown>
@@ -677,9 +691,12 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.deepEqual(params.runtimeWorkspaceRoots, [])
   assert.equal(params.approvalsReviewer, 'user')
   assert.equal(params.approvalPolicy, 'never')
-  assert.equal(params.developerInstructions, 'Verify before finishing.')
+  assert.match(String(params.developerInstructions), /Baton is the canonical execution owner/)
+  assert.match(String(params.developerInstructions), /Use only the dynamic tools exposed by Baton/)
+  assert.match(String(params.developerInstructions), /Verify before finishing\.$/)
   assert.deepEqual(params.dynamicTools, [])
   assert.deepEqual(params.config, {
+    'agents.enabled': false,
     web_search: 'disabled',
     project_doc_max_bytes: 0,
     'features.multi_agent': false,
@@ -987,6 +1004,15 @@ test('adapter rejects foreign native ids', async () => {
   const terminal = await execution.terminal
   assert.equal(terminal.status, 'failed')
   assert.match(String(terminal.error?.message), /foreign/)
+})
+
+test('adapter ignores opted-out global lifecycle events for detached Codex threads', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('foreignStatus', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  assert.equal((await execution.terminal).status, 'completed')
 })
 
 test('adapter rejects a resolved provider that bypasses the configured Baton proxy', async () => {

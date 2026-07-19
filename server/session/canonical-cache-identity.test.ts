@@ -35,6 +35,7 @@ test('canonical Responses bridge authenticates locally and deterministically rep
     upstreamBaseUrl: 'http://127.0.0.1:8317',
     upstreamToken: 'upstream-secret',
     promptCacheKey: 'baton-th-v1-canonical-key',
+    allowedToolNames: ['read_file'],
     fetchImpl: async (url, init) => {
       calls.push({
         url: String(url),
@@ -65,6 +66,12 @@ test('canonical Responses bridge authenticates locally and deterministically rep
       body: JSON.stringify({
         model: 'gpt-test',
         input: [{ role: 'user', content: 'hello' }],
+        tools: [
+          { type: 'function', name: 'read_file', parameters: { type: 'object' } },
+          { type: 'function', name: 'spawn_agent', parameters: { type: 'object' } },
+          { type: 'namespace', name: 'collaboration', tools: [] },
+          { type: 'web_search' },
+        ],
         prompt_cache_key: 'untrusted-native-thread-id',
       }),
     })
@@ -78,6 +85,7 @@ test('canonical Responses bridge authenticates locally and deterministically rep
     assert.deepEqual(calls[0]?.body, {
       model: 'gpt-test',
       input: [{ role: 'user', content: 'hello' }],
+      tools: [{ type: 'function', name: 'read_file', parameters: { type: 'object' } }],
       prompt_cache_key: 'baton-th-v1-canonical-key',
     })
   } finally {
@@ -91,6 +99,7 @@ test('canonical Responses bridge has no alternate route or direct fallback', asy
       upstreamBaseUrl: 'https://api.openai.com',
       upstreamToken: 'must-not-be-used',
       promptCacheKey: 'baton-th-v1-canonical-key',
+      allowedToolNames: [],
     }),
     /127\.0\.0\.1 HTTP upstream/,
   )
@@ -99,6 +108,7 @@ test('canonical Responses bridge has no alternate route or direct fallback', asy
     upstreamBaseUrl: 'http://127.0.0.1:8317',
     upstreamToken: 'upstream-secret',
     promptCacheKey: 'baton-th-v1-canonical-key',
+    allowedToolNames: [],
     fetchImpl: async () => {
       upstreamCalls += 1
       throw new Error('proxy unavailable')
@@ -135,6 +145,7 @@ test('canonical Responses bridge isolates concurrent turns and aborts in-flight 
     upstreamBaseUrl: 'http://127.0.0.1:8317',
     upstreamToken: 'upstream-secret',
     promptCacheKey: 'baton-th-v1-shared-thread-key',
+    allowedToolNames: [],
     fetchImpl: async (_url, init) => {
       calls += 1
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>

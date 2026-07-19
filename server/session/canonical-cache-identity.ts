@@ -37,6 +37,8 @@ export interface CanonicalResponsesBridgeOptions {
   upstreamBaseUrl: string
   upstreamToken: string
   promptCacheKey: string
+  /** Exact Baton-owned dynamic functions that may reach the provider. */
+  allowedToolNames: readonly string[]
   fetchImpl?: typeof fetch
 }
 
@@ -71,6 +73,7 @@ export async function startCanonicalResponsesBridge(
   options: CanonicalResponsesBridgeOptions,
 ): Promise<CanonicalResponsesBridge> {
   const upstreamOrigin = validatedUpstreamOrigin(options.upstreamBaseUrl)
+  const allowedToolNames = validatedAllowedToolNames(options.allowedToolNames)
   const bridgeToken = randomBytes(32).toString('base64url')
   const fetchImpl = options.fetchImpl ?? fetch
   const server = createServer((request, response) => {
@@ -81,6 +84,7 @@ export async function startCanonicalResponsesBridge(
       request,
       response,
       options,
+      allowedToolNames,
       upstreamOrigin,
       bridgeToken,
       fetchImpl,
@@ -128,6 +132,7 @@ async function handleResponsesRequest(
   bodyStream: AsyncIterable<Uint8Array>,
   response: ServerResponse,
   options: CanonicalResponsesBridgeOptions,
+  allowedToolNames: ReadonlySet<string>,
   upstreamOrigin: URL,
   bridgeToken: string,
   fetchImpl: typeof fetch,
@@ -147,8 +152,12 @@ async function handleResponsesRequest(
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new TypeError('Responses request body must be a JSON object')
     }
+    const requestBody = parsed as Record<string, unknown>
     const rewritten = Buffer.from(JSON.stringify({
-      ...(parsed as Record<string, unknown>),
+      ...requestBody,
+      ...(requestBody.tools === undefined
+        ? {}
+        : { tools: allowedProviderTools(requestBody.tools, allowedToolNames) }),
       prompt_cache_key: options.promptCacheKey,
     }))
     const abort = new AbortController()
@@ -186,6 +195,28 @@ async function handleResponsesRequest(
         : 'canonical_cache_bridge_upstream_failed',
     })
   }
+}
+
+function validatedAllowedToolNames(names: readonly string[]): ReadonlySet<string> {
+  if (!Array.isArray(names) || names.some((name) => typeof name !== 'string' || !name.trim())) {
+    throw new TypeError('Canonical Responses bridge tool names must be non-empty strings')
+  }
+  const unique = new Set(names)
+  if (unique.size !== names.length) {
+    throw new TypeError('Canonical Responses bridge tool names must be unique')
+  }
+  return unique
+}
+
+function allowedProviderTools(value: unknown, allowedNames: ReadonlySet<string>): unknown[] {
+  if (!Array.isArray(value)) throw new TypeError('Responses request tools must be an array')
+  return value.filter((tool) => {
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return false
+    const record = tool as Record<string, unknown>
+    return record.type === 'function'
+      && typeof record.name === 'string'
+      && allowedNames.has(record.name)
+  })
 }
 
 function validatedUpstreamOrigin(value: string): URL {

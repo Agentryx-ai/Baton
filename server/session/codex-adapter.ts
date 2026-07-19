@@ -25,6 +25,7 @@ import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 import { hasPortableUserContent, imageAttachments, type ImageArtifactResolver } from './image-artifacts.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
+  'agents.enabled': false,
   web_search: 'disabled',
   project_doc_max_bytes: 0,
   'features.multi_agent': false,
@@ -45,6 +46,20 @@ const VERIFIED_FEATURES = [
   'apps',
   'plugins',
 ] as const
+
+// These app-server lifecycle notifications describe every thread known to the
+// process, including detached/internal threads. They are not execution events
+// for the active canonical turn and are explicitly opted out at initialize.
+const IGNORED_GLOBAL_NOTIFICATIONS = new Set([
+  'thread/started',
+  'thread/status/changed',
+])
+
+const CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS = `Baton is the canonical execution owner.
+Use only the dynamic tools exposed by Baton in this turn. Do not invoke Codex-native collaboration,
+subagent, shell, web search, MCP, app, plugin, approval, or task-execution tools. If requested work
+requires an unavailable capability, continue safely with available Baton tools or report the exact
+limitation; never create execution outside Baton's canonical ledger.`
 
 const ALLOWED_ITEM_TYPES = new Set([
   'userMessage',
@@ -344,7 +359,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       model: request.model,
       effort: request.effort ?? null,
       cwd: snapshot.session.cwd,
-      developerInstructions: canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+      developerInstructions: canonicalToolBoundaryInstructions(
+        canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+      ),
       history,
       input: request.input.flatMap((item) => {
         const text = portableText(item.payload)
@@ -382,6 +399,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               this.cacheIdentitySecret,
               body.canonicalThreadId,
             ),
+            allowedToolNames: context.toolDefinitions.map((definition) => definition.name),
           })
         : null
       const executionConnection = cacheBridge
@@ -583,6 +601,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           clientInfo: { name: 'baton', title: 'Baton', version: '0.1.0' },
           capabilities: {
             experimentalApi: true,
+            optOutNotificationMethods: [...IGNORED_GLOBAL_NOTIFICATIONS],
             mcpServerOpenaiFormElicitation: false,
           },
         }),
@@ -711,10 +730,14 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               }
               throw capabilityViolation(`unexpected server request ${message.method}`)
             }
+            if (IGNORED_GLOBAL_NOTIFICATIONS.has(message.method)) continue
             const params = asOptionalObject(message.params)
             assertActiveNativeIds(params, nativeThreadId, nativeTurnId)
-            if (isForbiddenNotification(message.method, params)) {
-              throw capabilityViolation(`unexpected native execution event ${message.method}`)
+            const forbiddenItemType = forbiddenNotificationItemType(message.method, params)
+            if (forbiddenItemType !== null) {
+              throw capabilityViolation(
+                `unexpected native execution event ${message.method}:${forbiddenItemType}`,
+              )
             }
             if (message.method === 'thread/tokenUsage/updated') {
               const snapshot = codexUsageSnapshot(params)
@@ -1183,12 +1206,21 @@ function durableEventId(method: string, params: JsonObject | null): string {
   return `codex:${method}:${identity}`
 }
 
-function isForbiddenNotification(method: string, params: JsonObject | null): boolean {
-  if (method.startsWith('item/autoApprovalReview/')) return true
-  if (method === 'rawResponseItem/completed') return false
-  if (method !== 'item/started' && method !== 'item/completed') return false
+function canonicalToolBoundaryInstructions(userInstructions: string | null): string {
+  return userInstructions === null
+    ? CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS
+    : `${CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS}\n\n${userInstructions}`
+}
+
+function forbiddenNotificationItemType(method: string, params: JsonObject | null): string | null {
+  if (method.startsWith('item/autoApprovalReview/')) return 'autoApprovalReview'
+  if (method === 'rawResponseItem/completed') return null
+  if (method !== 'item/started' && method !== 'item/completed') return null
   const item = asOptionalObject(params?.item)
-  return typeof item?.type !== 'string' || !ALLOWED_ITEM_TYPES.has(item.type)
+  if (typeof item?.type !== 'string') return 'missing'
+  if (ALLOWED_ITEM_TYPES.has(item.type)) return null
+  const kind = typeof item.kind === 'string' ? item.kind : null
+  return kind === null ? item.type : `${item.type}:${kind}`
 }
 
 function isApprovalRequest(method: string): boolean {
