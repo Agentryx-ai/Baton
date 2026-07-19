@@ -552,6 +552,7 @@ export const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: 
   waiting_tool: { label: '도구 실행', dot: 'bg-info' },
   running: { label: '진행 중', dot: 'bg-ok' },
   queued: { label: '대기 중', dot: 'bg-info' },
+  awaiting_goal_turn: { label: '다음 작업 준비 중', dot: 'bg-info' },
   usage_limited: { label: '사용량 제한', dot: 'bg-warning' },
   budget_limited: { label: '실행 제한', dot: 'bg-warning' },
   blocked: { label: '차단됨', dot: 'bg-destructive' },
@@ -575,7 +576,7 @@ function SessionStatus({ status }: { status: CanonicalSessionDto['workStatus'] |
   const presentation = sessionStatusPresentation(status)
   return (
     <span className="inline-flex shrink-0 items-center gap-1 text-[0.625rem] font-normal text-muted-foreground">
-      <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
+      <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'awaiting_goal_turn' || status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
       {presentation.label}
     </span>
   )
@@ -2010,6 +2011,9 @@ export function ConversationWorkspace({
             <GoalControl
               key={`${snapshot.goal.id}:${goalPanelVersion}`}
               goal={snapshot.goal}
+              workStatus={['awaiting_goal_turn', 'queued', 'running', 'waiting_tool'].includes(snapshot.session.workStatus)
+                ? snapshot.session.workStatus as 'awaiting_goal_turn' | 'queued' | 'running' | 'waiting_tool'
+                : undefined}
               busyAction={goalBusyAction === 'create' ? null : goalBusyAction}
               defaultExpanded={goalPanelVersion > 0}
               className="mx-auto mb-2 w-full max-w-3xl"

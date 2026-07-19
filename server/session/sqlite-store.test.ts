@@ -2454,7 +2454,7 @@ test('turn activity keeps turn, execution, and thread status synchronized and is
   )
 })
 
-test('an active Goal is projected as queued instead of the previous terminal turn', (t) => {
+test('an active Goal awaiting its next turn is projected distinctly from launch execution', (t) => {
   const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
   t.after(() => store.close())
   const session = store.createSession({})
@@ -2469,7 +2469,7 @@ test('an active Goal is projected as queued instead of the previous terminal tur
     provider: 'codex',
     model: 'gpt-test',
   })
-  assert.equal(store.getSession(session.id)?.workStatus, 'queued')
+  assert.equal(store.getSession(session.id)?.workStatus, 'awaiting_goal_turn')
 
   store.updateGoalStatus({
     goalId: goal.id,

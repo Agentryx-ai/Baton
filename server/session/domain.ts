@@ -92,6 +92,7 @@ export type VisibleWorkStatus =
   | 'waiting_tool'
   | 'running'
   | 'queued'
+  | 'awaiting_goal_turn'
   | 'usage_limited'
   | 'budget_limited'
   | 'blocked'

@@ -32,6 +32,8 @@ export interface GoalStatusPresentation {
   tone: GoalStatusTone
 }
 
+export type GoalWorkStatus = 'awaiting_goal_turn' | 'queued' | 'running' | 'waiting_tool'
+
 const STATUS_PRESENTATION: Record<GoalViewStatus, GoalStatusPresentation> = {
   active: { label: '진행 중', tone: 'active' },
   paused: { label: '일시 정지', tone: 'muted' },
@@ -56,7 +58,18 @@ const REASON_LABELS: Readonly<Record<string, string>> = {
 
 const integerFormatter = new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 0 })
 
-export function goalStatusPresentation(status: GoalViewStatus): GoalStatusPresentation {
+const ACTIVE_WORK_PRESENTATION: Record<GoalWorkStatus, GoalStatusPresentation> = {
+  awaiting_goal_turn: { label: '다음 작업 준비 중', tone: 'active' },
+  queued: { label: '대기 중', tone: 'active' },
+  running: { label: '진행 중', tone: 'active' },
+  waiting_tool: { label: '도구 실행 중', tone: 'active' },
+}
+
+export function goalStatusPresentation(
+  status: GoalViewStatus,
+  workStatus?: GoalWorkStatus,
+): GoalStatusPresentation {
+  if (status === 'active' && workStatus) return ACTIVE_WORK_PRESENTATION[workStatus]
   return STATUS_PRESENTATION[status]
 }
 

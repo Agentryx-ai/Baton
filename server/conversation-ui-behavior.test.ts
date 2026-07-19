@@ -46,7 +46,7 @@ test('conversation header and sidebar share every canonical work status presenta
     sessionStatusPresentation: (status: unknown) => { label: string; dot: string }
   }
   for (const status of [
-    'idle', 'queued', 'running', 'waiting_tool', 'paused', 'blocked', 'usage_limited',
+    'idle', 'awaiting_goal_turn', 'queued', 'running', 'waiting_tool', 'paused', 'blocked', 'usage_limited',
     'budget_limited', 'failed', 'interrupted', 'cancelled', 'completed', 'complete', 'imported', 'archived',
   ]) {
     assert.ok(SESSION_STATUS[status]?.label)

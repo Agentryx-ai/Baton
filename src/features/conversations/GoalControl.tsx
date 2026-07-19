@@ -10,6 +10,7 @@ import {
   formatGoalTokens,
   formatGoalTurns,
   goalStatusPresentation,
+  type GoalWorkStatus,
   type GoalStatusTone,
   type GoalView,
 } from './goal-presentation'
@@ -18,6 +19,7 @@ export type GoalAction = 'edit' | 'pause' | 'resume' | 'clear'
 
 export interface GoalControlProps {
   goal: GoalView
+  workStatus?: GoalWorkStatus
   busyAction?: GoalAction | null
   disabledActions?: readonly GoalAction[]
   defaultExpanded?: boolean
@@ -34,6 +36,7 @@ const STATUS_CLASS: Record<GoalStatusTone, string> = {
 
 export function GoalControl({
   goal,
+  workStatus,
   busyAction = null,
   disabledActions = [],
   defaultExpanded = false,
@@ -42,7 +45,7 @@ export function GoalControl({
 }: GoalControlProps) {
   const [expanded, setExpanded] = useState(defaultExpanded)
   const detailsId = useId()
-  const status = goalStatusPresentation(goal.status)
+  const status = goalStatusPresentation(goal.status, workStatus)
   const latestReason = formatGoalReason(goal.statusReason)
   const showPersistentReason = status.tone === 'warning' && latestReason !== null
   const disabled = new Set(disabledActions)

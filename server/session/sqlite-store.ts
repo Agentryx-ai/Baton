@@ -5091,7 +5091,7 @@ function visibleWorkStatus(row: SqlRow, imported: boolean): CanonicalSession['wo
   const turn = nullableText(row, 'latest_turn_status')
   if (turn === 'waiting_tool' || turn === 'running' || turn === 'queued') return turn
   const goal = nullableText(row, 'current_goal_status')
-  if (goal === 'active') return 'queued'
+  if (goal === 'active') return 'awaiting_goal_turn'
   if (goal === 'usage_limited' || goal === 'budget_limited' || goal === 'blocked' || goal === 'paused') return goal
   if (turn === 'failed' || turn === 'interrupted' || turn === 'cancelled') return turn
   if (goal === 'complete') return 'complete'
