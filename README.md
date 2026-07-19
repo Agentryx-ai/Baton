@@ -194,9 +194,11 @@ SPA (React + Vite + Tailwind + shadcn)
 Baton이 선택하는 **CLIProxy 업스트림 계정**과 네이티브 클라이언트에
 로그인된 **로컬 계정**은 서로 다른 상태입니다.
 
-- Codex의 `/status`는 로컬에 캐시된 Codex 로그인·세션 정보를 표시합니다. Baton이
-  실제 요청에 사용한 업스트림 계정과 다를 수 있으며, Baton 라우팅 검증 수단이
-  아닙니다.
+- Codex의 `/status`와 `Heads up, you have less than ... of your weekly limit left` 같은
+  한도 경고는 `~/.codex/auth.json`의 **로컬 Codex 로그인 계정**을 기준으로 표시됩니다.
+  `model_provider = "baton"`일 때 Baton/CLIProxy가 실제 요청에 사용하는 업스트림 계정과
+  다를 수 있으므로, 이 표시만으로 실제 Baton 계정의 429 임박 여부를 판단하면 안 됩니다.
+  Codex CLI를 재시작해도 로컬 로그인 계정은 바뀌지 않아 같은 경고가 계속 보일 수 있습니다.
 - 실제 사용 계정은 요청을 한 번 전송한 뒤 계정의 **최근 실제 사용 시각** 또는 quota 변화를
   확인합니다. **정책 1순위**와 정책 로그는 계산상 순위이며 실제 전송 계정의 증거가 아닙니다.
 - `paused`인 계정은 기본 계정이어도 라우팅 대상이 아닙니다. `round-robin`에서는
