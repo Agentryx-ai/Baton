@@ -57,3 +57,19 @@ test('goal reason prefers sanitized display text and falls back to a stable labe
     at: '2026-07-19T00:00:00.000Z',
   }), '계속하려면 상태를 확인해 주세요.')
 })
+
+test('goal reason turns context-limit failures into an actionable localized warning', () => {
+  assert.equal(formatGoalReason({
+    code: 'context_input_too_large',
+    source: 'host',
+    message: 'Upcoming input requires approximately 1364559 tokens; usable input budget is 247424 for gpt-5.6-sol (272000 context tokens); compaction=generator_failed',
+    at: '2026-07-19T00:00:00.000Z',
+  }), '대화 컨텍스트가 gpt-5.6-sol의 입력 한도를 초과했습니다(약 1,364,559 / 247,424 토큰). 자동 압축을 완료하지 못해 작업을 멈췄습니다.')
+
+  assert.equal(formatGoalReason({
+    code: 'provider_failure',
+    source: 'host',
+    message: 'Upcoming input requires approximately 1364559 tokens; usable input budget is 104000',
+    at: '2026-07-19T00:00:00.000Z',
+  }), '대화 컨텍스트가 선택한 모델의 입력 한도를 초과했습니다(약 1,364,559 / 104,000 토큰). 자동 압축을 완료하지 못해 작업을 멈췄습니다.')
+})

@@ -44,6 +44,7 @@ const STATUS_PRESENTATION: Record<GoalViewStatus, GoalStatusPresentation> = {
 const REASON_LABELS: Readonly<Record<string, string>> = {
   no_progress: '진전이 없어 멈췄습니다.',
   provider_failure: '실행 중 오류가 발생했습니다.',
+  context_input_too_large: '선택한 모델의 입력 한도를 초과했고 자동 압축을 완료하지 못했습니다.',
   provider_usage_limit: '사용 가능한 계정의 사용량 제한에 도달했습니다.',
   goal_turn_limit: '자동 실행 횟수 제한에 도달했습니다.',
   goal_time_limit: '활성 시간 제한에 도달했습니다.',
@@ -89,8 +90,33 @@ export function formatGoalTokens(tokensUsed: number, tokenBudget: number | null)
 export function formatGoalReason(reason: GoalViewReason | null): string | null {
   if (!reason) return null
   const message = reason.message?.trim()
+  if (reason.code === 'context_input_too_large' || isLegacyContextLimitMessage(message)) {
+    return formatContextLimitReason(message)
+  }
   if (message) return message
   return REASON_LABELS[reason.code] ?? '계속하려면 상태를 확인해 주세요.'
+}
+
+function isLegacyContextLimitMessage(message: string | undefined): boolean {
+  return message?.startsWith('Upcoming input requires approximately ') ?? false
+}
+
+function formatContextLimitReason(message: string | undefined): string {
+  if (!message) return REASON_LABELS.context_input_too_large!
+  const match = message.match(
+    /Upcoming input requires approximately ([\d,]+) tokens; usable input budget is ([\d,]+)(?: for ([^(;]+))?/,
+  )
+  if (!match) return REASON_LABELS.context_input_too_large!
+  const required = formatTokenCount(match[1])
+  const budget = formatTokenCount(match[2])
+  const model = match[3]?.trim()
+  const subject = model ? `${model}의 입력 한도` : '선택한 모델의 입력 한도'
+  return `대화 컨텍스트가 ${subject}를 초과했습니다(약 ${required} / ${budget} 토큰). 자동 압축을 완료하지 못해 작업을 멈췄습니다.`
+}
+
+function formatTokenCount(value: string | undefined): string {
+  const parsed = Number(value?.replaceAll(',', ''))
+  return Number.isFinite(parsed) ? integerFormatter.format(parsed) : value ?? '0'
 }
 
 function safeCount(value: number): number {

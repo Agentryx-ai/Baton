@@ -195,10 +195,14 @@ Baton이 선택하는 **CLIProxy 업스트림 계정**과 네이티브 클라이
 로그인된 **로컬 계정**은 서로 다른 상태입니다.
 
 - Codex의 `/status`와 `Heads up, you have less than ... of your weekly limit left` 같은
-  한도 경고는 `~/.codex/auth.json`의 **로컬 Codex 로그인 계정**을 기준으로 표시됩니다.
-  `model_provider = "baton"`일 때 Baton/CLIProxy가 실제 요청에 사용하는 업스트림 계정과
-  다를 수 있으므로, 이 표시만으로 실제 Baton 계정의 429 임박 여부를 판단하면 안 됩니다.
-  Codex CLI를 재시작해도 로컬 로그인 계정은 바뀌지 않아 같은 경고가 계속 보일 수 있습니다.
+  한도 경고는 **provider가 OpenAI 인증을 쓸 때만**(`requires_openai_auth` — 예: `model_provider = "openai"`,
+  또는 예전 `openai` 세션을 그냥 `resume`해서 provider가 `openai`로 복원됐을 때) `~/.codex/auth.json`의
+  **로컬 Codex 로그인 계정**을 기준으로 표시됩니다. 이 값은 Baton/CLIProxy가 실제 요청에 쓰는
+  업스트림 계정과 다를 수 있으므로, 이 표시만으로 실제 Baton 계정의 429 임박을 판단하면 안 됩니다.
+- `model_provider = "baton"`으로 **새로 시작한 세션**에서는 Codex가
+  `should_prefetch_rate_limits`(= `requires_openai_auth && has_chatgpt_account`)로 게이트하여
+  **로컬 계정 한도를 조회·표시하지 않습니다.** 따라서 예전에 본 `/status`·경고는 대개 `resume`로
+  provider가 `openai`로 복원된 세션의 정상 표시입니다([Codex 세션 재개 시 provider 복원 주의](#codex-세션-재개-시-provider-복원-주의) 참고).
 - 실제 사용 계정은 요청을 한 번 전송한 뒤 계정의 **최근 실제 사용 시각** 또는 quota 변화를
   확인합니다. **정책 1순위**와 정책 로그는 계산상 순위이며 실제 전송 계정의 증거가 아닙니다.
 - `paused`인 계정은 기본 계정이어도 라우팅 대상이 아닙니다. `round-robin`에서는
@@ -242,6 +246,33 @@ npm start              # http://localhost:4400
 `.env`는 gitignore되며 BFF가 gateway dashboard에 로그인할 자격 증명을 보관합니다.
 정본 SQLite는 `BATON_DATA_DIR`에 저장되며, 기본값은 Windows에서
 `%LOCALAPPDATA%\Baton`, 그 외 환경에서는 사용자 홈의 `Baton` 디렉터리입니다.
+
+## Codex 세션 재개 시 provider 복원 주의
+
+**증상.** config를 Baton으로 바꾼 뒤에도 예전 Codex 세션을 재개(`codex resume`)하면
+Baton/CLIProxy를 우회해 원래 provider(예: `openai`)로 직접 나갑니다. 그 결과 소진되거나
+엉뚱한 계정으로 `You've hit your usage limit` 같은 오류가 날 수 있습니다. 새로 시작한
+세션과 Codex Desktop은 정상입니다.
+
+**원인(버그 아님).** Codex CLI는 각 세션이 *생성 당시의 model/provider를 소유*하고,
+재개 시 그 값을 복원합니다. `~/.codex/config.toml`의 `model_provider`는 *새 세션의
+기본값*일 뿐입니다. 대화 도중 provider/model이 조용히 바뀌면 비용·기능·reasoning-state
+호환성이 달라지므로, 명시적 override가 없으면 스레드에 저장된 설정을 복원하도록 의도적으로
+설계된 동작입니다(OpenAI, `openai/codex#32746`). 따라서 Baton으로 전환한 *이후*에 만든
+세션은 재개해도 Baton으로 복원되어 문제가 없고, 전환 *이전*에 만든 세션만 해당합니다.
+
+**해결.** 재개할 때 provider를 명시적으로 덮어쓰세요. `-c`는 세션 플래그 레이어를 만들어
+현재 config의 provider가 복원값을 이깁니다.
+
+```bash
+codex resume <session-id> -c model_provider=baton
+```
+
+- `baton` provider는 `env_key = BATON_PROXY_TOKEN`을 요구합니다.
+  `Missing environment variable: BATON_PROXY_TOKEN`이 뜨면 그 셸에 토큰이 없는 것입니다.
+  토큰(= CLIProxy API 키)을 설정한 뒤 연 **새 터미널 탭/창**에서 실행하거나 셸에 직접
+  주입하세요. 이미 열려 있던 셸은 나중에 설정한 값을 물려받지 못할 수 있습니다.
+  토큰 값을 로그·명령 기록에 남기지 않도록 주의하세요.
 
 ## Layout
 

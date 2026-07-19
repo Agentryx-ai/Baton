@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { AdapterRegistry } from './adapter-registry.ts'
 import type { ProviderBindingPatch, ProviderTurnExecution } from './adapter.ts'
-import type { CanonicalContextRuntimeContract } from './canonical-context-runtime.ts'
+import { ContextInputTooLargeError, type CanonicalContextRuntimeContract } from './canonical-context-runtime.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type {
   AgentToolDefinition,
@@ -114,6 +114,7 @@ export class TurnOrchestrator implements ConversationService {
     this.goalRuntime = new GoalRuntime(store, {
       ownerId: `baton-${process.pid}-${Date.now()}`,
       launchContinuation: (request) => this.launchGoalContinuation(request),
+      onGoalChanged: (goal) => this.events.publish(goal.threadId),
     })
   }
 
@@ -152,6 +153,8 @@ export class TurnOrchestrator implements ConversationService {
     ]
     this.contextRuntime?.assertUpcomingInputFits({
       ready,
+      provider: normalized.provider,
+      model: normalized.model,
       instructionSnapshot: normalized.instructionSnapshot,
       upcomingInput: normalized.input,
       toolDefinitions,
@@ -594,6 +597,7 @@ export class TurnOrchestrator implements ConversationService {
         goalAutomatic: automatic,
         ...(compaction ? {
           contextCompaction: {
+            viewKey: compaction.viewKey,
             reason: compaction.reason,
             artifactId: compaction.artifact?.id ?? null,
             estimatedTokensBefore: compaction.estimatedTokensBefore,
@@ -1139,6 +1143,13 @@ export class TurnOrchestrator implements ConversationService {
       }
       if (error instanceof SessionStoreError && error.code === 'turn_not_running') {
         return { status: 'not_started' as const, reason: 'busy' as const }
+      }
+      if (error instanceof ContextInputTooLargeError) {
+        return {
+          status: 'failed' as const,
+          category: 'context_input_too_large' as const,
+          message: error.message,
+        }
       }
       return {
         status: 'failed' as const,

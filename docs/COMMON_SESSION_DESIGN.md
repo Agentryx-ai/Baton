@@ -334,6 +334,30 @@ The implemented V1 keeps this boundary deterministic:
 
 Cache identity is separate from compaction identity. Baton derives a stable, non-reversible cache key from the installation secret and canonical thread ID. The same conversation reuses it across turns; different Baton conversations cannot alias it. Provider-private credentials and continuation bytes are not inputs to that key.
 
+### 7.1 Model changes and context downshifts
+
+A model change never creates a second conversation owner. The canonical thread and its append-only ledger remain the only SSOT; each provider/model receives a derived execution view sized for the model selected for that turn.
+
+- Resolve the target model's advertised context window first, then its maintained provider/model default, and use the conservative fallback only for an unknown model.
+- If the current materialized view fits the target budget, execute from the same canonical thread without rewriting history.
+- If a smaller target model cannot accept that view, compact before creating the turn. Large first-time summaries are folded through bounded chronological chunks rather than sent as one oversized summarization request.
+- Compaction artifacts remain derived and reproducible. Their source frontier, hashes, generator provider/model/version, and prior artifact are recorded; changing models does not mutate or fork the source history.
+- If compaction cannot produce a view that fits, do not issue the provider request. Persist a structured `context_input_too_large` blocked reason and show the required and usable token estimates in the conversation UI.
+
+Derived context is an artifact pool, not a thread-global replacement head. Each artifact branch is keyed by a versioned provider/budget contract (`provider`, usable input budget, summary budget, estimator version, and summary-prompt version). The exact target model is recorded as generator provenance, but compatible models may reuse a branch when their effective contract is identical.
+
+- Each `(thread_id, view_key)` has an independent compare-and-set head. A 258K view cannot advance or supersede a 1M view.
+- Long hierarchical summaries heartbeat their durable generation lease. A crashed worker remains reclaimable after lease expiry, while a healthy multi-chunk generation cannot lose its artifact merely because total provider latency exceeds the initial lease interval.
+- Each chronological chunk is retried once, with identical bytes and no tools, for a narrowly classified transient stream disconnect. Permanent provider failures still fail closed; successful earlier chunks remain in the in-memory fold so a last-chunk disconnect does not immediately restart the whole fold.
+- Summary-call input is capped independently of the target model window (104K usable, approximately 72K prompt data in V1). A large target model therefore increases the number of bounded folds instead of creating a single prompt that cannot finish inside the summary turn wall-clock limit.
+- Each tool-free summary fold has a five-minute wall-clock cap, still bounded by the Goal/runtime limits. This accommodates high-effort reasoning on the capped prompt without inheriting the much broader 30-minute ordinary agent-turn limit.
+- The planner first subtracts instructions, current input, tool schemas, reserved output, and safety headroom. If the immutable full ledger remains below the target model's compaction trigger, it is always preferred over every lossy artifact.
+- Otherwise the planner may use or extend only the target view branch. The chosen `full | artifact_id` is frozen in the execution budget receipt before launch and copied into the immutable execution-context manifest; a later concurrent head advance cannot change an in-flight execution.
+- Downshift therefore creates or reuses a smaller derived view without deleting canonical items. Upshift re-evaluates the immutable ledger and restores full history whenever it fits, or independently selects/creates the highest-fidelity artifact for the larger budget.
+- A single upcoming input that exceeds the usable budget is not compactable and fails before turn creation. A derived-state load failure may fall back to full history only when that full selection still satisfies the already resolved target budget.
+
+Maintaining independent conversations per input size is rejected: it would split Goal state, history, archive state, and continuation provenance into competing SSOTs. An explicit user fork remains valid when the user wants a genuinely independent branch, but it is not an automatic response to model downshift.
+
 ## 8. Consistency and failure rules
 
 - SQLite in WAL mode is the first storage implementation, behind a `SessionStore` interface.

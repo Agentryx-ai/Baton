@@ -46,6 +46,7 @@ import type {
 } from './domain.ts'
 import { uuidV7 } from './domain.ts'
 import { hasSafeContextToolState } from './context-materializer.js'
+import { LEGACY_CONTEXT_VIEW_KEY } from './context-view-contract.js'
 import type {
   ClaimGoalLeaseInput,
   ClaimFollowUpInput,
@@ -91,7 +92,7 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 15
+const SCHEMA_VERSION = 16
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
 const DEFAULT_GOAL_LEASE_MS = 30_000
@@ -1028,6 +1029,12 @@ export class SqliteSessionStore implements SessionStore {
         }
         this.#db.exec(`
           DROP TRIGGER context_compaction_jobs_immutable_columns;
+          DROP TRIGGER context_compaction_jobs_no_delete;
+          DROP TRIGGER context_compactions_no_delete;
+          DROP TRIGGER context_compaction_sources_no_delete;
+          DROP TRIGGER context_compaction_events_no_delete;
+          DROP TRIGGER execution_context_manifests_no_delete;
+          DROP TRIGGER execution_context_entries_no_delete;
           DROP TRIGGER context_compaction_jobs_terminal;
           DROP TRIGGER context_compaction_jobs_transition;
 
@@ -1053,6 +1060,38 @@ export class SqliteSessionStore implements SessionStore {
             OR NEW.expected_previous_artifact_id IS NOT OLD.expected_previous_artifact_id
             OR NEW.created_at IS NOT OLD.created_at
           BEGIN SELECT RAISE(ABORT, 'compaction job identity is immutable'); END;
+          CREATE TRIGGER context_compaction_jobs_no_delete BEFORE DELETE ON context_compaction_jobs
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction jobs are durable'); END;
+          CREATE TRIGGER context_compactions_no_delete BEFORE DELETE ON context_compactions
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction artifacts are append-only'); END;
+          CREATE TRIGGER context_compaction_sources_no_delete BEFORE DELETE ON context_compaction_source_items
+          WHEN NOT EXISTS (
+            SELECT 1 FROM context_compactions c JOIN threads th ON th.id=c.thread_id
+            JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE c.id=OLD.compaction_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction provenance is append-only'); END;
+          CREATE TRIGGER context_compaction_events_no_delete BEFORE DELETE ON context_compaction_job_events
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction events are append-only'); END;
+          CREATE TRIGGER execution_context_manifests_no_delete BEFORE DELETE ON execution_context_manifests
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'execution context manifests are append-only'); END;
+          CREATE TRIGGER execution_context_entries_no_delete BEFORE DELETE ON execution_context_manifest_entries
+          WHEN NOT EXISTS (
+            SELECT 1 FROM execution_context_manifests m JOIN threads th ON th.id=m.thread_id
+            JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE m.id=OLD.manifest_id
+          ) BEGIN SELECT RAISE(ABORT, 'execution context provenance is append-only'); END;
           CREATE TRIGGER context_compaction_jobs_terminal BEFORE UPDATE ON context_compaction_jobs
           WHEN OLD.status='completed'
           BEGIN SELECT RAISE(ABORT, 'terminal compaction jobs are immutable'); END;
@@ -1091,6 +1130,116 @@ export class SqliteSessionStore implements SessionStore {
           .run(15, 'session-ldplayer-capability', this.#now())
         this.#db.exec('PRAGMA user_version = 15')
         appliedVersion = 15
+      }
+      if (appliedVersion < 16) {
+        const legacyHeads = this.#all(this.#db.prepare(`
+          SELECT thread_id,compaction_id,revision,updated_at FROM context_compaction_heads
+        `))
+        this.#db.exec(`
+          DROP TRIGGER context_compaction_jobs_immutable_columns;
+          DROP TRIGGER context_compaction_jobs_no_delete;
+          DROP TRIGGER context_compactions_no_delete;
+          DROP TRIGGER context_compaction_sources_no_delete;
+          DROP TRIGGER context_compaction_events_no_delete;
+          DROP TRIGGER execution_context_manifests_no_delete;
+          DROP TRIGGER execution_context_entries_no_delete;
+          DROP TRIGGER context_compaction_heads_transition;
+          DROP TRIGGER context_compaction_heads_no_delete;
+          DROP INDEX context_compaction_jobs_active_frontier;
+
+          ALTER TABLE context_compaction_jobs ADD COLUMN view_key TEXT NOT NULL DEFAULT 'legacy-v15'
+            CHECK(length(view_key) BETWEEN 1 AND 120);
+          CREATE UNIQUE INDEX context_compaction_jobs_active_frontier
+            ON context_compaction_jobs(thread_id,view_key,COALESCE(expected_previous_artifact_id,''))
+            WHERE status IN ('queued','running');
+
+          ALTER TABLE context_compaction_heads RENAME TO context_compaction_heads_v15;
+          CREATE TABLE context_compaction_heads (
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            view_key TEXT NOT NULL CHECK(length(view_key) BETWEEN 1 AND 120),
+            compaction_id TEXT,
+            revision INTEGER NOT NULL CHECK(revision>=0),
+            head_hash TEXT NOT NULL CHECK(length(head_hash)=64),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id,view_key)
+          ) WITHOUT ROWID, STRICT;
+
+          CREATE TRIGGER context_compaction_jobs_immutable_columns BEFORE UPDATE ON context_compaction_jobs
+          WHEN NEW.id IS NOT OLD.id OR NEW.thread_id IS NOT OLD.thread_id
+            OR NEW.view_key IS NOT OLD.view_key
+            OR NEW.request_key IS NOT OLD.request_key OR NEW.request_hash IS NOT OLD.request_hash
+            OR NEW.source_item_ids_json IS NOT OLD.source_item_ids_json
+            OR NEW.source_hash IS NOT OLD.source_hash OR NEW.summary_input_hash IS NOT OLD.summary_input_hash
+            OR NEW.expected_previous_artifact_id IS NOT OLD.expected_previous_artifact_id
+            OR NEW.created_at IS NOT OLD.created_at
+          BEGIN SELECT RAISE(ABORT, 'compaction job identity is immutable'); END;
+          CREATE TRIGGER context_compaction_heads_transition BEFORE UPDATE ON context_compaction_heads
+          WHEN NEW.thread_id IS NOT OLD.thread_id OR NEW.view_key IS NOT OLD.view_key
+            OR NEW.revision<>OLD.revision+1 OR NEW.compaction_id IS OLD.compaction_id
+          BEGIN SELECT RAISE(ABORT, 'invalid compaction head transition'); END;
+        `)
+        const insertHead = this.#db.prepare(`
+          INSERT INTO context_compaction_heads(
+            thread_id,view_key,compaction_id,revision,head_hash,updated_at
+          ) VALUES (?,?,?,?,?,?)
+        `)
+        for (const head of legacyHeads) {
+          const threadId = text(head, 'thread_id')
+          const compactionId = nullableText(head, 'compaction_id')
+          const revision = integer(head, 'revision')
+          insertHead.run(
+            threadId,
+            LEGACY_CONTEXT_VIEW_KEY,
+            compactionId,
+            revision,
+            this.#contextCompactionHeadHash(threadId, LEGACY_CONTEXT_VIEW_KEY, compactionId, revision),
+            text(head, 'updated_at'),
+          )
+        }
+        this.#db.exec(`
+          DROP TABLE context_compaction_heads_v15;
+          CREATE TRIGGER context_compaction_jobs_no_delete BEFORE DELETE ON context_compaction_jobs
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction jobs are durable'); END;
+          CREATE TRIGGER context_compactions_no_delete BEFORE DELETE ON context_compactions
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction artifacts are append-only'); END;
+          CREATE TRIGGER context_compaction_sources_no_delete BEFORE DELETE ON context_compaction_source_items
+          WHEN NOT EXISTS (
+            SELECT 1 FROM context_compactions c JOIN threads th ON th.id=c.thread_id
+            JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE c.id=OLD.compaction_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction provenance is append-only'); END;
+          CREATE TRIGGER context_compaction_events_no_delete BEFORE DELETE ON context_compaction_job_events
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction events are append-only'); END;
+          CREATE TRIGGER execution_context_manifests_no_delete BEFORE DELETE ON execution_context_manifests
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'execution context manifests are append-only'); END;
+          CREATE TRIGGER execution_context_entries_no_delete BEFORE DELETE ON execution_context_manifest_entries
+          WHEN NOT EXISTS (
+            SELECT 1 FROM execution_context_manifests m JOIN threads th ON th.id=m.thread_id
+            JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE m.id=OLD.manifest_id
+          ) BEGIN SELECT RAISE(ABORT, 'execution context provenance is append-only'); END;
+          CREATE TRIGGER context_compaction_heads_no_delete BEFORE DELETE ON context_compaction_heads
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction head is durable'); END;
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(16, 'derived-context-view-branches', this.#now())
+        this.#db.exec('PRAGMA user_version = 16')
+        appliedVersion = 16
       }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
@@ -2341,13 +2490,18 @@ export class SqliteSessionStore implements SessionStore {
     if (!input.requestKey || input.requestKey.length > 200) {
       throw new ContextPersistenceError('invalid_input', 'Compaction requestKey must contain 1 to 200 characters')
     }
+    const viewKey = input.viewKey ?? LEGACY_CONTEXT_VIEW_KEY
+    if (!viewKey || viewKey.length > 120) {
+      throw new ContextPersistenceError('invalid_input', 'Compaction viewKey must contain 1 to 120 characters')
+    }
     validateSha256(input.summaryInputHash, 'summaryInputHash')
     return this.#transaction('IMMEDIATE', () => {
       const sourceItems = this.#resolveCompactionSource(input.threadId, input.sourceItemIds)
       const sourceHash = this.#sourceHashForItems(sourceItems)
       const requestHash = sha256Canonical({
-        schema: 'baton.context-compaction-request.v1',
+        schema: 'baton.context-compaction-request.v2',
         threadId: input.threadId,
+        viewKey,
         sourceItemIds: input.sourceItemIds,
         sourceHash,
         summaryInputHash: input.summaryInputHash,
@@ -2357,10 +2511,11 @@ export class SqliteSessionStore implements SessionStore {
         SELECT * FROM context_compaction_jobs WHERE thread_id=? AND request_key=?
       `), input.threadId, input.requestKey)
       const now = this.#now()
-      const head = this.#ensureContextCompactionHead(input.threadId, now)
+      const head = this.#ensureContextCompactionHead(input.threadId, viewKey, now)
       const latestArtifactId = nullableText(head, 'compaction_id')
       if (existing) {
-        if (text(existing, 'request_hash') !== requestHash) {
+        if (text(existing, 'view_key') !== viewKey
+          || text(existing, 'request_hash') !== requestHash) {
           throw new ContextPersistenceError(
             'idempotency_conflict',
             'Compaction requestKey was reused with different source or generator input',
@@ -2401,6 +2556,12 @@ export class SqliteSessionStore implements SessionStore {
           input.expectedPreviousArtifactId,
         )
         const previous = this.#contextCompactionArtifact(previousRow)
+        if (previous.viewKey !== viewKey) {
+          throw new ContextPersistenceError(
+            'invalid_input',
+            'Compaction frontier belongs to a different context view',
+          )
+        }
         const previousSourceIds = previous.sourceItems.map((item) => item.itemId)
         if (sourceItems.length <= previousSourceIds.length
           || previousSourceIds.some((id, index) => sourceItems[index]?.itemId !== id)) {
@@ -2413,6 +2574,7 @@ export class SqliteSessionStore implements SessionStore {
       if (claim !== null) {
         this.#recoverAbandonedContextCompactionFrontier(
           input.threadId,
+          viewKey,
           input.expectedPreviousArtifactId,
           existing ? text(existing, 'id') : null,
           input.requestKey,
@@ -2421,11 +2583,12 @@ export class SqliteSessionStore implements SessionStore {
       }
       const competing = this.#optional(this.#db.prepare(`
         SELECT id FROM context_compaction_jobs
-        WHERE thread_id=? AND expected_previous_artifact_id IS ?
+        WHERE thread_id=? AND view_key=? AND expected_previous_artifact_id IS ?
           AND status IN ('queued','running')
           AND id IS NOT ?
         LIMIT 1
-      `), input.threadId, input.expectedPreviousArtifactId, existing ? text(existing, 'id') : null)
+      `), input.threadId, viewKey, input.expectedPreviousArtifactId,
+      existing ? text(existing, 'id') : null)
       if (competing) {
         throw new ContextPersistenceError(
           'stale_frontier',
@@ -2448,11 +2611,12 @@ export class SqliteSessionStore implements SessionStore {
       const id = this.#idFactory()
       this.#db.prepare(`
         INSERT INTO context_compaction_jobs(
-          id,thread_id,request_key,request_hash,source_item_ids_json,source_hash,summary_input_hash,
+          id,thread_id,view_key,request_key,request_hash,source_item_ids_json,source_hash,summary_input_hash,
           expected_previous_artifact_id,
           status,revision,lease_owner,lease_expires_at,attempt_count,error_json,created_at,updated_at,completed_at
-        ) VALUES (?,?,?,?,?,?,?,?,'queued',1,NULL,NULL,0,NULL,?,?,NULL)
-      `).run(id, input.threadId, input.requestKey, requestHash, canonicalJson(input.sourceItemIds), sourceHash,
+        ) VALUES (?,?,?,?,?,?,?,?,?,'queued',1,NULL,NULL,0,NULL,?,?,NULL)
+      `).run(id, input.threadId, viewKey, input.requestKey, requestHash,
+        canonicalJson(input.sourceItemIds), sourceHash,
         input.summaryInputHash, input.expectedPreviousArtifactId, now, now)
       const inserted = this.#one(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), id)
       this.#appendContextCompactionJobEvent(inserted, {}, now)
@@ -2481,6 +2645,7 @@ export class SqliteSessionStore implements SessionStore {
 
   #recoverAbandonedContextCompactionFrontier(
     threadId: ThreadId,
+    viewKey: string,
     expectedPreviousArtifactId: string | null,
     exactJobId: string | null,
     replacementRequestKey: string,
@@ -2488,10 +2653,10 @@ export class SqliteSessionStore implements SessionStore {
   ): void {
     const competing = this.#optional(this.#db.prepare(`
       SELECT * FROM context_compaction_jobs
-      WHERE thread_id=? AND expected_previous_artifact_id IS ?
+      WHERE thread_id=? AND view_key=? AND expected_previous_artifact_id IS ?
         AND status IN ('queued','running') AND id IS NOT ?
       LIMIT 1
-    `), threadId, expectedPreviousArtifactId, exactJobId)
+    `), threadId, viewKey, expectedPreviousArtifactId, exactJobId)
     if (!competing) return
     if (text(competing, 'status') === 'running' && nullableText(competing, 'lease_expires_at')! > now) {
       throw new ContextPersistenceError(
@@ -2546,7 +2711,15 @@ export class SqliteSessionStore implements SessionStore {
       this.#appendContextCompactionJobEvent(row, { reason: 'lease_expired' }, now)
     }
     if (text(row, 'status') === 'running') {
-      return nullableText(row, 'lease_owner') === input.ownerId ? row : null
+      if (nullableText(row, 'lease_owner') !== input.ownerId) return null
+      const leaseExpiresAt = new Date(Date.parse(now) + input.leaseDurationMs).toISOString()
+      this.#db.prepare(`
+        UPDATE context_compaction_jobs SET revision=revision+1,lease_expires_at=?,updated_at=?
+        WHERE id=?
+      `).run(leaseExpiresAt, now, jobId)
+      row = this.#one(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), jobId)
+      this.#appendContextCompactionJobEvent(row, { reason: 'lease_heartbeat' }, now)
+      return row
     }
     if (text(row, 'status') !== 'queued') return null
     const leaseExpiresAt = new Date(Date.parse(now) + input.leaseDurationMs).toISOString()
@@ -2588,6 +2761,19 @@ export class SqliteSessionStore implements SessionStore {
       if (!row) throw new ContextPersistenceError('not_found', `Compaction job not found: ${input.jobId}`)
       const sourceItems = this.#sourceItemsForJob(row)
       const artifactHash = sha256Canonical({
+        schema: 'baton.context-compaction-artifact.v2',
+        jobId: input.jobId,
+        threadId: text(row, 'thread_id'),
+        viewKey: text(row, 'view_key'),
+        sourceHash: text(row, 'source_hash'),
+        summaryInputHash: text(row, 'summary_input_hash'),
+        expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+        summary: JSON.parse(summaryJson) as unknown,
+        generatorProvider: input.generatorProvider,
+        generatorModel: input.generatorModel,
+        generatorVersion: input.generatorVersion,
+      })
+      const legacyArtifactHash = sha256Canonical({
         schema: 'baton.context-compaction-artifact.v1',
         jobId: input.jobId,
         threadId: text(row, 'thread_id'),
@@ -2601,7 +2787,9 @@ export class SqliteSessionStore implements SessionStore {
       })
       if (text(row, 'status') === 'completed') {
         const existing = this.#one(this.#db.prepare('SELECT * FROM context_compactions WHERE job_id=?'), input.jobId)
-        if (text(existing, 'artifact_hash') !== artifactHash) {
+        if (text(existing, 'artifact_hash') !== artifactHash
+          && !(text(row, 'view_key') === LEGACY_CONTEXT_VIEW_KEY
+            && text(existing, 'artifact_hash') === legacyArtifactHash)) {
           throw new ContextPersistenceError('idempotency_conflict', 'Completed compaction has different artifact content')
         }
         return { artifact: this.#contextCompactionArtifact(existing), duplicate: true }
@@ -2611,7 +2799,8 @@ export class SqliteSessionStore implements SessionStore {
         || nullableText(row, 'lease_expires_at')! <= now) {
         throw new ContextPersistenceError('lease_lost', 'Compaction lease is missing, expired, or owned elsewhere')
       }
-      const head = this.#ensureContextCompactionHead(text(row, 'thread_id'), now)
+      const viewKey = text(row, 'view_key')
+      const head = this.#ensureContextCompactionHead(text(row, 'thread_id'), viewKey, now)
       const expectedPreviousArtifactId = nullableText(row, 'expected_previous_artifact_id')
       if (nullableText(head, 'compaction_id') !== expectedPreviousArtifactId) {
         throw new ContextPersistenceError('stale_frontier', 'Compaction head changed before artifact completion')
@@ -2641,14 +2830,14 @@ export class SqliteSessionStore implements SessionStore {
       this.#appendContextCompactionJobEvent(completed, { artifactId, artifactHash }, now)
       const nextHeadRevision = integer(head, 'revision') + 1
       const headHash = this.#contextCompactionHeadHash(
-        text(row, 'thread_id'), artifactId, nextHeadRevision,
+        text(row, 'thread_id'), viewKey, artifactId, nextHeadRevision,
       )
       const advanced = this.#db.prepare(`
         UPDATE context_compaction_heads
         SET compaction_id=?,revision=?,head_hash=?,updated_at=?
-        WHERE thread_id=? AND compaction_id IS ? AND revision=?
+        WHERE thread_id=? AND view_key=? AND compaction_id IS ? AND revision=?
       `).run(artifactId, nextHeadRevision, headHash, now, text(row, 'thread_id'),
-        expectedPreviousArtifactId, integer(head, 'revision'))
+        viewKey, expectedPreviousArtifactId, integer(head, 'revision'))
       if (Number(advanced.changes) !== 1) {
         throw new ContextPersistenceError('stale_frontier', 'Compaction head compare-and-set failed')
       }
@@ -2691,15 +2880,23 @@ export class SqliteSessionStore implements SessionStore {
     return row ? this.#contextCompactionArtifact(row) : null
   }
 
-  getLatestContextCompaction(threadId: ThreadId): ContextCompactionArtifact | null {
+  getLatestContextCompaction(
+    threadId: ThreadId,
+    viewKey = LEGACY_CONTEXT_VIEW_KEY,
+  ): ContextCompactionArtifact | null {
     if (!this.getThread(threadId)) throw new ContextPersistenceError('not_found', `Thread not found: ${threadId}`)
+    if (!viewKey || viewKey.length > 120) {
+      throw new ContextPersistenceError('invalid_input', 'Compaction viewKey must contain 1 to 120 characters')
+    }
     const head = this.#optional(this.#db.prepare(
-      'SELECT * FROM context_compaction_heads WHERE thread_id=?',
-    ), threadId)
+      'SELECT * FROM context_compaction_heads WHERE thread_id=? AND view_key=?',
+    ), threadId, viewKey)
     if (!head) {
       const artifact = this.#optional(this.#db.prepare(
-        'SELECT id FROM context_compactions WHERE thread_id=? LIMIT 1',
-      ), threadId)
+        `SELECT c.id FROM context_compactions c
+         JOIN context_compaction_jobs j ON j.id=c.job_id
+         WHERE c.thread_id=? AND j.view_key=? LIMIT 1`,
+      ), threadId, viewKey)
       if (artifact) throw new ContextPersistenceError('integrity_violation', 'Compaction head is missing')
       return null
     }
@@ -4036,6 +4233,15 @@ export class SqliteSessionStore implements SessionStore {
       throw new ContextPersistenceError('integrity_violation', 'Compaction job source hash does not match canonical items')
     }
     const expectedRequestHash = sha256Canonical({
+      schema: 'baton.context-compaction-request.v2',
+      threadId: text(row, 'thread_id'),
+      viewKey: text(row, 'view_key'),
+      sourceItemIds,
+      sourceHash: text(row, 'source_hash'),
+      summaryInputHash: text(row, 'summary_input_hash'),
+      expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+    })
+    const legacyRequestHash = sha256Canonical({
       schema: 'baton.context-compaction-request.v1',
       threadId: text(row, 'thread_id'),
       sourceItemIds,
@@ -4043,16 +4249,22 @@ export class SqliteSessionStore implements SessionStore {
       summaryInputHash: text(row, 'summary_input_hash'),
       expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
     })
-    if (expectedRequestHash !== text(row, 'request_hash')) {
+    if (expectedRequestHash !== text(row, 'request_hash')
+      && !(text(row, 'view_key') === LEGACY_CONTEXT_VIEW_KEY
+        && legacyRequestHash === text(row, 'request_hash'))) {
       throw new ContextPersistenceError('integrity_violation', 'Compaction job request hash is invalid')
     }
     const expectedPreviousArtifactId = nullableText(row, 'expected_previous_artifact_id')
     if (expectedPreviousArtifactId !== null) {
       const previous = this.#optional(
-        this.#db.prepare('SELECT thread_id FROM context_compactions WHERE id=?'),
+        this.#db.prepare(`
+          SELECT c.thread_id,j.view_key FROM context_compactions c
+          JOIN context_compaction_jobs j ON j.id=c.job_id WHERE c.id=?
+        `),
         expectedPreviousArtifactId,
       )
-      if (!previous || text(previous, 'thread_id') !== text(row, 'thread_id')) {
+      if (!previous || text(previous, 'thread_id') !== text(row, 'thread_id')
+        || text(previous, 'view_key') !== text(row, 'view_key')) {
         throw new ContextPersistenceError('integrity_violation', 'Compaction job frontier artifact is invalid')
       }
     }
@@ -4072,6 +4284,7 @@ export class SqliteSessionStore implements SessionStore {
     return {
       id: text(row, 'id'),
       threadId: text(row, 'thread_id'),
+      viewKey: text(row, 'view_key'),
       requestKey: text(row, 'request_key'),
       requestHash: text(row, 'request_hash'),
       sourceItemIds: sourceItems.map((source) => source.itemId),
@@ -4137,6 +4350,19 @@ export class SqliteSessionStore implements SessionStore {
       )
     }
     const expectedArtifactHash = sha256Canonical({
+      schema: 'baton.context-compaction-artifact.v2',
+      jobId: text(row, 'job_id'),
+      threadId: text(row, 'thread_id'),
+      viewKey: text(job, 'view_key'),
+      sourceHash: text(row, 'source_hash'),
+      summaryInputHash: text(row, 'summary_input_hash'),
+      expectedPreviousArtifactId: nullableText(job, 'expected_previous_artifact_id'),
+      summary,
+      generatorProvider: text(row, 'generator_provider'),
+      generatorModel: text(row, 'generator_model'),
+      generatorVersion: text(row, 'generator_version'),
+    })
+    const legacyArtifactHash = sha256Canonical({
       schema: 'baton.context-compaction-artifact.v1',
       jobId: text(row, 'job_id'),
       threadId: text(row, 'thread_id'),
@@ -4148,13 +4374,16 @@ export class SqliteSessionStore implements SessionStore {
       generatorModel: text(row, 'generator_model'),
       generatorVersion: text(row, 'generator_version'),
     })
-    if (expectedArtifactHash !== text(row, 'artifact_hash')) {
+    if (expectedArtifactHash !== text(row, 'artifact_hash')
+      && !(text(job, 'view_key') === LEGACY_CONTEXT_VIEW_KEY
+        && legacyArtifactHash === text(row, 'artifact_hash'))) {
       throw new ContextPersistenceError('integrity_violation', 'Compaction artifact hash is invalid')
     }
     return {
       id: text(row, 'id'),
       jobId: text(row, 'job_id'),
       threadId: text(row, 'thread_id'),
+      viewKey: text(job, 'view_key'),
       sourceHash: text(row, 'source_hash'),
       summaryInputHash: text(row, 'summary_input_hash'),
       artifactHash: text(row, 'artifact_hash'),
@@ -4308,49 +4537,60 @@ export class SqliteSessionStore implements SessionStore {
     })
   }
 
-  #contextCompactionHeadHash(threadId: ThreadId, compactionId: string | null, revision: number): string {
+  #contextCompactionHeadHash(
+    threadId: ThreadId,
+    viewKey: string,
+    compactionId: string | null,
+    revision: number,
+  ): string {
     return sha256Canonical({
-      schema: 'baton.context-compaction-head.v1',
+      schema: 'baton.context-compaction-head.v2',
       threadId,
+      viewKey,
       compactionId,
       revision,
     })
   }
 
-  #ensureContextCompactionHead(threadId: ThreadId, now: string): SqlRow {
-    const initialHash = this.#contextCompactionHeadHash(threadId, null, 0)
+  #ensureContextCompactionHead(threadId: ThreadId, viewKey: string, now: string): SqlRow {
+    const initialHash = this.#contextCompactionHeadHash(threadId, viewKey, null, 0)
     this.#db.prepare(`
-      INSERT INTO context_compaction_heads(thread_id,compaction_id,revision,head_hash,updated_at)
-      VALUES (?,NULL,0,?,?) ON CONFLICT(thread_id) DO NOTHING
-    `).run(threadId, initialHash, now)
+      INSERT INTO context_compaction_heads(thread_id,view_key,compaction_id,revision,head_hash,updated_at)
+      VALUES (?,?,NULL,0,?,?) ON CONFLICT(thread_id,view_key) DO NOTHING
+    `).run(threadId, viewKey, initialHash, now)
     const head = this.#one(this.#db.prepare(
-      'SELECT * FROM context_compaction_heads WHERE thread_id=?',
-    ), threadId)
+      'SELECT * FROM context_compaction_heads WHERE thread_id=? AND view_key=?',
+    ), threadId, viewKey)
     this.#validateContextCompactionHead(head)
     return head
   }
 
   #validateContextCompactionHead(row: SqlRow): void {
     const threadId = text(row, 'thread_id')
+    const viewKey = text(row, 'view_key')
     const compactionId = nullableText(row, 'compaction_id')
     const revision = integer(row, 'revision')
-    if (this.#contextCompactionHeadHash(threadId, compactionId, revision) !== text(row, 'head_hash')) {
+    if (this.#contextCompactionHeadHash(threadId, viewKey, compactionId, revision) !== text(row, 'head_hash')) {
       throw new ContextPersistenceError('integrity_violation', 'Compaction head hash is invalid')
     }
     if ((compactionId === null) !== (revision === 0)) {
       throw new ContextPersistenceError('integrity_violation', 'Compaction head revision is inconsistent')
     }
     const artifactCount = integer(this.#one(this.#db.prepare(`
-      SELECT COUNT(*) AS count FROM context_compactions WHERE thread_id=?
-    `), threadId), 'count')
+      SELECT COUNT(*) AS count FROM context_compactions c
+      JOIN context_compaction_jobs j ON j.id=c.job_id
+      WHERE c.thread_id=? AND j.view_key=?
+    `), threadId, viewKey), 'count')
     if (artifactCount !== revision) {
       throw new ContextPersistenceError('integrity_violation', 'Compaction head revision does not match artifacts')
     }
     if (compactionId !== null) {
       const artifact = this.#optional(this.#db.prepare(
-        'SELECT thread_id FROM context_compactions WHERE id=?',
+        `SELECT c.thread_id,j.view_key FROM context_compactions c
+         JOIN context_compaction_jobs j ON j.id=c.job_id WHERE c.id=?`,
       ), compactionId)
-      if (!artifact || text(artifact, 'thread_id') !== threadId) {
+      if (!artifact || text(artifact, 'thread_id') !== threadId
+        || text(artifact, 'view_key') !== viewKey) {
         throw new ContextPersistenceError('integrity_violation', 'Compaction head points to an invalid artifact')
       }
     }
@@ -4851,6 +5091,7 @@ function visibleWorkStatus(row: SqlRow, imported: boolean): CanonicalSession['wo
   const turn = nullableText(row, 'latest_turn_status')
   if (turn === 'waiting_tool' || turn === 'running' || turn === 'queued') return turn
   const goal = nullableText(row, 'current_goal_status')
+  if (goal === 'active') return 'queued'
   if (goal === 'usage_limited' || goal === 'budget_limited' || goal === 'blocked' || goal === 'paused') return goal
   if (turn === 'failed' || turn === 'interrupted' || turn === 'cancelled') return turn
   if (goal === 'complete') return 'complete'

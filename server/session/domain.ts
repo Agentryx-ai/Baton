@@ -256,6 +256,8 @@ export type ContextCompactionJobStatus = 'queued' | 'running' | 'completed' | 'f
 export interface ContextCompactionJob {
   id: ContextCompactionJobId
   threadId: ThreadId
+  /** Provider/budget contract for this independent derived-context branch. */
+  viewKey: string
   requestKey: string
   requestHash: string
   sourceItemIds: ItemId[]
@@ -287,6 +289,7 @@ export interface ContextCompactionArtifact {
   id: ContextCompactionId
   jobId: ContextCompactionJobId
   threadId: ThreadId
+  viewKey: string
   sourceHash: string
   summaryInputHash: string
   artifactHash: string
@@ -320,6 +323,8 @@ export type ExecutionContextSourceRef =
 
 export interface CreateContextCompactionJobInput {
   threadId: ThreadId
+  /** Omitted only by legacy low-level callers; new runtime paths must provide it. */
+  viewKey?: string
   /** Stable caller-generated idempotency key for this exact compaction request. */
   requestKey: string
   /** Exact canonical prefix, in lineage order, covered by the derived summary. */

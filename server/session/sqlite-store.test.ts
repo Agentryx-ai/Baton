@@ -66,6 +66,7 @@ function downgradeEmptyDerivedSchemaToV13(path: string): void {
     DROP TRIGGER context_compaction_jobs_terminal;
     DROP TRIGGER context_compaction_jobs_transition;
     DROP TABLE context_compaction_heads;
+    ALTER TABLE context_compaction_jobs DROP COLUMN view_key;
     ALTER TABLE context_compaction_jobs DROP COLUMN expected_previous_artifact_id;
 
     CREATE TRIGGER context_compaction_jobs_immutable_columns BEFORE UPDATE ON context_compaction_jobs
@@ -126,7 +127,7 @@ function beginSessionInput(
   }
 }
 
-test('initial session materialization is atomic, idempotent, and keeps schema v15', (t) => {
+test('initial session materialization is atomic, idempotent, and keeps schema v16', (t) => {
   const path = databasePath(t)
   const store = new SqliteSessionStore(path, deterministicOptions())
   const input = beginSessionInput()
@@ -174,7 +175,7 @@ test('initial session materialization is atomic, idempotent, and keeps schema v1
     const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
     assert.equal(row.count, expected, table)
   }
-  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
   store.close()
 
   const reopened = new SqliteSessionStore(path, deterministicOptions())
@@ -272,7 +273,7 @@ function nativeCandidate(contents: string[], cwd: string, contentDigest: string)
   }
 }
 
-test('schema v1 migrates through v15 with host capability storage', (t) => {
+test('schema v1 migrates through v16 with host capability storage', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -313,10 +314,10 @@ test('schema v1 migrates through v15 with host capability storage', (t) => {
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -343,7 +344,7 @@ test('schema v1 migrates through v15 with host capability storage', (t) => {
   }).follow_up_window, 'closed')
 })
 
-test('schema v6 migrates to v15 in place and reopens without replaying migrations', (t) => {
+test('schema v6 migrates to v16 in place and reopens without replaying migrations', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -396,11 +397,11 @@ test('schema v6 migrates to v15 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -412,7 +413,7 @@ test('schema v6 migrates to v15 in place and reopens without replaying migration
     .get() as { count: number }).count, 1)
 })
 
-test('schema v10 rebuilds follow-up constraints through v15 with foreign keys and reopens once', (t) => {
+test('schema v10 rebuilds follow-up constraints through v16 with foreign keys and reopens once', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -445,7 +446,7 @@ test('schema v10 rebuilds follow-up constraints through v15 with foreign keys an
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
   assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
   assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
 })
@@ -479,11 +480,11 @@ test('schema v12 migrates once to immutable derived context tables and preserves
 
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations WHERE version>=13 ORDER BY version')
       .all() as Array<{ version: number }>).map((row) => row.version),
-    [13, 14, 15],
+    [13, 14, 15, 16],
   )
   const tables = (inspected.prepare(`
     SELECT name FROM sqlite_schema WHERE type='table'
@@ -501,7 +502,7 @@ test('schema v12 migrates once to immutable derived context tables and preserves
   ])
 })
 
-test('schema v15 reopen fails closed when a derived-context protection trigger is missing', (t) => {
+test('schema v16 reopen fails closed when a derived-context protection trigger is missing', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   initial.close()
@@ -516,7 +517,7 @@ test('schema v15 reopen fails closed when a derived-context protection trigger i
   )
 })
 
-test('an empty released v13 database migrates through v15 and gains the authoritative frontier schema', (t) => {
+test('an empty released v13 database migrates through v16 and gains the authoritative frontier schema', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   const session = initial.createSession({ title: 'old-v13 sentinel' })
@@ -528,7 +529,7 @@ test('an empty released v13 database migrates through v15 and gains the authorit
   migrated.close()
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
   assert.ok((inspected.prepare(`
     SELECT 1 FROM pragma_table_info('context_compaction_jobs')
     WHERE name='expected_previous_artifact_id'
@@ -769,6 +770,43 @@ test('compaction head CAS admits only one different writer per frontier and surv
   t.after(() => reopened.close())
   assert.equal(reopened.getLatestContextCompaction(session.activeThreadId)?.id, artifact.id)
   assert.equal(reopened.getContextCompactionJob(acceptedJob.id)?.expectedPreviousArtifactId, null)
+})
+
+test('context view heads advance independently for different model budgets', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const sourceItemIds = store.listItems(session.activeThreadId).map((item) => item.id)
+
+  const completeView = (viewKey: string, requestKey: string, hash: string) => {
+    const job = store.reserveContextCompactionJob({
+      threadId: session.activeThreadId,
+      viewKey,
+      requestKey,
+      sourceItemIds,
+      summaryInputHash: hash.repeat(64),
+      expectedPreviousArtifactId: null,
+      ownerId: `owner-${viewKey}`,
+    }).job
+    return store.completeContextCompactionJob({
+      jobId: job.id,
+      ownerId: `owner-${viewKey}`,
+      summary: { text: viewKey, summaryInput: { previousArtifactId: null } },
+      generatorProvider: 'codex',
+      generatorModel: 'gpt-test',
+      generatorVersion: 'compactor/1',
+    }).artifact
+  }
+
+  const small = completeView('codex-258k-v1', 'small-view', 'a')
+  const large = completeView('codex-1m-v1', 'large-view', 'b')
+  assert.equal(store.getLatestContextCompaction(session.activeThreadId, 'codex-258k-v1')?.id, small.id)
+  assert.equal(store.getLatestContextCompaction(session.activeThreadId, 'codex-1m-v1')?.id, large.id)
+  assert.notEqual(small.id, large.id)
+  assert.equal(small.viewKey, 'codex-258k-v1')
+  assert.equal(large.viewKey, 'codex-1m-v1')
 })
 
 test('atomic compaction reservation retires a queued orphan before a different contract completes', (t) => {
@@ -1197,6 +1235,44 @@ test('expired compaction leases are durably reclaimed and terminal failure survi
       SELECT status FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence
     `).all(job.id) as Array<{ status: string }>).map((row) => row.status),
     ['queued', 'running', 'queued', 'running', 'failed'],
+  )
+})
+
+test('the current compaction owner heartbeats a long provider generation lease', (t) => {
+  const path = databasePath(t)
+  let now = '2026-07-18T00:00:00.000Z'
+  const store = new SqliteSessionStore(path, { ...deterministicOptions(), now: () => now })
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'heartbeat-lease',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '3'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+  const claimed = store.claimContextCompactionJob({
+    jobId: job.id, ownerId: 'summary-worker', leaseDurationMs: 1_000,
+  })!
+  now = '2026-07-18T00:00:00.500Z'
+  const extended = store.claimContextCompactionJob({
+    jobId: job.id, ownerId: 'summary-worker', leaseDurationMs: 1_000,
+  })!
+  assert.equal(extended.revision, claimed.revision + 1)
+  assert.equal(extended.leaseExpiresAt, '2026-07-18T00:00:01.500Z')
+  now = '2026-07-18T00:00:01.200Z'
+  assert.equal(store.claimContextCompactionJob({
+    jobId: job.id, ownerId: 'competing-worker', leaseDurationMs: 1_000,
+  }), null)
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.deepEqual(
+    (inspected.prepare(`
+      SELECT status FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence
+    `).all(job.id) as Array<{ status: string }>).map((event) => event.status),
+    ['queued', 'running', 'running'],
   )
 })
 
@@ -2376,6 +2452,32 @@ test('turn activity keeps turn, execution, and thread status synchronized and is
     () => store.setTurnActivity(started.turn.id, 'waiting_tool'),
     (error: unknown) => error instanceof SessionStoreError && error.code === 'turn_not_running',
   )
+})
+
+test('an active Goal is projected as queued instead of the previous terminal turn', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  assert.equal(store.getSession(session.id)?.workStatus, 'completed')
+
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'continue after the completed turn',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  assert.equal(store.getSession(session.id)?.workStatus, 'queued')
+
+  store.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: goal.revision,
+    status: 'blocked',
+    reason: { code: 'context_input_too_large', source: 'host', message: null, at: '2026-07-20T00:00:00.000Z' },
+  })
+  assert.equal(store.getSession(session.id)?.workStatus, 'blocked')
 })
 
 test('fork replay stops at the exact inherited item and branches remain isolated', (t) => {

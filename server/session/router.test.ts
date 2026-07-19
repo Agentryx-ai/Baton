@@ -510,16 +510,27 @@ test('first-turn route rejects malformed drafts and maps conflict/readiness fail
 
   const oversizedService = new TestConversationService()
   oversizedService.startSession = async () => {
-    throw new ContextInputTooLargeError(900, 800)
+    throw new ContextInputTooLargeError({
+      estimatedInputTokens: 900,
+      usableInputTokens: 800,
+      contextWindowTokens: 1_000,
+      provider: 'codex',
+      model: 'gpt-test',
+      compactionReason: 'generator_failed',
+    })
   }
   await withServer(oversizedService, async (baseUrl) => {
     const oversized = await firstTurnRequest(baseUrl)
     assert.equal(oversized.status, 413)
     assert.deepEqual(await json(oversized), {
       code: 'context_input_too_large',
-      error: 'Upcoming input requires approximately 900 tokens; usable input budget is 800',
+      error: 'Upcoming input requires approximately 900 tokens; usable input budget is 800 for gpt-test (1000 context tokens); compaction=generator_failed',
       estimatedInputTokens: 900,
       usableInputTokens: 800,
+      contextWindowTokens: 1_000,
+      provider: 'codex',
+      model: 'gpt-test',
+      compactionReason: 'generator_failed',
     })
   })
 })

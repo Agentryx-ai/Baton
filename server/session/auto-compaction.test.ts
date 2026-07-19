@@ -15,10 +15,10 @@ import {
 import type { ContextSummaryArtifact } from './context-materializer.js'
 
 const COMPACT_POLICY: AutoCompactionPolicy = {
-  contextWindowTokens: 400,
+  contextWindowTokens: 3_000,
   reservedOutputTokens: 80,
   safetyMarginTokens: 40,
-  triggerRatio: 0.5,
+  triggerRatio: 0.1,
   retainRecentTurns: 1,
   minimumSourceTokens: 1,
   maximumSummaryTokens: 40,
@@ -33,8 +33,8 @@ test('pre-turn engine automatically compacts a stable prefix with explicit headr
   const result = await engine.compactBeforeTurn(snapshot)
 
   assert.equal(result.reason, 'compacted')
-  assert.equal(result.inputBudgetTokens, 280)
-  assert.equal(result.triggerTokens, 140)
+  assert.equal(result.inputBudgetTokens, 2_880)
+  assert.equal(result.triggerTokens, 288)
   assert.equal(store.artifacts.length, 1)
   assert.deepEqual(store.savedExpectedIds, [null])
   assert.equal(generator.inputs.length, 1)
@@ -196,6 +196,53 @@ test('incremental compaction folds a valid prior summary and only sends uncovere
   assert.deepEqual(store.savedExpectedIds, [first.artifact?.id])
 })
 
+test('an over-budget preferred suffix adaptively retains fewer turns at the first fitting frontier', async () => {
+  const generator = new RecordingGenerator()
+  const result = await new AutoCompactionEngine(
+    new MemoryArtifactStore(),
+    generator,
+    { ...COMPACT_POLICY, retainRecentTurns: 2 },
+  ).compactBeforeTurn(largeSnapshot(3), { additionalInputTokens: 1_800 })
+
+  assert.equal(result.reason, 'compacted')
+  assert.deepEqual(generator.inputs[0]?.sourceItemIds, [
+    'user-1', 'private-1', 'assistant-1', 'user-2', 'assistant-2',
+  ])
+  assert.deepEqual(result.context.entries.map((entry) =>
+    entry.type === 'derived_summary' ? 'summary' : entry.item.id), [
+    'summary', 'user-3', 'assistant-3',
+  ])
+})
+
+test('an over-budget existing view incrementally extends beyond its preferred frontier', async () => {
+  const snapshot = largeSnapshot(3)
+  const first = await new AutoCompactionEngine(
+    new MemoryArtifactStore(),
+    new RecordingGenerator(),
+    { ...COMPACT_POLICY, retainRecentTurns: 2 },
+    () => '2026-07-19T03:00:00Z',
+  ).compactBeforeTurn(snapshot)
+  assert.equal(first.reason, 'compacted')
+
+  const generator = new RecordingGenerator()
+  const next = await new AutoCompactionEngine(
+    new MemoryArtifactStore([first.artifact!]),
+    generator,
+    { ...COMPACT_POLICY, retainRecentTurns: 2 },
+    () => '2026-07-19T04:00:00Z',
+  ).compactBeforeTurn(snapshot, { additionalInputTokens: 1_800 })
+
+  assert.equal(next.reason, 'compacted')
+  assert.equal(generator.inputs[0]?.previousSummary?.id, first.artifact?.id)
+  assert.deepEqual(generator.inputs[0]?.items.map((entry) => entry.id), [
+    'user-2', 'assistant-2',
+  ])
+  assert.deepEqual(next.context.entries.map((entry) =>
+    entry.type === 'derived_summary' ? 'summary' : entry.item.id), [
+    'summary', 'user-3', 'assistant-3',
+  ])
+})
+
 test('superseded writer reloads the winning artifact without corrupting context', async () => {
   const snapshot = largeSnapshot(2)
   const store = new MemoryArtifactStore()
@@ -229,7 +276,12 @@ test('upcoming input overhead can trigger compaction before the canonical snapsh
   const snapshot = largeSnapshot(2)
   const store = new MemoryArtifactStore()
   const generator = new RecordingGenerator()
-  const policy = { ...COMPACT_POLICY, contextWindowTokens: 10_000, retainRecentTurns: 0 }
+  const policy = {
+    ...COMPACT_POLICY,
+    contextWindowTokens: 10_000,
+    triggerRatio: 0.9,
+    retainRecentTurns: 0,
+  }
   const withoutInput = await new AutoCompactionEngine(store, generator, policy)
     .compactBeforeTurn(snapshot)
   assert.equal(withoutInput.reason, 'below_threshold')

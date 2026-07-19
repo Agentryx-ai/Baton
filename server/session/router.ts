@@ -975,6 +975,10 @@ export function createConversationRouter(
         error: error.message,
         estimatedInputTokens: error.estimatedInputTokens,
         usableInputTokens: error.usableInputTokens,
+        contextWindowTokens: error.contextWindowTokens,
+        provider: error.provider,
+        model: error.model,
+        compactionReason: error.compactionReason,
       })
       return
     }

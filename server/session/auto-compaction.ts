@@ -104,6 +104,10 @@ export interface ContextCompactionStore {
     reservation: ContextCompactionGenerationReservation,
     error: Record<string, unknown>,
   ): Promise<'failed' | 'superseded'>
+  /** Extends a long-running provider generation lease without changing its contract. */
+  heartbeatGeneration?(
+    reservation: ContextCompactionGenerationReservation,
+  ): Promise<'extended' | 'superseded'>
   /** Must atomically reject a stale writer when the expected frontier changed. */
   saveArtifact?(
     artifact: ContextSummaryArtifact,
@@ -126,6 +130,8 @@ export type AutoCompactionReason =
   | 'superseded'
 
 export interface AutoCompactionResult {
+  /** Stable provider/budget branch selected for this turn. */
+  viewKey: string
   reason: AutoCompactionReason
   /** Always usable; failures fall back to a prior valid artifact or full canonical history. */
   context: MaterializedContext
@@ -147,18 +153,21 @@ export class AutoCompactionEngine {
   readonly #now: () => string
   readonly #inputBudgetTokens: number
   readonly #triggerTokens: number
+  readonly #viewKey: string
 
   constructor(
     store: ContextCompactionStore,
     generator: ContextSummaryGenerator,
     policy: AutoCompactionPolicy,
     now: () => string = () => new Date().toISOString(),
+    viewKey = 'in-memory-context-view',
   ) {
     validatePolicy(policy)
     this.#store = store
     this.#generator = generator
     this.#policy = { ...policy }
     this.#now = now
+    this.#viewKey = viewKey
     this.#inputBudgetTokens = policy.contextWindowTokens
       - policy.reservedOutputTokens
       - policy.safetyMarginTokens
@@ -189,6 +198,8 @@ export class AutoCompactionEngine {
       )
     }
     const estimatedTokensBefore = withAdditionalTokens(current.estimatedTokens, additionalInputTokens)
+    const full = materializeContext(snapshot, [], options.provider)
+    const estimatedFullTokens = withAdditionalTokens(full.estimatedTokens, additionalInputTokens)
 
     // A caller invoking this after beginTurn cannot accidentally compact mid-loop.
     if (snapshot.turns.some((turn) =>
@@ -196,17 +207,47 @@ export class AutoCompactionEngine {
         && (turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_tool'))) {
       return this.#result('active_turn', current, current.artifact, estimatedTokensBefore, additionalInputTokens)
     }
+    // A larger model returning to this canonical thread should regain the
+    // immutable full ledger whenever it fits below that model's own trigger.
+    // A smaller view artifact must never become a global lossy head.
+    if (estimatedFullTokens <= this.#triggerTokens) {
+      return this.#result('below_threshold', full, null, estimatedFullTokens, additionalInputTokens)
+    }
     if (estimatedTokensBefore <= this.#triggerTokens) {
       return this.#result('below_threshold', current, current.artifact, estimatedTokensBefore, additionalInputTokens)
     }
 
     const prefixes = stableContextPrefixes(snapshot)
-    const candidateIndex = prefixes.length - 1 - this.#policy.retainRecentTurns
-    if (candidateIndex < 0) {
+    if (prefixes.length === 0) {
       return this.#result('no_stable_prefix', current, current.artifact, estimatedTokensBefore, additionalInputTokens)
     }
-    const candidate = prefixes[candidateIndex]!
-    if (current.artifact && candidate.throughSequence <= current.artifact.throughSequence) {
+
+    // Prefer the configured verbatim suffix, but do not let that preference
+    // make an otherwise compactable turn impossible. If the preferred view is
+    // still over the hard input budget, deterministically retire one more
+    // stable turn at a time until the derived view is guaranteed to fit.
+    const preferredIndex = Math.max(0, prefixes.length - 1 - this.#policy.retainRecentTurns)
+    const currentFrontier = current.artifact?.throughSequence ?? 0
+    if (current.artifact
+      && prefixes[preferredIndex]!.throughSequence <= currentFrontier
+      && estimatedTokensBefore <= this.#inputBudgetTokens) {
+      return this.#result('no_new_stable_prefix', current, current.artifact, estimatedTokensBefore, additionalInputTokens)
+    }
+    const candidate = prefixes.slice(preferredIndex).find((prefix) => {
+      if (prefix.throughSequence <= currentFrontier) return false
+      const coveredIds = new Set(coverageItems(snapshot, prefix).map((item) => item.id))
+      const suffixTokens = estimateContextTokens(
+        full.entries.filter((entry) =>
+          entry.type === 'canonical_item' && !coveredIds.has(entry.item.id)),
+        options.provider,
+      )
+      const maximumDerivedTokens = 16 + this.#policy.maximumSummaryTokens
+      return withAdditionalTokens(
+        withAdditionalTokens(maximumDerivedTokens, suffixTokens),
+        additionalInputTokens,
+      ) <= this.#inputBudgetTokens
+    })
+    if (!candidate) {
       return this.#result('no_new_stable_prefix', current, current.artifact, estimatedTokensBefore, additionalInputTokens)
     }
 
@@ -302,11 +343,18 @@ export class AutoCompactionEngine {
     const reservation = reservationResult.reservation
 
     let generated: ContextSummaryGenerationResult
+    const heartbeat = this.#generationHeartbeat(reservation)
     try {
       generated = await this.#generator.generate(generationInput)
     } catch (error) {
+      await heartbeat.stop()
       await this.#recordGenerationFailure(reservation, 'generator_failed', error)
       return this.#result('generator_failed', current, current.artifact,
+        estimatedTokensBefore, additionalInputTokens)
+    }
+    const leaseIntact = await heartbeat.stop()
+    if (!leaseIntact) {
+      return this.#result('superseded', current, current.artifact,
         estimatedTokensBefore, additionalInputTokens)
     }
 
@@ -411,6 +459,35 @@ export class AutoCompactionEngine {
     }
   }
 
+  #generationHeartbeat(reservation: ContextCompactionGenerationReservation): {
+    stop(): Promise<boolean>
+  } {
+    const heartbeat = this.#store.heartbeatGeneration
+    if (!heartbeat) return { stop: async () => true }
+    let stopped = false
+    let intact = true
+    let pending = Promise.resolve()
+    const timer = setInterval(() => {
+      pending = pending.then(async () => {
+        if (stopped || !intact) return
+        try {
+          intact = await heartbeat.call(this.#store, reservation) === 'extended'
+        } catch {
+          intact = false
+        }
+      })
+    }, 60_000)
+    timer.unref?.()
+    return {
+      stop: async () => {
+        stopped = true
+        clearInterval(timer)
+        await pending
+        return intact
+      },
+    }
+  }
+
   #result(
     reason: AutoCompactionReason,
     context: MaterializedContext,
@@ -419,6 +496,7 @@ export class AutoCompactionEngine {
     additionalInputTokens = 0,
   ): AutoCompactionResult {
     return {
+      viewKey: this.#viewKey,
       reason,
       context,
       artifact,

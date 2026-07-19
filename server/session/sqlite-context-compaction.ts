@@ -20,15 +20,36 @@ import type {
   MaterializedContext,
   MaterializedContextEntry,
 } from './context-materializer.js'
+import { LEGACY_CONTEXT_VIEW_KEY } from './context-view-contract.js'
 
-export const CONTEXT_MATERIALIZER_VERSION = 'baton-context-materializer/v1'
+export const CONTEXT_MATERIALIZER_VERSION = 'baton-context-materializer/v2'
 
 /** Exact generation contract namespace; distinct compactor inputs never alias one durable job. */
-export function contextCompactionRequestKey(sourceHash: string, summaryInputHash: string): string {
+export function contextCompactionRequestKey(sourceHash: string, summaryInputHash: string): string
+export function contextCompactionRequestKey(
+  viewKey: string,
+  sourceHash: string,
+  summaryInputHash: string,
+): string
+export function contextCompactionRequestKey(
+  viewKeyOrSourceHash: string,
+  sourceHashOrSummaryInputHash: string,
+  optionalSummaryInputHash?: string,
+): string {
+  const viewKey = optionalSummaryInputHash === undefined
+    ? LEGACY_CONTEXT_VIEW_KEY
+    : viewKeyOrSourceHash
+  const sourceHash = optionalSummaryInputHash === undefined
+    ? viewKeyOrSourceHash
+    : sourceHashOrSummaryInputHash
+  const summaryInputHash = optionalSummaryInputHash ?? sourceHashOrSummaryInputHash
+  if (!viewKey || viewKey.length > 120) throw new TypeError('Context view key is invalid')
   if (!/^[0-9a-f]{64}$/u.test(sourceHash) || !/^[0-9a-f]{64}$/u.test(summaryInputHash)) {
     throw new TypeError('Context compaction request hashes must be lowercase SHA-256 digests')
   }
-  return `context-v2:${sourceHash}:${summaryInputHash}`
+  return `context-v3:${createHash('sha256')
+    .update(`${viewKey}\0${sourceHash}\0${summaryInputHash}`)
+    .digest('hex')}`
 }
 
 /** Durable adapter between the generic pre-turn engine and schema-v14 receipts. */
@@ -36,19 +57,44 @@ export class SqliteContextCompactionStore implements ContextCompactionStore {
   readonly #store: SqliteSessionStore
   readonly #provider: CanonicalProvider
   readonly #ownerId: string
+  readonly #viewKey: string
 
-  constructor(store: SqliteSessionStore, provider: CanonicalProvider, ownerId: string) {
+  constructor(
+    store: SqliteSessionStore,
+    provider: CanonicalProvider,
+    ownerId: string,
+    viewKey = LEGACY_CONTEXT_VIEW_KEY,
+  ) {
     this.#store = store
     this.#provider = provider
     this.#ownerId = ownerId
+    this.#viewKey = viewKey
   }
 
   async listArtifacts(threadId: string): Promise<readonly ContextSummaryArtifact[]> {
-    let current = this.#store.getLatestContextCompaction(threadId)
+    const current = this.#store.getLatestContextCompaction(threadId, this.#viewKey)
+    return current ? this.#artifactChain(threadId, current.id) : []
+  }
+
+  async listArtifactsThrough(
+    threadId: string,
+    artifactId: string,
+  ): Promise<readonly ContextSummaryArtifact[]> {
+    return this.#artifactChain(threadId, artifactId)
+  }
+
+  #artifactChain(threadId: string, artifactId: string): ContextSummaryArtifact[] {
+    let current = this.#store.getContextCompactionArtifact(artifactId)
     if (!current) return []
     const artifacts: ContextSummaryArtifact[] = []
     const visited = new Set<string>()
     while (current !== null) {
+      if (current.threadId !== threadId || current.viewKey !== this.#viewKey) {
+        throw new ContextPersistenceError(
+          'integrity_violation',
+          'Compaction artifact belongs to a different thread or context view',
+        )
+      }
       if (visited.has(current.id)) {
         throw new ContextPersistenceError('integrity_violation', 'Compaction artifact chain contains a cycle')
       }
@@ -76,7 +122,12 @@ export class SqliteContextCompactionStore implements ContextCompactionStore {
     try {
       created = this.#store.reserveContextCompactionJob({
         threadId: request.threadId,
-        requestKey: contextCompactionRequestKey(request.sourceHash, request.summaryInputHash),
+        viewKey: this.#viewKey,
+        requestKey: contextCompactionRequestKey(
+          this.#viewKey,
+          request.sourceHash,
+          request.summaryInputHash,
+        ),
         sourceItemIds: [...request.sourceItemIds],
         summaryInputHash: request.summaryInputHash,
         expectedPreviousArtifactId: request.expectedPreviousArtifactId,
@@ -167,6 +218,19 @@ export class SqliteContextCompactionStore implements ContextCompactionStore {
     }
   }
 
+  async heartbeatGeneration(
+    reservation: ContextCompactionGenerationReservation,
+  ): Promise<'extended' | 'superseded'> {
+    const job = this.#store.claimContextCompactionJob({
+      jobId: reservation.receiptId,
+      ownerId: reservation.leaseOwner,
+      leaseDurationMs: 300_000,
+    })
+    return job?.status === 'running' && job.leaseOwner === reservation.leaseOwner
+      ? 'extended'
+      : 'superseded'
+  }
+
   async saveArtifact(
     artifact: ContextSummaryArtifact,
     expectedPreviousArtifactId: string | null,
@@ -179,7 +243,12 @@ export class SqliteContextCompactionStore implements ContextCompactionStore {
     try {
       created = this.#store.reserveContextCompactionJob({
         threadId: artifact.threadId,
-        requestKey: contextCompactionRequestKey(artifact.sourceHash, artifact.summaryInputHash),
+        viewKey: this.#viewKey,
+        requestKey: contextCompactionRequestKey(
+          this.#viewKey,
+          artifact.sourceHash,
+          artifact.summaryInputHash,
+        ),
         sourceItemIds: [...artifact.sourceItemIds],
         summaryInputHash: artifact.summaryInputHash,
         expectedPreviousArtifactId,

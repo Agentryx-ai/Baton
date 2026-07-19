@@ -36,7 +36,7 @@ export type GoalLaunchResult =
   | { status: 'not_started'; reason: 'busy' | 'stale' | 'lease_lost' | 'cancelled' }
   | {
       status: 'failed'
-      category: 'provider_failure' | 'provider_usage_limit'
+      category: 'provider_failure' | 'provider_usage_limit' | 'context_input_too_large'
       message?: string
     }
 
@@ -63,6 +63,7 @@ export interface AutomaticGoalTurnResult {
 export interface GoalRuntimeOptions {
   ownerId: string
   launchContinuation: GoalContinuationLauncher
+  onGoalChanged?: (goal: CanonicalGoal) => void
   leaseDurationMs?: number
   heartbeatIntervalMs?: number
   scanIntervalMs?: number
@@ -93,6 +94,7 @@ export class GoalRuntime {
   readonly #store: GoalRuntimeStore
   readonly #ownerId: string
   readonly #launchContinuation: GoalContinuationLauncher
+  readonly #onGoalChanged: (goal: CanonicalGoal) => void
   readonly #leaseDurationMs: number
   readonly #heartbeatIntervalMs: number
   readonly #scanIntervalMs: number
@@ -107,6 +109,7 @@ export class GoalRuntime {
     this.#store = store
     this.#ownerId = options.ownerId
     this.#launchContinuation = options.launchContinuation
+    this.#onGoalChanged = options.onGoalChanged ?? (() => {})
     this.#leaseDurationMs = options.leaseDurationMs ?? GOAL_LEASE_DURATION_MS
     this.#heartbeatIntervalMs = options.heartbeatIntervalMs ?? GOAL_LEASE_HEARTBEAT_MS
     this.#scanIntervalMs = options.scanIntervalMs ?? 1_000
@@ -194,11 +197,11 @@ export class GoalRuntime {
   stopForProviderFailure(input: {
     goalId: string
     goalRevision: number
-    category: 'provider_failure' | 'provider_usage_limit'
+    category: 'provider_failure' | 'provider_usage_limit' | 'context_input_too_large'
     message?: string
   }): GoalCasResult {
     const usageLimited = input.category === 'provider_usage_limit'
-    return this.#store.updateGoalStatus({
+    return this.#notifyApplied(this.#store.updateGoalStatus({
       goalId: input.goalId,
       expectedRevision: input.goalRevision,
       status: usageLimited ? 'usage_limited' : 'blocked',
@@ -208,7 +211,7 @@ export class GoalRuntime {
         message: input.message ?? null,
         at: this.#now().toISOString(),
       },
-    })
+    }))
   }
 
   /** Commits pause before invoking the non-transactional provider interrupt. */
@@ -218,7 +221,7 @@ export class GoalRuntime {
     interrupt: () => Promise<void> | void
     message?: string
   }): Promise<GoalCasResult> {
-    const paused = this.#store.updateGoalStatus({
+    const paused = this.#notifyApplied(this.#store.updateGoalStatus({
       goalId: input.goalId,
       expectedRevision: input.goalRevision,
       status: 'paused',
@@ -228,7 +231,7 @@ export class GoalRuntime {
         message: input.message ?? null,
         at: this.#now().toISOString(),
       },
-    })
+    }))
     if (paused.status === 'applied') {
       this.#pendingControllers.get(input.goalId)?.abort()
       await input.interrupt()
@@ -254,7 +257,7 @@ export class GoalRuntime {
       timeLimitReached = true
       controller.abort(new Error('Goal active-time limit reached while preparing continuation'))
       try {
-        this.#store.updateGoalStatus({
+        this.#notifyApplied(this.#store.updateGoalStatus({
           goalId: goal.id,
           expectedRevision: goal.revision,
           status: 'budget_limited',
@@ -264,7 +267,7 @@ export class GoalRuntime {
             message: null,
             at: this.#now().toISOString(),
           },
-        })
+        }))
       } catch {
         // A concurrent user mutation wins its revision CAS; the aborted launch
         // still cannot consume the stale lease.
@@ -349,7 +352,7 @@ export class GoalRuntime {
   #enforceLimits(goal: CanonicalGoal): GoalScheduleResult | null {
     const limit = exhaustedLimit(goal)
     if (!limit) return null
-    const stopped = this.#store.updateGoalStatus({
+    const stopped = this.#notifyApplied(this.#store.updateGoalStatus({
       goalId: goal.id,
       expectedRevision: goal.revision,
       status: limit.status,
@@ -359,8 +362,13 @@ export class GoalRuntime {
         message: null,
         at: this.#now().toISOString(),
       },
-    })
+    }))
     return { status: stopped.status === 'applied' ? 'limited' : 'stale', goal: stopped.goal }
+  }
+
+  #notifyApplied(result: GoalCasResult): GoalCasResult {
+    if (result.status === 'applied' && result.goal) this.#onGoalChanged(result.goal)
+    return result
   }
 }
 
