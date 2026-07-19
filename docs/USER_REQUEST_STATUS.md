@@ -1,6 +1,6 @@
 # 사용자 요청 전체 점검표
 
-> 상태 기준 시각: 2026-07-19 08:46 (Asia/Seoul)
+> 상태 기준 시각: 2026-07-19 09:23 (Asia/Seoul)
 >
 > 이 문서는 대화에서 요청된 작업의 **누락 확인용 인벤토리**다. 제품 계약의 정본은
 > [`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md), 현재 구현 판정의 정본은
@@ -25,10 +25,10 @@
 
 | ID | 요청 | 상태 | 현재 근거와 남은 일 |
 |---|---|---|---|
-| LIVE-01 | `:4400` 새로고침 후 흰 화면 수정 | 완료 | 구버전 BFF가 `workStatus`를 생략할 때 UI가 `undefined.dot`에서 죽던 문제를 fail-safe 처리했다. `96235a0`; 실제 `/#conversations` 렌더와 브라우저 오류 0건 확인. 이미 굳은 기존 renderer 탭은 닫고 새 탭을 사용해야 할 수 있다. |
+| LIVE-01 | `:4400` 새로고침 후 흰 화면 수정 | 완료·화면 전환 회귀 수정 검증 중 | 구버전 BFF가 `workStatus`를 생략할 때 UI가 `undefined.dot`에서 죽던 문제는 fail-safe 처리했다. `96235a0`; 실제 `/#conversations` 렌더와 브라우저 오류 0건을 확인했다. 이후 홈→대화 전환에서 선택 URL만 남고 본문이 비는 별도 request-generation race를 발견해 최소 수정했으며, 현재 작업 트리에서 재검증 중이다. |
 | LIVE-02 | 정상 Claude 계정에서 “organization has disabled subscription access” 오류 수정 | 부분 완료·영구 코드 및 재시작 상태 승인 | 4400을 새 코드로 재시작하고 정책 엔진 **ON**, gateway `fill-first`, 정상 계정 active 1개·수동 정지 계정 paused 1개·engine pause 0개를 live 재확인했다. 영구 코드는 95/100% 자동 pause 제거, 전체 비수동-pause pool, ON/OFF epoch 직렬화, 매 tick `fill-first` 2xx ACK, OFF crash-recovery journal을 구현했다. 독립 적대적 APPROVE, 정책 계약 16/16과 전체 306/306·build 통과. 실제 429 동일 요청 failover와 요청 단위 upstream 계정 trace는 남았다. |
 | LIVE-03 | 순차 소진을 위해 proxy를 `fill-first`로 전환 | 완료 | 설치된 CCS 계약이 `PUT {value}`임을 확인해 live gateway를 `fill-first`로 전환했다. Baton SPA의 잘못된 `POST {strategy}`와 session-affinity POST도 PUT 계약으로 수정하고 회귀 테스트를 추가했다. `ce608ee`. |
-| LIVE-04 | 라이브 수정은 구현되는 즉시 4400에서 사용 가능하게 반영 | 부분 완료 | 최신 커밋 `b0373c0`까지 포함한 새 서버 프로세스로 4400을 재시작했다. API·정책·모델·quota 응답은 새 코드로 확인했으며, 새 대화·폴더 선택·follow-up의 브라우저 조작 E2E가 남았다. |
+| LIVE-04 | 라이브 수정은 구현되는 즉시 4400에서 사용 가능하게 반영 | 부분 완료 | 커밋 `b0373c0`과 이후 build를 반영해 4400을 재시작했다. Claude Fable 5 첫 턴, 지연 생성, 정책·모델·quota, workspace read/write 도구는 live 확인했다. 아직 커밋하지 않은 cache/compaction 및 홈→대화 회귀 수정은 최종 build·재시작·브라우저 검증 전이다. |
 
 ## 1. 프로젝트 목적·공개 저장소·개발 규율
 
@@ -38,7 +38,7 @@
 | META-02 | “Baton이 대화의 정본, provider는 현재 턴 어댑터”를 핵심 정체성으로 README에 강조 | 완료 | README 첫 설명, Why, Product invariants, Architecture에 반복 명시. `f5cd57c`. |
 | META-03 | Claude/Codex/Gemini 등 여러 계정의 usage·상태·라우팅 관리도 동등한 핵심 정체성으로 유지 | 완료 | README Why/Current status/대시보드 및 account control plane 설계에 명시. |
 | META-04 | Baton 저장소를 Agentryx-ai 조직의 public repo로 공개 | 완료 | `Agentryx-ai/Baton`, GitHub visibility=`PUBLIC`; 인증 헤더 없는 `curl`로 `https://github.com/Agentryx-ai/Baton` HTTP 200 재확인. |
-| META-05 | 작업 전·중 원자적 커밋과 push | 부분 완료·현재 작업 트리 정리됨 | 기능별 원자 커밋을 만들고 `feat/canonical-runtime-workspace`를 origin에 push했다. 최신 기능 커밋은 `b0373c0`; 작업 트리는 사용자 소유 untracked `.serena/`를 제외하면 깨끗하다. 아직 최종 검증과 main 통합은 남았다. |
+| META-05 | 작업 전·중 원자적 커밋과 push | 부분 완료·현재 기능 초안 미커밋 | 기능별 원자 커밋을 만들고 `feat/canonical-runtime-workspace`를 origin에 push했다. 최신 문서 커밋은 `91b7c8e`, 최신 기능 커밋은 `b0373c0`이다. 현재 cache identity·auto compaction·화면 전환 수정은 검증 전 작업 트리에 있으며, 사용자 소유 untracked `.serena/`는 건드리지 않는다. |
 | META-06 | 큰 작업은 실제 DAG로 분해하고 독립 노드를 병렬 실행 | 완료·계속 적용 | follow-up backend/UI/stateless steer를 독립 노드로 병렬화해 검수·통합·커밋했고, 현재 deferred session backend/UI와 compaction 사전 검토도 파일 소유권을 분리해 병렬 진행한다. |
 | META-07 | Gemini는 환불 요청 중이므로 메시지를 보내지 말고 기존 대화만 열람 | 완료(운영 제약) | live Gemini 요청을 실행하지 않았다. 인증도 현재 차단 상태다. 이후에도 명시 해제 전 live 메시지 금지. |
 | META-08 | 지금까지 요청한 모든 작업과 완수 여부를 누락 확인용으로 문서화 | 완료·계속 갱신 | 이 문서가 114개 독립 요청·질문을 ID별로 추적한다. 완료·부분 완료·검증 필요·외부 차단을 직접 근거와 남은 일로 구분했으며, 이후 상태 변화도 같은 ID에 갱신한다. |
@@ -86,14 +86,14 @@
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
 | SESSION-01 | provider-neutral 공통 세션 관리 계층 설계, Gemini 포함 | 완료(설계)·V1 구현 | canonical session/thread/turn/item/execution SQLite와 Claude/Codex/Gemini adapter가 존재. |
-| SESSION-02 | Baton만 대화 정본이고 provider는 현재 턴 실행 어댑터 | 완료(계약)·부분 구현 | README/설계/SQLite/adapter 경계에 반영. ordered content parts, compaction, child execution 등 완성 전. |
+| SESSION-02 | Baton만 대화 정본이고 provider는 현재 턴 실행 어댑터 | 완료(계약)·핵심 V1 구현·확장 진행 중 | README/설계/SQLite/adapter 경계와 canonical turn loop에 반영했다. ordered canonical items와 provider별 실행 materialization은 구현됐고, derived auto compaction은 현재 미커밋 통합·검증 중이다. Baton-managed child execution은 미완성이다. |
 | SESSION-03 | 응답마다 요청 model/실제 model/effort 등 turn 메타데이터 보존 | 완료 | assistant payload/turn provenance와 UI model label을 보존하며 Fable→Opus fallback도 구분. |
 | SESSION-04 | Codex/Claude native subagent·task가 정본 밖 대화를 만들지 못하도록 차단 | 완료(차단 모드) | Codex app-server native child/MCP/plugin/shell surface 검증 및 차단. Claude/Gemini는 Baton 도구만 전달. |
 | SESSION-05 | 향후 child execution은 Baton이 ID·계보·예산·권한을 소유 | 부분 완료 | execution schema와 delegation disabled 계약만 존재. child API/scheduler/join/cancel은 미구현. |
 | SESSION-06 | Codex native thread SSOT 모드와 Baton canonical runtime을 모순 없이 분리 | 완료(설계/설정) | native client proxy는 Codex thread SSOT, canonical runtime은 Baton SSOT로 명시. 자동 merge하지 않음. |
 | SESSION-07 | provider 간 fork/DB 직접 수정으로 이중 SSOT를 만들지 않음 | 완료(정책) | DB/JSONL 직접 mutation 금지, native import는 명시적 fork-copy만 수행. |
-| SESSION-08 | Codex/Claude 세션 포맷 차이를 분석하고 Baton이 달라야 하는 부분 반영 | 부분 완료 | provider-private continuation과 turn별 provenance를 분리했다. ordered content/artifact/compaction 모델은 남음. |
-| SESSION-09 | `prompt_cache_key`를 Baton 대화별 고유하게 사용 | 미구현 | 현재 소스에 `prompt_cache_key`/동등한 명시적 session cache key가 없다. provider 기본 캐싱에만 의존하므로 적대적 검수 요구를 아직 충족하지 못했다. |
+| SESSION-08 | Codex/Claude 세션 포맷 차이를 분석하고 Baton이 달라야 하는 부분 반영 | 부분 완료·compaction 초안 통합 | provider-private continuation과 turn별 provenance를 분리했다. ordered canonical item은 구현됐고 immutable 원문 + 파생 compaction artifact/execution manifest의 schema v13 초안이 작업 트리에 있다. 전체 회귀·적대적 검수 전이다. |
+| SESSION-09 | `prompt_cache_key`를 Baton 대화별 고유하게 사용 | 구현 초안·NO-GO | canonical thread ID와 설치 비밀의 HMAC으로 안정적이고 비가역적인 cache identity를 만드는 코드와 테스트가 작업 트리에 있다. Codex canonical loopback bridge와 Claude automatic cache control까지 연결했지만 live gateway 수용, A/B 격리, no-direct-fallback 및 전체 회귀 전이라 배포·완료로 보지 않는다. |
 
 ## 5. 네이티브 세션 가져오기·검색·그룹화
 
@@ -132,7 +132,7 @@
 | UI-17 | 세션 상태 표시 | 완료 | idle/running/wait/tool/limit/failure/completion/import/archive 상태 projection. |
 | UI-18 | active turn 중 추가 메시지, Stop과 Send 분리, pending FIFO 표시 | 완료(코드)·4400 live 대기 | durable backend/UI/stateless steer가 독립 적대적 APPROVE와 전체 회귀를 통과해 `f066f5d`로 커밋됐다. 실제 4400 렌더·전송 확인은 최종 live gate에 포함한다. |
 | UI-19 | ChatGPT·Claude·Gemini 웹과 Codex/Claude Desktop/CLI의 대화 표시를 벤치마킹 | 부분 완료 | 2-column, compact tool details, long-message disclosure, model/effort metadata에 반영했다. 제품별 최신 버전의 동일 시나리오 스크린샷 비교표와 최종 시각 승인 기록은 아직 없다. Gemini에는 메시지를 보내지 않았다. |
-| UI-20 | 테스트 메시지를 보내도 응답이 오지 않는 문제 | 부분 완료 | provider loop/오류 표시는 구현됐지만 당시 실제 실패 요청의 end-to-end 원인과 동일 조건 재검증 기록이 없다. Claude live routing 영구 수정 및 workspace live smoke와 함께 다시 확인해야 한다. |
+| UI-20 | 테스트 메시지를 보내도 응답이 오지 않는 문제 | 완료(Claude live)·Codex 재검증 필요 | 재시작한 4400에서 Claude Fable 5 첫 턴이 terminal 완료되고 한글 응답이 표시되는 것을 확인했다. workspace 도구 턴도 완료됐다. 현재 cache bridge 통합 뒤 Codex live 재검증과 일반 오류 경로 회귀는 남아 있다. |
 
 ## 7. 로컬 폴더 권한·프로젝트별 새 대화·도구
 
@@ -141,9 +141,9 @@
 | WORKSPACE-01 | 사용자 허용 후 Baton이 로컬 폴더 파일에 접근 | 완료(코드)·live E2E 대기 | 절대 `cwd` realpath/CAS와 root 한정 도구(`405d6bd`), native picker host API(`006a7d6`), 대화 UI 선택·연결을 통합했다. 실제 선택 폴더 read/write turn은 4400 live gate에 남았다. |
 | WORKSPACE-02 | 폴더별로 접근을 요청·허용 | 완료(코드)·live E2E 대기 | 명시적 사용자 클릭의 OS native picker, 취소·typed error, 기존/신규 세션별 연결·해제를 구현했다. |
 | WORKSPACE-03 | 폴더(프로젝트)별 작업/세션 생성 | 완료(코드) | 첫 turn 원자 생성 시 canonical cwd를 session grouping identity로 저장하며, 폴더 없는 `cwd=null` 일반 chat도 지원한다. |
-| WORKSPACE-04 | “새 대화” 클릭만으로 DB 세션을 만들지 않고 임시 composer에서 폴더/model/message를 고른 뒤 첫 전송 때 원자 생성 | 완료(코드)·4400 live 대기 | 클릭은 sessionStorage draft만 만들고 API를 호출하지 않는다. 첫 send의 단일 idempotent PUT이 session/thread/turn/execution/items/events를 `BEGIN IMMEDIATE`로 생성한다. unknown delivery는 frozen ID/body 재시도, 409 conflict는 명시적 새 draft ID로 처리한다. 독립 감사 98/98·전체 323/323 APPROVE. |
+| WORKSPACE-04 | “새 대화” 클릭만으로 DB 세션을 만들지 않고 임시 composer에서 폴더/model/message를 고른 뒤 첫 전송 때 원자 생성 | 완료·4400 live 확인 | 클릭 전후 session count가 같고, 첫 Enter 전송 때에만 draft ID와 같은 canonical session이 생성되어 Claude 응답까지 완료되는 것을 확인했다. 단일 idempotent PUT/`BEGIN IMMEDIATE`, unknown-delivery 재시도와 409 새 draft 처리 계약도 유지된다. |
 | WORKSPACE-05 | 가져온 세션의 source cwd는 제안일 뿐, 명시 연결 전 권한 없음 | 완료 | source cwd와 authorized cwd를 분리하고 drift/junction 교체를 fail-closed 처리. |
-| WORKSPACE-06 | 실제 file tool call이 동작 | 완료(V1)·live E2E 필요 | read/list/search/write/replace broker와 durability/realpath/CAS 테스트가 있다. 4400에서 사용자 선택 폴더를 연결한 실제 turn E2E는 남음. |
+| WORKSPACE-06 | 실제 file tool call이 동작 | 완료(V1)·live E2E 확인 | 임시 허용 root에서 Claude가 `write_file`→`read_file`을 호출하고 정확한 `BATON_WORKSPACE_OK` 내용을 읽은 뒤 turn을 완료했다. smoke session은 휴지통으로 이동했다. OS picker의 실제 마우스 선택 경로는 별도 브라우저 자동화 제약 때문에 아직 수동 확인이 필요하다. |
 | WORKSPACE-07 | `run_command`도 안전하게 사용 | 미완료·fail-closed | Windows sandbox가 cwd 밖 read를 막는다는 검증이 부족해 광고하지 않는다. elevated backend/검증 뒤 opt-in 필요. |
 | WORKSPACE-08 | 웹보다 Electron 등 Desktop 전환이 적합하면 전환 | 결정 필요 | 전체 Electron migration은 아직 하지 않았다. 현재 핵심 blocker는 웹 UI 자체가 아니라 BFF에 안전한 native directory grant/picker가 없는 점이다. 이를 작은 host capability로 해결 가능한지 먼저 구현·검증한 뒤 전환 여부를 결정한다. |
 
@@ -172,11 +172,11 @@
 
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
-| CONTEXT-01 | 서로 다른 대화 A/B를 번갈아 실행해도 provider cache가 세션별로 작동하는지 설명 | 답변 완료·제품 검증 미완료 | 대화별 안정 prefix/cache key가 중요하다고 설명했으나 Baton에는 명시적 `prompt_cache_key`가 없어 실제 hit-rate instrumentation이 없다. |
+| CONTEXT-01 | 서로 다른 대화 A/B를 번갈아 실행해도 provider cache가 세션별로 작동하는지 설명 | 구현 초안·live/계측 검증 미완료 | canonical thread별 HMAC cache identity를 추가해 A/B가 같은 key를 공유하지 않고 같은 대화의 turn은 안정 key를 재사용하도록 했다. Codex bridge unit과 Claude cache-control unit은 있으나 실제 provider hit/miss 수치 계측과 live 교차 실행은 아직 없다. |
 | CONTEXT-02 | Codex CLI 세션 포맷과 Baton 포맷 비교, Baton만의 필수 차이 정의 | 완료(설계) | provider-neutral item/event, turn별 model provenance, provider-private binding 분리를 설계·부분 구현. |
-| CONTEXT-03 | Codex auto compact 동작을 참고해 Baton auto compact 구현 | 미착수(구현) | Codex native compaction event 관측/기록만 한다. Baton context builder의 budget-triggered compaction은 없다. |
+| CONTEXT-03 | Codex auto compact 동작을 참고해 Baton auto compact 구현 | 구현 초안·NO-GO | pre-turn budget trigger, 보수적 UTF-8 token 추정, provider 실행 요약 생성, immutable artifact, hash-chain job event, exact execution manifest를 schema v13과 orchestrator에 통합했다. 원문 canonical items는 삭제·교체하지 않으며 오류 시 full-history로 fail-safe한다. 전체 회귀와 적대적 검수, live 장문 턴 전이라 미커밋 상태다. |
 | CONTEXT-04 | compaction 시 정본 원문을 남길지 정본 자체를 축약할지 결정 | 완료(설계) | **원문 canonical items는 불변으로 보존**하고 compaction은 exact covered range/source hash를 가진 재생성 가능한 derived item으로 저장한다. 최신 valid compaction + uncovered suffix만 provider context에 materialize한다. [`COMMON_SESSION_DESIGN.md`](COMMON_SESSION_DESIGN.md) §7. |
-| CONTEXT-05 | provider-private continuation을 잘못 compact하지 않음 | 완료(계약)·구현 필요 | pending provider-private blocks는 compact/타 provider 이동 금지로 계약했다. 실제 Baton compactor가 아직 없음. |
+| CONTEXT-05 | provider-private continuation을 잘못 compact하지 않음 | 구현 초안·적대적 검수 필요 | summary source에서는 provider-private item을 제외하고 canonical 원문과 execution manifest에는 보존한다. 다만 covered 과거 continuation을 새 summary 뒤 provider에 다시 materialize하는 현재 경계가 continuation 호환성에 안전한지 독립 검수가 필요하다. |
 
 ## 10. 모델·provider 표시와 fallback
 
@@ -214,14 +214,15 @@
 
 1. **Claude 영구 라우팅 live gate** — 95% 선제 pause 제거·전체 pool·fill-first 영구 코드는 승인·커밋됐고,
    정책 ON 재시작까지 확인했다. 실제 429 same-request failover와 요청 단위 upstream 계정 trace를 남겼다.
-2. **native folder grant + deferred conversation creation** — 폴더 선택/허용 → 임시 composer → 첫 전송에서
-   session+turn 원자 생성. 이 경로로 실제 read/write tool E2E를 수행한다.
+2. **native folder grant + deferred conversation creation** — 지연 생성과 허용 root의 실제 read/write tool turn은 live 통과했다.
+   OS native picker를 사용자가 직접 선택하는 UI 경로와 홈→대화 전환 race 수정만 최종 브라우저에서 재검증한다.
 3. **Fable 5 quota live UI** — raw schema discovery와 BFF 보강 코드는 `dc4434d`로 완료됐고 재시작한 4400 API에서
    Fable 전용 window를 확인했다. 브라우저 게이지만 검증한다.
-4. **Baton auto compaction** — immutable canonical history를 유지하는 derived compaction 정책을 context builder와
-   SQLite/API/UI에 구현하고 exact-range/source-hash/replay/provider-switch tests를 추가한다.
-5. **cache identity** — provider가 지원하는 경우 Baton thread별 안정적인 cache key를 적용하고 A/B 교차 실행 hit/miss를 계측한다.
-6. **전체 완료 audit** — typecheck, lint, full tests, clean build, DB v10→v12 reopen, 4400 browser, Claude/Codex live turn,
+4. **Baton auto compaction** — schema v13/context builder/orchestrator의 미커밋 초안을 적대적으로 검수하고
+   provider-private continuation·fork·실패 turn 경계를 확정한 뒤 전체 회귀를 통과시킨다.
+5. **cache identity** — thread별 HMAC identity와 Codex bridge/Claude cache-control 초안을 live 검증하고 A/B 격리,
+   proxy failure 시 no-direct-fallback, 가능한 범위의 hit/miss 관측을 완료한다.
+6. **전체 완료 audit** — typecheck, lint, full tests, clean build, DB v10→v13 reopen, 4400 browser, Claude/Codex live turn,
    proxy failure/no-direct-fallback, workspace tool, Goal/follow-up 우선순위를 검증한다.
 
 ## 14. 명시적으로 누락 여부를 확인할 항목
@@ -231,12 +232,12 @@
 - [ ] 실제 429 전까지 정상 Claude 계정을 유지하고 429에서 같은 요청을 failover
 - [ ] 403/만료 Claude 계정을 자동 INELIGIBLE 처리
 - [ ] Claude Fable 5 전용 usage 게이지의 4400 시각 검증(API는 확인 완료)
-- [ ] `prompt_cache_key` 또는 provider별 동등 cache identity의 Baton thread별 적용과 적대적 검수
+- [ ] `prompt_cache_key` 또는 provider별 동등 cache identity의 Baton thread별 초안 검증·적대적 검수·커밋
 - [x] 실행 중 follow-up의 durable FIFO/steer/next-turn/Goal-priority 코드 통합(브라우저 live만 남음)
-- [x] OS native 폴더 선택·권한 허용 UX 코드 통합(실제 선택 live만 남음)
-- [x] 첫 메시지를 보낼 때만 session+turn을 원자 생성하는 새 대화 UX 코드 통합(브라우저 live만 남음)
-- [ ] 선택 폴더에서 실제 Baton file tool live E2E
-- [ ] provider-neutral Baton auto compaction 구현
+- [x] OS native 폴더 선택·권한 허용 UX 코드 통합(실제 picker 선택 live만 남음)
+- [x] 첫 메시지를 보낼 때만 session+turn을 원자 생성하는 새 대화 UX 코드 및 브라우저 live
+- [x] 허용된 선택 root에서 실제 Baton file tool live E2E
+- [ ] provider-neutral Baton auto compaction 초안의 적대적 검수·전체 회귀·커밋
 - [ ] Baton-managed child execution 및 approval/user-input wait
 - [ ] Codex native-openai ChatGPT/API-key 실제 proxy 경유와 no-direct-fallback smoke
 - [ ] native 원본↔Baton authority migration/sync
