@@ -8,6 +8,7 @@ import {
   isLongConversationText,
   latestUsageSummary,
   payloadText,
+  tailConversationEntries,
   transcriptItems,
   usageSummary,
 } from '../src/features/conversations/conversation-presentation.ts'
@@ -88,6 +89,20 @@ test('tool calls and results become one compact transcript entry', () => {
   assert.equal(entries.length, 1)
   assert.equal(entries[0]?.toolResult?.id, 'result')
   assert.equal(activitySummary(call, result), '읽기 · src/App.tsx · 완료')
+})
+
+test('large transcripts render a bounded tail while retaining an explicit hidden count', () => {
+  const entries = conversationEntries([
+    { ...item({ text: 'one' }), id: 'one', kind: 'assistant_message' },
+    { ...item({ text: 'two' }), id: 'two', kind: 'assistant_message' },
+    { ...item({ text: 'three' }), id: 'three', kind: 'assistant_message' },
+  ])
+
+  assert.deepEqual(tailConversationEntries(entries, 2), {
+    entries: entries.slice(1),
+    hiddenCount: 1,
+  })
+  assert.deepEqual(tailConversationEntries(entries, 20), { entries, hiddenCount: 0 })
 })
 
 test('nested canonical tool results preserve success and failure presentation', () => {

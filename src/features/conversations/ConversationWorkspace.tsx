@@ -34,7 +34,7 @@ import { cn } from '@/lib/utils'
 import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
-import { conversationEntries, latestUsageSummary } from './conversation-presentation'
+import { conversationEntries, latestUsageSummary, tailConversationEntries } from './conversation-presentation'
 import {
   clearConversationDraft,
   applyDraftFolderSelection,
@@ -138,6 +138,7 @@ const EFFORT_NAME: Record<string, string> = {
 }
 
 const SESSION_PROJECTION_POLL_MS = 10_000
+const TRANSCRIPT_PAGE_SIZE = 200
 
 interface SessionProjectionPollHost {
   setInterval(callback: () => void, delayMs: number): number
@@ -660,6 +661,10 @@ export function ConversationWorkspace({
   const [selectedLdPlayer, setSelectedLdPlayer] = useState('')
   const [ldPlayerBusy, setLdPlayerBusy] = useState(false)
   const [ldPlayerError, setLdPlayerError] = useState<string | null>(null)
+  const [transcriptWindow, setTranscriptWindow] = useState<{ threadId: string | null; limit: number }>({
+    threadId: null,
+    limit: TRANSCRIPT_PAGE_SIZE,
+  })
   const [sessionScope, setSessionScope] = useState<'active' | 'trash'>('active')
   const [pendingArchive, setPendingArchive] = useState<CanonicalSessionDto | null>(null)
   const [changingSessionId, setChangingSessionId] = useState<string | null>(null)
@@ -1327,7 +1332,14 @@ export function ConversationWorkspace({
 
   const latestTurn = snapshot?.turns.at(-1) ?? null
   const latestUsage = latestUsageSummary(snapshot?.turns ?? [])
-  const visibleEntries = conversationEntries(snapshot?.items ?? [])
+  const visibleEntries = useMemo(
+    () => conversationEntries(snapshot?.items ?? []),
+    [snapshot?.items],
+  )
+  const transcriptLimit = transcriptWindow.threadId === threadId
+    ? transcriptWindow.limit
+    : TRANSCRIPT_PAGE_SIZE
+  const transcriptEntries = tailConversationEntries(visibleEntries, transcriptLimit)
   const turnsById = useMemo(
     () => new Map((snapshot?.turns ?? []).map((turn) => [turn.id, turn] as const)),
     [snapshot?.turns],
@@ -1928,9 +1940,27 @@ export function ConversationWorkspace({
               </div>
             ) : (
               <div>
-                {visibleEntries.map(({ item, toolResult }, index) => {
+                {transcriptEntries.hiddenCount > 0 ? (
+                  <div className="mb-6 flex flex-col items-center gap-2 text-center">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setTranscriptWindow({
+                        threadId,
+                        limit: transcriptLimit + TRANSCRIPT_PAGE_SIZE,
+                      })}
+                    >
+                      이전 기록 {Math.min(TRANSCRIPT_PAGE_SIZE, transcriptEntries.hiddenCount)}개 더 보기
+                    </Button>
+                    <p className="text-xs text-muted-foreground">
+                      빠른 표시를 위해 이전 기록 {transcriptEntries.hiddenCount}개를 접었습니다.
+                    </p>
+                  </div>
+                ) : null}
+                {transcriptEntries.entries.map(({ item, toolResult }, index) => {
                   const compact = isCompactTranscriptItem(item)
-                  const previousCompact = index > 0 && isCompactTranscriptItem(visibleEntries[index - 1]!.item)
+                  const previousCompact = index > 0 && isCompactTranscriptItem(transcriptEntries.entries[index - 1]!.item)
                   return (
                     <div key={item.id} className={cn(index > 0 && (compact && previousCompact ? 'mt-2' : 'mt-7'))}>
                       <ConversationItem

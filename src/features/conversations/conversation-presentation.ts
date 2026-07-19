@@ -85,6 +85,15 @@ export interface ConversationDisplayEntry {
   toolResult: CanonicalItemDto | null
 }
 
+export function tailConversationEntries(
+  entries: ConversationDisplayEntry[],
+  limit: number,
+): { entries: ConversationDisplayEntry[]; hiddenCount: number } {
+  const visibleCount = Math.max(0, Math.floor(limit))
+  const hiddenCount = Math.max(0, entries.length - visibleCount)
+  return { entries: entries.slice(hiddenCount), hiddenCount }
+}
+
 export function conversationEntries(items: CanonicalItemDto[]): ConversationDisplayEntry[] {
   const entries: ConversationDisplayEntry[] = []
   const toolCalls = new Map<string, number>()
