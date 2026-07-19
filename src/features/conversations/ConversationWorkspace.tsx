@@ -859,10 +859,10 @@ export function ConversationWorkspace({
   }, [])
 
   useEffect(() => {
+    // refreshThread increments its own generation, so the next thread request
+    // already invalidates the previous one. Cleanup must not invalidate the
+    // only request issued by a StrictMode remount (home -> conversation).
     void refreshThread()
-    return () => {
-      threadRequest.current += 1
-    }
   }, [refreshThread])
 
   const onStreamEvent = useCallback(() => refreshThread(), [refreshThread])
