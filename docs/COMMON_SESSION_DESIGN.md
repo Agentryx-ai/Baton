@@ -321,6 +321,19 @@ The append-only canonical history is never destructively shortened. Before each 
 
 A compaction item records its covered item range, generating provider/model, prompt version, visible summary, and source hash. It is a derived view, not a replacement for history.
 
+The implemented V1 keeps this boundary deterministic:
+
+- the canonical source items remain append-only; compaction never edits or deletes them;
+- each artifact binds the exact source prefix, prior artifact, portable delta, terminal turn receipts, prompt version, generator identity, and hashes;
+- the provider receives the newest valid artifact plus the uncovered suffix, while covered provider-private continuation is retired rather than summarized or replayed;
+- one authoritative head per thread advances by compare-and-set;
+- reservation, orphan recovery, and lease acquisition occur in one `BEGIN IMMEDIATE` transaction before provider generation;
+- a queued orphan or expired competing lease becomes a durable failed receipt before another generation contract can own the same frontier;
+- an intact competing lease is never preempted, and incomplete/cyclic artifact chains fail closed;
+- first-turn oversize and post-compaction oversize are rejected before an unsafe provider request.
+
+Cache identity is separate from compaction identity. Baton derives a stable, non-reversible cache key from the installation secret and canonical thread ID. The same conversation reuses it across turns; different Baton conversations cannot alias it. Provider-private credentials and continuation bytes are not inputs to that key.
+
 ## 8. Consistency and failure rules
 
 - SQLite in WAL mode is the first storage implementation, behind a `SessionStore` interface.
