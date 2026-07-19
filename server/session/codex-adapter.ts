@@ -16,6 +16,11 @@ import type {
   SessionProviderAdapter,
 } from './adapter.ts'
 import type { AgentToolResult, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import {
+  canonicalConversationCacheKey,
+  startCanonicalResponsesBridge,
+  type CanonicalResponsesBridge,
+} from './canonical-cache-identity.ts'
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
@@ -78,10 +83,13 @@ export interface CodexAdapterOptions {
   proxyConnection?: () => Promise<CodexProxyConnection>
   /** Test/embedding override. Production defaults to a fresh Baton-owned temporary home. */
   isolatedCodexHome?: string
+  /** Durable installation-local secret; never sent to Codex or the upstream provider. */
+  cacheIdentitySecret?: Uint8Array
 }
 
 interface MaterializedCodexTurn {
   turnId: string
+  canonicalThreadId: string
   model: string
   effort: string | null
   cwd: string | null
@@ -257,6 +265,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   private readonly proxyConnectionProvider: (() => Promise<CodexProxyConnection>) | undefined
   private readonly isolatedCodexHome: string
   private readonly ownsIsolatedCodexHome: boolean
+  private readonly cacheIdentitySecret: Buffer | null
   private proxyConnection: CodexProxyConnection | null = null
   private initializePromise: Promise<AdapterHandshake> | null = null
   private mcpDisableOverrides: Record<string, false> = {}
@@ -268,6 +277,12 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     this.processFactory = options.processFactory ?? spawnCodexProcess
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000
     this.proxyConnectionProvider = options.proxyConnection
+    this.cacheIdentitySecret = options.cacheIdentitySecret === undefined
+      ? null
+      : Buffer.from(options.cacheIdentitySecret)
+    if (this.cacheIdentitySecret !== null && this.cacheIdentitySecret.byteLength < 32) {
+      throw new TypeError('Codex canonical cache identity secret must contain at least 32 bytes')
+    }
     this.ownsIsolatedCodexHome = options.isolatedCodexHome === undefined && options.processFactory === undefined
     this.isolatedCodexHome = options.isolatedCodexHome
       ?? (options.processFactory
@@ -313,6 +328,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     })
     const body: MaterializedCodexTurn = {
       turnId: request.turnId,
+      canonicalThreadId: snapshot.thread.id,
       model: request.model,
       effort: request.effort ?? null,
       cwd: snapshot.session.cwd,
@@ -333,11 +349,31 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     if (this.shuttingDown) throw new Error('Codex adapter is shutting down')
     await this.initialize()
     const body = parseMaterializedRequest(request.body)
-    const process = this.processFactory(
-      this.executable,
-      launchArgs(this.mcpDisableOverrides, this.proxyConnection),
-      proxyEnvironment(this.proxyConnection, this.isolatedCodexHome),
-    )
+    let cacheBridge: CanonicalResponsesBridge | null = null
+    let process: CodexAppServerProcess
+    try {
+      cacheBridge = this.proxyConnection && this.cacheIdentitySecret
+        ? await startCanonicalResponsesBridge({
+            upstreamBaseUrl: this.proxyConnection.baseUrl,
+            upstreamToken: this.proxyConnection.token,
+            promptCacheKey: canonicalConversationCacheKey(
+              this.cacheIdentitySecret,
+              body.canonicalThreadId,
+            ),
+          })
+        : null
+      const executionConnection = cacheBridge
+        ? { baseUrl: cacheBridge.baseUrl, token: cacheBridge.token }
+        : this.proxyConnection
+      process = this.processFactory(
+        this.executable,
+        launchArgs(this.mcpDisableOverrides, executionConnection),
+        proxyEnvironment(executionConnection, this.isolatedCodexHome),
+      )
+    } catch (error) {
+      await cacheBridge?.close().catch(() => undefined)
+      throw error
+    }
     const client = new CodexJsonlRpcClient(process)
     const eventQueue = new AsyncQueue<NativeProviderEvent>()
     let terminalResult: ProviderTerminalResult | null = null
@@ -444,6 +480,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           delay(this.shutdownTimeoutMs),
         ])
       }
+      await cacheBridge?.close().catch(() => undefined)
     }
 
     const cancel = async (code = 'user_cancelled', message = 'Codex turn was cancelled'): Promise<void> => {
@@ -854,6 +891,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         mcpServersDisabled: Object.keys(this.mcpDisableOverrides).length,
         toolTransport: 'client-owned-dynamic-functions',
         providerLocalMetadataTools: ['update_plan'],
+        canonicalCacheIdentity: this.cacheIdentitySecret
+          ? 'hmac-sha256-loopback-responses-bridge-v1'
+          : 'disabled-no-installation-secret',
       },
     }
   }
@@ -996,6 +1036,7 @@ function parseMaterializedRequest(value: unknown): MaterializedCodexTurn {
   }
   return {
     turnId: requiredString(body.turnId, 'canonical turn id'),
+    canonicalThreadId: requiredString(body.canonicalThreadId, 'canonical thread id'),
     model: requiredString(body.model, 'Codex model'),
     effort: typeof body.effort === 'string' ? body.effort : null,
     cwd: typeof body.cwd === 'string' ? body.cwd : null,

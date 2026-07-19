@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from 'node:crypto'
+import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { DatabaseSync, type StatementSync } from 'node:sqlite'
 
 import type {
@@ -16,8 +16,18 @@ import type {
   CanonicalStreamEventType,
   CanonicalThread,
   CanonicalTurn,
+  ClaimContextCompactionJobInput,
+  CompleteContextCompactionJobInput,
+  ContextCompactionArtifact,
+  ContextCompactionJob,
+  ContextCompactionSourceItem,
+  CreateContextCompactionJobInput,
+  CreateExecutionContextManifestInput,
   CreateSessionInput,
+  ExecutionContextManifest,
+  ExecutionContextManifestEntry,
   ExecutionPolicySnapshot,
+  FailContextCompactionJobInput,
   FinishTurnInput,
   GoalSchedulerLease,
   GoalId,
@@ -26,6 +36,7 @@ import type {
   NewCanonicalItem,
   ProviderBinding,
   ProviderCapabilities,
+  ReserveContextCompactionJobInput,
   SessionId,
   ThreadId,
   ThreadSnapshot,
@@ -33,6 +44,7 @@ import type {
   UpsertProviderBindingInput,
 } from './domain.ts'
 import { uuidV7 } from './domain.ts'
+import { hasSafeContextToolState } from './context-materializer.js'
 import type {
   ClaimGoalLeaseInput,
   ClaimFollowUpInput,
@@ -75,7 +87,7 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 12
+const SCHEMA_VERSION = 14
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
 const DEFAULT_GOAL_LEASE_MS = 30_000
@@ -116,6 +128,41 @@ function canonicalJson(value: unknown): string {
     throw new TypeError(`Canonical JSON rejects ${typeof current} values`)
   }
   return JSON.stringify(visit(value))
+}
+
+function sha256Canonical(value: unknown): string {
+  return createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex')
+}
+
+function validateSha256(value: string, field: string): void {
+  if (!/^[0-9a-f]{64}$/u.test(value)) {
+    throw new ContextPersistenceError('invalid_input', `${field} must be a lowercase SHA-256 digest`)
+  }
+}
+
+export class ContextPersistenceError extends Error {
+  public readonly code:
+    | 'not_found'
+    | 'invalid_input'
+    | 'idempotency_conflict'
+    | 'stale_frontier'
+    | 'lease_lost'
+    | 'integrity_violation'
+
+  constructor(
+    code:
+      | 'not_found'
+      | 'invalid_input'
+      | 'idempotency_conflict'
+      | 'stale_frontier'
+      | 'lease_lost'
+      | 'integrity_violation',
+    message: string,
+  ) {
+    super(message)
+    this.code = code
+    this.name = 'ContextPersistenceError'
+  }
 }
 
 const SESSION_PREVIEW_CODE_POINTS = 240
@@ -227,8 +274,17 @@ export class SqliteSessionStore implements SessionStore {
       PRAGMA trusted_schema = OFF;
       PRAGMA busy_timeout = 5000;
     `)
-    this.#migrate()
-    this.#nativeIdentityKey = this.#loadNativeIdentityKey()
+    try {
+      this.#migrate()
+      this.#nativeIdentityKey = this.#loadNativeIdentityKey()
+    } catch (error) {
+      try {
+        this.#db.close()
+      } catch {
+        // Preserve the schema/opening error that caused fail-closed startup.
+      }
+      throw error
+    }
   }
 
   #migrate(): void {
@@ -775,11 +831,283 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 12')
         appliedVersion = 12
       }
+      if (appliedVersion < 13) {
+        this.#db.exec(`
+          CREATE TABLE context_compaction_jobs (
+            id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            request_key TEXT NOT NULL CHECK(length(request_key) BETWEEN 1 AND 200),
+            request_hash TEXT NOT NULL CHECK(length(request_hash)=64),
+            source_item_ids_json TEXT NOT NULL
+              CHECK(json_valid(source_item_ids_json) AND json_type(source_item_ids_json)='array'
+                AND json_array_length(source_item_ids_json)>0),
+            source_hash TEXT NOT NULL CHECK(length(source_hash)=64),
+            summary_input_hash TEXT NOT NULL CHECK(length(summary_input_hash)=64),
+            status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed')),
+            revision INTEGER NOT NULL CHECK(revision>=1),
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count>=0),
+            error_json TEXT CHECK(error_json IS NULL OR json_valid(error_json)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            UNIQUE(thread_id,request_key),
+            CHECK((status='running')=(lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)),
+            CHECK((status IN ('completed','failed'))=(completed_at IS NOT NULL)),
+            CHECK((status='failed')=(error_json IS NOT NULL))
+          ) STRICT;
+          CREATE INDEX context_compaction_jobs_queue
+            ON context_compaction_jobs(status,created_at,id) WHERE status IN ('queued','running');
+
+          CREATE TABLE context_compactions (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL UNIQUE REFERENCES context_compaction_jobs(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            source_hash TEXT NOT NULL CHECK(length(source_hash)=64),
+            summary_input_hash TEXT NOT NULL CHECK(length(summary_input_hash)=64),
+            artifact_hash TEXT NOT NULL UNIQUE CHECK(length(artifact_hash)=64),
+            summary_json TEXT NOT NULL CHECK(json_valid(summary_json) AND json_type(summary_json)='object'),
+            generator_provider TEXT NOT NULL CHECK(generator_provider IN ('claude','codex','gemini')),
+            generator_model TEXT NOT NULL CHECK(length(generator_model)>=1),
+            generator_version TEXT NOT NULL CHECK(length(generator_version)>=1),
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX context_compactions_thread_created
+            ON context_compactions(thread_id,created_at,id);
+
+          CREATE TABLE context_compaction_source_items (
+            compaction_id TEXT NOT NULL REFERENCES context_compactions(id) ON DELETE RESTRICT,
+            ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+            item_id TEXT NOT NULL REFERENCES items(id) ON DELETE RESTRICT,
+            item_sequence INTEGER NOT NULL CHECK(item_sequence>=1),
+            item_digest TEXT NOT NULL CHECK(length(item_digest)=64),
+            PRIMARY KEY(compaction_id,ordinal),
+            UNIQUE(compaction_id,item_id)
+          ) WITHOUT ROWID, STRICT;
+
+          CREATE TABLE context_compaction_job_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL REFERENCES context_compaction_jobs(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            revision INTEGER NOT NULL CHECK(revision>=1),
+            status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed')),
+            payload_json TEXT NOT NULL CHECK(json_valid(payload_json) AND json_type(payload_json)='object'),
+            state_hash TEXT NOT NULL CHECK(length(state_hash)=64),
+            previous_event_hash TEXT CHECK(previous_event_hash IS NULL OR length(previous_event_hash)=64),
+            event_hash TEXT NOT NULL UNIQUE CHECK(length(event_hash)=64),
+            created_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX context_compaction_job_events_job
+            ON context_compaction_job_events(job_id,sequence);
+
+          CREATE TABLE execution_context_manifests (
+            id TEXT PRIMARY KEY,
+            execution_id TEXT NOT NULL UNIQUE REFERENCES executions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            materializer_version TEXT NOT NULL CHECK(length(materializer_version)>=1),
+            materialized_context_hash TEXT NOT NULL CHECK(length(materialized_context_hash)=64),
+            manifest_hash TEXT NOT NULL UNIQUE CHECK(length(manifest_hash)=64),
+            created_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE execution_context_manifest_entries (
+            manifest_id TEXT NOT NULL REFERENCES execution_context_manifests(id) ON DELETE RESTRICT,
+            ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('canonical_item','compaction')),
+            item_id TEXT REFERENCES items(id) ON DELETE RESTRICT,
+            compaction_id TEXT REFERENCES context_compactions(id) ON DELETE RESTRICT,
+            digest TEXT NOT NULL CHECK(length(digest)=64),
+            PRIMARY KEY(manifest_id,ordinal),
+            CHECK(
+              (source_kind='canonical_item' AND item_id IS NOT NULL AND compaction_id IS NULL)
+              OR (source_kind='compaction' AND item_id IS NULL AND compaction_id IS NOT NULL)
+            )
+          ) WITHOUT ROWID, STRICT;
+
+          CREATE TRIGGER context_compaction_jobs_immutable_columns BEFORE UPDATE ON context_compaction_jobs
+          WHEN NEW.id IS NOT OLD.id OR NEW.thread_id IS NOT OLD.thread_id
+            OR NEW.request_key IS NOT OLD.request_key OR NEW.request_hash IS NOT OLD.request_hash
+            OR NEW.source_item_ids_json IS NOT OLD.source_item_ids_json
+            OR NEW.source_hash IS NOT OLD.source_hash OR NEW.summary_input_hash IS NOT OLD.summary_input_hash
+            OR NEW.created_at IS NOT OLD.created_at
+          BEGIN SELECT RAISE(ABORT, 'compaction job identity is immutable'); END;
+          CREATE TRIGGER context_compaction_jobs_terminal BEFORE UPDATE ON context_compaction_jobs
+          WHEN OLD.status IN ('completed','failed')
+          BEGIN SELECT RAISE(ABORT, 'terminal compaction jobs are immutable'); END;
+          CREATE TRIGGER context_compaction_jobs_transition BEFORE UPDATE OF status ON context_compaction_jobs
+          WHEN NOT (
+            (OLD.status='queued' AND NEW.status='running')
+            OR (OLD.status='running' AND NEW.status IN ('running','queued','completed','failed'))
+          )
+          BEGIN SELECT RAISE(ABORT, 'invalid compaction job transition'); END;
+          CREATE TRIGGER context_compaction_jobs_no_delete BEFORE DELETE ON context_compaction_jobs
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction jobs are durable'); END;
+
+          CREATE TRIGGER context_compactions_no_update BEFORE UPDATE ON context_compactions
+          BEGIN SELECT RAISE(ABORT, 'compaction artifacts are append-only'); END;
+          CREATE TRIGGER context_compactions_no_delete BEFORE DELETE ON context_compactions
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction artifacts are append-only'); END;
+          CREATE TRIGGER context_compaction_sources_no_update BEFORE UPDATE ON context_compaction_source_items
+          BEGIN SELECT RAISE(ABORT, 'compaction provenance is append-only'); END;
+          CREATE TRIGGER context_compaction_sources_no_delete BEFORE DELETE ON context_compaction_source_items
+          WHEN NOT EXISTS (
+            SELECT 1 FROM context_compactions c JOIN threads th ON th.id=c.thread_id
+            JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE c.id=OLD.compaction_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction provenance is append-only'); END;
+          CREATE TRIGGER context_compaction_events_no_update BEFORE UPDATE ON context_compaction_job_events
+          BEGIN SELECT RAISE(ABORT, 'compaction events are append-only'); END;
+          CREATE TRIGGER context_compaction_events_no_delete BEFORE DELETE ON context_compaction_job_events
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction events are append-only'); END;
+          CREATE TRIGGER execution_context_manifests_no_update BEFORE UPDATE ON execution_context_manifests
+          BEGIN SELECT RAISE(ABORT, 'execution context manifests are append-only'); END;
+          CREATE TRIGGER execution_context_manifests_no_delete BEFORE DELETE ON execution_context_manifests
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'execution context manifests are append-only'); END;
+          CREATE TRIGGER execution_context_entries_no_update BEFORE UPDATE ON execution_context_manifest_entries
+          BEGIN SELECT RAISE(ABORT, 'execution context provenance is append-only'); END;
+          CREATE TRIGGER execution_context_entries_no_delete BEFORE DELETE ON execution_context_manifest_entries
+          WHEN NOT EXISTS (
+            SELECT 1 FROM execution_context_manifests m JOIN threads th ON th.id=m.thread_id
+            JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE m.id=OLD.manifest_id
+          ) BEGIN SELECT RAISE(ABORT, 'execution context provenance is append-only'); END;
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(13, 'derived-context-compaction-provenance', this.#now())
+        this.#db.exec('PRAGMA user_version = 13')
+        appliedVersion = 13
+      }
+      if (appliedVersion < 14) {
+        const derivedRows = integer(this.#one(this.#db.prepare(`
+          SELECT
+            (SELECT COUNT(*) FROM context_compaction_jobs)
+            + (SELECT COUNT(*) FROM context_compactions)
+            + (SELECT COUNT(*) FROM context_compaction_source_items)
+            + (SELECT COUNT(*) FROM context_compaction_job_events)
+            + (SELECT COUNT(*) FROM execution_context_manifests)
+            + (SELECT COUNT(*) FROM execution_context_manifest_entries) AS count
+        `)), 'count')
+        if (derivedRows !== 0) {
+          throw new ContextPersistenceError(
+            'integrity_violation',
+            'Schema v13 contains derived-context rows that require an explicit frontier migration',
+          )
+        }
+        this.#db.exec(`
+          DROP TRIGGER context_compaction_jobs_immutable_columns;
+          DROP TRIGGER context_compaction_jobs_terminal;
+          DROP TRIGGER context_compaction_jobs_transition;
+
+          ALTER TABLE context_compaction_jobs ADD COLUMN expected_previous_artifact_id TEXT
+            CHECK(expected_previous_artifact_id IS NULL OR length(expected_previous_artifact_id)>=1);
+          CREATE UNIQUE INDEX context_compaction_jobs_active_frontier
+            ON context_compaction_jobs(thread_id,COALESCE(expected_previous_artifact_id,''))
+            WHERE status IN ('queued','running');
+
+          CREATE TABLE context_compaction_heads (
+            thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE RESTRICT,
+            compaction_id TEXT,
+            revision INTEGER NOT NULL CHECK(revision>=0),
+            head_hash TEXT NOT NULL CHECK(length(head_hash)=64),
+            updated_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TRIGGER context_compaction_jobs_immutable_columns BEFORE UPDATE ON context_compaction_jobs
+          WHEN NEW.id IS NOT OLD.id OR NEW.thread_id IS NOT OLD.thread_id
+            OR NEW.request_key IS NOT OLD.request_key OR NEW.request_hash IS NOT OLD.request_hash
+            OR NEW.source_item_ids_json IS NOT OLD.source_item_ids_json
+            OR NEW.source_hash IS NOT OLD.source_hash OR NEW.summary_input_hash IS NOT OLD.summary_input_hash
+            OR NEW.expected_previous_artifact_id IS NOT OLD.expected_previous_artifact_id
+            OR NEW.created_at IS NOT OLD.created_at
+          BEGIN SELECT RAISE(ABORT, 'compaction job identity is immutable'); END;
+          CREATE TRIGGER context_compaction_jobs_terminal BEFORE UPDATE ON context_compaction_jobs
+          WHEN OLD.status='completed'
+          BEGIN SELECT RAISE(ABORT, 'terminal compaction jobs are immutable'); END;
+          CREATE TRIGGER context_compaction_jobs_transition BEFORE UPDATE OF status ON context_compaction_jobs
+          WHEN NOT (
+            (OLD.status='queued' AND NEW.status='running')
+            OR (OLD.status='running' AND NEW.status IN ('running','queued','completed','failed'))
+            OR (OLD.status='failed' AND NEW.status='queued')
+          )
+          BEGIN SELECT RAISE(ABORT, 'invalid compaction job transition'); END;
+          CREATE TRIGGER context_compaction_heads_transition BEFORE UPDATE ON context_compaction_heads
+          WHEN NEW.thread_id IS NOT OLD.thread_id OR NEW.revision<>OLD.revision+1
+            OR NEW.compaction_id IS OLD.compaction_id
+          BEGIN SELECT RAISE(ABORT, 'invalid compaction head transition'); END;
+          CREATE TRIGGER context_compaction_heads_no_delete BEFORE DELETE ON context_compaction_heads
+          WHEN NOT EXISTS (
+            SELECT 1 FROM threads th JOIN session_purge_context pc ON pc.session_id=th.session_id
+            WHERE th.id=OLD.thread_id
+          ) BEGIN SELECT RAISE(ABORT, 'compaction head is durable'); END;
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(14, 'derived-context-frontier-cas', this.#now())
+        this.#db.exec('PRAGMA user_version = 14')
+        appliedVersion = 14
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
       }
+      this.#validateDerivedContextSchema()
     })
+  }
+
+  #validateDerivedContextSchema(): void {
+    const required: ReadonlyArray<readonly [type: 'table' | 'index' | 'trigger', name: string]> = [
+      ['table', 'context_compaction_jobs'],
+      ['table', 'context_compaction_heads'],
+      ['table', 'context_compactions'],
+      ['table', 'context_compaction_source_items'],
+      ['table', 'context_compaction_job_events'],
+      ['table', 'execution_context_manifests'],
+      ['table', 'execution_context_manifest_entries'],
+      ['index', 'context_compaction_jobs_queue'],
+      ['index', 'context_compaction_jobs_active_frontier'],
+      ['index', 'context_compactions_thread_created'],
+      ['index', 'context_compaction_job_events_job'],
+      ['trigger', 'context_compaction_jobs_immutable_columns'],
+      ['trigger', 'context_compaction_jobs_terminal'],
+      ['trigger', 'context_compaction_jobs_transition'],
+      ['trigger', 'context_compaction_jobs_no_delete'],
+      ['trigger', 'context_compactions_no_update'],
+      ['trigger', 'context_compactions_no_delete'],
+      ['trigger', 'context_compaction_heads_transition'],
+      ['trigger', 'context_compaction_heads_no_delete'],
+      ['trigger', 'context_compaction_sources_no_update'],
+      ['trigger', 'context_compaction_sources_no_delete'],
+      ['trigger', 'context_compaction_events_no_update'],
+      ['trigger', 'context_compaction_events_no_delete'],
+      ['trigger', 'execution_context_manifests_no_update'],
+      ['trigger', 'execution_context_manifests_no_delete'],
+      ['trigger', 'execution_context_entries_no_update'],
+      ['trigger', 'execution_context_entries_no_delete'],
+    ]
+    const actual = new Set(this.#all(this.#db.prepare(`
+      SELECT type,name FROM sqlite_schema WHERE type IN ('table','index','trigger')
+    `)).map((row) => `${text(row, 'type')}:${text(row, 'name')}`))
+    const missing = required
+      .map(([type, name]) => `${type}:${name}`)
+      .filter((identity) => !actual.has(identity))
+    if (missing.length > 0) {
+      throw new ContextPersistenceError(
+        'integrity_violation',
+        `Session schema is missing required derived-context protections: ${missing.join(', ')}`,
+      )
+    }
   }
 
   #transaction<T>(mode: 'IMMEDIATE' | 'EXCLUSIVE', action: () => T): T {
@@ -1091,6 +1419,36 @@ export class SqliteSessionStore implements SessionStore {
         DELETE FROM provider_bindings WHERE thread_id IN (
           SELECT th.id FROM threads th
           JOIN session_purge_context pc ON pc.session_id = th.session_id
+        );
+        DELETE FROM execution_context_manifest_entries WHERE manifest_id IN (
+          SELECT m.id FROM execution_context_manifests m
+          JOIN threads th ON th.id=m.thread_id
+          JOIN session_purge_context pc ON pc.session_id=th.session_id
+        );
+        DELETE FROM execution_context_manifests WHERE thread_id IN (
+          SELECT th.id FROM threads th
+          JOIN session_purge_context pc ON pc.session_id=th.session_id
+        );
+        DELETE FROM context_compaction_source_items WHERE compaction_id IN (
+          SELECT c.id FROM context_compactions c
+          JOIN threads th ON th.id=c.thread_id
+          JOIN session_purge_context pc ON pc.session_id=th.session_id
+        );
+        DELETE FROM context_compaction_job_events WHERE thread_id IN (
+          SELECT th.id FROM threads th
+          JOIN session_purge_context pc ON pc.session_id=th.session_id
+        );
+        DELETE FROM context_compactions WHERE thread_id IN (
+          SELECT th.id FROM threads th
+          JOIN session_purge_context pc ON pc.session_id=th.session_id
+        );
+        DELETE FROM context_compaction_heads WHERE thread_id IN (
+          SELECT th.id FROM threads th
+          JOIN session_purge_context pc ON pc.session_id=th.session_id
+        );
+        DELETE FROM context_compaction_jobs WHERE thread_id IN (
+          SELECT th.id FROM threads th
+          JOIN session_purge_context pc ON pc.session_id=th.session_id
         );
         DELETE FROM executions
           WHERE session_id IN (SELECT session_id FROM session_purge_context);
@@ -1882,6 +2240,465 @@ export class SqliteSessionStore implements SessionStore {
     const thread = this.getThread(threadId)
     if (!thread) throw new SessionStoreError('not_found', `Thread not found: ${threadId}`)
     return this.#itemsForSegments(this.#lineage(thread), afterSequence)
+  }
+
+  createContextCompactionJob(input: CreateContextCompactionJobInput): {
+    job: ContextCompactionJob
+    duplicate: boolean
+  } {
+    return this.#persistContextCompactionJob(input, null)
+  }
+
+  reserveContextCompactionJob(input: ReserveContextCompactionJobInput): {
+    job: ContextCompactionJob
+    duplicate: boolean
+  } {
+    const leaseDurationMs = this.#validateContextCompactionLease(input.ownerId, input.leaseDurationMs)
+    return this.#persistContextCompactionJob(input, { ownerId: input.ownerId, leaseDurationMs })
+  }
+
+  #persistContextCompactionJob(
+    input: CreateContextCompactionJobInput,
+    claim: { ownerId: string; leaseDurationMs: number } | null,
+  ): { job: ContextCompactionJob; duplicate: boolean } {
+    if (!input.requestKey || input.requestKey.length > 200) {
+      throw new ContextPersistenceError('invalid_input', 'Compaction requestKey must contain 1 to 200 characters')
+    }
+    validateSha256(input.summaryInputHash, 'summaryInputHash')
+    return this.#transaction('IMMEDIATE', () => {
+      const sourceItems = this.#resolveCompactionSource(input.threadId, input.sourceItemIds)
+      const sourceHash = this.#sourceHashForItems(sourceItems)
+      const requestHash = sha256Canonical({
+        schema: 'baton.context-compaction-request.v1',
+        threadId: input.threadId,
+        sourceItemIds: input.sourceItemIds,
+        sourceHash,
+        summaryInputHash: input.summaryInputHash,
+        expectedPreviousArtifactId: input.expectedPreviousArtifactId,
+      })
+      const existing = this.#optional(this.#db.prepare(`
+        SELECT * FROM context_compaction_jobs WHERE thread_id=? AND request_key=?
+      `), input.threadId, input.requestKey)
+      const now = this.#now()
+      const head = this.#ensureContextCompactionHead(input.threadId, now)
+      const latestArtifactId = nullableText(head, 'compaction_id')
+      if (existing) {
+        if (text(existing, 'request_hash') !== requestHash) {
+          throw new ContextPersistenceError(
+            'idempotency_conflict',
+            'Compaction requestKey was reused with different source or generator input',
+          )
+        }
+        if (text(existing, 'status') === 'completed') {
+          const completedArtifact = this.#one(
+            this.#db.prepare('SELECT id FROM context_compactions WHERE job_id=?'),
+            text(existing, 'id'),
+          )
+          if (latestArtifactId !== text(completedArtifact, 'id')) {
+            throw new ContextPersistenceError(
+              'stale_frontier',
+              'Completed duplicate is no longer the current compaction frontier',
+            )
+          }
+          return this.#contextCompactionReservationResult(existing, true, claim, now)
+        }
+        if (latestArtifactId !== input.expectedPreviousArtifactId) {
+          throw new ContextPersistenceError(
+            'stale_frontier',
+            'Compaction artifact frontier changed before the duplicate request was resumed',
+          )
+        }
+        if (text(existing, 'status') !== 'failed') {
+          return this.#contextCompactionReservationResult(existing, true, claim, now)
+        }
+      }
+      if (latestArtifactId !== input.expectedPreviousArtifactId) {
+        throw new ContextPersistenceError(
+          'stale_frontier',
+          'Compaction artifact frontier changed before the request was persisted',
+        )
+      }
+      if (input.expectedPreviousArtifactId !== null) {
+        const previousRow = this.#one(
+          this.#db.prepare('SELECT * FROM context_compactions WHERE id=?'),
+          input.expectedPreviousArtifactId,
+        )
+        const previous = this.#contextCompactionArtifact(previousRow)
+        const previousSourceIds = previous.sourceItems.map((item) => item.itemId)
+        if (sourceItems.length <= previousSourceIds.length
+          || previousSourceIds.some((id, index) => sourceItems[index]?.itemId !== id)) {
+          throw new ContextPersistenceError(
+            'invalid_input',
+            'Compaction source must strictly extend the expected frontier coverage',
+          )
+        }
+      }
+      if (claim !== null) {
+        this.#recoverAbandonedContextCompactionFrontier(
+          input.threadId,
+          input.expectedPreviousArtifactId,
+          existing ? text(existing, 'id') : null,
+          input.requestKey,
+          now,
+        )
+      }
+      const competing = this.#optional(this.#db.prepare(`
+        SELECT id FROM context_compaction_jobs
+        WHERE thread_id=? AND expected_previous_artifact_id IS ?
+          AND status IN ('queued','running')
+          AND id IS NOT ?
+        LIMIT 1
+      `), input.threadId, input.expectedPreviousArtifactId, existing ? text(existing, 'id') : null)
+      if (competing) {
+        throw new ContextPersistenceError(
+          'stale_frontier',
+          'Another compaction request already owns the expected artifact frontier',
+        )
+      }
+      if (existing) {
+        this.#db.prepare(`
+          UPDATE context_compaction_jobs SET status='queued',revision=revision+1,
+            lease_owner=NULL,lease_expires_at=NULL,error_json=NULL,updated_at=?,completed_at=NULL
+          WHERE id=?
+        `).run(now, text(existing, 'id'))
+        const retried = this.#one(
+          this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'),
+          text(existing, 'id'),
+        )
+        this.#appendContextCompactionJobEvent(retried, { reason: 'retry_failed' }, now)
+        return this.#contextCompactionReservationResult(retried, true, claim, now)
+      }
+      const id = this.#idFactory()
+      this.#db.prepare(`
+        INSERT INTO context_compaction_jobs(
+          id,thread_id,request_key,request_hash,source_item_ids_json,source_hash,summary_input_hash,
+          expected_previous_artifact_id,
+          status,revision,lease_owner,lease_expires_at,attempt_count,error_json,created_at,updated_at,completed_at
+        ) VALUES (?,?,?,?,?,?,?,?,'queued',1,NULL,NULL,0,NULL,?,?,NULL)
+      `).run(id, input.threadId, input.requestKey, requestHash, canonicalJson(input.sourceItemIds), sourceHash,
+        input.summaryInputHash, input.expectedPreviousArtifactId, now, now)
+      const inserted = this.#one(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), id)
+      this.#appendContextCompactionJobEvent(inserted, {}, now)
+      return this.#contextCompactionReservationResult(inserted, false, claim, now)
+    })
+  }
+
+  #validateContextCompactionLease(ownerId: string, requestedDurationMs: number | undefined): number {
+    if (!ownerId) throw new ContextPersistenceError('invalid_input', 'Compaction lease owner must not be empty')
+    const leaseDurationMs = requestedDurationMs ?? 30_000
+    if (!Number.isInteger(leaseDurationMs) || leaseDurationMs < 1 || leaseDurationMs > 300_000) {
+      throw new ContextPersistenceError('invalid_input', 'Compaction lease duration must be 1 to 300000 milliseconds')
+    }
+    return leaseDurationMs
+  }
+
+  #contextCompactionReservationResult(
+    row: SqlRow,
+    duplicate: boolean,
+    claim: { ownerId: string; leaseDurationMs: number } | null,
+    now: string,
+  ): { job: ContextCompactionJob; duplicate: boolean } {
+    const claimed = claim === null ? row : this.#claimContextCompactionJobRow(row, claim, now)
+    return { job: this.#contextCompactionJob(claimed ?? row), duplicate }
+  }
+
+  #recoverAbandonedContextCompactionFrontier(
+    threadId: ThreadId,
+    expectedPreviousArtifactId: string | null,
+    exactJobId: string | null,
+    replacementRequestKey: string,
+    now: string,
+  ): void {
+    const competing = this.#optional(this.#db.prepare(`
+      SELECT * FROM context_compaction_jobs
+      WHERE thread_id=? AND expected_previous_artifact_id IS ?
+        AND status IN ('queued','running') AND id IS NOT ?
+      LIMIT 1
+    `), threadId, expectedPreviousArtifactId, exactJobId)
+    if (!competing) return
+    if (text(competing, 'status') === 'running' && nullableText(competing, 'lease_expires_at')! > now) {
+      throw new ContextPersistenceError(
+        'stale_frontier',
+        'Another compaction request already owns the expected artifact frontier',
+      )
+    }
+
+    const recoveryOwner = `baton-recovery:${replacementRequestKey.slice(0, 64)}`
+    const recovered = this.#claimContextCompactionJobRow(
+      competing,
+      { ownerId: recoveryOwner, leaseDurationMs: 1 },
+      now,
+    )
+    if (!recovered || text(recovered, 'status') !== 'running'
+      || nullableText(recovered, 'lease_owner') !== recoveryOwner) {
+      throw new ContextPersistenceError('integrity_violation', 'Abandoned compaction frontier could not be recovered')
+    }
+    const reason = text(competing, 'status') === 'queued'
+      ? 'orphaned_queued_reservation'
+      : 'expired_competing_reservation'
+    const error = { code: 'abandoned_reservation', reason }
+    const errorJson = canonicalJson(error)
+    this.#db.prepare(`
+      UPDATE context_compaction_jobs SET status='failed',revision=revision+1,
+        lease_owner=NULL,lease_expires_at=NULL,error_json=?,updated_at=?,completed_at=? WHERE id=?
+    `).run(errorJson, now, now, text(recovered, 'id'))
+    const failed = this.#one(
+      this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'),
+      text(recovered, 'id'),
+    )
+    this.#appendContextCompactionJobEvent(
+      failed,
+      { reason, errorHash: sha256Canonical(error) },
+      now,
+    )
+  }
+
+  #claimContextCompactionJobRow(
+    initial: SqlRow,
+    input: { ownerId: string; leaseDurationMs: number },
+    now: string,
+  ): SqlRow | null {
+    let row = initial
+    const jobId = text(row, 'id')
+    if (text(row, 'status') === 'running' && nullableText(row, 'lease_expires_at')! <= now) {
+      this.#db.prepare(`
+        UPDATE context_compaction_jobs SET status='queued',revision=revision+1,
+          lease_owner=NULL,lease_expires_at=NULL,updated_at=? WHERE id=?
+      `).run(now, jobId)
+      row = this.#one(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), jobId)
+      this.#appendContextCompactionJobEvent(row, { reason: 'lease_expired' }, now)
+    }
+    if (text(row, 'status') === 'running') {
+      return nullableText(row, 'lease_owner') === input.ownerId ? row : null
+    }
+    if (text(row, 'status') !== 'queued') return null
+    const leaseExpiresAt = new Date(Date.parse(now) + input.leaseDurationMs).toISOString()
+    this.#db.prepare(`
+      UPDATE context_compaction_jobs SET status='running',revision=revision+1,
+        lease_owner=?,lease_expires_at=?,attempt_count=attempt_count+1,updated_at=? WHERE id=?
+    `).run(input.ownerId, leaseExpiresAt, now, jobId)
+    row = this.#one(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), jobId)
+    this.#appendContextCompactionJobEvent(row, { attemptCount: integer(row, 'attempt_count') }, now)
+    return row
+  }
+
+  getContextCompactionJob(jobId: string): ContextCompactionJob | null {
+    const row = this.#optional(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), jobId)
+    return row ? this.#contextCompactionJob(row) : null
+  }
+
+  claimContextCompactionJob(input: ClaimContextCompactionJobInput): ContextCompactionJob | null {
+    const leaseDurationMs = this.#validateContextCompactionLease(input.ownerId, input.leaseDurationMs)
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), input.jobId)
+      if (!row) throw new ContextPersistenceError('not_found', `Compaction job not found: ${input.jobId}`)
+      const now = this.#now()
+      const claimed = this.#claimContextCompactionJobRow(row, { ownerId: input.ownerId, leaseDurationMs }, now)
+      return claimed ? this.#contextCompactionJob(claimed) : null
+    })
+  }
+
+  completeContextCompactionJob(input: CompleteContextCompactionJobInput): {
+    artifact: ContextCompactionArtifact
+    duplicate: boolean
+  } {
+    if (!input.ownerId || !input.generatorModel || !input.generatorVersion) {
+      throw new ContextPersistenceError('invalid_input', 'Compaction owner, generator model, and version are required')
+    }
+    const summaryJson = canonicalJson(input.summary)
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), input.jobId)
+      if (!row) throw new ContextPersistenceError('not_found', `Compaction job not found: ${input.jobId}`)
+      const sourceItems = this.#sourceItemsForJob(row)
+      const artifactHash = sha256Canonical({
+        schema: 'baton.context-compaction-artifact.v1',
+        jobId: input.jobId,
+        threadId: text(row, 'thread_id'),
+        sourceHash: text(row, 'source_hash'),
+        summaryInputHash: text(row, 'summary_input_hash'),
+        expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+        summary: JSON.parse(summaryJson) as unknown,
+        generatorProvider: input.generatorProvider,
+        generatorModel: input.generatorModel,
+        generatorVersion: input.generatorVersion,
+      })
+      if (text(row, 'status') === 'completed') {
+        const existing = this.#one(this.#db.prepare('SELECT * FROM context_compactions WHERE job_id=?'), input.jobId)
+        if (text(existing, 'artifact_hash') !== artifactHash) {
+          throw new ContextPersistenceError('idempotency_conflict', 'Completed compaction has different artifact content')
+        }
+        return { artifact: this.#contextCompactionArtifact(existing), duplicate: true }
+      }
+      const now = this.#now()
+      if (text(row, 'status') !== 'running' || nullableText(row, 'lease_owner') !== input.ownerId
+        || nullableText(row, 'lease_expires_at')! <= now) {
+        throw new ContextPersistenceError('lease_lost', 'Compaction lease is missing, expired, or owned elsewhere')
+      }
+      const head = this.#ensureContextCompactionHead(text(row, 'thread_id'), now)
+      const expectedPreviousArtifactId = nullableText(row, 'expected_previous_artifact_id')
+      if (nullableText(head, 'compaction_id') !== expectedPreviousArtifactId) {
+        throw new ContextPersistenceError('stale_frontier', 'Compaction head changed before artifact completion')
+      }
+      const artifactId = this.#idFactory()
+      this.#db.prepare(`
+        INSERT INTO context_compactions(
+          id,job_id,thread_id,source_hash,summary_input_hash,artifact_hash,summary_json,
+          generator_provider,generator_model,generator_version,created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `).run(artifactId, input.jobId, text(row, 'thread_id'), text(row, 'source_hash'),
+        text(row, 'summary_input_hash'), artifactHash, summaryJson, input.generatorProvider,
+        input.generatorModel, input.generatorVersion, now)
+      const insertSource = this.#db.prepare(`
+        INSERT INTO context_compaction_source_items(
+          compaction_id,ordinal,item_id,item_sequence,item_digest
+        ) VALUES (?,?,?,?,?)
+      `)
+      for (const source of sourceItems) {
+        insertSource.run(artifactId, source.ordinal, source.itemId, source.itemSequence, source.itemDigest)
+      }
+      this.#db.prepare(`
+        UPDATE context_compaction_jobs SET status='completed',revision=revision+1,
+          lease_owner=NULL,lease_expires_at=NULL,updated_at=?,completed_at=? WHERE id=?
+      `).run(now, now, input.jobId)
+      const completed = this.#one(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), input.jobId)
+      this.#appendContextCompactionJobEvent(completed, { artifactId, artifactHash }, now)
+      const nextHeadRevision = integer(head, 'revision') + 1
+      const headHash = this.#contextCompactionHeadHash(
+        text(row, 'thread_id'), artifactId, nextHeadRevision,
+      )
+      const advanced = this.#db.prepare(`
+        UPDATE context_compaction_heads
+        SET compaction_id=?,revision=?,head_hash=?,updated_at=?
+        WHERE thread_id=? AND compaction_id IS ? AND revision=?
+      `).run(artifactId, nextHeadRevision, headHash, now, text(row, 'thread_id'),
+        expectedPreviousArtifactId, integer(head, 'revision'))
+      if (Number(advanced.changes) !== 1) {
+        throw new ContextPersistenceError('stale_frontier', 'Compaction head compare-and-set failed')
+      }
+      return {
+        artifact: this.#contextCompactionArtifact(this.#one(
+          this.#db.prepare('SELECT * FROM context_compactions WHERE id=?'), artifactId,
+        )),
+        duplicate: false,
+      }
+    })
+  }
+
+  failContextCompactionJob(input: FailContextCompactionJobInput): ContextCompactionJob {
+    if (!input.ownerId) throw new ContextPersistenceError('invalid_input', 'Compaction lease owner must not be empty')
+    const errorJson = canonicalJson(input.error)
+    return this.#transaction('IMMEDIATE', () => {
+      const row = this.#optional(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), input.jobId)
+      if (!row) throw new ContextPersistenceError('not_found', `Compaction job not found: ${input.jobId}`)
+      const now = this.#now()
+      if (text(row, 'status') !== 'running' || nullableText(row, 'lease_owner') !== input.ownerId
+        || nullableText(row, 'lease_expires_at')! <= now) {
+        throw new ContextPersistenceError('lease_lost', 'Compaction lease is missing, expired, or owned elsewhere')
+      }
+      this.#db.prepare(`
+        UPDATE context_compaction_jobs SET status='failed',revision=revision+1,
+          lease_owner=NULL,lease_expires_at=NULL,error_json=?,updated_at=?,completed_at=? WHERE id=?
+      `).run(errorJson, now, now, input.jobId)
+      const failed = this.#one(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), input.jobId)
+      this.#appendContextCompactionJobEvent(
+        failed,
+        { errorHash: sha256Canonical(JSON.parse(errorJson) as unknown) },
+        now,
+      )
+      return this.#contextCompactionJob(failed)
+    })
+  }
+
+  getContextCompactionArtifact(compactionId: string): ContextCompactionArtifact | null {
+    const row = this.#optional(this.#db.prepare('SELECT * FROM context_compactions WHERE id=?'), compactionId)
+    return row ? this.#contextCompactionArtifact(row) : null
+  }
+
+  getLatestContextCompaction(threadId: ThreadId): ContextCompactionArtifact | null {
+    if (!this.getThread(threadId)) throw new ContextPersistenceError('not_found', `Thread not found: ${threadId}`)
+    const head = this.#optional(this.#db.prepare(
+      'SELECT * FROM context_compaction_heads WHERE thread_id=?',
+    ), threadId)
+    if (!head) {
+      const artifact = this.#optional(this.#db.prepare(
+        'SELECT id FROM context_compactions WHERE thread_id=? LIMIT 1',
+      ), threadId)
+      if (artifact) throw new ContextPersistenceError('integrity_violation', 'Compaction head is missing')
+      return null
+    }
+    this.#validateContextCompactionHead(head)
+    const compactionId = nullableText(head, 'compaction_id')
+    if (compactionId === null) return null
+    const row = this.#optional(this.#db.prepare('SELECT * FROM context_compactions WHERE id=?'), compactionId)
+    if (!row) throw new ContextPersistenceError('integrity_violation', 'Compaction head artifact is missing')
+    return this.#contextCompactionArtifact(row)
+  }
+
+  createExecutionContextManifest(input: CreateExecutionContextManifestInput): {
+    manifest: ExecutionContextManifest
+    duplicate: boolean
+  } {
+    if (!input.materializerVersion) {
+      throw new ContextPersistenceError('invalid_input', 'Context materializer version must not be empty')
+    }
+    validateSha256(input.materializedContextHash, 'materializedContextHash')
+    return this.#transaction('IMMEDIATE', () => {
+      const execution = this.#optional(this.#db.prepare('SELECT * FROM executions WHERE id=?'), input.executionId)
+      if (!execution) throw new ContextPersistenceError('not_found', `Execution not found: ${input.executionId}`)
+      if (text(execution, 'thread_id') !== input.threadId) {
+        throw new ContextPersistenceError('invalid_input', 'Execution belongs to a different canonical thread')
+      }
+      const entries = this.#resolveExecutionContextSources(input.threadId, input.sources)
+      const manifestHash = sha256Canonical({
+        schema: 'baton.execution-context-manifest.v1',
+        executionId: input.executionId,
+        threadId: input.threadId,
+        materializerVersion: input.materializerVersion,
+        materializedContextHash: input.materializedContextHash,
+        entries,
+      })
+      const existing = this.#optional(this.#db.prepare(
+        'SELECT * FROM execution_context_manifests WHERE execution_id=?',
+      ), input.executionId)
+      if (existing) {
+        if (text(existing, 'manifest_hash') !== manifestHash) {
+          throw new ContextPersistenceError('idempotency_conflict', 'Execution already has a different context manifest')
+        }
+        return { manifest: this.#executionContextManifest(existing), duplicate: true }
+      }
+      const id = this.#idFactory()
+      const now = this.#now()
+      this.#db.prepare(`
+        INSERT INTO execution_context_manifests(
+          id,execution_id,thread_id,materializer_version,materialized_context_hash,manifest_hash,created_at
+        ) VALUES (?,?,?,?,?,?,?)
+      `).run(id, input.executionId, input.threadId, input.materializerVersion,
+        input.materializedContextHash, manifestHash, now)
+      const insertEntry = this.#db.prepare(`
+        INSERT INTO execution_context_manifest_entries(
+          manifest_id,ordinal,source_kind,item_id,compaction_id,digest
+        ) VALUES (?,?,?,?,?,?)
+      `)
+      for (const entry of entries) {
+        insertEntry.run(id, entry.ordinal, entry.kind,
+          entry.kind === 'canonical_item' ? entry.itemId : null,
+          entry.kind === 'compaction' ? entry.compactionId : null,
+          entry.digest)
+      }
+      return {
+        manifest: this.#executionContextManifest(this.#one(
+          this.#db.prepare('SELECT * FROM execution_context_manifests WHERE id=?'), id,
+        )),
+        duplicate: false,
+      }
+    })
+  }
+
+  getExecutionContextManifest(executionId: string): ExecutionContextManifest | null {
+    const row = this.#optional(this.#db.prepare(
+      'SELECT * FROM execution_context_manifests WHERE execution_id=?',
+    ), executionId)
+    return row ? this.#executionContextManifest(row) : null
   }
 
   listEvents(threadId: ThreadId, afterSequence = 0): CanonicalStreamEvent[] {
@@ -2972,6 +3789,503 @@ export class SqliteSessionStore implements SessionStore {
       this.#appendFollowUpChanged(queued, now)
     }
     return rows.length
+  }
+
+  #itemEnvelope(row: SqlRow): Record<string, unknown> {
+    return {
+      id: text(row, 'id'),
+      sessionId: text(row, 'session_id'),
+      threadId: text(row, 'thread_id'),
+      turnId: nullableText(row, 'turn_id'),
+      sequence: integer(row, 'sequence'),
+      kind: text(row, 'kind'),
+      visibility: text(row, 'visibility'),
+      payload: parseObject(row.payload_json),
+      provider: nullableText(row, 'provider'),
+      nativeId: nullableText(row, 'native_id'),
+      createdAt: text(row, 'created_at'),
+    }
+  }
+
+  #itemDigest(row: SqlRow): string {
+    return sha256Canonical(this.#itemEnvelope(row))
+  }
+
+  #sourceHashForItems(items: ContextCompactionSourceItem[]): string {
+    return sha256Canonical(items.map((item) => this.#itemEnvelope(
+      this.#one(this.#db.prepare('SELECT * FROM items WHERE id=?'), item.itemId),
+    )))
+  }
+
+  #resolveCompactionSource(threadId: ThreadId, sourceItemIds: string[]): ContextCompactionSourceItem[] {
+    if (!Array.isArray(sourceItemIds) || sourceItemIds.length === 0
+      || sourceItemIds.some((id) => typeof id !== 'string' || !id)) {
+      throw new ContextPersistenceError('invalid_input', 'Compaction source must contain canonical item IDs')
+    }
+    if (new Set(sourceItemIds).size !== sourceItemIds.length) {
+      throw new ContextPersistenceError('invalid_input', 'Compaction source item IDs must be unique')
+    }
+    const thread = this.getThread(threadId)
+    if (!thread) throw new ContextPersistenceError('not_found', `Thread not found: ${threadId}`)
+    const lineage = this.#itemsForSegments(this.#lineage(thread), 0)
+    let previousIndex = -1
+    for (const id of sourceItemIds) {
+      const index = lineage.findIndex((item, candidateIndex) => candidateIndex > previousIndex && item.id === id)
+      if (index < 0) {
+        throw new ContextPersistenceError(
+          'invalid_input',
+          'Compaction source must be an exact ordered subset of the canonical thread lineage',
+        )
+      }
+      previousIndex = index
+    }
+    if (previousIndex < 0) {
+      throw new ContextPersistenceError(
+        'invalid_input',
+        'Compaction source must contain canonical lineage items',
+      )
+    }
+    const frontierSequence = lineage[previousIndex]!.sequence
+    const covered = lineage.filter((item) => item.sequence <= frontierSequence && item.turnId !== null)
+    if (covered.length !== sourceItemIds.length
+      || covered.some((item, index) => item.id !== sourceItemIds[index])) {
+      throw new ContextPersistenceError(
+        'invalid_input',
+        'Compaction source must cover every canonical item in the terminal turn prefix',
+      )
+    }
+    const coveredByTurn = new Map<string, CanonicalItem[]>()
+    for (const item of covered) {
+      const turnItems = coveredByTurn.get(item.turnId!) ?? []
+      turnItems.push(item)
+      coveredByTurn.set(item.turnId!, turnItems)
+    }
+    for (const [turnId, turnItems] of coveredByTurn) {
+      const turn = this.#one(this.#db.prepare('SELECT status FROM turns WHERE id=?'), turnId)
+      if (!TERMINAL_TURN_STATUSES.has(text(turn, 'status')) || !hasSafeContextToolState(turnItems)) {
+        throw new ContextPersistenceError(
+          'invalid_input',
+          'Compaction source must stay within a terminal prefix with resolved tool state',
+        )
+      }
+    }
+    return sourceItemIds.map((itemId, ordinal) => {
+      const row = this.#one(this.#db.prepare('SELECT * FROM items WHERE id=?'), itemId)
+      const turnId = nullableText(row, 'turn_id')
+      if (turnId !== null) {
+        const turn = this.#one(this.#db.prepare('SELECT status FROM turns WHERE id=?'), turnId)
+        if (!TERMINAL_TURN_STATUSES.has(text(turn, 'status'))) {
+          throw new ContextPersistenceError('invalid_input', 'Compaction source cannot include an active turn')
+        }
+      }
+      return {
+        ordinal,
+        itemId,
+        itemSequence: integer(row, 'sequence'),
+        itemDigest: this.#itemDigest(row),
+      }
+    })
+  }
+
+  #sourceItemsForJob(row: SqlRow): ContextCompactionSourceItem[] {
+    const sourceItemIds = parseArray(row.source_item_ids_json).map((value) => {
+      if (typeof value !== 'string' || !value) {
+        throw new ContextPersistenceError('integrity_violation', 'Compaction job contains an invalid source item ID')
+      }
+      return value
+    })
+    const sourceItems = this.#resolveCompactionSource(text(row, 'thread_id'), sourceItemIds)
+    if (this.#sourceHashForItems(sourceItems) !== text(row, 'source_hash')) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction job source hash does not match canonical items')
+    }
+    const expectedRequestHash = sha256Canonical({
+      schema: 'baton.context-compaction-request.v1',
+      threadId: text(row, 'thread_id'),
+      sourceItemIds,
+      sourceHash: text(row, 'source_hash'),
+      summaryInputHash: text(row, 'summary_input_hash'),
+      expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+    })
+    if (expectedRequestHash !== text(row, 'request_hash')) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction job request hash is invalid')
+    }
+    const expectedPreviousArtifactId = nullableText(row, 'expected_previous_artifact_id')
+    if (expectedPreviousArtifactId !== null) {
+      const previous = this.#optional(
+        this.#db.prepare('SELECT thread_id FROM context_compactions WHERE id=?'),
+        expectedPreviousArtifactId,
+      )
+      if (!previous || text(previous, 'thread_id') !== text(row, 'thread_id')) {
+        throw new ContextPersistenceError('integrity_violation', 'Compaction job frontier artifact is invalid')
+      }
+    }
+    return sourceItems
+  }
+
+  #contextCompactionJob(row: SqlRow): ContextCompactionJob {
+    const sourceItems = this.#sourceItemsForJob(row)
+    const status = text(row, 'status') as ContextCompactionJob['status']
+    const artifactRow = this.#optional(this.#db.prepare(
+      'SELECT id FROM context_compactions WHERE job_id=?',
+    ), text(row, 'id'))
+    if ((status === 'completed') !== (artifactRow !== null)) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction job and artifact completion state diverged')
+    }
+    this.#validateContextCompactionJobEvents(row)
+    return {
+      id: text(row, 'id'),
+      threadId: text(row, 'thread_id'),
+      requestKey: text(row, 'request_key'),
+      requestHash: text(row, 'request_hash'),
+      sourceItemIds: sourceItems.map((source) => source.itemId),
+      sourceHash: text(row, 'source_hash'),
+      summaryInputHash: text(row, 'summary_input_hash'),
+      expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+      status,
+      revision: integer(row, 'revision'),
+      leaseOwner: nullableText(row, 'lease_owner'),
+      leaseExpiresAt: nullableText(row, 'lease_expires_at'),
+      attemptCount: integer(row, 'attempt_count'),
+      artifactId: artifactRow ? text(artifactRow, 'id') : null,
+      error: parseNullableObject(row.error_json),
+      createdAt: text(row, 'created_at'),
+      updatedAt: text(row, 'updated_at'),
+      completedAt: nullableText(row, 'completed_at'),
+    }
+  }
+
+  #contextCompactionArtifact(row: SqlRow): ContextCompactionArtifact {
+    const sourceRows = this.#all(this.#db.prepare(`
+      SELECT * FROM context_compaction_source_items WHERE compaction_id=? ORDER BY ordinal
+    `), text(row, 'id'))
+    const sourceItems = sourceRows.map((sourceRow, index) => {
+      if (integer(sourceRow, 'ordinal') !== index) {
+        throw new ContextPersistenceError('integrity_violation', 'Compaction source ordinals are not contiguous')
+      }
+      const itemRow = this.#optional(this.#db.prepare('SELECT * FROM items WHERE id=?'), text(sourceRow, 'item_id'))
+      if (!itemRow || integer(itemRow, 'sequence') !== integer(sourceRow, 'item_sequence')
+        || this.#itemDigest(itemRow) !== text(sourceRow, 'item_digest')) {
+        throw new ContextPersistenceError('integrity_violation', 'Compaction source item provenance is invalid')
+      }
+      return {
+        ordinal: index,
+        itemId: text(sourceRow, 'item_id'),
+        itemSequence: integer(sourceRow, 'item_sequence'),
+        itemDigest: text(sourceRow, 'item_digest'),
+      }
+    })
+    if (sourceItems.length === 0 || this.#sourceHashForItems(sourceItems) !== text(row, 'source_hash')) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction artifact source hash is invalid')
+    }
+    const job = this.#optional(this.#db.prepare('SELECT * FROM context_compaction_jobs WHERE id=?'), text(row, 'job_id'))
+    if (!job || text(job, 'status') !== 'completed' || text(job, 'thread_id') !== text(row, 'thread_id')
+      || text(job, 'source_hash') !== text(row, 'source_hash')
+      || text(job, 'summary_input_hash') !== text(row, 'summary_input_hash')) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction artifact does not match its durable job')
+    }
+    this.#validateContextCompactionJobEvents(job)
+    const jobSourceIds = parseArray(job.source_item_ids_json)
+    if (canonicalJson(jobSourceIds) !== canonicalJson(sourceItems.map((source) => source.itemId))) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction artifact covers different items than its job')
+    }
+    const summary = parseObject(row.summary_json)
+    const summaryInput = objectValue(summary.summaryInput)
+    const summaryPreviousArtifactId = summaryInput?.previousArtifactId
+    if (!summaryInput
+      || (summaryPreviousArtifactId !== null && typeof summaryPreviousArtifactId !== 'string')
+      || summaryPreviousArtifactId !== nullableText(job, 'expected_previous_artifact_id')) {
+      throw new ContextPersistenceError(
+        'integrity_violation',
+        'Compaction summary input does not match its expected artifact frontier',
+      )
+    }
+    const expectedArtifactHash = sha256Canonical({
+      schema: 'baton.context-compaction-artifact.v1',
+      jobId: text(row, 'job_id'),
+      threadId: text(row, 'thread_id'),
+      sourceHash: text(row, 'source_hash'),
+      summaryInputHash: text(row, 'summary_input_hash'),
+      expectedPreviousArtifactId: nullableText(job, 'expected_previous_artifact_id'),
+      summary,
+      generatorProvider: text(row, 'generator_provider'),
+      generatorModel: text(row, 'generator_model'),
+      generatorVersion: text(row, 'generator_version'),
+    })
+    if (expectedArtifactHash !== text(row, 'artifact_hash')) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction artifact hash is invalid')
+    }
+    return {
+      id: text(row, 'id'),
+      jobId: text(row, 'job_id'),
+      threadId: text(row, 'thread_id'),
+      sourceHash: text(row, 'source_hash'),
+      summaryInputHash: text(row, 'summary_input_hash'),
+      artifactHash: text(row, 'artifact_hash'),
+      summary,
+      generatorProvider: text(row, 'generator_provider') as CanonicalProvider,
+      generatorModel: text(row, 'generator_model'),
+      generatorVersion: text(row, 'generator_version'),
+      sourceItems,
+      createdAt: text(row, 'created_at'),
+    }
+  }
+
+  #resolveExecutionContextSources(
+    threadId: ThreadId,
+    sources: CreateExecutionContextManifestInput['sources'],
+  ): ExecutionContextManifestEntry[] {
+    if (!Array.isArray(sources) || sources.length === 0) {
+      throw new ContextPersistenceError('invalid_input', 'Execution context manifest must have source provenance')
+    }
+    const thread = this.getThread(threadId)
+    if (!thread) throw new ContextPersistenceError('not_found', `Thread not found: ${threadId}`)
+    const lineage = this.#itemsForSegments(this.#lineage(thread), 0)
+    let representedIds = new Set<string>()
+    const canonicalIds: string[] = []
+    const entries = sources.map((source, ordinal): ExecutionContextManifestEntry => {
+      if (source.kind === 'compaction') {
+        if (ordinal !== 0 || sources.some((candidate, index) => index > 0 && candidate.kind === 'compaction')) {
+          throw new ContextPersistenceError('invalid_input', 'A manifest may begin with exactly one compaction artifact')
+        }
+        const row = this.#optional(this.#db.prepare('SELECT * FROM context_compactions WHERE id=?'), source.compactionId)
+        if (!row) throw new ContextPersistenceError('not_found', `Compaction not found: ${source.compactionId}`)
+        const artifact = this.#contextCompactionArtifact(row)
+        if (artifact.threadId !== threadId) {
+          throw new ContextPersistenceError('invalid_input', 'Compaction artifact belongs to a different thread')
+        }
+        representedIds = new Set(artifact.sourceItems.map((item) => item.itemId))
+        return { ordinal, kind: 'compaction', compactionId: artifact.id, digest: artifact.artifactHash }
+      }
+      if (source.kind !== 'canonical_item' || !source.itemId) {
+        throw new ContextPersistenceError('invalid_input', 'Manifest source is invalid')
+      }
+      const row = this.#optional(this.#db.prepare('SELECT * FROM items WHERE id=?'), source.itemId)
+      if (!row) throw new ContextPersistenceError('not_found', `Canonical item not found: ${source.itemId}`)
+      canonicalIds.push(source.itemId)
+      return { ordinal, kind: 'canonical_item', itemId: source.itemId, digest: this.#itemDigest(row) }
+    })
+    const expectedCanonicalIds = lineage.filter((item) => !representedIds.has(item.id)).map((item) => item.id)
+    if (canonicalIds.length !== expectedCanonicalIds.length
+      || canonicalIds.some((id, index) => expectedCanonicalIds[index] !== id)) {
+      throw new ContextPersistenceError(
+        'invalid_input',
+        'Execution context provenance must retain every canonical item not represented by its compaction',
+      )
+    }
+    return entries
+  }
+
+  #executionContextManifest(row: SqlRow): ExecutionContextManifest {
+    const entryRows = this.#all(this.#db.prepare(`
+      SELECT * FROM execution_context_manifest_entries WHERE manifest_id=? ORDER BY ordinal
+    `), text(row, 'id'))
+    if (entryRows.length === 0) {
+      throw new ContextPersistenceError('integrity_violation', 'Execution context manifest has no provenance')
+    }
+    let representedIds = new Set<string>()
+    const canonicalIds: string[] = []
+    const entries = entryRows.map((entryRow, index): ExecutionContextManifestEntry => {
+      if (integer(entryRow, 'ordinal') !== index) {
+        throw new ContextPersistenceError('integrity_violation', 'Execution context ordinals are not contiguous')
+      }
+      const kind = text(entryRow, 'source_kind')
+      if (kind === 'canonical_item') {
+        const itemId = nullableText(entryRow, 'item_id')
+        const item = itemId ? this.#optional(this.#db.prepare('SELECT * FROM items WHERE id=?'), itemId) : null
+        if (!item || this.#itemDigest(item) !== text(entryRow, 'digest')) {
+          throw new ContextPersistenceError('integrity_violation', 'Execution context item digest is invalid')
+        }
+        canonicalIds.push(itemId as string)
+        return { ordinal: index, kind, itemId: itemId as string, digest: text(entryRow, 'digest') }
+      }
+      const compactionId = nullableText(entryRow, 'compaction_id')
+      const compactionRow = compactionId
+        ? this.#optional(this.#db.prepare('SELECT * FROM context_compactions WHERE id=?'), compactionId)
+        : null
+      if (!compactionRow) {
+        throw new ContextPersistenceError('integrity_violation', 'Execution context compaction is missing')
+      }
+      const artifact = this.#contextCompactionArtifact(compactionRow)
+      if (index !== 0 || artifact.threadId !== text(row, 'thread_id')
+        || artifact.artifactHash !== text(entryRow, 'digest')) {
+        throw new ContextPersistenceError('integrity_violation', 'Execution context compaction provenance is invalid')
+      }
+      representedIds = new Set(artifact.sourceItems.map((item) => item.itemId))
+      return { ordinal: index, kind: 'compaction', compactionId: artifact.id, digest: artifact.artifactHash }
+    })
+    const thread = this.getThread(text(row, 'thread_id'))
+    if (!thread) throw new ContextPersistenceError('integrity_violation', 'Execution context thread is missing')
+    const lineage = this.#itemsForSegments(this.#lineage(thread), 0)
+    const capturedIds = new Set([...representedIds, ...canonicalIds])
+    const lastCapturedIndex = lineage.findLastIndex((item) => capturedIds.has(item.id))
+    const capturedLineage = lineage.slice(0, lastCapturedIndex + 1)
+    const expectedCanonicalIds = capturedLineage.filter((item) => !representedIds.has(item.id)).map((item) => item.id)
+    if (capturedIds.size !== capturedLineage.length
+      || canonicalIds.length !== expectedCanonicalIds.length
+      || canonicalIds.some((id, index) => expectedCanonicalIds[index] !== id)) {
+      throw new ContextPersistenceError('integrity_violation', 'Execution context provenance is not an exact lineage prefix')
+    }
+    const manifestHash = sha256Canonical({
+      schema: 'baton.execution-context-manifest.v1',
+      executionId: text(row, 'execution_id'),
+      threadId: text(row, 'thread_id'),
+      materializerVersion: text(row, 'materializer_version'),
+      materializedContextHash: text(row, 'materialized_context_hash'),
+      entries,
+    })
+    if (manifestHash !== text(row, 'manifest_hash')) {
+      throw new ContextPersistenceError('integrity_violation', 'Execution context manifest hash is invalid')
+    }
+    return {
+      id: text(row, 'id'),
+      executionId: text(row, 'execution_id'),
+      threadId: text(row, 'thread_id'),
+      materializerVersion: text(row, 'materializer_version'),
+      materializedContextHash: text(row, 'materialized_context_hash'),
+      manifestHash,
+      entries,
+      createdAt: text(row, 'created_at'),
+    }
+  }
+
+  #contextCompactionJobStateHash(row: SqlRow): string {
+    const artifact = this.#optional(this.#db.prepare(
+      'SELECT id FROM context_compactions WHERE job_id=?',
+    ), text(row, 'id'))
+    return sha256Canonical({
+      schema: 'baton.context-compaction-job-state.v1',
+      id: text(row, 'id'),
+      threadId: text(row, 'thread_id'),
+      requestHash: text(row, 'request_hash'),
+      sourceHash: text(row, 'source_hash'),
+      summaryInputHash: text(row, 'summary_input_hash'),
+      expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+      status: text(row, 'status'),
+      revision: integer(row, 'revision'),
+      leaseOwner: nullableText(row, 'lease_owner'),
+      leaseExpiresAt: nullableText(row, 'lease_expires_at'),
+      attemptCount: integer(row, 'attempt_count'),
+      artifactId: artifact ? text(artifact, 'id') : null,
+      error: parseNullableObject(row.error_json),
+      completedAt: nullableText(row, 'completed_at'),
+    })
+  }
+
+  #contextCompactionHeadHash(threadId: ThreadId, compactionId: string | null, revision: number): string {
+    return sha256Canonical({
+      schema: 'baton.context-compaction-head.v1',
+      threadId,
+      compactionId,
+      revision,
+    })
+  }
+
+  #ensureContextCompactionHead(threadId: ThreadId, now: string): SqlRow {
+    const initialHash = this.#contextCompactionHeadHash(threadId, null, 0)
+    this.#db.prepare(`
+      INSERT INTO context_compaction_heads(thread_id,compaction_id,revision,head_hash,updated_at)
+      VALUES (?,NULL,0,?,?) ON CONFLICT(thread_id) DO NOTHING
+    `).run(threadId, initialHash, now)
+    const head = this.#one(this.#db.prepare(
+      'SELECT * FROM context_compaction_heads WHERE thread_id=?',
+    ), threadId)
+    this.#validateContextCompactionHead(head)
+    return head
+  }
+
+  #validateContextCompactionHead(row: SqlRow): void {
+    const threadId = text(row, 'thread_id')
+    const compactionId = nullableText(row, 'compaction_id')
+    const revision = integer(row, 'revision')
+    if (this.#contextCompactionHeadHash(threadId, compactionId, revision) !== text(row, 'head_hash')) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction head hash is invalid')
+    }
+    if ((compactionId === null) !== (revision === 0)) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction head revision is inconsistent')
+    }
+    const artifactCount = integer(this.#one(this.#db.prepare(`
+      SELECT COUNT(*) AS count FROM context_compactions WHERE thread_id=?
+    `), threadId), 'count')
+    if (artifactCount !== revision) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction head revision does not match artifacts')
+    }
+    if (compactionId !== null) {
+      const artifact = this.#optional(this.#db.prepare(
+        'SELECT thread_id FROM context_compactions WHERE id=?',
+      ), compactionId)
+      if (!artifact || text(artifact, 'thread_id') !== threadId) {
+        throw new ContextPersistenceError('integrity_violation', 'Compaction head points to an invalid artifact')
+      }
+    }
+  }
+
+  #validateContextCompactionJobEvents(row: SqlRow): void {
+    const events = this.#all(this.#db.prepare(`
+      SELECT * FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence
+    `), text(row, 'id'))
+    let previousEventHash: string | null = null
+    let previousRevision = 0
+    for (const event of events) {
+      const revision = integer(event, 'revision')
+      const payload = parseObject(event.payload_json)
+      if (text(event, 'thread_id') !== text(row, 'thread_id') || revision !== previousRevision + 1
+        || nullableText(event, 'previous_event_hash') !== previousEventHash) {
+        throw new ContextPersistenceError('integrity_violation', 'Compaction job event chain is discontinuous')
+      }
+      const eventHash = sha256Canonical({
+        schema: 'baton.context-compaction-job-event.v1',
+        jobId: text(event, 'job_id'),
+        threadId: text(event, 'thread_id'),
+        expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+        revision,
+        status: text(event, 'status'),
+        payload,
+        stateHash: text(event, 'state_hash'),
+        previousEventHash,
+        createdAt: text(event, 'created_at'),
+      })
+      if (eventHash !== text(event, 'event_hash')) {
+        throw new ContextPersistenceError('integrity_violation', 'Compaction job event hash is invalid')
+      }
+      previousRevision = revision
+      previousEventHash = eventHash
+    }
+    const latest = events.at(-1)
+    if (!latest || integer(latest, 'revision') !== integer(row, 'revision')
+      || text(latest, 'status') !== text(row, 'status')
+      || text(latest, 'state_hash') !== this.#contextCompactionJobStateHash(row)) {
+      throw new ContextPersistenceError('integrity_violation', 'Compaction job state does not match its audit chain')
+    }
+  }
+
+  #appendContextCompactionJobEvent(
+    row: SqlRow,
+    payload: Record<string, unknown>,
+    now: string,
+  ): void {
+    const previous = this.#optional(this.#db.prepare(`
+      SELECT event_hash FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence DESC LIMIT 1
+    `), text(row, 'id'))
+    const previousEventHash = previous ? text(previous, 'event_hash') : null
+    const stateHash = this.#contextCompactionJobStateHash(row)
+    const eventHash = sha256Canonical({
+      schema: 'baton.context-compaction-job-event.v1',
+      jobId: text(row, 'id'),
+      threadId: text(row, 'thread_id'),
+      expectedPreviousArtifactId: nullableText(row, 'expected_previous_artifact_id'),
+      revision: integer(row, 'revision'),
+      status: text(row, 'status'),
+      payload,
+      stateHash,
+      previousEventHash,
+      createdAt: now,
+    })
+    this.#db.prepare(`
+      INSERT INTO context_compaction_job_events(
+        job_id,thread_id,revision,status,payload_json,state_hash,previous_event_hash,event_hash,created_at
+      ) VALUES (?,?,?,?,?,?,?,?,?)
+    `).run(text(row, 'id'), text(row, 'thread_id'), integer(row, 'revision'), text(row, 'status'),
+      canonicalJson(payload), stateHash, previousEventHash, eventHash, now)
   }
 
   #appendFollowUpChanged(followUp: CanonicalFollowUp, now: string): void {

@@ -591,6 +591,10 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         body: JSON.stringify({
           model: body.model,
           max_tokens: requestMaxTokens,
+          // Anthropic automatic prompt caching advances the breakpoint with
+          // the growing canonical history. No provider-visible thread ID is
+          // needed; cache reuse remains prefix-bound by the Messages API.
+          cache_control: { type: 'ephemeral' },
           ...(body.developerInstructions ? { system: body.developerInstructions } : {}),
           messages,
           ...(tools.length > 0 ? { tools } : {}),

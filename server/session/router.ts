@@ -20,6 +20,7 @@ import type { ProviderModelDescriptor } from './model-catalog.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 import { NativeImportError } from './native-import/service.ts'
 import type { CodexNativeScanFilter, NativeSourceClient } from './native-import/contracts.ts'
+import { ContextInputTooLargeError } from './canonical-context-runtime.ts'
 
 const PROVIDERS = new Set<CanonicalProvider>(['claude', 'codex', 'gemini'])
 const ITEM_KINDS = new Set<CanonicalItemKind>([
@@ -888,6 +889,15 @@ export function createConversationRouter(
     }
     if (error instanceof ProviderReadinessError) {
       res.status(503).json({ code: error.code, error: error.message })
+      return
+    }
+    if (error instanceof ContextInputTooLargeError) {
+      res.status(413).json({
+        code: error.code,
+        error: error.message,
+        estimatedInputTokens: error.estimatedInputTokens,
+        usableInputTokens: error.usableInputTokens,
+      })
       return
     }
     if (error instanceof FollowUpStoreError) {

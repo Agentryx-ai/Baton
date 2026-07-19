@@ -13,6 +13,10 @@ import type {
   SessionProviderAdapter,
 } from './adapter.ts'
 import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import {
+  CanonicalContextRuntime,
+  ContextInputTooLargeError,
+} from './canonical-context-runtime.ts'
 import { ConversationEventHub } from './event-hub.ts'
 import { chargeableGoalTokens, TurnOrchestrator } from './orchestrator.ts'
 import { ProviderReadinessError } from './service.ts'
@@ -278,6 +282,54 @@ test('TurnOrchestrator durably executes one canonical turn and deduplicates retr
   assert.equal(orchestrator.getSnapshot(session.activeThreadId)?.turns.length, 1)
 })
 
+test('orchestrator runs compaction before beginTurn and records the execution context before provider materialization', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-context-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const adapterSnapshots: ThreadSnapshot[] = []
+  registry.register(safeAdapter(adapterSnapshots))
+  const order: string[] = []
+  const contextRuntime = {
+    assertUpcomingInputFits() {
+      return { additionalInputTokens: 0, inputBudgetTokens: 1 }
+    },
+    async compactBeforeTurn({ snapshot }: { snapshot: ThreadSnapshot }) {
+      order.push(`compact:${snapshot.turns.length}`)
+      return null
+    },
+    async materializeForExecution({ snapshot }: { snapshot: ThreadSnapshot }) {
+      order.push(`materialize:${snapshot.turns.at(-1)?.status}`)
+      return snapshot
+    },
+  }
+  const orchestrator = new TurnOrchestrator(
+    store,
+    registry,
+    new ConversationEventHub(),
+    10_000,
+    contextRuntime,
+  )
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  const session = orchestrator.createSession({})
+  const started = await orchestrator.startTurn({
+    threadId: session.activeThreadId,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'context-request',
+    expectedRevision: 0,
+    input: [{ kind: 'user_message', payload: { text: 'question' } }],
+  })
+  await waitForTerminal(store, started.turn.id)
+
+  assert.deepEqual(order, ['compact:0', 'materialize:running'])
+  assert.equal(adapterSnapshots.length, 1)
+  assert.equal(adapterSnapshots[0]?.items.length, 0, 'current input remains the explicit turn request')
+})
+
 test('first send verifies workspace, creates the canonical graph once, and replays before rechecking cwd', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-initial-session-'))
   const workspace = join(directory, 'workspace')
@@ -326,6 +378,46 @@ test('first send verifies workspace, creates the canonical graph once, and repla
     (error) => error instanceof Error && /different initial request/.test(error.message),
   )
   assert.equal(store.listSessions().length, 1)
+})
+
+test('oversized first send is rejected before any canonical rows are created', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-initial-budget-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const adapter = safeAdapter([])
+  let executeCount = 0
+  const execute = adapter.execute.bind(adapter)
+  adapter.execute = async (request, context) => {
+    executeCount += 1
+    return execute(request, context)
+  }
+  registry.register(adapter)
+  const orchestrator = new TurnOrchestrator(
+    store,
+    registry,
+    new ConversationEventHub(),
+    10_000,
+    new CanonicalContextRuntime(store, 'initial-budget-test'),
+  )
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  await assert.rejects(orchestrator.startSession({
+    sessionId: 'oversized-first-session',
+    clientRequestId: 'oversized-first-request',
+    cwd: null,
+    instructionSnapshot: { developerInstructions: 'be exact' },
+    provider: 'codex',
+    model: 'gpt-test',
+    effort: 'high',
+    input: [{ kind: 'user_message', payload: { text: 'x'.repeat(100_000) } }],
+  }), (error) => error instanceof ContextInputTooLargeError
+    && error.code === 'context_input_too_large')
+
+  assert.deepEqual(store.listSessions('all'), [])
+  assert.equal(executeCount, 0)
 })
 
 test('concurrent equivalent first sends normalize defaults and execute the adapter once', async (t) => {

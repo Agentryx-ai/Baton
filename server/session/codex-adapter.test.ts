@@ -660,6 +660,45 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   await adapter.shutdown()
 })
 
+test('canonical Codex execution uses an authenticated per-turn cache bridge without exposing the upstream credential', async () => {
+  const argsSeen: string[][] = []
+  const environmentsSeen: Array<Readonly<Record<string, string>> | undefined> = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('normal', [], argsSeen, environmentsSeen),
+    proxyConnection: async () => ({
+      baseUrl: 'http://127.0.0.1:8317',
+      token: 'upstream-proxy-token',
+    }),
+    cacheIdentitySecret: Buffer.alloc(32, 11),
+    shutdownTimeoutMs: 20,
+  })
+  const handshake = await adapter.initialize()
+  assert.equal(
+    handshake.enforcementEvidence.canonicalCacheIdentity,
+    'hmac-sha256-loopback-responses-bridge-v1',
+  )
+  const materialized = adapter.materialize(request(), snapshot())
+  assert.equal(
+    (materialized.body as Record<string, unknown>).canonicalThreadId,
+    snapshot().thread.id,
+  )
+  const execution = await adapter.execute(materialized, context())
+  await collect(execution.events)
+  assert.equal((await execution.terminal).status, 'completed')
+  await execution.dispose()
+
+  assert.equal(argsSeen.length, 2)
+  const turnBaseUrl = argsSeen[1]?.find((argument) =>
+    argument.startsWith('model_providers.baton.base_url='))
+  assert.ok(turnBaseUrl)
+  assert.doesNotMatch(turnBaseUrl, /8317/)
+  assert.match(turnBaseUrl, /^model_providers\.baton\.base_url="http:\/\/127\.0\.0\.1:\d+\/v1"$/)
+  assert.equal(environmentsSeen[0]?.BATON_PROXY_TOKEN, 'upstream-proxy-token')
+  assert.notEqual(environmentsSeen[1]?.BATON_PROXY_TOKEN, 'upstream-proxy-token')
+  assert.ok(environmentsSeen[1]?.BATON_PROXY_TOKEN)
+  await adapter.shutdown()
+})
+
 test('Codex automatic compaction is recorded as private lifecycle metadata instead of a capability failure', async () => {
   const adapter = new CodexCanonicalAdapter({
     processFactory: scriptedFactory('compaction', [], []),

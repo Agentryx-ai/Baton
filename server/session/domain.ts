@@ -8,6 +8,9 @@ export type ItemId = string
 export type ExecutionId = string
 export type GoalId = string
 export type FollowUpId = string
+export type ContextCompactionJobId = string
+export type ContextCompactionId = string
+export type ExecutionContextManifestId = string
 
 export type ThreadStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'archived'
 export type TurnStatus =
@@ -234,6 +237,123 @@ export interface CanonicalItem {
   provider: CanonicalProvider | null
   nativeId: string | null
   createdAt: string
+}
+
+export type ContextCompactionJobStatus = 'queued' | 'running' | 'completed' | 'failed'
+
+/** Durable work receipt for producing a derived summary. Canonical items are never replaced. */
+export interface ContextCompactionJob {
+  id: ContextCompactionJobId
+  threadId: ThreadId
+  requestKey: string
+  requestHash: string
+  sourceItemIds: ItemId[]
+  sourceHash: string
+  summaryInputHash: string
+  /** Artifact frontier observed by the caller; null means no prior artifact existed. */
+  expectedPreviousArtifactId: ContextCompactionId | null
+  status: ContextCompactionJobStatus
+  revision: number
+  leaseOwner: string | null
+  leaseExpiresAt: string | null
+  attemptCount: number
+  artifactId: ContextCompactionId | null
+  error: Record<string, unknown> | null
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
+}
+
+export interface ContextCompactionSourceItem {
+  ordinal: number
+  itemId: ItemId
+  itemSequence: number
+  itemDigest: string
+}
+
+/** Immutable derived context artifact; it is provenance, never canonical conversation history. */
+export interface ContextCompactionArtifact {
+  id: ContextCompactionId
+  jobId: ContextCompactionJobId
+  threadId: ThreadId
+  sourceHash: string
+  summaryInputHash: string
+  artifactHash: string
+  summary: Record<string, unknown>
+  generatorProvider: CanonicalProvider
+  generatorModel: string
+  generatorVersion: string
+  sourceItems: ContextCompactionSourceItem[]
+  createdAt: string
+}
+
+export type ExecutionContextManifestEntry =
+  | { ordinal: number; kind: 'canonical_item'; itemId: ItemId; digest: string }
+  | { ordinal: number; kind: 'compaction'; compactionId: ContextCompactionId; digest: string }
+
+/** Immutable replay/audit receipt for the exact provider-neutral context selected for an execution. */
+export interface ExecutionContextManifest {
+  id: ExecutionContextManifestId
+  executionId: ExecutionId
+  threadId: ThreadId
+  materializerVersion: string
+  materializedContextHash: string
+  manifestHash: string
+  entries: ExecutionContextManifestEntry[]
+  createdAt: string
+}
+
+export type ExecutionContextSourceRef =
+  | { kind: 'canonical_item'; itemId: ItemId }
+  | { kind: 'compaction'; compactionId: ContextCompactionId }
+
+export interface CreateContextCompactionJobInput {
+  threadId: ThreadId
+  /** Stable caller-generated idempotency key for this exact compaction request. */
+  requestKey: string
+  /** Exact canonical prefix, in lineage order, covered by the derived summary. */
+  sourceItemIds: ItemId[]
+  /** Digest of the visibility-filtered generator input, distinct from the full canonical source hash. */
+  summaryInputHash: string
+  /** Compare-and-set frontier. The job is accepted only while this remains the latest artifact. */
+  expectedPreviousArtifactId: ContextCompactionId | null
+}
+
+export interface ClaimContextCompactionJobInput {
+  jobId: ContextCompactionJobId
+  ownerId: string
+  leaseDurationMs?: number
+}
+
+/** Creates/reclaims and leases one exact compaction request in a single durable transaction. */
+export interface ReserveContextCompactionJobInput extends CreateContextCompactionJobInput {
+  ownerId: string
+  leaseDurationMs?: number
+}
+
+export interface CompleteContextCompactionJobInput {
+  jobId: ContextCompactionJobId
+  ownerId: string
+  summary: Record<string, unknown>
+  generatorProvider: CanonicalProvider
+  generatorModel: string
+  generatorVersion: string
+}
+
+export interface FailContextCompactionJobInput {
+  jobId: ContextCompactionJobId
+  ownerId: string
+  error: Record<string, unknown>
+}
+
+export interface CreateExecutionContextManifestInput {
+  executionId: ExecutionId
+  threadId: ThreadId
+  materializerVersion: string
+  /** Hash of the exact provider-neutral context body produced by the materializer. */
+  materializedContextHash: string
+  /** Either every canonical lineage item, or one prefix compaction followed by its exact uncovered suffix. */
+  sources: ExecutionContextSourceRef[]
 }
 
 export type FollowUpDelivery = 'steer_or_queue' | 'next_turn'

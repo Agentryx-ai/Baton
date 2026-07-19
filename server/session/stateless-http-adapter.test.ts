@@ -132,6 +132,7 @@ test('Claude adapter sends stateless history and records a provider-reported mod
   const sentBody = sentBodies[0]
   assert.ok(sentBody)
   assert.equal((sentBody.output_config as Record<string, unknown>).effort, 'high')
+  assert.deepEqual(sentBody.cache_control, { type: 'ephemeral' })
   assert.equal(sentBody.system, 'Verify before finishing.')
   assert.deepEqual(sentBody.messages, [
     { role: 'assistant', content: 'history' },
@@ -205,6 +206,7 @@ test('Gemini adapter uses the proxy compatibility route without native tools', a
   for await (const _event of execution.events) { /* drain */ }
   assert.equal(requestedUrl, 'http://proxy/v1/chat/completions')
   assert.ok(sentBodies[0])
+  assert.equal(sentBodies[0].cache_control, undefined)
   assert.deepEqual((sentBodies[0].messages as unknown[])[0], {
     role: 'system', content: 'Use the canonical plan.',
   })

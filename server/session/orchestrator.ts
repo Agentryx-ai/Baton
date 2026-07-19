@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { AdapterRegistry } from './adapter-registry.ts'
 import type { ProviderBindingPatch, ProviderTurnExecution } from './adapter.ts'
+import type { CanonicalContextRuntimeContract } from './canonical-context-runtime.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type {
   AgentToolDefinition,
@@ -10,6 +11,7 @@ import type {
   BeginTurnResult,
   CanonicalGoal,
   CanonicalFollowUp,
+  CanonicalExecution,
   CanonicalItem,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -77,6 +79,7 @@ export class TurnOrchestrator implements ConversationService {
   private readonly adapters: AdapterRegistry
   private readonly events: ConversationEventHub
   private readonly cancellationTimeoutMs: number
+  private readonly contextRuntime: CanonicalContextRuntimeContract | null
   private readonly goalRuntime: GoalRuntime
   private readonly active = new Map<TurnId, ActiveTurn>()
   private closed = false
@@ -91,11 +94,13 @@ export class TurnOrchestrator implements ConversationService {
     adapters: AdapterRegistry,
     events: ConversationEventHub,
     cancellationTimeoutMs = 10_000,
+    contextRuntime: CanonicalContextRuntimeContract | null = null,
   ) {
     this.store = store
     this.adapters = adapters
     this.events = events
     this.cancellationTimeoutMs = cancellationTimeoutMs
+    this.contextRuntime = contextRuntime
     this.goalRuntime = new GoalRuntime(store, {
       ownerId: `baton-${process.pid}-${Date.now()}`,
       launchContinuation: (request) => this.launchGoalContinuation(request),
@@ -134,6 +139,12 @@ export class TurnOrchestrator implements ConversationService {
       ...workspaceRuntime.definitions,
       ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
     ]
+    this.contextRuntime?.assertUpcomingInputFits({
+      ready,
+      instructionSnapshot: normalized.instructionSnapshot,
+      upcomingInput: normalized.input,
+      toolDefinitions,
+    })
     const result = this.store.beginSession({
       sessionId: normalized.sessionId,
       clientRequestId: normalized.clientRequestId,
@@ -483,6 +494,19 @@ export class TurnOrchestrator implements ConversationService {
       ...workspaceRuntime.definitions,
       ...goalToolDefinitions,
     ]
+    const beforeTurn = this.store.getSnapshot(input.threadId)
+    const compaction = beforeTurn && beforeTurn.thread.revision === input.expectedRevision && this.contextRuntime
+      ? await this.contextRuntime.compactBeforeTurn({
+          snapshot: beforeTurn,
+          ready,
+          provider: input.provider,
+          model: input.model,
+          effort: input.effort ?? null,
+          upcomingInput: input.input,
+          toolDefinitions,
+        })
+      : null
+    if (startSignal?.aborted) throw startSignal.reason ?? new Error('Goal continuation start was cancelled')
     const result = this.store.beginTurn({
       threadId: input.threadId,
       provider: input.provider,
@@ -505,6 +529,15 @@ export class TurnOrchestrator implements ConversationService {
         ...(input.effort ? { effort: input.effort } : {}),
         agentLoopLimits: DEFAULT_AGENT_LOOP_LIMITS,
         goalAutomatic: automatic,
+        ...(compaction ? {
+          contextCompaction: {
+            reason: compaction.reason,
+            artifactId: compaction.artifact?.id ?? null,
+            estimatedTokensBefore: compaction.estimatedTokensBefore,
+            estimatedTokensAfter: compaction.estimatedTokensAfter,
+            triggerTokens: compaction.triggerTokens,
+          },
+        } : {}),
       },
       leaseExpiresAt: null,
       goalContext,
@@ -551,6 +584,7 @@ export class TurnOrchestrator implements ConversationService {
     })
     const completion = this.executeTurn(
       result.turn,
+      result.execution,
       input,
       ready.adapter,
       ready.handshake.capabilities,
@@ -663,6 +697,7 @@ export class TurnOrchestrator implements ConversationService {
 
   private async executeTurn(
     turn: CanonicalTurn,
+    canonicalExecution: CanonicalExecution,
     input: StartTurnInput,
     adapter: Awaited<ReturnType<AdapterRegistry['getReady']>>['adapter'],
     capabilities: Awaited<ReturnType<AdapterRegistry['getReady']>>['handshake']['capabilities'],
@@ -695,7 +730,14 @@ export class TurnOrchestrator implements ConversationService {
     try {
       const persisted = this.store.getSnapshot(input.threadId)
       if (!persisted) throw new Error(`Thread disappeared after turn start: ${input.threadId}`)
-      const snapshot = adapterSnapshot(persisted, input.provider, turn.id)
+      const materialized = this.contextRuntime
+        ? await this.contextRuntime.materializeForExecution({
+            snapshot: persisted,
+            execution: canonicalExecution,
+            provider: input.provider,
+          })
+        : persisted
+      const snapshot = adapterSnapshot(materialized, input.provider, turn.id)
       assertNoUnresolvedToolCalls(snapshot)
       const request = {
         turnId: turn.id,

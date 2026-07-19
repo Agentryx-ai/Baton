@@ -6,6 +6,7 @@ import type { Router } from 'express'
 import { parse as parseToml } from 'smol-toml'
 import { loadProxyConnection } from '../client-integration.ts'
 import { AdapterRegistry } from './adapter-registry.ts'
+import { CanonicalContextRuntime } from './canonical-context-runtime.ts'
 import { CodexCanonicalAdapter } from './codex-adapter.ts'
 import { StatelessHttpCanonicalAdapter } from './stateless-http-adapter.ts'
 import { buildProviderModelCatalog } from './model-catalog.ts'
@@ -34,9 +35,11 @@ export interface ConversationRuntime {
 export function createConversationRuntime(options: ConversationRuntimeOptions): ConversationRuntime {
   mkdirSync(options.dataDir, { recursive: true })
   const store = new SqliteSessionStore(path.join(options.dataDir, 'canonical-conversations.sqlite3'))
+  const nativeNamespaceSecret = store.getNativeImportNamespaceKey()
   const adapters = new AdapterRegistry()
   adapters.register(new CodexCanonicalAdapter({
     executable: options.codexExecutable,
+    cacheIdentitySecret: nativeNamespaceSecret,
     proxyConnection: async () => {
       const connection = await loadProxyConnection(false)
       return { baseUrl: connection.baseUrl, token: connection.token }
@@ -55,8 +58,8 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
     proxyConnection: statelessProxyConnection,
   }))
   const events = new ConversationEventHub()
-  const service = new TurnOrchestrator(store, adapters, events)
-  const nativeNamespaceSecret = store.getNativeImportNamespaceKey()
+  const contextRuntime = new CanonicalContextRuntime(store)
+  const service = new TurnOrchestrator(store, adapters, events, 10_000, contextRuntime)
   const nativeImport = new NativeSessionImportService(store, [
     new CodexLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),
     new ClaudeLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),

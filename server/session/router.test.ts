@@ -24,6 +24,7 @@ import {
   type ConversationRouterOptions,
 } from './router.ts'
 import { ProviderReadinessError } from './service.ts'
+import { ContextInputTooLargeError } from './canonical-context-runtime.ts'
 import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type {
@@ -470,6 +471,21 @@ test('first-turn route rejects malformed drafts and maps conflict/readiness fail
     const unavailable = await firstTurnRequest(baseUrl)
     assert.equal(unavailable.status, 503)
     assert.equal((await json(unavailable)).code, 'provider_not_ready')
+  })
+
+  const oversizedService = new TestConversationService()
+  oversizedService.startSession = async () => {
+    throw new ContextInputTooLargeError(900, 800)
+  }
+  await withServer(oversizedService, async (baseUrl) => {
+    const oversized = await firstTurnRequest(baseUrl)
+    assert.equal(oversized.status, 413)
+    assert.deepEqual(await json(oversized), {
+      code: 'context_input_too_large',
+      error: 'Upcoming input requires approximately 900 tokens; usable input budget is 800',
+      estimatedInputTokens: 900,
+      usableInputTokens: 800,
+    })
   })
 })
 
