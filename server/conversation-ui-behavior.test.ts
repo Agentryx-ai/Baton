@@ -98,6 +98,20 @@ test('thread refresh replaces only the matching sidebar session projection', asy
   assert.equal(replaceSessionProjection(null, { id: 'selected', workStatus: 'running' }), null)
 })
 
+test('session lists retain only an explicit valid selection and never auto-open the first row', async () => {
+  const { retainExplicitSessionSelection } = await import(workspaceModulePath) as {
+    retainExplicitSessionSelection: (
+      selectedSessionId: string | null,
+      sessions: Array<{ id: string }>,
+    ) => string | null
+  }
+  const sessions = [{ id: 'newest' }, { id: 'explicit' }]
+
+  assert.equal(retainExplicitSessionSelection(null, sessions), null)
+  assert.equal(retainExplicitSessionSelection('explicit', sessions), 'explicit')
+  assert.equal(retainExplicitSessionSelection('missing', sessions), null)
+})
+
 test('background session projection polling runs only while visible and cleans up listeners', async () => {
   const { installSessionProjectionPolling } = await import(workspaceModulePath) as {
     installSessionProjectionPolling: (

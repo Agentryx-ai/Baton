@@ -253,6 +253,15 @@ export function replaceSessionProjection(
   return sessions.map((session) => session.id === projection.id ? projection : session)
 }
 
+export function retainExplicitSessionSelection(
+  selectedSessionId: string | null,
+  sessions: readonly Pick<CanonicalSessionDto, 'id'>[],
+): string | null {
+  return selectedSessionId !== null && sessions.some((session) => session.id === selectedSessionId)
+    ? selectedSessionId
+    : null
+}
+
 export interface UnknownMutationCall {
   turnId: string
   callId: string
@@ -671,7 +680,6 @@ export function ConversationWorkspace({
   const threadRequest = useRef(0)
   const sessionListRequest = useRef(0)
   const sessionListBusy = useRef(false)
-  const sessionsRef = useRef<CanonicalSessionDto[] | null>(sessions)
   const draftSessionIdRef = useRef<string | null>(draft?.sessionId ?? null)
   const draftRef = useRef<ConversationDraft | null>(draft)
   const draftOpenRef = useRef(draftOpen)
@@ -689,7 +697,6 @@ export function ConversationWorkspace({
   draftSessionIdRef.current = draftSessionId
   draftRef.current = draft
   draftOpenRef.current = draftOpen
-  sessionsRef.current = sessions
   const threadId = selectedSession?.activeThreadId ?? null
   const currentCatalog = catalogs[provider]
   const models = currentCatalog?.models ?? null
@@ -718,8 +725,7 @@ export function ConversationWorkspace({
       setSessions(result)
       setSelectedSessionId((current) => {
         if (draftOpenRef.current && draftSessionIdRef.current && sessionScope === 'active' && current === null) return null
-        if (current && result.some((session) => session.id === current)) return current
-        return result[0]?.id ?? null
+        return retainExplicitSessionSelection(current, result)
       })
       if (!background) setError(null)
     } catch (cause) {
@@ -872,7 +878,7 @@ export function ConversationWorkspace({
           conversationRouteWithoutSelection(window.location.href),
         )
       }
-      setSelectedSessionId(sessionsRef.current?.[0]?.id ?? null)
+      setSelectedSessionId(null)
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
