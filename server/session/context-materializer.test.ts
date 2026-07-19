@@ -213,6 +213,19 @@ test('unknown mutation outcome cannot become a summary source', () => {
     }),
   ])
   assert.deepEqual(stableContextPrefixes(snapshot), [])
+
+  const hostSnapshot = makeSnapshot([turn('turn-host', 1, 'completed')], [
+    item('host-call', 'turn-host', 1, 'tool_call', { callId: 'host-1', sideEffect: 'host_mutation' }),
+    item('host-result', 'turn-host', 2, 'tool_result', {
+      callId: 'host-1',
+      result: {
+        success: false,
+        metadata: { reconciliation: { resolution: 'unknown_outcome' } },
+        error: { code: 'unknown_mutation_acknowledged' },
+      },
+    }),
+  ])
+  assert.deepEqual(stableContextPrefixes(hostSnapshot), [])
 })
 
 test('provider-private, Baton-private, usage, and provider-event records never enter summary input', () => {

@@ -22,6 +22,7 @@ import {
   type CanonicalResponsesBridge,
 } from './canonical-cache-identity.ts'
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
+import { hasPortableUserContent, imageAttachments, type ImageArtifactResolver } from './image-artifacts.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
@@ -85,6 +86,7 @@ export interface CodexAdapterOptions {
   isolatedCodexHome?: string
   /** Durable installation-local secret; never sent to Codex or the upstream provider. */
   cacheIdentitySecret?: Uint8Array
+  imageArtifacts?: ImageArtifactResolver
 }
 
 interface MaterializedCodexTurn {
@@ -95,7 +97,7 @@ interface MaterializedCodexTurn {
   cwd: string | null
   developerInstructions: string | null
   history: JsonObject[]
-  input: Array<{ type: 'text'; text: string }>
+  input: Array<{ type: 'text'; text: string } | { type: 'localImage'; path: string }>
 }
 
 interface RpcMessage {
@@ -266,6 +268,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   private readonly isolatedCodexHome: string
   private readonly ownsIsolatedCodexHome: boolean
   private readonly cacheIdentitySecret: Buffer | null
+  private readonly imageArtifacts: ImageArtifactResolver | null
   private proxyConnection: CodexProxyConnection | null = null
   private initializePromise: Promise<AdapterHandshake> | null = null
   private mcpDisableOverrides: Record<string, false> = {}
@@ -280,6 +283,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     this.cacheIdentitySecret = options.cacheIdentitySecret === undefined
       ? null
       : Buffer.from(options.cacheIdentitySecret)
+    this.imageArtifacts = options.imageArtifacts ?? null
     if (this.cacheIdentitySecret !== null && this.cacheIdentitySecret.byteLength < 32) {
       throw new TypeError('Codex canonical cache identity secret must contain at least 32 bytes')
     }
@@ -298,10 +302,10 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   validate(request: CanonicalTurnRequest, snapshot: ThreadSnapshot): void {
     if (request.model.trim().length === 0) throw new Error('Codex model is required')
     if (snapshot.thread.status === 'archived') throw new Error('Cannot execute an archived thread')
-    if (request.input.length === 0) throw new Error('Codex turn requires text input')
+    if (request.input.length === 0) throw new Error('Codex turn requires input')
     for (const item of request.input) {
-      if (item.kind !== 'user_message' || portableText(item.payload) === null) {
-        throw new Error('Safe Codex mode accepts text user_message input only')
+      if (item.kind !== 'user_message' || !hasPortableUserContent(item.payload)) {
+        throw new Error('Safe Codex mode accepts portable text and image user_message input only')
       }
     }
   }
@@ -311,17 +315,25 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     const history = snapshot.items.flatMap((item): JsonObject[] => {
       if (item.visibility !== 'portable') return []
       const text = portableHistoryText(item.kind, item.payload)
-      if (text === null) return []
+      const attachments = item.kind === 'user_message' ? imageAttachments(item.payload) : []
+      if (text === null && attachments.length === 0) return []
       const role = item.kind === 'user_message' ? 'user' : 'assistant'
+      if (attachments.length > 0 && !this.imageArtifacts) {
+        throw new Error('Codex history contains images without an artifact resolver')
+      }
       return [
         {
           type: 'message',
           role,
           content: [
-            {
+            ...(text === null ? [] : [{
               type: role === 'user' ? 'input_text' : 'output_text',
               text,
-            },
+            }]),
+            ...attachments.map((attachment) => ({
+              type: 'input_image',
+              image_url: this.imageArtifacts!.dataUrl(attachment),
+            })),
           ],
         },
       ]
@@ -334,10 +346,20 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       cwd: snapshot.session.cwd,
       developerInstructions: canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
       history,
-      input: request.input.map((item) => ({
-        type: 'text',
-        text: portableText(item.payload) as string,
-      })),
+      input: request.input.flatMap((item) => {
+        const text = portableText(item.payload)
+        const attachments = imageAttachments(item.payload)
+        if (attachments.length > 0 && !this.imageArtifacts) {
+          throw new Error('Codex input contains images without an artifact resolver')
+        }
+        return [
+          ...(text === null ? [] : [{ type: 'text' as const, text }]),
+          ...attachments.map((attachment) => ({
+            type: 'localImage' as const,
+            path: this.imageArtifacts!.pathFor(attachment),
+          })),
+        ]
+      }),
     }
     return { body }
   }
@@ -677,7 +699,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 const result = await resultPromise
                 if (terminalResult !== null) return
                 await client.respond(message.id, {
-                  contentItems: [{ type: 'inputText', text: JSON.stringify(result) }],
+                  contentItems: codexToolResultContent(result, this.imageArtifacts),
                   success: result.success,
                 })
                 continue
@@ -876,7 +898,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       adapterVersion: requiredString(hardened.initialized.userAgent, 'Codex userAgent'),
       capabilities: {
         roles: ['user', 'assistant'],
-        contentTypes: ['text'],
+        contentTypes: ['text', 'image'],
         toolCalling: true,
         parallelTools: true,
         contextWindow: null,
@@ -1043,8 +1065,12 @@ function parseMaterializedRequest(value: unknown): MaterializedCodexTurn {
     developerInstructions: typeof body.developerInstructions === 'string' ? body.developerInstructions : null,
     history: body.history.map((item) => asObject(item, 'Codex history item')),
     input: body.input.map((item) => {
-      const input = asObject(item, 'Codex text input')
-      return { type: 'text', text: requiredString(input.text, 'Codex input text') }
+      const input = asObject(item, 'Codex input')
+      if (input.type === 'text') return { type: 'text', text: requiredString(input.text, 'Codex input text') }
+      if (input.type === 'localImage') {
+        return { type: 'localImage', path: requiredString(input.path, 'Codex local image path') }
+      }
+      throw new Error('Invalid Codex input type')
     }),
   }
 }
@@ -1068,6 +1094,18 @@ function dynamicToolSpec(definition: ProviderExecutionContext['toolDefinitions']
     description: definition.description,
     inputSchema: definition.inputSchema,
   }
+}
+
+function codexToolResultContent(
+  result: AgentToolResult,
+  artifacts: ImageArtifactResolver | null,
+): JsonObject[] {
+  const content: JsonObject[] = [{ type: 'inputText', text: JSON.stringify(result) }]
+  for (const image of result.success ? result.images ?? [] : []) {
+    if (!artifacts) throw new Error('Codex tool returned an image without an artifact resolver')
+    content.push({ type: 'inputImage', imageUrl: artifacts.dataUrl(image) })
+  }
+  return content
 }
 
 function parseDynamicToolCall(value: unknown): {

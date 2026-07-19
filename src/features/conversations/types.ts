@@ -56,12 +56,36 @@ export interface CanonicalSessionDto {
   activeThreadId: string
   projectKey: string | null
   cwd: string | null
+  ldPlayer?: LdPlayerGrantDto | null
   schemaVersion: number
   createdAt: string
   updatedAt: string
   archivedAt: string | null
   workStatus: VisibleWorkStatus
   source?: NativeSessionSourceSummaryDto | null
+}
+
+export interface LdPlayerGrantDto {
+  kind: 'ldplayer'
+  installationRoot: string
+  instanceIndex: number
+  instanceName: string
+}
+
+export interface LdPlayerInstanceDto extends LdPlayerGrantDto {
+  running: boolean
+  androidStarted: boolean
+}
+
+export interface ImageArtifactRefDto extends JsonObject {
+  id: string
+  sha256: string
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  byteLength: number
+  width: number | null
+  height: number | null
+  fileName: string
+  source: 'upload' | 'ldplayer_capture'
 }
 
 export type NativeImportSourceClient = 'codex_local' | 'claude_desktop' | 'claude_code'
@@ -278,6 +302,7 @@ export type CanonicalStreamEventType =
   | 'turn_failed'
   | 'turn_interrupted'
   | 'workspace_changed'
+  | 'host_capability_changed'
   | 'goal_changed'
 
 export interface CanonicalStreamEventDto {

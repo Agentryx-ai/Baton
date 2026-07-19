@@ -11,6 +11,7 @@ import {
 } from './codex-adapter.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type { AgentToolDefinition, AgentToolInvocation, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import type { ImageArtifactRef } from './image-artifacts.ts'
 
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null }
 type Scenario =
@@ -489,6 +490,45 @@ function request() {
   }
 }
 
+const TEST_IMAGE: ImageArtifactRef = {
+  id: `sha256-${'a'.repeat(64)}`,
+  sha256: 'a'.repeat(64),
+  mediaType: 'image/png',
+  byteLength: 67,
+  width: 1,
+  height: 1,
+  fileName: 'screen.png',
+  source: 'upload',
+}
+
+test('materializes canonical image references as Codex localImage input and data-only replay history', () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: () => new FakeProcess(),
+    imageArtifacts: {
+      pathFor: () => 'C:/Baton/image-artifacts/screen.png',
+      dataUrl: () => 'data:image/png;base64,AAAA',
+    },
+  })
+  const projected = adapter.materialize({
+    turnId: 'image-turn', model: 'gpt-test',
+    input: [{ kind: 'user_message', payload: { attachments: [TEST_IMAGE] } }],
+  }, {
+    ...snapshot(),
+    items: [{
+      ...snapshot().items[0]!,
+      kind: 'user_message',
+      payload: { text: 'prior image', attachments: [TEST_IMAGE] },
+    }],
+  }).body as Record<string, unknown>
+  assert.deepEqual(projected.input, [{ type: 'localImage', path: 'C:/Baton/image-artifacts/screen.png' }])
+  assert.deepEqual(projected.history, [{
+    type: 'message', role: 'user', content: [
+      { type: 'input_text', text: 'prior image' },
+      { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
+    ],
+  }])
+})
+
 function readFileTool(): AgentToolDefinition {
   return {
     name: 'read_file',
@@ -743,13 +783,17 @@ test('adapter exposes only Baton dynamic tools and returns their result through 
   const adapter = new CodexCanonicalAdapter({
     processFactory: scriptedFactory('tool', created, []),
     shutdownTimeoutMs: 20,
+    imageArtifacts: {
+      pathFor: () => 'C:/Baton/image-artifacts/screen.png',
+      dataUrl: () => 'data:image/png;base64,AAAA',
+    },
   })
   const tool = readFileTool()
   const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
     tools: [tool],
     executeTool: async (invocation) => {
       invocations.push(invocation)
-      return { success: true, content: { text: 'contents' }, error: null }
+      return { success: true, content: { text: 'contents' }, images: [TEST_IMAGE], error: null }
     },
   }))
   const events = await collect(execution.events)
@@ -772,7 +816,10 @@ test('adapter exposes only Baton dynamic tools and returns their result through 
   assert.deepEqual(response?.result, {
     contentItems: [{
       type: 'inputText',
-      text: JSON.stringify({ success: true, content: { text: 'contents' }, error: null }),
+      text: JSON.stringify({ success: true, content: { text: 'contents' }, images: [TEST_IMAGE], error: null }),
+    }, {
+      type: 'inputImage',
+      imageUrl: 'data:image/png;base64,AAAA',
     }],
     success: true,
   })

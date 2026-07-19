@@ -18,6 +18,8 @@ import { runSessionRetentionSweep, SESSION_RETENTION_INTERVAL_MS } from './reten
 import { CodexLocalSourceReader } from './native-import/codex-source.ts'
 import { ClaudeLocalSourceReader } from './native-import/claude-source.ts'
 import { NativeSessionImportService } from './native-import/service.ts'
+import { LocalImageArtifactStore } from './image-artifacts.ts'
+import { LdPlayerHost } from './tools/ldplayer-runtime.ts'
 
 export interface ConversationRuntimeOptions {
   dataDir: string
@@ -35,11 +37,13 @@ export interface ConversationRuntime {
 export function createConversationRuntime(options: ConversationRuntimeOptions): ConversationRuntime {
   mkdirSync(options.dataDir, { recursive: true })
   const store = new SqliteSessionStore(path.join(options.dataDir, 'canonical-conversations.sqlite3'))
+  const imageArtifacts = new LocalImageArtifactStore(path.join(options.dataDir, 'image-artifacts'))
   const nativeNamespaceSecret = store.getNativeImportNamespaceKey()
   const adapters = new AdapterRegistry()
   adapters.register(new CodexCanonicalAdapter({
     executable: options.codexExecutable,
     cacheIdentitySecret: nativeNamespaceSecret,
+    imageArtifacts,
     proxyConnection: async () => {
       const connection = await loadProxyConnection(false)
       return { baseUrl: connection.baseUrl, token: connection.token }
@@ -52,20 +56,27 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
   adapters.register(new StatelessHttpCanonicalAdapter({
     provider: 'claude',
     proxyConnection: statelessProxyConnection,
+    imageArtifacts,
   }))
   adapters.register(new StatelessHttpCanonicalAdapter({
     provider: 'gemini',
     proxyConnection: statelessProxyConnection,
+    imageArtifacts,
   }))
   const events = new ConversationEventHub()
   const contextRuntime = new CanonicalContextRuntime(store)
-  const service = new TurnOrchestrator(store, adapters, events, 10_000, contextRuntime)
+  const ldPlayer = new LdPlayerHost()
+  const service = new TurnOrchestrator(store, adapters, events, 10_000, contextRuntime, {
+    ldPlayer,
+    artifacts: imageArtifacts,
+  })
   const nativeImport = new NativeSessionImportService(store, [
     new CodexLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),
     new ClaudeLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),
   ])
   const router = createConversationRouter(service, {
     nativeImport,
+    imageArtifacts,
     listModels: async (provider) => {
       const connection = await loadProxyConnection(true)
       const configuredDefault = provider === 'codex'

@@ -19,6 +19,7 @@ import type {
   ThreadSnapshot,
 } from './domain.ts'
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
+import { hasPortableUserContent, imageAttachments, parseImageArtifactRef, type ImageArtifactResolver } from './image-artifacts.ts'
 
 type SupportedProvider = Extract<CanonicalProvider, 'claude' | 'gemini'>
 type JsonObject = Record<string, unknown>
@@ -42,6 +43,7 @@ export interface StatelessHttpAdapterOptions {
   provider: SupportedProvider
   proxyConnection: () => Promise<StatelessProxyConnection>
   fetchImpl?: typeof fetch
+  imageArtifacts?: ImageArtifactResolver
 }
 
 type ProviderMessage = Record<string, unknown>
@@ -232,6 +234,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
   readonly provider: SupportedProvider
   private readonly proxyConnectionProvider: () => Promise<StatelessProxyConnection>
   private readonly fetchImpl: typeof fetch
+  private readonly imageArtifacts: ImageArtifactResolver | null
   private connection: StatelessProxyConnection | null = null
   private initializePromise: Promise<AdapterHandshake> | null = null
   private shuttingDown = false
@@ -241,6 +244,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     this.provider = options.provider
     this.proxyConnectionProvider = options.proxyConnection
     this.fetchImpl = options.fetchImpl ?? fetch
+    this.imageArtifacts = options.imageArtifacts ?? null
   }
 
   initialize(): Promise<AdapterHandshake> {
@@ -250,7 +254,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         adapterVersion: `baton-${this.provider}-http-v1`,
         capabilities: {
           roles: ['user', 'assistant'],
-          contentTypes: ['text'],
+          contentTypes: ['text', 'image'],
           toolCalling: true,
           parallelTools: true,
           contextWindow: null,
@@ -278,10 +282,10 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     if (request.effort !== null && request.effort !== undefined && request.effort.trim().length === 0) {
       throw new Error('Effort must be null or a non-empty string')
     }
-    if (request.input.length === 0) throw new Error(`${this.provider} turn requires text input`)
+    if (request.input.length === 0) throw new Error(`${this.provider} turn requires input`)
     for (const item of request.input) {
-      if (item.kind !== 'user_message' || portableText(item.payload) === null) {
-        throw new Error(`${this.provider} safe mode accepts text user_message input only`)
+      if (item.kind !== 'user_message' || !hasPortableUserContent(item.payload)) {
+        throw new Error(`${this.provider} safe mode accepts portable text and image user_message input only`)
       }
     }
   }
@@ -290,7 +294,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     this.validate(request, snapshot)
     const messages = materializeProviderHistory(snapshot, this.provider)
     for (const item of request.input) {
-      messages.push({ role: 'user', content: portableText(item.payload) as string })
+      messages.push({ role: 'user', content: portableUserContent(item.payload) })
     }
     const body: MaterializedHttpTurn = {
       turnId: request.turnId,
@@ -572,7 +576,11 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     ) => Promise<void>,
     steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
-    const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
+    const messages: ProviderMessage[] = body.messages.map((message) => hydrateProviderMessage(
+      message,
+      'claude',
+      this.imageArtifacts,
+    ))
     const tools = context.toolDefinitions.map(toClaudeTool)
     const usage: JsonObject = {}
     const seenProviderCallIds = new Set<string>()
@@ -771,18 +779,20 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         throw error
       }
       const results = await executeToolBatch(body.turnId, toolUses, context, signal)
-      const toolResultMessage = {
+      const durableToolResultMessage = {
         role: 'user',
         content: results.map((result, index) => claudeToolResult(
           toolUses[index]!.providerCallId,
           result,
           context.limits.toolOutputBytes,
+          this.imageArtifacts,
         )),
       }
+      const toolResultMessage = hydrateProviderMessage(durableToolResultMessage, 'claude', this.imageArtifacts)
       const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
       await recordRound({
         assistant: assistantMessage,
-        toolResults: [toolResultMessage],
+        toolResults: [durableToolResultMessage],
         ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
       })
       messages.push(assistantMessage, toolResultMessage)
@@ -806,7 +816,11 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     ) => Promise<void>,
     steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
-    const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
+    const messages: ProviderMessage[] = body.messages.map((message) => hydrateProviderMessage(
+      message,
+      'gemini',
+      this.imageArtifacts,
+    ))
     const tools = context.toolDefinitions.map(toOpenAiTool)
     const usage: JsonObject = {}
     const seenProviderCallIds = new Set<string>()
@@ -913,6 +927,19 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           name: toolCalls[index]!.name,
           content: serializeToolResult(result, context.limits.toolOutputBytes).content,
         })
+        const images = result.success ? result.images ?? [] : []
+        if (images.length > 0) {
+          toolResultMessages.push({
+            role: 'user',
+            content: [
+              { type: 'text', text: `Image output from ${toolCalls[index]!.name}` },
+              ...images.map((image) => ({
+                type: 'baton_image',
+                artifact: image,
+              })),
+            ],
+          })
+        }
       }
       const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
       await onModelRound(roundRecord, usage, {
@@ -920,7 +947,10 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         toolResults: toolResultMessages,
         ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
       })
-      messages.push(assistantMessage, ...toolResultMessages)
+      messages.push(
+        assistantMessage,
+        ...toolResultMessages.map((message) => hydrateProviderMessage(message, 'gemini', this.imageArtifacts)),
+      )
       steerQueue.appendAndAccept(messages, steers)
     }
     throw new ProviderLoopError(
@@ -1050,12 +1080,22 @@ function claudeToolResult(
   providerCallId: string,
   result: AgentToolResult,
   byteLimit: number,
+  _artifacts: ImageArtifactResolver | null,
 ): JsonObject {
   const serialized = serializeToolResult(result, byteLimit)
+  const images = result.success ? result.images ?? [] : []
   return {
     type: 'tool_result',
     tool_use_id: providerCallId,
-    content: serialized.content,
+    content: images.length === 0
+      ? serialized.content
+      : [
+          { type: 'text', text: serialized.content },
+          ...images.map((image) => ({
+            type: 'baton_image',
+            artifact: image,
+          })),
+        ],
     ...(serialized.isError ? { is_error: true } : {}),
   }
 }
@@ -1233,7 +1273,11 @@ function parseClaudeHistoryMessage(message: JsonObject): ProviderMessage {
 
 function parseGeminiHistoryMessage(message: JsonObject): ProviderMessage {
   if (message.role === 'user') {
-    return { role: 'user', content: requiredString(message.content, 'Gemini user message content') }
+    if (typeof message.content === 'string') return { role: 'user', content: requiredString(message.content, 'Gemini user message content') }
+    if (!Array.isArray(message.content) || message.content.some((part) => !isObject(part))) {
+      throw new Error('Invalid Gemini structured user content')
+    }
+    return { role: 'user', content: message.content }
   }
   if (message.role === 'tool') {
     return {
@@ -1367,16 +1411,24 @@ function materializeProviderHistory(
         continue
       }
       const text = portableHistoryText(item.kind, item.payload)
-      if (text === null) continue
+      const attachments = item.kind === 'user_message' ? imageAttachments(item.payload) : []
+      if (text === null && attachments.length === 0) continue
       const role = item.kind === 'user_message' ? 'user' : 'assistant'
+      const content = role === 'user' && attachments.length > 0
+        ? portableUserContent(item.payload)
+        : text as string
       if (hasExactContinuation) {
-        messages.push({ role, content: text })
+        messages.push({ role, content })
+        continue
+      }
+      if (typeof content !== 'string') {
+        messages.push({ role, content })
         continue
       }
       appendMessage(
         messages,
         role,
-        text,
+        content,
         aggregatePortableContinuation && role === 'assistant' ? '' : '\n\n',
       )
     }
@@ -1431,6 +1483,52 @@ function portableText(payload: JsonObject): string | null {
   }
   if (Array.isArray(payload.plan)) return JSON.stringify(payload.plan)
   return null
+}
+
+function portableUserContent(payload: JsonObject): string | JsonObject[] {
+  const text = portableText(payload)
+  const attachments = imageAttachments(payload)
+  if (attachments.length === 0) return text as string
+  return [
+    ...(text === null ? [] : [{ type: 'text', text }]),
+    ...attachments.map((attachment) => ({ type: 'baton_image', artifact: attachment })),
+  ]
+}
+
+function hydrateProviderMessage(
+  message: ProviderMessage,
+  provider: SupportedProvider,
+  artifacts: ImageArtifactResolver | null,
+): ProviderMessage {
+  return hydrateProviderValue(message, provider, artifacts) as ProviderMessage
+}
+
+function hydrateProviderValue(
+  value: unknown,
+  provider: SupportedProvider,
+  artifacts: ImageArtifactResolver | null,
+): unknown {
+  if (Array.isArray(value)) return value.map((entry) => hydrateProviderValue(entry, provider, artifacts))
+  if (!isObject(value)) return value
+  if (value.type === 'baton_image') {
+    if (!artifacts) throw new Error(`${provider} image content requires an artifact resolver`)
+    const artifact = parseImageArtifactRef(value.artifact)
+    const dataUrl = artifacts.dataUrl(artifact)
+    return provider === 'claude'
+      ? {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: artifact.mediaType,
+            data: dataUrl.split(',', 2)[1],
+          },
+        }
+      : { type: 'image_url', image_url: { url: dataUrl } }
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+    key,
+    hydrateProviderValue(entry, provider, artifacts),
+  ]))
 }
 
 function isObject(value: unknown): value is JsonObject {

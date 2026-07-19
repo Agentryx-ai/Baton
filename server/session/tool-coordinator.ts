@@ -20,6 +20,7 @@ import type {
 } from './store.ts'
 import { GoalStoreError } from './store.ts'
 import { LocalWorkspaceToolRuntime } from './tools/local-workspace-runtime.ts'
+import { parseImageArtifactRef } from './image-artifacts.ts'
 
 type JsonObject = Record<string, unknown>
 
@@ -407,7 +408,7 @@ export class ToolCoordinator {
       items: [toolCallItem(invocation, sideEffect)],
     })
     this.#persisted.set(invocation.callId, { invocation, result: null })
-    if (sideEffect === 'workspace_mutation' || sideEffect === 'workspace_command') {
+    if (sideEffect === 'workspace_mutation' || sideEffect === 'workspace_command' || sideEffect === 'host_mutation') {
       this.#unresolvedMutations.add(invocation.callId)
     }
   }
@@ -441,7 +442,8 @@ export class ToolCoordinator {
         const input = object(item.payload.input)
         if (providerCallId && name && input) {
           this.#persisted.set(callId, { invocation: { callId, providerCallId, name, input }, result: null })
-          if (item.payload.sideEffect === 'workspace_mutation' || item.payload.sideEffect === 'workspace_command') {
+          if (item.payload.sideEffect === 'workspace_mutation' || item.payload.sideEffect === 'workspace_command'
+            || item.payload.sideEffect === 'host_mutation') {
             this.#unresolvedMutations.add(callId)
           }
         }
@@ -649,9 +651,19 @@ function agentToolResult(value: unknown): AgentToolResult | null {
   const candidate = object(value)
   if (!candidate || typeof candidate.success !== 'boolean') return null
   if (candidate.success === true && object(candidate.content) && candidate.error === null) {
+    let images
+    try {
+      images = candidate.images === undefined
+        ? undefined
+        : Array.isArray(candidate.images) ? candidate.images.map(parseImageArtifactRef) : null
+    } catch {
+      return null
+    }
+    if (images === null) return null
     return {
       success: true,
       content: candidate.content as JsonObject,
+      ...(images ? { images } : {}),
       ...(object(candidate.metadata) ? { metadata: candidate.metadata as JsonObject } : {}),
       error: null,
     }

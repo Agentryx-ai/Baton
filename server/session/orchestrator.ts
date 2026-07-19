@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import path from 'node:path'
 import { AdapterRegistry } from './adapter-registry.ts'
 import type { ProviderBindingPatch, ProviderTurnExecution } from './adapter.ts'
 import type { CanonicalContextRuntimeContract } from './canonical-context-runtime.ts'
@@ -13,6 +14,7 @@ import type {
   CanonicalFollowUp,
   CanonicalExecution,
   CanonicalItem,
+  NewCanonicalItem,
   CanonicalSession,
   CanonicalStreamEvent,
   CanonicalThread,
@@ -23,12 +25,13 @@ import type {
   ThreadId,
   ThreadSnapshot,
   TurnId,
+  LdPlayerGrant,
 } from './domain.ts'
 import { ConversationEventHub } from './event-hub.ts'
 import { GoalRuntime, type GoalContinuationRequest } from './goal-runtime.ts'
 import { goalContinuationPrompt } from './goal-prompts.ts'
 import { ProviderReadinessError } from './service.ts'
-import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
+import type { ConversationService, LdPlayerMutationInput, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
 import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
 import type {
   ClearGoalInput,
@@ -51,6 +54,10 @@ import {
   type ToolRuntime,
 } from './tool-coordinator.ts'
 import { LocalWorkspaceToolRuntime } from './tools/local-workspace-runtime.ts'
+import { CompositeToolRuntime } from './tools/composite-runtime.ts'
+import { LdPlayerHost, LdPlayerToolRuntime } from './tools/ldplayer-runtime.ts'
+import type { LocalImageArtifactStore } from './image-artifacts.ts'
+import { hasPortableUserContent, imageAttachments } from './image-artifacts.ts'
 import { assertWorkspaceRoot, resolveWorkspaceRoot } from './workspace-root.ts'
 
 interface ActiveTurn {
@@ -80,6 +87,7 @@ export class TurnOrchestrator implements ConversationService {
   private readonly events: ConversationEventHub
   private readonly cancellationTimeoutMs: number
   private readonly contextRuntime: CanonicalContextRuntimeContract | null
+  private readonly hostRuntime: { ldPlayer: LdPlayerHost; artifacts: LocalImageArtifactStore } | null
   private readonly goalRuntime: GoalRuntime
   private readonly active = new Map<TurnId, ActiveTurn>()
   private closed = false
@@ -95,12 +103,14 @@ export class TurnOrchestrator implements ConversationService {
     events: ConversationEventHub,
     cancellationTimeoutMs = 10_000,
     contextRuntime: CanonicalContextRuntimeContract | null = null,
+    hostRuntime: { ldPlayer: LdPlayerHost; artifacts: LocalImageArtifactStore } | null = null,
   ) {
     this.store = store
     this.adapters = adapters
     this.events = events
     this.cancellationTimeoutMs = cancellationTimeoutMs
     this.contextRuntime = contextRuntime
+    this.hostRuntime = hostRuntime
     this.goalRuntime = new GoalRuntime(store, {
       ownerId: `baton-${process.pid}-${Date.now()}`,
       launchContinuation: (request) => this.launchGoalContinuation(request),
@@ -119,6 +129,7 @@ export class TurnOrchestrator implements ConversationService {
   async startSession(input: StartSessionInput): Promise<BeginSessionResult> {
     if (this.closed) throw new Error('Canonical conversation runtime is closed')
     const normalized = normalizeStartSessionInput(input)
+    this.validateImageInputs(normalized.input)
     const requestHash = hashSessionStartRequest(normalized)
     const replay = this.store.getInitialSessionResult({
       sessionId: normalized.sessionId,
@@ -134,7 +145,7 @@ export class TurnOrchestrator implements ConversationService {
     } catch (error) {
       throw new ProviderReadinessError(normalized.provider, { cause: error })
     }
-    const workspaceRuntime = this.workspaceRuntime(workspaceCwd)
+    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, null)
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
       ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
@@ -206,6 +217,50 @@ export class TurnOrchestrator implements ConversationService {
       sessionId,
       expectedThreadRevision: expectedRevision,
       cwd: null,
+    })
+    this.events.publish(session.activeThreadId)
+    return session
+  }
+  async listLdPlayerInstances(): Promise<Array<LdPlayerGrant & { running: boolean; androidStarted: boolean }>> {
+    if (!this.hostRuntime) return []
+    return (await this.hostRuntime.ldPlayer.listInstances()).map((instance) => ({
+      kind: 'ldplayer',
+      installationRoot: instance.installationRoot,
+      instanceIndex: instance.index,
+      instanceName: instance.name,
+      running: instance.running,
+      androidStarted: instance.androidStarted,
+    }))
+  }
+
+  async connectLdPlayer(input: LdPlayerMutationInput): Promise<CanonicalSession> {
+    if (!this.hostRuntime) throw new SessionStoreError('not_found', 'LDPlayer integration is unavailable')
+    const candidate: LdPlayerGrant = {
+      kind: 'ldplayer',
+      installationRoot: input.installationRoot,
+      instanceIndex: input.instanceIndex,
+      instanceName: '',
+    }
+    const requestedRoot = path.resolve(candidate.installationRoot)
+    const discovered = (await this.hostRuntime.ldPlayer.listInstances()).find((instance) => (
+      path.resolve(instance.installationRoot).toLowerCase() === requestedRoot.toLowerCase()
+      && instance.index === candidate.instanceIndex
+    ))
+    if (!discovered) throw new SessionStoreError('not_found', 'LDPlayer instance was not found')
+    const session = this.store.updateLdPlayerGrant({
+      sessionId: input.sessionId,
+      expectedThreadRevision: input.expectedRevision,
+      grant: { ...candidate, instanceName: discovered.name },
+    })
+    this.events.publish(session.activeThreadId)
+    return session
+  }
+
+  disconnectLdPlayer(sessionId: SessionId, expectedRevision: number): CanonicalSession {
+    const session = this.store.updateLdPlayerGrant({
+      sessionId,
+      expectedThreadRevision: expectedRevision,
+      grant: null,
     })
     this.events.publish(session.activeThreadId)
     return session
@@ -411,8 +466,8 @@ export class TurnOrchestrator implements ConversationService {
         this.events.publish(threadId)
         return false
       }
-      const workspaceCwd = this.workspaceCwd(threadId)
-      const workspaceRuntime = this.workspaceRuntime(workspaceCwd)
+      const workspaceCwd = snapshot.session.cwd ? assertWorkspaceRoot(snapshot.session.cwd) : null
+      const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, snapshot.session.ldPlayer ?? null)
       const toolDefinitions = [
         ...workspaceRuntime.definitions,
         ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
@@ -427,7 +482,10 @@ export class TurnOrchestrator implements ConversationService {
         adapterVersion: ready.handshake.adapterVersion,
         policySnapshot: {
           delegationMode: 'disabled', allowedTools: toolDefinitions.map((tool) => tool.name),
-          approvalPolicy: 'never', cwd: workspaceCwd, maxDepth: 0, capabilityGrant: null,
+          approvalPolicy: 'never', cwd: workspaceCwd, maxDepth: 0,
+          capabilityGrant: snapshot.session.ldPlayer
+            ? `ldplayer:${snapshot.session.ldPlayer.instanceIndex}`
+            : null,
         },
         budget: { ...(prior.effort ? { effort: prior.effort } : {}), agentLoopLimits: DEFAULT_AGENT_LOOP_LIMITS, goalAutomatic: false },
       } as BeginTurnFromFollowUpInput)
@@ -484,17 +542,20 @@ export class TurnOrchestrator implements ConversationService {
   ): Promise<BeginTurnResult> {
     if (this.closed) throw new Error('Canonical conversation runtime is closed')
     validateTurnInput(input, automatic)
+    this.validateImageInputs(input.input)
 
     const ready = await this.adapters.getReady(input.provider)
     if (startSignal?.aborted) throw startSignal.reason ?? new Error('Goal continuation start was cancelled')
-    const workspaceCwd = this.workspaceCwd(input.threadId)
-    const workspaceRuntime = this.workspaceRuntime(workspaceCwd)
+    const beforeTurn = this.store.getSnapshot(input.threadId)
+    const workspaceCwd = beforeTurn?.session.cwd
+      ? assertWorkspaceRoot(beforeTurn.session.cwd)
+      : null
+    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, beforeTurn?.session.ldPlayer ?? null)
     const goalToolDefinitions = GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal')
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
       ...goalToolDefinitions,
     ]
-    const beforeTurn = this.store.getSnapshot(input.threadId)
     const compaction = beforeTurn && beforeTurn.thread.revision === input.expectedRevision && this.contextRuntime
       ? await this.contextRuntime.compactBeforeTurn({
           snapshot: beforeTurn,
@@ -523,7 +584,9 @@ export class TurnOrchestrator implements ConversationService {
         approvalPolicy: 'never',
         cwd: workspaceCwd,
         maxDepth: 0,
-        capabilityGrant: null,
+        capabilityGrant: beforeTurn?.session.ldPlayer
+          ? `ldplayer:${beforeTurn.session.ldPlayer.instanceIndex}`
+          : null,
       },
       budget: {
         ...(input.effort ? { effort: input.effort } : {}),
@@ -896,13 +959,6 @@ export class TurnOrchestrator implements ConversationService {
     )
   }
 
-  private workspaceCwd(threadId: ThreadId): string | null {
-    const snapshot = this.store.getSnapshot(threadId)
-    if (!snapshot) return null
-    if (snapshot.session.cwd) return assertWorkspaceRoot(snapshot.session.cwd)
-    return null
-  }
-
   private flushActiveGoalTurns(goalId: string): void {
     for (const active of this.active.values()) {
       if (active.turn.goalId !== goalId) continue
@@ -910,8 +966,23 @@ export class TurnOrchestrator implements ConversationService {
     }
   }
 
-  private workspaceRuntime(cwd: string | null): ToolRuntime {
-    return cwd ? new LocalWorkspaceToolRuntime({ cwd }) : NO_WORKSPACE_RUNTIME
+  private sessionToolRuntime(cwd: string | null, ldPlayer: LdPlayerGrant | null): ToolRuntime {
+    const runtimes: ToolRuntime[] = []
+    if (cwd) runtimes.push(new LocalWorkspaceToolRuntime({ cwd }))
+    if (ldPlayer && this.hostRuntime) {
+      runtimes.push(new LdPlayerToolRuntime(ldPlayer, this.hostRuntime.ldPlayer, this.hostRuntime.artifacts))
+    }
+    if (runtimes.length === 0) return NO_WORKSPACE_RUNTIME
+    return runtimes.length === 1 ? runtimes[0]! : new CompositeToolRuntime(runtimes)
+  }
+
+  private validateImageInputs(items: readonly NewCanonicalItem[]): void {
+    for (const item of items) {
+      for (const attachment of imageAttachments(item.payload)) {
+        if (!this.hostRuntime) throw new Error('Image attachments are unavailable')
+        this.hostRuntime.artifacts.pathFor(attachment)
+      }
+    }
   }
 
   private checkpointGoalTurn(
@@ -1157,9 +1228,11 @@ function normalizeStartSessionInput(input: StartSessionInput): NormalizedStartSe
       || visibility !== 'portable'
       || (item.provider !== undefined && item.provider !== null)
       || (item.nativeId !== undefined && item.nativeId !== null)
-      || typeof item.payload.text !== 'string'
-      || !item.payload.text.trim()) {
+      || !hasPortableUserContent(item.payload)) {
       throw new Error('initial input accepts non-empty portable provider-neutral user messages only')
+    }
+    if (item.payload.attachments !== undefined && !Array.isArray(item.payload.attachments)) {
+      throw new Error('initial input attachments must be an array')
     }
     return {
       kind: 'user_message' as const,
@@ -1268,6 +1341,9 @@ function validateTurnInput(input: StartTurnInput, internalGoalTurn = false): voi
       || (visibility !== 'portable' && !(internalGoalTurn && visibility === 'baton_private'))) {
       throw new Error('turn input accepts portable user messages and internal Goal continuations only')
     }
+    if (visibility === 'portable' && !hasPortableUserContent(item.payload)) {
+      throw new Error('portable user messages require text or image attachments')
+    }
   }
 }
 
@@ -1306,7 +1382,8 @@ function elapsedTurnSeconds(turn: CanonicalTurn, endIso: string): number {
 function goalProgressDigest(snapshot: ThreadSnapshot | null, goalRevision: number, turnId: TurnId): string | null {
   const turnItems = snapshot?.items.filter((item) => item.turnId === turnId) ?? []
   const mutatingCalls = new Set(turnItems.flatMap((item) => {
-    if (item.kind !== 'tool_call' || item.payload.sideEffect !== 'workspace_mutation') return []
+    if (item.kind !== 'tool_call'
+      || (item.payload.sideEffect !== 'workspace_mutation' && item.payload.sideEffect !== 'host_mutation')) return []
     return typeof item.payload.callId === 'string' ? [item.payload.callId] : []
   }))
   const evidence = turnItems

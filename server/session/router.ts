@@ -21,6 +21,7 @@ import type { NativeSessionImportService } from './native-import/service.ts'
 import { NativeImportError } from './native-import/service.ts'
 import type { CodexNativeScanFilter, NativeSourceClient } from './native-import/contracts.ts'
 import { ContextInputTooLargeError } from './canonical-context-runtime.ts'
+import { hasPortableUserContent, ImageArtifactError, MAX_IMAGE_ARTIFACT_BYTES, type LocalImageArtifactStore } from './image-artifacts.ts'
 
 const PROVIDERS = new Set<CanonicalProvider>(['claude', 'codex', 'gemini'])
 const ITEM_KINDS = new Set<CanonicalItemKind>([
@@ -51,6 +52,7 @@ export interface ConversationRouterOptions {
     defaultModel: string | null
   }>
   nativeImport?: NativeSessionImportService
+  imageArtifacts?: LocalImageArtifactStore
 }
 
 class RequestValidationError extends Error {
@@ -118,6 +120,15 @@ function safeDisplayAlias(value: string | null): string | null {
     return trimmed.split(/[\\/]+/).filter(Boolean).at(-1) ?? null
   }
   return trimmed
+}
+
+function decodeUploadFileName(value: string | undefined): string {
+  if (!value) return 'image'
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
 }
 
 function optionalNullableString(
@@ -371,8 +382,7 @@ function parseStartSessionInput(sessionId: string, value: unknown): StartSession
     || (item.visibility !== undefined && item.visibility !== 'portable')
     || (item.provider !== undefined && item.provider !== null)
     || (item.nativeId !== undefined && item.nativeId !== null)
-    || typeof item.payload.text !== 'string'
-    || !item.payload.text.trim())) {
+    || !hasPortableUserContent(item.payload))) {
     throw new RequestValidationError('input must contain non-empty portable provider-neutral user messages')
   }
   return {
@@ -400,8 +410,9 @@ function parseFollowUpInput(threadId: string, value: unknown): SubmitFollowUpInp
   if (input.some((item) => item.kind !== 'user_message'
     || (item.visibility !== undefined && item.visibility !== 'portable')
     || (item.provider !== undefined && item.provider !== null)
-    || (item.nativeId !== undefined && item.nativeId !== null))) {
-    throw new RequestValidationError('follow-up input must contain only portable provider-neutral user messages')
+    || (item.nativeId !== undefined && item.nativeId !== null)
+    || item.payload.attachments !== undefined)) {
+    throw new RequestValidationError('follow-up input must contain text-only portable provider-neutral user messages')
   }
   return {
     threadId,
@@ -506,6 +517,37 @@ export function createConversationRouter(
     } catch (error) { next(error) }
   })
   router.use('/native-import', express.json({ limit: '8mb' }))
+  router.post('/artifacts/images', express.raw({
+    type: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+    limit: MAX_IMAGE_ARTIFACT_BYTES,
+  }), route((req, res) => {
+    if (!options.imageArtifacts) {
+      res.status(503).json({ code: 'image_artifacts_unavailable', error: 'image attachments are unavailable' })
+      return
+    }
+    if (req.get('X-Baton-Interaction') !== 'image-upload') {
+      throw new RequestValidationError('image upload requires an explicit user interaction header')
+    }
+    if (!Buffer.isBuffer(req.body)) throw new RequestValidationError('image upload body is required')
+    const mediaType = req.get('content-type')?.split(';', 1)[0]
+    if (mediaType !== 'image/png' && mediaType !== 'image/jpeg'
+      && mediaType !== 'image/webp' && mediaType !== 'image/gif') {
+      throw new RequestValidationError('image content type is unsupported')
+    }
+    const fileName = decodeUploadFileName(req.get('X-Baton-Filename'))
+    res.status(201).json(options.imageArtifacts.put(req.body, mediaType, fileName, 'upload'))
+  }))
+  router.get('/artifacts/images/:artifactId', route((req, res) => {
+    if (!options.imageArtifacts) {
+      res.status(404).end()
+      return
+    }
+    const artifact = options.imageArtifacts.readById(pathParam(req, 'artifactId'))
+    res.setHeader('Content-Type', artifact.mediaType)
+    res.setHeader('Cache-Control', 'private, immutable, max-age=31536000')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.send(artifact.buffer)
+  }))
   router.use(express.json({ limit: '2mb' }))
 
   router.post(
@@ -556,6 +598,42 @@ export function createConversationRouter(
     const body = bodyRecord(req.body)
     requireOnlyKeys(body, ['expectedRevision'])
     res.json(service.disconnectWorkspace(
+      pathParam(req, 'sessionId'),
+      requiredNonNegativeInteger(body, 'expectedRevision'),
+    ))
+  }))
+
+  router.get('/host/ldplayer/instances', route(async (_req, res) => {
+    if (!service.listLdPlayerInstances) {
+      res.status(503).json({ code: 'ldplayer_unavailable', error: 'LDPlayer integration is unavailable' })
+      return
+    }
+    res.json({ instances: await service.listLdPlayerInstances() })
+  }))
+
+  router.put('/sessions/:sessionId/ldplayer', route(async (req, res) => {
+    if (!service.connectLdPlayer) {
+      res.status(503).json({ code: 'ldplayer_unavailable', error: 'LDPlayer integration is unavailable' })
+      return
+    }
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['installationRoot', 'instanceIndex', 'expectedRevision'])
+    res.json(await service.connectLdPlayer({
+      sessionId: pathParam(req, 'sessionId'),
+      installationRoot: requiredNonEmptyString(body, 'installationRoot'),
+      instanceIndex: requiredNonNegativeInteger(body, 'instanceIndex'),
+      expectedRevision: requiredNonNegativeInteger(body, 'expectedRevision'),
+    }))
+  }))
+
+  router.delete('/sessions/:sessionId/ldplayer', route((req, res) => {
+    if (!service.disconnectLdPlayer) {
+      res.status(503).json({ code: 'ldplayer_unavailable', error: 'LDPlayer integration is unavailable' })
+      return
+    }
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['expectedRevision'])
+    res.json(service.disconnectLdPlayer(
       pathParam(req, 'sessionId'),
       requiredNonNegativeInteger(body, 'expectedRevision'),
     ))
@@ -898,6 +976,14 @@ export function createConversationRouter(
         estimatedInputTokens: error.estimatedInputTokens,
         usableInputTokens: error.usableInputTokens,
       })
+      return
+    }
+    if (error instanceof ImageArtifactError) {
+      const status = error.code === 'artifact_not_found' ? 404
+        : error.code === 'invalid_image_size' ? 413
+          : error.code === 'artifact_integrity_error' ? 409
+            : 400
+      res.status(status).json({ code: error.code, error: error.message })
       return
     }
     if (error instanceof FollowUpStoreError) {

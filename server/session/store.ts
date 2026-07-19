@@ -28,6 +28,7 @@ import type {
   TurnId,
   UpsertProviderBindingInput,
   ProviderBinding,
+  LdPlayerGrant,
 } from './domain.ts'
 import type { NativeImportStore } from './native-import/contracts.ts'
 
@@ -235,6 +236,13 @@ export interface UpdateWorkspaceInput {
   cwd: string | null
 }
 
+export interface UpdateLdPlayerGrantInput {
+  sessionId: SessionId
+  expectedThreadRevision: number
+  /** Verified against the current host inventory by the service; null revokes access. */
+  grant: LdPlayerGrant | null
+}
+
 export interface SessionStore extends NativeImportStore {
   createSession(input: CreateSessionInput): CanonicalSession
   getInitialSessionResult(input: InitialSessionRequestIdentity): BeginSessionResult | null
@@ -244,6 +252,7 @@ export interface SessionStore extends NativeImportStore {
   archiveSession(sessionId: SessionId): CanonicalSession
   restoreSession(sessionId: SessionId): CanonicalSession
   updateWorkspace(input: UpdateWorkspaceInput): CanonicalSession
+  updateLdPlayerGrant(input: UpdateLdPlayerGrantInput): CanonicalSession
   purgeExpiredSessions(cutoffIso: string, batchSize?: number): number
   getThread(threadId: ThreadId): CanonicalThread | null
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null

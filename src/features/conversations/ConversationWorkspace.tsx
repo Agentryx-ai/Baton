@@ -9,11 +9,14 @@ import {
   ListFilter,
   Menu,
   MessageSquarePlus,
+  Paperclip,
   RefreshCw,
   Send,
+  Smartphone,
   Square,
   Trash2,
   Undo2,
+  X,
 } from 'lucide-react'
 
 import { AppNavigation, type AppView } from '@/components/AppNavigation'
@@ -74,6 +77,8 @@ import type {
   ProviderModelDescriptorDto,
   UnknownMutationResolution,
   ThreadSnapshotDto,
+  ImageArtifactRefDto,
+  LdPlayerInstanceDto,
 } from './types'
 import { useConversationEvents } from './useConversationEvents'
 
@@ -251,7 +256,7 @@ export interface UnknownMutationCall {
   turnId: string
   callId: string
   toolName: string
-  sideEffect: 'workspace_mutation' | 'workspace_command'
+  sideEffect: 'workspace_mutation' | 'workspace_command' | 'host_mutation'
 }
 
 export function unresolvedUnknownMutations(snapshot: ThreadSnapshotDto | null): UnknownMutationCall[] {
@@ -270,7 +275,8 @@ export function unresolvedUnknownMutations(snapshot: ThreadSnapshotDto | null): 
     const toolName = typeof item.payload.name === 'string' ? item.payload.name : null
     const sideEffect = item.payload.sideEffect
     if (!callId || !toolName || completed.has(`${item.turnId}\0${callId}`)
-      || (sideEffect !== 'workspace_mutation' && sideEffect !== 'workspace_command')) return []
+      || (sideEffect !== 'workspace_mutation' && sideEffect !== 'workspace_command'
+        && sideEffect !== 'host_mutation')) return []
     return [{ turnId: item.turnId, callId, toolName, sideEffect }]
   })
 }
@@ -646,6 +652,13 @@ export function ConversationWorkspace({
   const [reconcileNotice, setReconcileNotice] = useState<string | null>(null)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
+  const [attachments, setAttachments] = useState<ImageArtifactRefDto[]>([])
+  const [uploadingImages, setUploadingImages] = useState(false)
+  const [ldPlayerDialogOpen, setLdPlayerDialogOpen] = useState(false)
+  const [ldPlayerInstances, setLdPlayerInstances] = useState<LdPlayerInstanceDto[]>([])
+  const [selectedLdPlayer, setSelectedLdPlayer] = useState('')
+  const [ldPlayerBusy, setLdPlayerBusy] = useState(false)
+  const [ldPlayerError, setLdPlayerError] = useState<string | null>(null)
   const [sessionScope, setSessionScope] = useState<'active' | 'trash'>('active')
   const [pendingArchive, setPendingArchive] = useState<CanonicalSessionDto | null>(null)
   const [changingSessionId, setChangingSessionId] = useState<string | null>(null)
@@ -659,6 +672,7 @@ export function ConversationWorkspace({
   const transcriptScroller = useRef<HTMLDivElement | null>(null)
   const lastPositionedThread = useRef<string | null>(null)
   const followOutput = useRef(true)
+  const imageInput = useRef<HTMLInputElement | null>(null)
 
   const selectedSession = useMemo(
     () => sessions?.find((session) => session.id === selectedSessionId) ?? null,
@@ -888,6 +902,7 @@ export function ConversationWorkspace({
     setModel(next.model)
     setEffort(next.effort)
     setPrompt(next.message)
+    setAttachments([])
     setGoalComposerMode(false)
     setMobileSidebarOpen(false)
     setError(null)
@@ -994,6 +1009,88 @@ export function ConversationWorkspace({
       setWorkspaceError(errorMessage(cause))
     } finally {
       setWorkspaceBusy(false)
+    }
+  }
+
+  const addImageFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0 || uploadingImages) return
+    const available = Math.max(0, 8 - attachments.length)
+    const selected = Array.from(files).slice(0, available)
+    if (selected.length === 0) {
+      setError('이미지는 한 메시지에 최대 8개까지 첨부할 수 있습니다.')
+      return
+    }
+    if (selected.some((file) => !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type))) {
+      setError('PNG, JPEG, WebP, GIF 이미지만 첨부할 수 있습니다.')
+      return
+    }
+    setUploadingImages(true)
+    try {
+      const uploaded = await Promise.all(selected.map((file) => conversationApi.uploadImage(file)))
+      setAttachments((current) => [...new Map(
+        [...current, ...uploaded].map((attachment) => [attachment.id, attachment]),
+      ).values()].slice(0, 8))
+      setError(null)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setUploadingImages(false)
+      if (imageInput.current) imageInput.current.value = ''
+    }
+  }
+
+  const openLdPlayerDialog = async () => {
+    if (!snapshot) return
+    setLdPlayerDialogOpen(true)
+    setLdPlayerBusy(true)
+    setLdPlayerError(null)
+    try {
+      const instances = await conversationApi.listLdPlayerInstances()
+      setLdPlayerInstances(instances)
+      const current = snapshot.session.ldPlayer
+      const selected = current
+        ? instances.find((instance) => instance.installationRoot === current.installationRoot
+          && instance.instanceIndex === current.instanceIndex)
+        : instances.find((instance) => instance.instanceName.startsWith('Audit-LD9')) ?? instances[0]
+      setSelectedLdPlayer(selected ? `${selected.installationRoot}|${selected.instanceIndex}` : '')
+    } catch (cause) {
+      setLdPlayerError(errorMessage(cause))
+    } finally {
+      setLdPlayerBusy(false)
+    }
+  }
+
+  const connectLdPlayer = async () => {
+    if (!snapshot) return
+    const instance = ldPlayerInstances.find((candidate) => (
+      `${candidate.installationRoot}|${candidate.instanceIndex}` === selectedLdPlayer
+    ))
+    if (!instance) return
+    setLdPlayerBusy(true)
+    setLdPlayerError(null)
+    try {
+      await conversationApi.connectLdPlayer(snapshot.session.id, instance, snapshot.thread.revision)
+      setLdPlayerDialogOpen(false)
+      await Promise.all([refreshThread(), refreshSessions(true)])
+    } catch (cause) {
+      setLdPlayerError(errorMessage(cause))
+    } finally {
+      setLdPlayerBusy(false)
+    }
+  }
+
+  const disconnectLdPlayer = async () => {
+    if (!snapshot) return
+    setLdPlayerBusy(true)
+    setLdPlayerError(null)
+    try {
+      await conversationApi.disconnectLdPlayer(snapshot.session.id, snapshot.thread.revision)
+      setLdPlayerDialogOpen(false)
+      await Promise.all([refreshThread(), refreshSessions(true)])
+    } catch (cause) {
+      setLdPlayerError(errorMessage(cause))
+    } finally {
+      setLdPlayerBusy(false)
     }
   }
 
@@ -1112,7 +1209,11 @@ export function ConversationWorkspace({
 
   const startTurn = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if ((!snapshot && !isDraft) || !prompt.trim()) return
+    if ((!snapshot && !isDraft) || (!prompt.trim() && attachments.length === 0)) return
+    if (activeTurn && attachments.length > 0) {
+      setError('이미지는 현재 응답이 끝난 뒤 새 턴에 첨부해 주세요.')
+      return
+    }
     if (isDraft && draft) {
       if (!model.trim()) return
       setSubmitting(true)
@@ -1120,13 +1221,14 @@ export function ConversationWorkspace({
       try {
         frozen = draft.frozenRequest
           ? draft
-          : freezeFirstTurn({ ...draft, provider, model, effort, message: prompt })
+          : freezeFirstTurn({ ...draft, provider, model, effort, message: prompt }, attachments)
         persistDraft(frozen)
         const result = await conversationApi.createFirstTurn(frozen.sessionId, frozen.frozenRequest!)
         try { clearConversationDraft(window.sessionStorage) } catch { /* storage unavailable */ }
         setDraft(null)
         setDraftOpen(false)
         setPrompt('')
+        setAttachments([])
         setSessions((current) => [result.session, ...(current ?? []).filter((item) => item.id !== result.session.id)])
         setSelectedSessionId(result.session.id)
         setSnapshot({
@@ -1190,7 +1292,7 @@ export function ConversationWorkspace({
       const input = [{
         kind: 'user_message' as const,
         visibility: 'portable' as const,
-        payload: { text: prompt.trim() },
+        payload: { text: prompt.trim(), ...(attachments.length ? { attachments } : {}) },
       }]
       if (submissionKind === 'follow_up' && activeTurn) {
         await conversationApi.enqueueFollowUp(snapshot.thread.id, {
@@ -1211,6 +1313,7 @@ export function ConversationWorkspace({
         })
       }
       setPrompt('')
+      setAttachments([])
       setError(null)
       await refreshThread()
     } catch (cause) {
@@ -1273,9 +1376,11 @@ export function ConversationWorkspace({
   }
 
   const canSubmit = Boolean(
-    prompt.trim()
+    (prompt.trim() || attachments.length > 0)
       && !submitting
       && !folderPickerBusy
+      && !uploadingImages
+      && !(activeTurn && attachments.length > 0)
       && (isDraft
         ? draft && !draft.conflict && model.trim()
         : snapshot
@@ -1287,6 +1392,7 @@ export function ConversationWorkspace({
     setDraftOpen(false)
     setSelectedSessionId(sessionId)
     setPrompt('')
+    setAttachments([])
     setGoalPanelVersion(0)
     setGoalDialog(null)
     setGoalComposerMode(false)
@@ -1464,6 +1570,46 @@ export function ConversationWorkspace({
         onOpenChange={setNativeImportOpen}
         onImported={refreshSessions}
       />
+
+      <Dialog open={ldPlayerDialogOpen} onOpenChange={(open) => { if (!ldPlayerBusy) setLdPlayerDialogOpen(open) }}>
+        <DialogContent className="max-w-md">
+          <DialogTitle>LDPlayer 연결</DialogTitle>
+          <DialogDescription>
+            이 대화에 선택한 인스턴스의 시작, 화면 조작, 캡처 권한만 부여합니다. 임의 ADB 또는 셸 명령은 허용하지 않습니다.
+          </DialogDescription>
+          {ldPlayerError ? <p role="alert" className="text-sm text-destructive">{ldPlayerError}</p> : null}
+          <label className="space-y-1.5 text-sm">
+            <span className="font-medium">인스턴스</span>
+            <select
+              value={selectedLdPlayer}
+              onChange={(event) => setSelectedLdPlayer(event.target.value)}
+              disabled={ldPlayerBusy}
+              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {ldPlayerInstances.length === 0 ? <option value="">설치 또는 인스턴스를 찾지 못했습니다</option> : null}
+              {ldPlayerInstances.map((instance) => (
+                <option
+                  key={`${instance.installationRoot}:${instance.instanceIndex}`}
+                  value={`${instance.installationRoot}|${instance.instanceIndex}`}
+                >
+                  {instance.instanceName} · #{instance.instanceIndex} · {instance.androidStarted ? '실행 중' : '종료됨'}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="flex items-center justify-end gap-2">
+            {snapshot?.session.ldPlayer ? (
+              <Button type="button" variant="destructive" className="mr-auto" disabled={ldPlayerBusy} onClick={() => void disconnectLdPlayer()}>
+                연결 해제
+              </Button>
+            ) : null}
+            <Button type="button" variant="ghost" disabled={ldPlayerBusy} onClick={() => setLdPlayerDialogOpen(false)}>취소</Button>
+            <Button type="button" disabled={ldPlayerBusy || !selectedLdPlayer} onClick={() => void connectLdPlayer()}>
+              {ldPlayerBusy ? '확인 중…' : snapshot?.session.ldPlayer ? '변경' : '연결'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={workspaceDialogOpen} onOpenChange={(open) => { if (!workspaceBusy) setWorkspaceDialogOpen(open) }}>
         <DialogContent className="max-w-md">
@@ -1675,6 +1821,12 @@ export function ConversationWorkspace({
               <Button type="button" variant="ghost" size="xs" onClick={openWorkspaceDialog}>
                 <FolderOpen aria-hidden />
                 {snapshot.session.cwd ? '폴더 연결됨' : '폴더 연결'}
+              </Button>
+            ) : null}
+            {snapshot && sessionScope === 'active' ? (
+              <Button type="button" variant="ghost" size="xs" onClick={() => void openLdPlayerDialog()}>
+                <Smartphone aria-hidden />
+                {snapshot.session.ldPlayer ? snapshot.session.ldPlayer.instanceName : 'LDPlayer'}
               </Button>
             ) : null}
             {isDraft ? (
@@ -1898,6 +2050,27 @@ export function ConversationWorkspace({
                 </button>
               </div>
             ) : null}
+            {attachments.length > 0 ? (
+              <div className="flex gap-2 overflow-x-auto px-2 pt-2" aria-label="첨부 이미지">
+                {attachments.map((attachment) => (
+                  <div key={attachment.id} className="group relative size-20 shrink-0 overflow-hidden rounded-xl border bg-muted">
+                    <img
+                      src={conversationApi.imageUrl(attachment.id)}
+                      alt={attachment.fileName}
+                      className="size-full object-cover"
+                    />
+                    <button
+                      type="button"
+                      className="absolute right-1 top-1 rounded-full bg-background/90 p-1 opacity-90 shadow-sm hover:opacity-100"
+                      aria-label={`${attachment.fileName} 첨부 제거`}
+                      onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}
+                    >
+                      <X className="size-3" aria-hidden />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <textarea
               value={prompt}
               onChange={(event) => {
@@ -1927,6 +2100,25 @@ export function ConversationWorkspace({
             />
 
             <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
+              <input
+                ref={imageInput}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                multiple
+                className="hidden"
+                onChange={(event) => void addImageFiles(event.currentTarget.files)}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                title="이미지 첨부"
+                aria-label="이미지 첨부"
+                disabled={uploadingImages || goalComposerMode || Boolean(activeTurn) || attachments.length >= 8}
+                onClick={() => imageInput.current?.click()}
+              >
+                <Paperclip aria-hidden />
+              </Button>
               {isDraft ? (
                 <div className="flex items-center gap-1">
                   <Button
@@ -1957,6 +2149,7 @@ export function ConversationWorkspace({
                   type="button"
                   variant="ghost"
                   size="xs"
+                  disabled={attachments.length > 0}
                   onClick={() => {
                     setPrompt((current) => limitGoalObjectiveDraft(current))
                     setGoalComposerMode(true)

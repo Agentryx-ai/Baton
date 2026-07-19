@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 
 import express from 'express'
@@ -38,6 +41,7 @@ import type {
 } from './store.ts'
 import type { SessionListScope } from './store.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
+import { LocalImageArtifactStore } from './image-artifacts.ts'
 
 const now = '2026-07-18T00:00:00.000Z'
 
@@ -387,6 +391,37 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
       }
     },
   })
+})
+
+test('image upload requires explicit interaction and serves immutable verified bytes', async (t) => {
+  const service = new TestConversationService()
+  const directory = mkdtempSync(path.join(tmpdir(), 'baton-router-images-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const artifacts = new LocalImageArtifactStore(directory)
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  await withServer(service, async (baseUrl) => {
+    const rejected = await fetch(`${baseUrl}/artifacts/images`, {
+      method: 'POST', headers: { 'content-type': 'image/png' }, body: png,
+    })
+    assert.equal(rejected.status, 400)
+
+    const uploaded = await fetch(`${baseUrl}/artifacts/images`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'image/png',
+        'x-baton-interaction': 'image-upload',
+        'x-baton-filename': encodeURIComponent('화면.png'),
+      },
+      body: png,
+    })
+    assert.equal(uploaded.status, 201)
+    const ref = await json(uploaded) as { id: string; fileName: string }
+    assert.equal(ref.fileName, '화면.png')
+    const served = await fetch(`${baseUrl}/artifacts/images/${ref.id}`)
+    assert.equal(served.status, 200)
+    assert.equal(served.headers.get('cache-control'), 'private, immutable, max-age=31536000')
+    assert.equal(Buffer.from(await served.arrayBuffer()).equals(png), true)
+  }, { imageArtifacts: artifacts })
 })
 
 test('first-turn route parses the immutable draft payload and reports idempotent replay', async () => {

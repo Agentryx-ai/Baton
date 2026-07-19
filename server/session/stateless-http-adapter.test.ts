@@ -6,6 +6,7 @@ import type { ProviderExecutionContext } from './adapter.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type { AgentToolInvocation, AgentToolResult, NewCanonicalItem } from './domain.ts'
 import type { ThreadSnapshot } from './domain.ts'
+import type { ImageArtifactRef } from './image-artifacts.ts'
 
 function executionContext(overrides: Partial<ProviderExecutionContext> = {}): ProviderExecutionContext {
   return {
@@ -29,6 +30,17 @@ const readTool = {
     additionalProperties: false,
   },
   sideEffect: 'read_only' as const,
+}
+
+const TEST_IMAGE: ImageArtifactRef = {
+  id: `sha256-${'b'.repeat(64)}`,
+  sha256: 'b'.repeat(64),
+  mediaType: 'image/png',
+  byteLength: 67,
+  width: 1,
+  height: 1,
+  fileName: 'screen.png',
+  source: 'upload',
 }
 
 async function collectExecution(adapter: StatelessHttpCanonicalAdapter, execution: Awaited<ReturnType<StatelessHttpCanonicalAdapter['execute']>>) {
@@ -152,6 +164,48 @@ test('Claude adapter sends stateless history and records a provider-reported mod
   const completed = events.find((event) => event.type === 'response/completed')
   assert.ok(completed)
   assert.equal(adapter.extractBinding(completed)?.modelFamily, 'claude-opus-4-8')
+})
+
+test('Claude and Gemini hydrate canonical image refs only at the outbound multimodal boundary', async () => {
+  for (const provider of ['claude', 'gemini'] as const) {
+    const sentBodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider,
+      proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      imageArtifacts: {
+        pathFor: () => 'C:/Baton/image-artifacts/screen.png',
+        dataUrl: () => 'data:image/png;base64,AAAA',
+      },
+      fetchImpl: async (_url, init) => {
+        sentBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        return provider === 'claude'
+          ? Response.json({
+              id: 'message-image', model: 'claude-opus-4-8', stop_reason: 'end_turn',
+              content: [{ type: 'text', text: 'seen' }], usage: {},
+            })
+          : Response.json({
+              id: 'response-image', model: 'gemini-2.5-pro', usage: {},
+              choices: [{ finish_reason: 'stop', message: { content: 'seen' } }],
+            })
+      },
+    })
+    const materialized = adapter.materialize({
+      turnId: `image-${provider}`,
+      model: provider === 'claude' ? 'claude-opus-4-8' : 'gemini-2.5-pro',
+      input: [{ kind: 'user_message', payload: { attachments: [TEST_IMAGE] } }],
+    }, { ...snapshot, items: [] })
+    assert.match(JSON.stringify(materialized.body), /baton_image/)
+    assert.doesNotMatch(JSON.stringify(materialized.body), /base64,AAAA/)
+    const execution = await adapter.execute(materialized, executionContext())
+    await collectExecution(adapter, execution)
+    const messages = sentBodies[0]?.messages as Array<Record<string, unknown>>
+    const user = messages.find((message) => message.role === 'user')
+    assert.ok(user)
+    const wire = JSON.stringify(user.content)
+    assert.match(wire, /AAAA/)
+    assert.doesNotMatch(wire, /baton_image/)
+    await adapter.shutdown()
+  }
 })
 
 test('stateless adapters preserve portable reasoning, plan, task, and summary history', () => {
@@ -310,6 +364,51 @@ const repliesForAssertionClaudeAssistant = [
   { type: 'text', text: 'I will inspect it.' },
   { type: 'tool_use', id: 'tool-1', name: 'read_file', input: { path: 'README.md' } },
 ]
+
+test('Claude tool screenshots are hydrated on wire while durable continuation keeps only artifact refs', async () => {
+  const bodies: Record<string, unknown>[] = []
+  const replies = [
+    {
+      id: 'tool-image', model: 'claude-opus-4-8', stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'capture-1', name: 'ldplayer_capture', input: {} }], usage: {},
+    },
+    {
+      id: 'tool-image-final', model: 'claude-opus-4-8', stop_reason: 'end_turn',
+      content: [{ type: 'text', text: 'inspected' }], usage: {},
+    },
+  ]
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    imageArtifacts: {
+      pathFor: () => 'C:/Baton/image-artifacts/screen.png',
+      dataUrl: () => 'data:image/png;base64,AAAA',
+    },
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return Response.json(replies.shift())
+    },
+  })
+  const captureTool = { ...readTool, name: 'ldplayer_capture', inputSchema: { type: 'object', properties: {} } }
+  const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+    turnId: 'tool-image-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'capture' } }],
+  }, snapshot), executionContext({
+    toolDefinitions: [captureTool],
+    async executeTool() {
+      return { success: true, content: { artifact: TEST_IMAGE }, images: [TEST_IMAGE], error: null }
+    },
+  })))
+
+  assert.ok(bodies[1])
+  const secondWire = JSON.stringify((bodies[1].messages as unknown[]).at(-1))
+  assert.match(secondWire, /"type":"image"/)
+  assert.match(secondWire, /AAAA/)
+  const privateState = normalizedItems(adapter, result.events)
+    .find((item) => item.visibility === 'provider_private')?.payload
+  assert.match(JSON.stringify(privateState), /baton_image/)
+  assert.doesNotMatch(JSON.stringify(privateState), /base64,AAAA/)
+})
 
 test('Claude executes parallel tools but returns one ordered tool-result user message', async () => {
   const bodies: Record<string, unknown>[] = []

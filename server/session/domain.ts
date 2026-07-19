@@ -124,7 +124,7 @@ export const DEFAULT_AGENT_LOOP_LIMITS: Readonly<AgentLoopLimits> = Object.freez
   maxProviderRetries: 3,
 })
 
-export type AgentToolSideEffect = 'read_only' | 'workspace_mutation' | 'workspace_command' | 'goal'
+export type AgentToolSideEffect = 'read_only' | 'workspace_mutation' | 'workspace_command' | 'host_mutation' | 'goal'
 
 export interface AgentToolDefinition {
   name: string
@@ -144,6 +144,8 @@ export type AgentToolResult =
   | {
       success: true
       content: Record<string, unknown>
+      /** Immutable local images returned to the current provider without embedding bytes in canonical JSON. */
+      images?: import('./image-artifacts.ts').ImageArtifactRef[]
       metadata?: Record<string, unknown>
       error: null
     }
@@ -176,6 +178,8 @@ export interface CanonicalSession {
   activeThreadId: ThreadId
   projectKey: string | null
   cwd: string | null
+  /** Exact local emulator capability explicitly connected by the user; null grants no ADB access. */
+  ldPlayer?: LdPlayerGrant | null
   schemaVersion: number
   createdAt: string
   updatedAt: string
@@ -191,6 +195,13 @@ export interface CanonicalSession {
     /** Native metadata only. It is never an authorized tool root until the user connects it. */
     cwd: string | null
   } | null
+}
+
+export interface LdPlayerGrant {
+  kind: 'ldplayer'
+  installationRoot: string
+  instanceIndex: number
+  instanceName: string
 }
 
 export interface CanonicalThread {
@@ -398,6 +409,7 @@ export type CanonicalStreamEventType =
   | 'turn_interrupted'
   | 'follow_up_changed'
   | 'workspace_changed'
+  | 'host_capability_changed'
   | 'goal_changed'
 
 export interface CanonicalStreamEvent {

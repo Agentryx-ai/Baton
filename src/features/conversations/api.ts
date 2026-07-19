@@ -20,6 +20,8 @@ import type {
   NativeImportSourceClient,
   ReconcileUnknownMutationDto,
   ReconcileUnknownMutationResultDto,
+  ImageArtifactRefDto,
+  LdPlayerInstanceDto,
 } from './types.ts'
 
 const BASE_PATH = '/baton/v1'
@@ -149,6 +151,37 @@ export const conversationApi = {
       method: 'POST',
       headers: { 'X-Baton-Interaction': 'native-folder-picker' },
     }),
+
+  uploadImage: (file: File): Promise<ImageArtifactRefDto> =>
+    hostRequest('/baton/v1/artifacts/images', {
+      method: 'POST',
+      headers: {
+        'Content-Type': file.type,
+        'X-Baton-Interaction': 'image-upload',
+        'X-Baton-Filename': encodeURIComponent(file.name),
+      },
+      body: file,
+    }),
+
+  imageUrl: (artifactId: string): string =>
+    `${BASE_PATH}/artifacts/images/${encodeURIComponent(artifactId)}`,
+
+  listLdPlayerInstances: async (): Promise<LdPlayerInstanceDto[]> => {
+    const result = await request<{ instances: LdPlayerInstanceDto[] }>('/host/ldplayer/instances')
+    return result.instances
+  },
+
+  connectLdPlayer: (
+    sessionId: string,
+    instance: Pick<LdPlayerInstanceDto, 'installationRoot' | 'instanceIndex'>,
+    expectedRevision: number,
+  ): Promise<CanonicalSessionDto> => request(
+    `/sessions/${encodeURIComponent(sessionId)}/ldplayer`,
+    jsonRequest('PUT', { ...instance, expectedRevision }),
+  ),
+
+  disconnectLdPlayer: (sessionId: string, expectedRevision: number): Promise<CanonicalSessionDto> =>
+    request(`/sessions/${encodeURIComponent(sessionId)}/ldplayer`, jsonRequest('DELETE', { expectedRevision })),
 
   archiveSession: (sessionId: string): Promise<CanonicalSessionDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),

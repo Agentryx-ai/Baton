@@ -229,7 +229,9 @@ function emptyEvents(after: Promise<unknown> = Promise.resolve()): AsyncIterable
 }
 
 async function waitForTerminal(store: SqliteSessionStore, turnId: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  // Goal active-time tests intentionally use a one-second deadline; leave
+  // enough polling headroom for that real timer plus scheduler jitter.
+  for (let attempt = 0; attempt < 300; attempt += 1) {
     const status = store.getTurn(turnId)?.status
     if (status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted') return
     await new Promise((resolve) => setTimeout(resolve, 5))

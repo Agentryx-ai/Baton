@@ -1,4 +1,4 @@
-import type { CanonicalProvider, FirstTurnDto } from './types.ts'
+import type { CanonicalProvider, FirstTurnDto, ImageArtifactRefDto } from './types.ts'
 
 export const DRAFT_STORAGE_KEY = 'baton.conversation.draft.v1'
 
@@ -44,10 +44,10 @@ export function createConversationDraft(input: {
   }
 }
 
-export function freezeFirstTurn(draft: ConversationDraft): ConversationDraft {
+export function freezeFirstTurn(draft: ConversationDraft, attachments: ImageArtifactRefDto[] = []): ConversationDraft {
   if (draft.frozenRequest) return draft
   const message = draft.message.trim()
-  if (!draft.model.trim() || !message) throw new Error('Model and message are required')
+  if (!draft.model.trim() || (!message && attachments.length === 0)) throw new Error('Model and message or image are required')
   const request: FirstTurnDto = {
     clientRequestId: draft.clientRequestId,
     cwd: draft.cwd,
@@ -57,7 +57,7 @@ export function freezeFirstTurn(draft: ConversationDraft): ConversationDraft {
     input: [{
       kind: 'user_message',
       visibility: 'portable',
-      payload: { text: message },
+      payload: { text: message, ...(attachments.length ? { attachments } : {}) },
     }],
   }
   return { ...draft, message, frozenRequest: request, deliveryUnknown: false, conflict: false }

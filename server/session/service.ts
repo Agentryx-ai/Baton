@@ -14,6 +14,7 @@ import type {
   ThreadId,
   ThreadSnapshot,
   TurnId,
+  LdPlayerGrant,
 } from './domain.ts'
 import type {
   ClearGoalInput,
@@ -72,6 +73,13 @@ export interface WorkspaceMutationInput {
   cwd: string
 }
 
+export interface LdPlayerMutationInput {
+  sessionId: SessionId
+  expectedRevision: number
+  installationRoot: string
+  instanceIndex: number
+}
+
 export interface SubmitFollowUpInput {
   threadId: ThreadId
   clientRequestId: string
@@ -89,6 +97,9 @@ export interface ConversationService {
   restoreSession(sessionId: SessionId): CanonicalSession
   connectWorkspace(input: WorkspaceMutationInput): CanonicalSession
   disconnectWorkspace(sessionId: SessionId, expectedRevision: number): CanonicalSession
+  listLdPlayerInstances?(): Promise<Array<LdPlayerGrant & { running: boolean; androidStarted: boolean }>>
+  connectLdPlayer?(input: LdPlayerMutationInput): Promise<CanonicalSession>
+  disconnectLdPlayer?(sessionId: SessionId, expectedRevision: number): CanonicalSession
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null
   forkThread(input: ForkThreadInput): CanonicalThread
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]

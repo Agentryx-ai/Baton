@@ -92,6 +92,7 @@ ID는 바뀌지 않습니다.
 | Persistent Goal runtime | **V1 구현** | `/goal`, CAS/lease, 자동 후속 턴, pause/resume/edit/clear, 24턴·2시간·no-progress 안전 한도 |
 | Codex turn adapter | **V1 구현** | app-server ephemeral thread, Baton tools, web/MCP/plugin/subagent 차단, model provenance |
 | Canonical conversation UI | **Preview 구현** | 2-column 대화, 첫 전송 전 draft, native 폴더 선택, 작업 상태, provider/model/effort, Goal panel, 턴 실행·취소 |
+| 이미지·LDPlayer 자동화 | **Preview 구현** | 이미지 첨부와 provider별 멀티모달 전달, 세션별 LDPlayer 권한, ADB 캡처·제한 조작·선언형 UX-flow. Computer Use와 내장 브라우저는 TODO |
 | Claude turn adapter | **Preview 구현** | portable text history 기반 stateless 실행; Fable 5 live 검증 완료 |
 | Gemini turn adapter | **Preview 구현·live 차단** | OpenAI 호환 stateless 경로 구현; 현재 proxy 인증 문제로 모델이 0개라 UI에서 비활성화 |
 | Baton-managed child execution | 기반만 구현, 실행 비활성 | execution 기록과 delegation-disabled 정책; child API·실행기는 예정 |
@@ -103,6 +104,8 @@ Codex와 Claude adapter는 실행 가능하며 Gemini도 같은 정본 계약으
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md)에 있습니다.
 대화에서 요청된 항목별 완료·미완료·검증 상태는
 [`docs/USER_REQUEST_STATUS.md`](docs/USER_REQUEST_STATUS.md)에서 추적합니다.
+로컬 호스트 자동화의 권한·이미지 컨텍스트·TODO 경계는
+[`docs/HOST_AUTOMATION.md`](docs/HOST_AUTOMATION.md)에 있습니다.
 
 ## Architecture
 
@@ -166,6 +169,12 @@ SPA (React + Vite + Tailwind + shadcn)
   - provider readiness 30초, turn 30분, tool/retry/output 한도로 무한 대기를 차단
   - tool/retry/time/output 한도와 late completion보다 cancellation 우선; Codex app-server가
     공개하지 않는 정확한 sampling/retry 합계는 30분 turn timeout과 host tool limit로 보완
+- 이미지와 LDPlayer 호스트 자동화
+  - Codex Desktop과 같은 숨은 이미지 picker·미리보기, content-addressed 로컬 저장과 정본 참조
+  - Codex `localImage`/dynamic-tool `inputImage`, Claude image block, Gemini `image_url`로 실제 모델 컨텍스트에 전달
+  - 대화별 정확한 LDPlayer 인스턴스만 연결·해제하고 start/tap/swipe/text/key/capture만 노출
+  - bounded UX-flow 템플릿으로 여러 조작·대기·캡처 지점을 한 작업으로 실행
+  - raw ADB·임의 shell은 미노출; Computer Use와 built-in browser는 후속 TODO
 - persistent Goal runtime
   - `/goal`, `/goal edit|pause|resume|clear`, Goal panel과 세션 상태
   - SQLite CAS/event, scheduler lease, 자동 continuation, token/turn/time/no-progress 한도

@@ -84,7 +84,8 @@ function downgradeEmptyDerivedSchemaToV13(path: string): void {
       OR (OLD.status='running' AND NEW.status IN ('running','queued','completed','failed'))
     )
     BEGIN SELECT RAISE(ABORT, 'invalid compaction job transition'); END;
-    DELETE FROM schema_migrations WHERE version=14;
+    DELETE FROM schema_migrations WHERE version>=14;
+    ALTER TABLE sessions DROP COLUMN ldplayer_grant_json;
     PRAGMA user_version=13;
   `)
   database.close()
@@ -125,7 +126,7 @@ function beginSessionInput(
   }
 }
 
-test('initial session materialization is atomic, idempotent, and keeps schema v14', (t) => {
+test('initial session materialization is atomic, idempotent, and keeps schema v15', (t) => {
   const path = databasePath(t)
   const store = new SqliteSessionStore(path, deterministicOptions())
   const input = beginSessionInput()
@@ -173,7 +174,7 @@ test('initial session materialization is atomic, idempotent, and keeps schema v1
     const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
     assert.equal(row.count, expected, table)
   }
-  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14)
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
   store.close()
 
   const reopened = new SqliteSessionStore(path, deterministicOptions())
@@ -271,7 +272,7 @@ function nativeCandidate(contents: string[], cwd: string, contentDigest: string)
   }
 }
 
-test('schema v1 migrates through v14 with derived context provenance', (t) => {
+test('schema v1 migrates through v15 with host capability storage', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -312,10 +313,10 @@ test('schema v1 migrates through v14 with derived context provenance', (t) => {
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -342,7 +343,7 @@ test('schema v1 migrates through v14 with derived context provenance', (t) => {
   }).follow_up_window, 'closed')
 })
 
-test('schema v6 migrates to v14 in place and reopens without replaying migrations', (t) => {
+test('schema v6 migrates to v15 in place and reopens without replaying migrations', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -395,11 +396,11 @@ test('schema v6 migrates to v14 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -411,7 +412,7 @@ test('schema v6 migrates to v14 in place and reopens without replaying migration
     .get() as { count: number }).count, 1)
 })
 
-test('schema v10 rebuilds follow-up constraints through v14 with foreign keys and reopens once', (t) => {
+test('schema v10 rebuilds follow-up constraints through v15 with foreign keys and reopens once', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -444,7 +445,7 @@ test('schema v10 rebuilds follow-up constraints through v14 with foreign keys an
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
   assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
   assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
 })
@@ -465,6 +466,7 @@ test('schema v12 migrates once to immutable derived context tables and preserves
     DROP TABLE context_compactions;
     DROP TABLE context_compaction_jobs;
     DELETE FROM schema_migrations WHERE version>=13;
+    ALTER TABLE sessions DROP COLUMN ldplayer_grant_json;
     PRAGMA user_version=12;
   `)
   legacy.close()
@@ -477,11 +479,11 @@ test('schema v12 migrates once to immutable derived context tables and preserves
 
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations WHERE version>=13 ORDER BY version')
       .all() as Array<{ version: number }>).map((row) => row.version),
-    [13, 14],
+    [13, 14, 15],
   )
   const tables = (inspected.prepare(`
     SELECT name FROM sqlite_schema WHERE type='table'
@@ -499,7 +501,7 @@ test('schema v12 migrates once to immutable derived context tables and preserves
   ])
 })
 
-test('schema v14 reopen fails closed when a derived-context protection trigger is missing', (t) => {
+test('schema v15 reopen fails closed when a derived-context protection trigger is missing', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   initial.close()
@@ -514,7 +516,7 @@ test('schema v14 reopen fails closed when a derived-context protection trigger i
   )
 })
 
-test('an empty released v13 database migrates to v14 and gains the authoritative frontier schema', (t) => {
+test('an empty released v13 database migrates through v15 and gains the authoritative frontier schema', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   const session = initial.createSession({ title: 'old-v13 sentinel' })
@@ -526,7 +528,7 @@ test('an empty released v13 database migrates to v14 and gains the authoritative
   migrated.close()
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15)
   assert.ok((inspected.prepare(`
     SELECT 1 FROM pragma_table_info('context_compaction_jobs')
     WHERE name='expected_previous_artifact_id'
@@ -1379,6 +1381,45 @@ test('workspace mutation uses thread CAS, invalidates bindings, and blocks activ
     cwd: null,
   }).cwd, null)
   assert.equal(store.getThread(session.activeThreadId)?.revision, 2)
+})
+
+test('LDPlayer capability is exact, revision-CAS guarded, and revocable only while idle', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const grant = {
+    kind: 'ldplayer' as const,
+    installationRoot: 'C:\\LDPlayer\\LDPlayer9',
+    instanceIndex: 14,
+    instanceName: 'Audit-LD9-Fresh',
+  }
+  const connected = store.updateLdPlayerGrant({
+    sessionId: session.id,
+    expectedThreadRevision: 0,
+    grant,
+  })
+  assert.deepEqual(connected.ldPlayer, grant)
+  assert.equal(store.getThread(session.activeThreadId)?.revision, 1)
+  assert.deepEqual(store.listEvents(session.activeThreadId).at(-1)?.payload, {
+    capability: 'ldplayer', connected: true, previousConnected: false, revision: 1,
+  })
+  assert.throws(
+    () => store.updateLdPlayerGrant({ sessionId: session.id, expectedThreadRevision: 0, grant: null }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict',
+  )
+  const started = store.beginTurn({ ...beginInput(session.activeThreadId), expectedRevision: 1 })
+  const activeRevision = store.getThread(session.activeThreadId)?.revision ?? -1
+  assert.throws(
+    () => store.updateLdPlayerGrant({ sessionId: session.id, expectedThreadRevision: activeRevision, grant: null }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'session_busy',
+  )
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  const disconnected = store.updateLdPlayerGrant({
+    sessionId: session.id,
+    expectedThreadRevision: store.getThread(session.activeThreadId)?.revision ?? -1,
+    grant: null,
+  })
+  assert.equal(disconnected.ldPlayer, null)
 })
 
 test('native cwd remains a suggestion and refresh never overwrites the authorized workspace', (t) => {

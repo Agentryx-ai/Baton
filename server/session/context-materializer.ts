@@ -418,7 +418,8 @@ export function hasSafeContextToolState(items: readonly CanonicalItem[]): boolea
 
 function mutationOutcomeIsUnknown(call: CanonicalItem, result: CanonicalItem): boolean {
   if (call.payload.sideEffect !== 'workspace_mutation'
-    && call.payload.sideEffect !== 'workspace_command') return false
+    && call.payload.sideEffect !== 'workspace_command'
+    && call.payload.sideEffect !== 'host_mutation') return false
   const reconciliation = object(result.payload.reconciliation)
   const nestedResult = object(result.payload.result)
   const nestedMetadata = object(nestedResult?.metadata)
