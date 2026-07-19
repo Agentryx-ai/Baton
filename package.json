@@ -13,6 +13,7 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "oxlint",
     "smoke:codex-adapter": "tsx scripts/codex-adapter-smoke.ts",
+    "restore:native-goals": "tsx scripts/restore-native-goals.ts",
     "preview": "vite preview"
   },
   "dependencies": {

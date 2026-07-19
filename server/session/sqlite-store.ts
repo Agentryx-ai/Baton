@@ -84,7 +84,9 @@ import type {
   NativeImportCommitResult,
   NativeImportCommitState,
   NativeImportReceipt,
+  NativeGoalReconcileResult,
   NativeImportStoredState,
+  NativeSessionCandidate,
   NativeSourceClient,
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
@@ -3459,6 +3461,7 @@ export class SqliteSessionStore implements SessionStore {
       const existing = this.#nativeSourceRow(candidate)
       if (existing && text(existing, 'current_content_digest') === candidate.contentDigest) {
         this.#promoteNativeSource(existing, candidate)
+        this.#reconcileNativeGoal(existing, candidate, true)
         const result = { candidateId: candidate.candidateId, status: 'duplicate' as const,
           sessionId: text(existing, 'session_id'), importedItemCount: 0 }
         if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
@@ -3510,6 +3513,7 @@ export class SqliteSessionStore implements SessionStore {
     this.#insertNativeRecords(sourceId, revisionId, candidate.records, imported, now)
     this.#appendStreamEvent(sessionId, threadId, null, 'session_created', { sessionId, threadId, imported: true }, now)
     if (imported.length) this.#appendStreamEvent(sessionId, threadId, null, 'items_appended', { itemIds: imported.map((item) => item.id) }, now)
+    this.#reconcileNativeGoal(this.#one(this.#db.prepare('SELECT * FROM native_session_sources WHERE id=?'), sourceId), candidate, true)
     return { candidateId: candidate.candidateId, status: 'imported', sessionId, importedItemCount: imported.length }
   }
 
@@ -3555,7 +3559,64 @@ export class SqliteSessionStore implements SessionStore {
     this.#promoteNativeSource(existing, candidate)
     this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, current.sessionId)
     if (imported.length) this.#appendStreamEvent(current.sessionId, threadId, null, 'items_appended', { itemIds: imported.map((item) => item.id), nativeDelta: true }, now)
+    this.#reconcileNativeGoal(existing, candidate, true)
     return { candidateId: candidate.candidateId, status: 'updated', sessionId: current.sessionId, importedItemCount: imported.length }
+  }
+
+  reconcileNativeGoal(candidate: NativeSessionCandidate, apply = true): NativeGoalReconcileResult {
+    return this.#transaction('IMMEDIATE', () => {
+      const source = this.#nativeSourceRow(candidate)
+      return source
+        ? this.#reconcileNativeGoal(source, candidate, apply)
+        : { candidateId: candidate.candidateId, status: 'no_import' }
+    })
+  }
+
+  #reconcileNativeGoal(source: SqlRow, candidate: NativeSessionCandidate, apply: boolean): NativeGoalReconcileResult {
+    const sessionId = text(source, 'session_id')
+    const base = { candidateId: candidate.candidateId, sessionId }
+    if (!candidate.goal) return { ...base, status: 'no_goal' }
+    const threadRow = this.#optional(this.#db.prepare(
+      'SELECT id FROM threads WHERE session_id=? AND parent_thread_id IS NULL',
+    ), sessionId)
+    if (!threadRow) return { ...base, status: 'invalid_goal', error: 'Imported root thread is missing' }
+    const threadId = text(threadRow, 'id')
+    const contextual = { ...base, threadId }
+    const current = this.#optional(this.#db.prepare('SELECT id FROM goals WHERE thread_id=?'), threadId)
+    if (current) return { ...contextual, status: 'existing_goal', goalId: text(current, 'id') }
+    try {
+      validateGoalObjective(candidate.goal.objective)
+      if (!candidate.goal.model) throw new GoalStoreError('invalid_goal_input', 'Goal model must not be empty')
+    } catch (error) {
+      return { ...contextual, status: 'invalid_goal', error: error instanceof Error ? error.message : String(error) }
+    }
+    if (!apply) return { ...contextual, status: 'would_restore' }
+
+    const now = this.#now()
+    const id = this.#idFactory()
+    const reason: GoalStatusReason = {
+      code: 'native_goal_restored_paused', source: 'host',
+      message: 'Restored from an imported native conversation and paused for review', at: now,
+    }
+    this.#db.prepare(`
+      INSERT INTO goals(
+        id,thread_id,objective,status,status_reason_json,revision,provider,model,effort,
+        token_budget,tokens_used,time_used_seconds,max_automatic_turns,automatic_turns_used,
+        max_active_seconds,no_progress_count,last_progress_digest,created_at,updated_at,started_at,completed_at
+      ) VALUES (?,?,?,'paused',?,1,?,?,?, NULL,0,0,?,0,?,0,NULL,?,?,?,NULL)
+    `).run(id, threadId, candidate.goal.objective, canonicalJson(reason), candidate.provider,
+      candidate.goal.model, candidate.goal.effort, DEFAULT_GOAL_TURNS, DEFAULT_GOAL_ACTIVE_SECONDS, now, now, now)
+    const restored = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), id))
+    this.#appendGoalEvent(restored, sessionId, 'goal_created', {
+      goal: restored,
+      nativeImport: {
+        sourceId: text(source, 'id'), sourceClient: candidate.sourceClient,
+        parserVersion: candidate.parserVersion, evidence: candidate.goal.evidence,
+        detectedAt: candidate.goal.detectedAt,
+      },
+    }, now)
+    this.#appendGoalChanged(restored, sessionId, null, now)
+    return { ...contextual, status: 'restored', goalId: restored.id }
   }
 
   #nativeSourceRow(identity: NativeSourceIdentity): SqlRow | null {

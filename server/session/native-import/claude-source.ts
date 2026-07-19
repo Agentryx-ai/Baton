@@ -8,10 +8,14 @@ import type {
 } from './contracts.ts'
 import {
   candidateId, canonicalRoot, containedRealPath, cwdAlias, inspectStableFile, mapWithConcurrency,
-  MAX_NATIVE_CANDIDATES, nativePhysicalLines, NativeRecordAccumulator, PARSER_VERSION,
+  MAX_NATIVE_CANDIDATES, messageText, nativePhysicalLines, NativeRecordAccumulator, PARSER_VERSION,
   pseudonymousNamespace, readStableFile, safeAlias, sanitizeToolInput, sanitizeToolResult,
   sha256, stableJson,
 } from './source-utils.ts'
+import {
+  applyGoalCommand, NativeGoalReconstructor, parseClaudeGoalCommand,
+  parseClaudeGoalConfirmation, parseExplicitGoalCommand,
+} from './goal-reconstruction.ts'
 
 interface ClaudeDesktopMetadata {
   sessionId?: unknown
@@ -34,6 +38,7 @@ interface ParsedClaudeRecords {
   skipped: number
   title: NativeTitle | null
   warnings: string[]
+  goal: NativeSessionCandidate['goal']
 }
 
 const CLAUDE_TOP_LEVEL_TYPES = new Set([
@@ -48,6 +53,7 @@ const CLAUDE_BLOCK_TYPES = new Set([
   'text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'fallback', 'image', 'document',
   'server_tool_use', 'web_search_tool_result',
 ])
+const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-goal-v2`
 
 export interface ClaudeSourceReaderOptions {
   desktopRoot?: string
@@ -259,8 +265,9 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
       portableItemCount: parsed?.portableItemCount ?? 0,
       sourceLocator: { path: canonicalTranscript },
       records: parsed?.records ?? [],
+      goal: parsed?.goal,
       skippedItemCount: parsed?.skipped ?? 0,
-      parserVersion: PARSER_VERSION,
+      parserVersion: CLAUDE_PARSER_VERSION,
       warnings: parsed?.warnings ?? [],
       identityKeys: [
         { kind: 'native_session_id', value: nativeSessionId, scopeNamespaceKey: namespaceKey },
@@ -321,6 +328,7 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
       warnings: parsed.warnings,
       sourceLocator: { path: sourcePath },
       records: parsed.records,
+      goal: parsed.goal,
       materialized: true,
     }
   }
@@ -350,6 +358,9 @@ function parseClaudeRecords(
 ): ParsedClaudeRecords {
   const records = new NativeRecordAccumulator(includeRecords)
   const toolNames = new Map<string, string>()
+  const goal = new NativeGoalReconstructor()
+  let currentModel: string | null = null
+  let currentEffort: string | null = null
   let cwd: string | null = null
   let createdAt: string | null = null
   let updatedAt: string | null = null
@@ -373,6 +384,21 @@ function parseClaudeRecords(
     const timestamp = string(event.timestamp)
     createdAt ??= timestamp
     updatedAt = timestamp ?? updatedAt
+    if (eventType === 'queue-operation') {
+      applyGoalCommand(goal, parseExplicitGoalCommand(string(event.content) ?? ''), timestamp, 'slash_command')
+      skipped += 1
+      continue
+    }
+    if (eventType === 'attachment') {
+      const attachment = object(event.attachment)
+      if (string(attachment?.type) === 'goal_status') {
+        const condition = string(attachment?.condition)
+        if (attachment?.met === true) goal.clear()
+        else if (attachment?.met === false && condition) goal.set(condition, timestamp, 'claude_goal_status')
+      }
+      skipped += 1
+      continue
+    }
     if (eventType === 'custom-title' || eventType === 'ai-title' || eventType === 'agent-name') {
       const recordSessionId = string(event.sessionId)
       const field = eventType === 'custom-title' ? 'customTitle' : eventType === 'ai-title' ? 'aiTitle' : 'agentName'
@@ -394,10 +420,24 @@ function parseClaudeRecords(
       }, timestamp, sourceClient)
       continue
     }
+    if (eventType === 'system') {
+      const content = string(event.content) ?? ''
+      const command = parseClaudeGoalCommand(content)
+      const confirmation = parseClaudeGoalConfirmation(content)
+      applyGoalCommand(goal, command, timestamp, 'slash_command')
+      applyGoalCommand(goal, confirmation, timestamp, 'claude_goal_confirmation')
+      skipped += 1
+      continue
+    }
     if (eventType !== 'user' && eventType !== 'assistant') { skipped += 1; continue }
     const message = object(event.message)
     if (!message || !('content' in message)) throw new Error('claude_message_framing_invalid')
     const content = message.content
+    currentModel = string(message.model) ?? currentModel
+    currentEffort = string(message.effort) ?? currentEffort
+    const fullText = messageText(content) ?? ''
+    applyGoalCommand(goal, parseClaudeGoalCommand(fullText), timestamp, 'slash_command')
+    applyGoalCommand(goal, parseClaudeGoalConfirmation(fullText), timestamp, 'claude_goal_confirmation')
     const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : null
     if (!blocks) throw new Error('claude_message_content_framing_invalid')
     const baseId = string(event.uuid) ?? `${sessionId}:${lineIndex + 1}`
@@ -460,6 +500,7 @@ function parseClaudeRecords(
     cwd, createdAt, updatedAt, skipped,
     title: customTitle ?? aiTitle ?? agentName,
     warnings: skipped ? [`${skipped} known non-portable or hidden Claude records/blocks were not imported`] : [],
+    goal: goal.snapshot('claude', currentModel, currentEffort),
   }
 }
 

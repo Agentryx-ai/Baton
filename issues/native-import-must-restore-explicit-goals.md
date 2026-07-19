@@ -3,8 +3,17 @@
 ## 상태
 
 - 확인됨
-- 구현 필요
+- 구현 및 기존 데이터 복원 완료 (`feat/canonical-runtime-workspace`)
 - 발견일: 2026-07-19
+
+## 구현 결과
+
+- Codex의 exact `/goal`, 성공한 `create_goal`/`update_goal` 호출과 Claude의 구조화 `/goal`, `Goal set/cleared`, `goal_status` attachment를 분석한다.
+- 새 import와 기존 import 재분석 모두 같은 store reconcile 경로를 사용한다.
+- 미완료 Goal은 자동 실행되지 않도록 처음부터 `paused`로 원자 생성한다.
+- 기존 Baton Goal은 덮어쓰지 않는다. 수동 복원된 `다음끼니 마케팅 리서치 보고서` Goal도 그대로 보존됐다.
+- `npm run restore:native-goals`는 기본 dry-run이며 `-- --apply`에서만 복원한다.
+- 2026-07-19 실데이터 복원에서 14개 Goal을 복원했고, 명시 Goal 없음/완료/clear 46개는 건너뛰었으며 기존 Goal 1개를 보존했다. 원본 transcript delta가 있는 1개는 선행 re-import가 필요해 건너뛰었다.
 
 ## 요약
 

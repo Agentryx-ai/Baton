@@ -12,6 +12,11 @@ import {
   pseudonymousNamespace, readStableFile, safeAlias, sanitizeToolInput, sanitizeToolResult,
   sanitizeReasoningSummary, sha256, stableJson,
 } from './source-utils.ts'
+import {
+  applyGoalCommand, codexToolCallSucceeded, NativeGoalReconstructor,
+  parseCodexGoalToolAction, parseExplicitGoalCommand,
+  type CodexGoalToolAction,
+} from './goal-reconstruction.ts'
 
 export interface CodexSourceReaderOptions {
   codexHome?: string
@@ -26,6 +31,7 @@ interface ParsedCodexRecords {
   portableItemCount: number
   skipped: number
   warnings: string[]
+  goal: NativeSessionCandidate['goal']
 }
 
 const CODEX_TOP_LEVEL_TYPES = new Set([
@@ -34,7 +40,7 @@ const CODEX_TOP_LEVEL_TYPES = new Set([
   // provider-private state and is therefore counted as loss rather than copied.
   'world_state', 'compacted', 'inter_agent_communication_metadata',
 ])
-const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-turn-context-v2`
+const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-turn-context-goal-v3`
 
 export class CodexLocalSourceReader implements NativeSourceReader {
   readonly sourceClient = 'codex_local' as const
@@ -179,6 +185,7 @@ export class CodexLocalSourceReader implements NativeSourceReader {
       portableItemCount: parsed?.portableItemCount ?? 0,
       sourceLocator: { path: canonicalRolloutPath },
       records: parsed?.records ?? [],
+      goal: parsed?.goal,
       skippedItemCount: parsed?.skipped ?? 0,
       parserVersion: CODEX_PARSER_VERSION,
       warnings: parsed?.warnings ?? [],
@@ -213,6 +220,7 @@ export class CodexLocalSourceReader implements NativeSourceReader {
       ...candidate, sourceHead: source.head, contentDigest: parsed.contentDigest, prefixDigest: parsed.contentDigest,
       portableItemCount: parsed.portableItemCount, skippedItemCount: parsed.skipped, warnings: parsed.warnings,
       sourceLocator: { path: sourcePath }, records: parsed.records, materialized: true,
+      goal: parsed.goal,
     }
   }
 
@@ -241,6 +249,8 @@ function codexOrigin(value: unknown): CodexNativeOrigin {
 function parseCodexRecords(text: string, sessionId: string, includeRecords: boolean): ParsedCodexRecords {
   const records = new NativeRecordAccumulator(includeRecords)
   const toolNames = new Map<string, string>()
+  const goalToolActions = new Map<string, { action: CodexGoalToolAction; timestamp: string | null }>()
+  const goal = new NativeGoalReconstructor()
   let currentModel: string | null = null
   let currentEffort: string | null = null
   let skipped = 0
@@ -284,6 +294,9 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       }
       const textValue = messageText(portableContent)
       if (!textValue?.trim()) { skipped += 1; continue }
+      if (role === 'user') {
+        applyGoalCommand(goal, parseExplicitGoalCommand(textValue), timestamp, 'slash_command')
+      }
       const legacyPayload = {
         text: textValue, nativeSourceClient: 'codex_local', nativeRecordType: payloadType, nativeTimestamp: timestamp,
       }
@@ -299,6 +312,10 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       const name = safeAlias(string(payload.name) ?? 'tool', 'tool')
       toolNames.set(callId, name)
       const rawInput = parseJsonString(payload.arguments ?? payload.input)
+      const goalAction = name === 'exec' && typeof rawInput === 'string'
+        ? parseCodexGoalToolAction(rawInput)
+        : null
+      if (goalAction) goalToolActions.set(callId, { action: goalAction, timestamp })
       const sanitized = sanitizeToolInput(rawInput)
       skipped += sanitized.lossCount
       addRecord(records, `${baseId}:call`, 'tool_call', {
@@ -310,6 +327,11 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
     }
     if (payloadType === 'function_call_output' || payloadType === 'custom_tool_call_output') {
       const callId = safeAlias(string(payload.call_id) ?? baseId, baseId)
+      const pendingGoal = goalToolActions.get(callId)
+      if (pendingGoal && codexToolCallSucceeded(payload.output)) {
+        applyGoalCommand(goal, pendingGoal.action, pendingGoal.timestamp ?? timestamp, 'codex_goal_tool')
+      }
+      goalToolActions.delete(callId)
       const sanitized = sanitizeToolResult(payload.output)
       skipped += sanitized.lossCount
       addRecord(records, `${baseId}:result`, 'tool_result', {
@@ -334,6 +356,7 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
     portableItemCount: records.count,
     skipped,
     warnings: skipped ? [`${skipped} known non-portable or hidden Codex records were not imported`] : [],
+    goal: goal.snapshot('codex', currentModel, currentEffort),
   }
 }
 

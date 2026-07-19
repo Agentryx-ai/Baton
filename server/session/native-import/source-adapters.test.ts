@@ -73,7 +73,7 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   assert.equal(JSON.stringify(assistant?.item.payload).includes('never-copy'), false)
   // 5 metadata + 3 denied tool-input fields + 1 omitted output + 1 summary DLP + 1 encrypted reasoning.
   assert.equal(candidates[0]?.skippedItemCount, 11)
-  assert.match(String(candidates[0]?.parserVersion), /codex-turn-context-v2$/)
+  assert.match(String(candidates[0]?.parserVersion), /codex-turn-context-goal-v3$/)
   assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'codex_json_corrupt'), true)
   assert.deepEqual(await fileHead(rollout), before)
 
@@ -99,6 +99,37 @@ test('Codex adapter never derives an alias from first_user_message', async () =>
   const [candidate] = await new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET }).scan()
   assert.equal(candidate?.sourceAlias, 'safe-project')
   assert.equal(candidate?.aliasSource, 'path_fallback')
+})
+
+test('Codex adapter reconstructs the last successful unresolved Goal with source model metadata', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-goal-'))
+  const sessions = path.join(home, 'sessions')
+  await mkdir(sessions)
+  const rollout = path.join(sessions, 'goal.jsonl')
+  await writeFile(rollout, [
+    JSON.stringify({ timestamp: '2026-07-18T00:00:00Z', type: 'response_item', payload: {
+      type: 'message', role: 'user', content: [{ type: 'input_text', text: '/goal finish the native import audit' }],
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:01Z', type: 'response_item', payload: {
+      type: 'custom_tool_call', call_id: 'failed-create', name: 'exec',
+      input: 'await tools.create_goal({objective: "must not replace"})',
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:02Z', type: 'response_item', payload: {
+      type: 'custom_tool_call_output', call_id: 'failed-create', output: 'Script failed\nScript error:\ncannot create a new goal',
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:03Z', type: 'turn_context', payload: {
+      model: 'gpt-5.6-sol', effort: 'high',
+    } }),
+  ].join('\n'))
+  const db = createCodexDatabase(home)
+  db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('goal', rollout, 1, 2, null, 'Goal task', null)
+  db.close()
+
+  const [candidate] = await new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET }).scan()
+  assert.deepEqual(candidate?.goal, {
+    objective: 'finish the native import audit', model: 'gpt-5.6-sol', effort: 'high',
+    detectedAt: '2026-07-18T00:00:00Z', evidence: 'slash_command',
+  })
 })
 
 test('Claude adapter captures native title provenance, tools, file summaries, hidden loss, and cross-client identity scope', async () => {
@@ -169,6 +200,35 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
     namespaceSecret: NAMESPACE_SECRET, profileProvenance: 'another-opaque-profile',
   }).scan()
   assert.notEqual(otherProfile[0]?.namespaceKey, candidate?.namespaceKey)
+})
+
+test('Claude adapter reconstructs a confirmed Goal and ignores ordinary Stop-hook prose as lifecycle', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'baton-claude-goal-'))
+  const projects = path.join(root, 'projects', 'project')
+  await mkdir(projects, { recursive: true })
+  await writeFile(path.join(projects, 'goal-cli.jsonl'), [
+    JSON.stringify({ type: 'user', uuid: 'command', timestamp: '2026-07-18T00:00:00Z', message: { content:
+      '<command-name>/goal</command-name>\n<command-args>complete the EagleEye evidence path</command-args>' } }),
+    JSON.stringify({ type: 'user', uuid: 'confirmation', timestamp: '2026-07-18T00:00:01Z', message: { content:
+      '<local-command-stdout>Goal set: complete the EagleEye evidence path</local-command-stdout>' } }),
+    JSON.stringify({ type: 'attachment', timestamp: '2026-07-18T00:00:01Z', attachment: {
+      type: 'goal_status', met: false, condition: 'complete the EagleEye evidence path',
+    } }),
+    JSON.stringify({ type: 'user', uuid: 'hook', timestamp: '2026-07-18T00:00:02Z', message: { content:
+      'A session-scoped Stop hook is now active. This is informational prose.' } }),
+    JSON.stringify({ type: 'assistant', uuid: 'assistant', timestamp: '2026-07-18T00:00:03Z', message: {
+      model: 'claude-fable-5', content: [{ type: 'text', text: 'Working' }],
+    } }),
+  ].join('\n'))
+
+  const [candidate] = await new ClaudeLocalSourceReader({
+    desktopRoot: path.join(root, 'missing-desktop'), projectsRoot: path.join(root, 'projects'),
+    namespaceSecret: NAMESPACE_SECRET,
+  }).scan()
+  assert.deepEqual(candidate?.goal, {
+    objective: 'complete the EagleEye evidence path', model: 'claude-fable-5', effort: null,
+    detectedAt: '2026-07-18T00:00:01Z', evidence: 'claude_goal_status',
+  })
 })
 
 test('Codex local inventory defaults to active user surfaces and opts into internal or archived tasks', async () => {
