@@ -2,7 +2,12 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 
-const POWERSHELL = 'powershell.exe'
+/**
+ * pwsh (PowerShell 7 / .NET 5+) renders FolderBrowserDialog as the modern
+ * resizable IFileDialog folder picker; Windows PowerShell (.NET Framework)
+ * falls back to the legacy cramped tree dialog. Prefer pwsh when installed.
+ */
+const POWERSHELL_CANDIDATES = Object.freeze(['pwsh.exe', 'powershell.exe'])
 const DEFAULT_TIMEOUT_MS = 5 * 60_000
 const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024
 const TERMINATION_GRACE_MS = 2_000
@@ -30,6 +35,9 @@ try {
   $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
   $dialog.Description = 'Select a folder for Baton'
   $dialog.ShowNewFolderButton = $true
+  if ($null -ne $dialog.PSObject.Properties['UseDescriptionForTitle']) {
+    $dialog.UseDescriptionForTitle = $true
+  }
   $result = $dialog.ShowDialog($owner)
   if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($dialog.SelectedPath)
@@ -111,19 +119,23 @@ export async function pickNativeFolder(options: NativeFolderPickerOptions = {}):
   const maxOutputBytes = positiveInteger(options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES, 'maxOutputBytes')
   const runner = options.runner ?? new SpawnNativeFolderPickerRunner()
 
-  let result: NativeFolderPickerProcessResult
-  try {
-    result = await runner.run({
-      executable: POWERSHELL,
-      args: WINDOWS_PICKER_ARGS,
-      timeoutMs,
-      maxOutputBytes,
-    })
-  } catch (error) {
-    if (isMissingExecutable(error)) {
-      throw new NativeFolderPickerError('picker_unavailable', 'The native folder picker is unavailable')
+  let result: NativeFolderPickerProcessResult | null = null
+  for (const executable of POWERSHELL_CANDIDATES) {
+    try {
+      result = await runner.run({
+        executable,
+        args: WINDOWS_PICKER_ARGS,
+        timeoutMs,
+        maxOutputBytes,
+      })
+      break
+    } catch (error) {
+      if (isMissingExecutable(error)) continue
+      throw new NativeFolderPickerError('picker_failed', 'The native folder picker could not be started')
     }
-    throw new NativeFolderPickerError('picker_failed', 'The native folder picker could not be started')
+  }
+  if (result === null) {
+    throw new NativeFolderPickerError('picker_unavailable', 'The native folder picker is unavailable')
   }
 
   if (result.timedOut) {

@@ -19,7 +19,7 @@ test('Windows picker uses a fixed hidden STA command and returns an existing dir
   assert.equal(await pickNativeFolder({ platform: 'win32', runner }), await realpath(directory))
   assert.equal(runner.requests.length, 1)
   const [request] = runner.requests
-  assert.equal(request?.executable, 'powershell.exe')
+  assert.equal(request?.executable, 'pwsh.exe')
   assert.deepEqual(request?.args.slice(0, 6), ['-NoLogo', '-NoProfile', '-STA', '-WindowStyle', 'Hidden', '-EncodedCommand'])
   assert.equal(request?.args.length, 7)
   assert.equal(request?.args.some((argument) => argument.includes(directory)), false)
@@ -27,6 +27,14 @@ test('Windows picker uses a fixed hidden STA command and returns an existing dir
   assert.match(script, /FolderBrowserDialog/)
   assert.match(script, /pathBase64/)
   assert.doesNotMatch(script, /Get-ChildItem|Get-Content|Environment/)
+})
+
+test('Windows picker falls back to Windows PowerShell when pwsh is not installed', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-native-picker-fallback-'))
+  const runner = new MissingPwshRunner(result(selectedResponse(directory)))
+
+  assert.equal(await pickNativeFolder({ platform: 'win32', runner }), await realpath(directory))
+  assert.deepEqual(runner.requests.map((request) => request.executable), ['pwsh.exe', 'powershell.exe'])
 })
 
 test('Windows picker returns null only for the exact cancellation protocol', async () => {
@@ -98,6 +106,21 @@ class FakeRunner implements NativeFolderPickerRunner {
 
   async run(request: NativeFolderPickerProcessRequest): Promise<NativeFolderPickerProcessResult> {
     this.requests.push(request)
+    return this.#response
+  }
+}
+
+class MissingPwshRunner implements NativeFolderPickerRunner {
+  readonly requests: NativeFolderPickerProcessRequest[] = []
+  readonly #response: NativeFolderPickerProcessResult
+
+  constructor(response: NativeFolderPickerProcessResult) {
+    this.#response = response
+  }
+
+  async run(request: NativeFolderPickerProcessRequest): Promise<NativeFolderPickerProcessResult> {
+    this.requests.push(request)
+    if (request.executable === 'pwsh.exe') throw Object.assign(new Error('spawn pwsh.exe ENOENT'), { code: 'ENOENT' })
     return this.#response
   }
 }
