@@ -9,6 +9,7 @@ test('context view identity follows provider and effective budget, not exact mod
     usableInputTokens: 258_400,
     maximumSummaryTokens: 8_192,
   })
+  assert.match(codex258k, /^context-view-v2:[a-f0-9]{64}$/)
   assert.equal(codex258k, contextViewKey({
     provider: 'codex',
     usableInputTokens: 258_400,
