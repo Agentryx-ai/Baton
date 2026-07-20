@@ -11,3 +11,4 @@
 - [Codex 대용량 압축 요청의 event-loop starvation](codex-native-proxy-must-not-block-event-loop-on-large-compressed-requests.md)
 - [Codex built-in skill의 Native proxy 회귀](resolved-codex-built-in-skills-failed-through-native-proxy.md)
 - [Native import의 명시적 Goal 복원](native-import-must-restore-explicit-goals.md)
+- [중단된 읽기 전용 tool call의 provider 전환 복구](provider-switch-must-repair-interrupted-read-only-tool-calls.md)

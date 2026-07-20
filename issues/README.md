@@ -18,6 +18,7 @@
 | [Claude actual-429 계정 전환](claude-rotation-must-switch-on-actual-429.md) | 부분 해결 |
 | [Codex model-aware failover와 plan 갱신](codex-native-proxy-must-failover-and-preserve-model-availability.md) | 부분 해결 |
 | [Codex Responses WebSocket transport](codex-native-proxy-needs-responses-websocket-transport.md) | 미해결 |
+| [Codex workspace command의 codex-path 상속](codex-workspace-command-must-inherit-codex-path.md) | 부분 해결 |
 | [마이그레이션된 Claude 계정 quota·중복·placeholder](migrated-claude-accounts-fail-quota-and-canary-placeholder-duplicate.md) | 부분 해결 |
 | [범용 모델 fallback 후보 순회와 override 정리](model-fallback-must-exhaust-candidates-and-clear-failed-overrides.md) | 미해결 |
 
