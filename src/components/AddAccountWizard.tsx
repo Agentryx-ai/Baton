@@ -184,12 +184,19 @@ export function AddAccountWizard({
   }, [step, oauthState, provider, forceNative, markComplete])
 
   const openAuthTab = useCallback((url: string) => {
-    const win = window.open(url, "_blank", "noopener,noreferrer")
+    // window.open(..., "noopener") always returns null by spec, so a `!win`
+    // check misreports every successful open as "blocked". Open a blank tab
+    // first (same-origin → real handle for accurate block detection), sever the
+    // opener for the same anti-tabnabbing protection, then navigate.
+    const win = window.open("", "_blank")
     if (!win) {
       toast.warning(
         "새 탭이 차단되었어요. 'URL 다시 열기' 버튼으로 열거나 URL을 복사해 직접 여세요."
       )
+      return
     }
+    win.opener = null
+    win.location.replace(url)
   }, [])
 
   async function handleStart() {
