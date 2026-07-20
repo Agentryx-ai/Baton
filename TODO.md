@@ -25,6 +25,8 @@
 ## P2 — 제품 기능
 
 - [ ] WorkSet/WorkGraph scheduler, child execution API, acceptance receipt 구현
+- [ ] Canonical 대화에 provider/plugin skill discovery와 Baton-owned MCP execution 연결
+      (`issues/canonical-conversations-must-expose-plugin-skills-and-mcp.md`)
 - [ ] Built-in browser의 durable navigation/action/result 계약 구현
 - [ ] Computer Use screenshot→approval→action→result loop 구현
 - [ ] 범용 모델 fallback 다중 후보 순회와 실패 override 정리
