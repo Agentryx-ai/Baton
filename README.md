@@ -108,6 +108,7 @@ Pareto orchestration plugin과 evolving graph의 확장안은
 | 여러 provider/계정 UI | 구현됨 | Claude/Codex 계정, quota, reset, pause/resume/delete |
 | Baton Native Claude Proxy | 부분 완료 | OAuth vault, refresh, quota preflight, same-request failover, SSE 보존; 단일계정 live canary 완료, 2계정/rollback gate 대기 |
 | Baton Native Codex Proxy | 합성 검증 완료 | OAuth, live-claim plan, account별 model catalog, model-aware failover; 실제 OAuth/free→pro/2계정 canary 대기 |
+| Codex primary-runtime bridge | 구현·canary 완료 | CLI에 `load_workspace_dependencies`가 없을 때 검증된 공식 runtime만 노출; artifact-tool workbook render/export E2E 통과 |
 | CLIProxy 호환 경로 | 유지됨 | 기존 gateway 계정 API와 custom-provider 모드 지원; Native core는 CLIProxy 코드나 프로세스에 의존하지 않음 |
 | 범용 모델 자동전환 | 부분 완료 | 기본 OFF, capability/mapping 기반 fallback과 복귀, Fable 5→Opus 4.8 live 전환 완료; 다중 fallback 후보와 실패 정리 보강 필요 |
 | Canonical conversation runtime | V1 부분 구현 | provider-neutral model/tool loop, SQLite/WAL, replay SSE, bounded cancel/recovery |
@@ -195,6 +196,10 @@ CLI/Desktop을 완전히 종료했다가 다시 시작해야 합니다.
 
 - Native proxy는 구현됐지만 실제 2계정 failover, Codex free→pro entitlement refresh,
   CLI/Desktop rollback과 24시간 canary는 외부 계정/시간 조건 때문에 아직 완료되지 않았습니다.
+- Codex CLI 0.144.6은 OpenAI Spreadsheets plugin을 노출하면서 plugin이 요구하는
+  `load_workspace_dependencies` 도구를 등록하지 않습니다. Baton runtime bridge가 공식 primary
+  runtime을 검증해 우회하지만, upstream CLI/plugin 계약이 수정되면 native loader를 다시
+  우선합니다.
 - 모델 fallback은 첫 후보 실패 후 다음 후보를 순회하고 실패한 override를 정리하는 보강이
   필요합니다. 현재 compatibility seed는 Fable 5→Opus 4.8이며 범용 schema 자체는 모델명과
   분리돼 있습니다.
@@ -225,6 +230,7 @@ CLI/Desktop을 완전히 종료했다가 다시 시작해야 합니다.
 - `docs/WORK_CENTRIC_ORCHESTRATION_DESIGN_V4.md` — work-centric runtime 최신 목표 설계
 - `docs/HOST_AUTOMATION.md` — 권한 profile, host command, 이미지와 자동화 경계
 - `docs/BATON_NATIVE_CLAUDE_PROXY_TODO.md` — Native proxy/fallback 검증 및 미해결 작업
+- `plugins/baton-codex-runtime-bridge/` — Codex CLI primary-runtime loader compatibility plugin
 
 ## 설계 문서
 
@@ -234,3 +240,4 @@ CLI/Desktop을 완전히 종료했다가 다시 시작해야 합니다.
 - [Host access and automation](docs/HOST_AUTOMATION.md)
 - [Native session import and grouping](docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
+- [Codex primary-runtime bridge](docs/CODEX_PRIMARY_RUNTIME_BRIDGE.md)

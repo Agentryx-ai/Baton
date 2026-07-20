@@ -65,6 +65,18 @@ Codex CLI가 설치돼 있으면 다음 smoke test도 실행합니다.
 npm run smoke:codex-adapter
 ```
 
+Codex CLI에서 OpenAI primary-runtime 문서 plugin을 사용할 경우 Baton의 repo-local
+compatibility marketplace와 bridge plugin도 설치합니다. Marketplace source는 checkout root입니다.
+
+```bash
+codex plugin marketplace add <BATON_CHECKOUT>
+codex plugin add baton-codex-runtime-bridge@baton-local
+```
+
+`codex debug prompt-input`에 `baton-codex-runtime-bridge:resolve-codex-runtime`이 나타나는지
+확인합니다. 이 bridge는 `load_workspace_dependencies`가 없는 CLI에서만 쓰며, 공식 loader가
+추가되면 loader를 우선합니다.
+
 검증이 실패하면 오류 원인을 확인하고 설치에 필요한 최소 변경만 적용한 뒤 실패한 검사와 관련
 전체 검사를 다시 실행합니다. Gateway 또는 CLIProxy가 없어서 외부 연동 검증만 실패한 경우에도
 Baton 자체 build/test 결과와 외부 blocker를 구분해 보고합니다.
@@ -101,6 +113,7 @@ npm start
 
 - 설치 경로와 branch/commit
 - 의존성 설치, typecheck, lint, test, build와 선택 smoke 결과
+- Codex를 사용하는 경우 runtime bridge plugin 설치/검증 결과
 - Baton 실행 상태와 대시보드 URL
 - 재실행 명령과 종료 방법
 - gateway/CLIProxy/OAuth/login처럼 사용자가 직접 처리해야 하는 남은 조건

@@ -1,0 +1,22 @@
+{
+  "name": "baton-codex-runtime-bridge",
+  "version": "0.1.0+codex.20260720123033",
+  "description": "Validates and exposes the official Codex primary runtime when the CLI omits load_workspace_dependencies.",
+  "author": {
+    "name": "Agentryx AI"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Baton Codex Runtime Bridge",
+    "shortDescription": "Restore official workspace dependencies in Codex CLI.",
+    "longDescription": "Uses a validated resolver for the installed OpenAI primary runtime when Codex CLI exposes its plugins but omits the workspace dependency loader.",
+    "developerName": "Agentryx AI",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Resolve the official Codex runtime for this spreadsheet task"
+    ]
+  }
+}
