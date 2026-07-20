@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Target, Shield, Moon, Pause, Play, Crosshair, Trash2 } from 'lucide-react'
+import { Target, Shield, Moon, Pause, Play, Crosshair, RefreshCw, Star, Trash2 } from 'lucide-react'
 
 import type { Account, AccountQuota } from '@/api/types'
 import { cn } from '@/lib/utils'
@@ -21,16 +21,15 @@ import { QuotaBar } from '@/components/QuotaBar'
 
 /**
  * Honest account state — every value maps to a real backend fact, never an
- * inert "default" flag (CLIProxy round-robins all non-paused credentials; there
- * is no per-request default lever). See docs/DESIGN.md §5 and the default-concept
- * removal note.
+ * inert "default" flag. Baton Native attempts enabled credentials by priority.
  *
  * - target        : engine's calculated first-ranked account (engine ON only;
- *                   CLIProxy request order is still determined by its strategy)
- * - reserve       : another account kept in the active pool (engine ON only)
- * - engine-paused : the engine removed it from rotation to preserve quota (engine ON only)
+ *                   retained only for imported historical policy state)
+ * - reserve       : engine's calculated second-ranked account (engine ON only;
+ *                   every non-manually-paused account remains in the pool)
+ * - engine-paused : a legacy engine-owned pause pending restoration
  * - user-paused   : the user manually removed it from rotation (either mode)
- * - active        : in the round-robin pool, not a distinguished role
+ * - active        : in the Baton Native routing pool
  */
 export type AccountStatus = 'target' | 'reserve' | 'engine-paused' | 'user-paused' | 'active'
 
@@ -45,7 +44,11 @@ export interface AccountCardProps {
   onPause: () => void
   onResume: () => void
   onSolo: () => void
+  onRefreshEntitlements?: () => void
+  onPrefer?: () => void
   onRemove: () => void
+  pluginReferenceAlternatives?: Account[]
+  onReassignPluginReference?: (accountId: string | null) => Promise<void>
 }
 
 const STATUS_BADGE: Record<
@@ -53,8 +56,8 @@ const STATUS_BADGE: Record<
   { label: string; icon: React.ComponentType<{ className?: string }>; className: string } | null
 > = {
   target: { label: '정책 1순위', icon: Target, className: 'text-ok' },
-  reserve: { label: '활성 예비', icon: Shield, className: 'text-muted-foreground' },
-  'engine-paused': { label: '엔진 대기 · 쿼터 보존', icon: Moon, className: 'text-muted-foreground' },
+  reserve: { label: '정책 2순위', icon: Shield, className: 'text-muted-foreground' },
+  'engine-paused': { label: '과거 엔진 정지 · 복구 대기', icon: Moon, className: 'text-muted-foreground' },
   'user-paused': { label: '수동 정지', icon: Pause, className: 'text-warn' },
   active: null,
 }
@@ -100,20 +103,41 @@ export function AccountCard({
   onPause,
   onResume,
   onSolo,
+  onRefreshEntitlements,
+  onPrefer,
   onRemove,
+  pluginReferenceAlternatives = [],
+  onReassignPluginReference,
 }: AccountCardProps) {
   const [confirmOpen, setConfirmOpen] = React.useState(false)
+  const [replacementAccountId, setReplacementAccountId] = React.useState('local_only')
+  const [replacementBusy, setReplacementBusy] = React.useState(false)
+  const [replacementError, setReplacementError] = React.useState<string | null>(null)
 
   const hasNickname = account.nickname && account.nickname !== account.email
   const badge = STATUS_BADGE[status]
-  // Engine ON: engine-paused accounts are engine-managed (resuming is futile — it
-  // re-pauses next tick), so no manual pause/resume on them. User-paused stays
-  // user-resumable in both modes.
+  // A legacy engine-owned pause is recovered by the policy journal. Keep manual
+  // controls out of that transition so ownership is not silently reassigned.
   const engineManaged = status === 'engine-paused'
 
   const handleConfirmRemove = () => {
     setConfirmOpen(false)
     onRemove()
+  }
+
+  const handleReassignAndRemove = async () => {
+    if (!onReassignPluginReference) return
+    setReplacementBusy(true)
+    setReplacementError(null)
+    try {
+      await onReassignPluginReference(replacementAccountId === 'local_only' ? null : replacementAccountId)
+      setConfirmOpen(false)
+      onRemove()
+    } catch (error) {
+      setReplacementError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setReplacementBusy(false)
+    }
   }
 
   return (
@@ -141,6 +165,18 @@ export function AccountCard({
               {badge.label}
             </Badge>
           )}
+          {account.isDefault && onPrefer ? (
+            <Badge variant="outline" className="gap-1 text-ok">
+              <Star className="size-3" aria-hidden />
+              Native 우선계정
+            </Badge>
+          ) : null}
+          {account.isPluginReference ? (
+            <Badge variant="outline" className="gap-1 text-sky-700 dark:text-sky-300">
+              <Shield className="size-3" aria-hidden />
+              플러그인 기준계정
+            </Badge>
+          ) : null}
         </div>
 
         {/* Quota */}
@@ -158,8 +194,7 @@ export function AccountCard({
 
         <Separator />
 
-        {/* Actions — every control maps to a real backend op (pause/resume =
-            CLIProxy rotation membership). No "default" (inert for routing). */}
+        {/* Actions — every control maps to a real backend operation. */}
         <div className="flex flex-wrap items-center gap-2">
           {status === 'user-paused' ? (
             <Button variant="outline" size="sm" onClick={onResume}>
@@ -182,6 +217,18 @@ export function AccountCard({
               이 계정만
             </Button>
           )}
+          {onRefreshEntitlements ? (
+            <Button variant="outline" size="sm" onClick={onRefreshEntitlements}>
+              <RefreshCw className="size-3" aria-hidden />
+              엔트리먼트 새로고침
+            </Button>
+          ) : null}
+          {onPrefer && !account.isDefault && status === 'active' ? (
+            <Button variant="outline" size="sm" onClick={onPrefer}>
+              <Star className="size-3" aria-hidden />
+              우선계정으로
+            </Button>
+          ) : null}
           <Button
             variant="ghost"
             size="icon-sm"
@@ -204,13 +251,41 @@ export function AccountCard({
               삭제합니다. 이 작업은 되돌릴 수 없습니다.
             </DialogDescription>
           </DialogHeader>
+          {account.isPluginReference ? (
+            <div className="space-y-2">
+              <p className="text-sm text-amber-700 dark:text-amber-300">
+                이 계정은 Codex 플러그인 기준계정입니다. 삭제 전에 다른 계정이나 local-only로 전환해야 합니다.
+              </p>
+              <select
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                value={replacementAccountId}
+                onChange={(event) => setReplacementAccountId(event.target.value)}
+                disabled={replacementBusy}
+              >
+                <option value="local_only">local-only</option>
+                {pluginReferenceAlternatives.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.nickname || candidate.email}{candidate.paused ? ' · 모델 라우팅 중지됨' : ''}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Connector와 private workspace 권한은 계정 간 이전되지 않으며 다시 인증해야 할 수 있습니다.
+              </p>
+              {replacementError ? <p className="text-xs text-destructive">{replacementError}</p> : null}
+            </div>
+          ) : null}
           <DialogFooter>
             <DialogClose asChild>
               <Button variant="outline">취소</Button>
             </DialogClose>
-            <Button variant="destructive" onClick={handleConfirmRemove}>
+            <Button
+              variant="destructive"
+              disabled={replacementBusy || (account.isPluginReference && !onReassignPluginReference)}
+              onClick={() => void (account.isPluginReference ? handleReassignAndRemove() : handleConfirmRemove())}
+            >
               <Trash2 className="size-4" aria-hidden />
-              삭제
+              {replacementBusy ? '전환 중…' : account.isPluginReference ? '전환 후 삭제' : '삭제'}
             </Button>
           </DialogFooter>
         </DialogContent>

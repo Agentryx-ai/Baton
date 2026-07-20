@@ -15,6 +15,8 @@ import {
   usageSummary,
 } from './conversation-presentation'
 import type { CanonicalItemDto, CanonicalTurnDto } from './types'
+import type { ImageArtifactRefDto } from './types'
+import { conversationApi } from './api'
 import type { AssistantLabelMode } from './session-view-preferences'
 
 const ICON = {
@@ -69,6 +71,7 @@ export function ConversationItem({
     || item.kind === 'tool_result'
     || item.kind === 'file_change'
     || item.kind === 'provider_event'
+  const images = itemImages(item, toolResult)
 
   if (isToolActivity) {
     const failed = activityFailed(item) || (toolResult ? activityFailed(toolResult) : false)
@@ -80,6 +83,7 @@ export function ConversationItem({
           <span className="min-w-0 truncate font-medium">{activitySummary(item, toolResult)}</span>
           <ChevronRight className="ml-auto size-3.5 shrink-0 opacity-50 transition-transform group-open/activity:rotate-90" aria-hidden />
         </summary>
+        {images.length > 0 ? <ImageStrip images={images} /> : null}
         <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-lg border bg-muted/30 p-3 font-mono text-[0.6875rem] text-foreground">
           {payloadDetail(item)}
           {toolResult ? `\n\n결과\n${payloadDetail(toolResult)}` : ''}
@@ -91,6 +95,7 @@ export function ConversationItem({
   if (item.kind === 'user_message') {
     return (
       <article className="ml-auto max-w-[88%] rounded-2xl bg-muted px-4 py-3 sm:max-w-[78%]">
+        {images.length > 0 ? <ImageStrip images={images} /> : null}
         <LongContent text={body} className="text-[0.9375rem] leading-6 text-foreground" fadeClassName="after:from-muted" />
       </article>
     )
@@ -163,6 +168,45 @@ export function ConversationItem({
       )}
     </article>
   )
+}
+
+function ImageStrip({ images }: { images: ImageArtifactRefDto[] }) {
+  return (
+    <div className="mb-2 flex max-w-full gap-2 overflow-x-auto">
+      {images.map((image) => (
+        <a
+          key={image.id}
+          href={conversationApi.imageUrl(image.id)}
+          target="_blank"
+          rel="noreferrer"
+          className="block max-w-full shrink-0 overflow-hidden rounded-xl border bg-background"
+        >
+          <img
+            src={conversationApi.imageUrl(image.id)}
+            alt={image.fileName}
+            className="max-h-72 max-w-full object-contain"
+          />
+        </a>
+      ))}
+    </div>
+  )
+}
+
+function itemImages(item: CanonicalItemDto, toolResult: CanonicalItemDto | null): ImageArtifactRefDto[] {
+  const direct = parseImages(item.payload.attachments)
+  const result = toolResult?.payload.result
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return direct
+  return [...direct, ...parseImages((result as Record<string, unknown>).images)]
+}
+
+function parseImages(value: unknown): ImageArtifactRefDto[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+    const image = entry as Partial<ImageArtifactRefDto>
+    return typeof image.id === 'string' && typeof image.mediaType === 'string'
+      && typeof image.fileName === 'string' ? [image as ImageArtifactRefDto] : []
+  })
 }
 
 export function assistantExecutionMetadata(

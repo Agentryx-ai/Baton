@@ -4,8 +4,11 @@ import type {
   NativeProviderEvent,
   NativeTurnRequest,
   ProviderExecutionContext,
+  ProviderSteerRequest,
+  ProviderSteerResult,
   ProviderTerminalResult,
   ProviderTurnExecution,
+  ProviderSkillResource,
   SessionProviderAdapter,
 } from './adapter.ts'
 import type {
@@ -17,6 +20,8 @@ import type {
   ThreadSnapshot,
 } from './domain.ts'
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
+import { hasPortableUserContent, imageAttachments, parseImageArtifactRef, type ImageArtifactResolver } from './image-artifacts.ts'
+import { latestNativeContextCheckpoint } from './native-context-checkpoint.ts'
 
 type SupportedProvider = Extract<CanonicalProvider, 'claude' | 'gemini'>
 type JsonObject = Record<string, unknown>
@@ -40,6 +45,8 @@ export interface StatelessHttpAdapterOptions {
   provider: SupportedProvider
   proxyConnection: () => Promise<StatelessProxyConnection>
   fetchImpl?: typeof fetch
+  imageArtifacts?: ImageArtifactResolver
+  skillResources?: readonly ProviderSkillResource[]
 }
 
 type ProviderMessage = Record<string, unknown>
@@ -75,6 +82,7 @@ interface ProviderContinuationState {
   assistant: ProviderMessage
   toolResults: ProviderMessage[]
   followUp?: ProviderMessage
+  liveFollowUps?: Array<{ followUpId: string; message: ProviderMessage }>
 }
 
 interface ModelRoundRecord extends ModelRoundProvenance {
@@ -149,10 +157,88 @@ class EventQueue<T> implements AsyncIterable<T> {
   }
 }
 
+interface ClaimedSteer {
+  request: ProviderSteerRequest
+  resolve: (result: ProviderSteerResult) => void
+  settled: boolean
+}
+
+class LiveSteerQueue {
+  private readonly pending: ClaimedSteer[] = []
+  private readonly unsettled = new Set<ClaimedSteer>()
+  private accepting = true
+  private readonly expectedTurnId: string
+
+  constructor(expectedTurnId: string) {
+    this.expectedTurnId = expectedTurnId
+  }
+
+  steer(request: ProviderSteerRequest): Promise<ProviderSteerResult> {
+    if (!request.followUpId || !request.text) {
+      return Promise.reject(new TypeError('Stateless steer requires a follow-up ID and text'))
+    }
+    if (!this.accepting || request.expectedTurnId !== this.expectedTurnId) {
+      return Promise.resolve({ status: 'closed' })
+    }
+    return new Promise((resolve) => {
+      const entry = { request, resolve, settled: false }
+      this.pending.push(entry)
+      this.unsettled.add(entry)
+    })
+  }
+
+  claim(round: number, limit: number | null, sealIfEmpty = false): ClaimedSteer[] {
+    if (!this.accepting || (limit !== null && round >= limit)) {
+      this.close()
+      return []
+    }
+    if (this.pending.length === 0) {
+      if (sealIfEmpty) this.close()
+      return []
+    }
+    return this.pending.splice(0)
+  }
+
+  continuation(batch: readonly ClaimedSteer[]): NonNullable<ProviderContinuationState['liveFollowUps']> {
+    return batch.filter((entry) => !entry.settled).map((entry) => ({
+      followUpId: entry.request.followUpId,
+      message: { role: 'user', content: entry.request.text },
+    }))
+  }
+
+  appendAndAccept(messages: ProviderMessage[], batch: readonly ClaimedSteer[]): number {
+    if (!this.accepting) return 0
+    let accepted = 0
+    for (const entry of batch) {
+      if (entry.settled) continue
+      messages.push({ role: 'user', content: entry.request.text })
+      entry.settled = true
+      this.unsettled.delete(entry)
+      entry.resolve({ status: 'accepted' })
+      accepted += 1
+    }
+    return accepted
+  }
+
+  close(): void {
+    if (!this.accepting && this.unsettled.size === 0) return
+    this.accepting = false
+    this.pending.length = 0
+    for (const entry of this.unsettled) {
+      if (entry.settled) continue
+      entry.settled = true
+      entry.resolve({ status: 'closed' })
+    }
+    this.unsettled.clear()
+  }
+}
+
 export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
   readonly provider: SupportedProvider
   private readonly proxyConnectionProvider: () => Promise<StatelessProxyConnection>
   private readonly fetchImpl: typeof fetch
+  private readonly imageArtifacts: ImageArtifactResolver | null
+  private readonly providerSkillResources: readonly ProviderSkillResource[]
   private connection: StatelessProxyConnection | null = null
   private initializePromise: Promise<AdapterHandshake> | null = null
   private shuttingDown = false
@@ -162,6 +248,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     this.provider = options.provider
     this.proxyConnectionProvider = options.proxyConnection
     this.fetchImpl = options.fetchImpl ?? fetch
+    this.imageArtifacts = options.imageArtifacts ?? null
+    this.providerSkillResources = Object.freeze([...(options.skillResources ?? [])])
   }
 
   initialize(): Promise<AdapterHandshake> {
@@ -171,7 +259,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         adapterVersion: `baton-${this.provider}-http-v1`,
         capabilities: {
           roles: ['user', 'assistant'],
-          contentTypes: ['text'],
+          contentTypes: ['text', 'image'],
           toolCalling: true,
           parallelTools: true,
           contextWindow: null,
@@ -199,10 +287,10 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     if (request.effort !== null && request.effort !== undefined && request.effort.trim().length === 0) {
       throw new Error('Effort must be null or a non-empty string')
     }
-    if (request.input.length === 0) throw new Error(`${this.provider} turn requires text input`)
+    if (request.input.length === 0) throw new Error(`${this.provider} turn requires input`)
     for (const item of request.input) {
-      if (item.kind !== 'user_message' || portableText(item.payload) === null) {
-        throw new Error(`${this.provider} safe mode accepts text user_message input only`)
+      if (item.kind !== 'user_message' || !hasPortableUserContent(item.payload)) {
+        throw new Error(`${this.provider} safe mode accepts portable text and image user_message input only`)
       }
     }
   }
@@ -211,17 +299,24 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     this.validate(request, snapshot)
     const messages = materializeProviderHistory(snapshot, this.provider)
     for (const item of request.input) {
-      appendMessage(messages, 'user', portableText(item.payload) as string)
+      messages.push({ role: 'user', content: portableUserContent(item.payload) })
     }
     const body: MaterializedHttpTurn = {
       turnId: request.turnId,
       provider: this.provider,
       model: request.model,
       effort: request.effort ?? null,
-      developerInstructions: canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+      developerInstructions: withSkillInstructions(
+        canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+        this.providerSkillResources,
+      ),
       messages,
     }
     return { body }
+  }
+
+  skillResources(): readonly ProviderSkillResource[] {
+    return this.providerSkillResources
   }
 
   async execute(
@@ -242,7 +337,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     }
     if (context.signal.aborted) abort()
     else context.signal.addEventListener('abort', abort, { once: true })
-    const timeout = setTimeout(() => {
+    const timeout = context.limits.turnTimeoutMs === null ? null : setTimeout(() => {
       turnTimedOut = true
       controller.abort(new Error(
         `${this.provider} turn exceeded time limit (${context.limits.turnTimeoutMs}ms)`,
@@ -250,6 +345,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     }, context.limits.turnTimeoutMs)
 
     const events = new EventQueue<NativeProviderEvent>()
+    const steerQueue = new LiveSteerQueue(body.turnId)
     let resolveTerminal!: (result: ProviderTerminalResult) => void
     const terminal = new Promise<ProviderTerminalResult>((resolve) => {
       resolveTerminal = resolve
@@ -275,7 +371,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       return events.pushAndWait(event)
     }
 
-    const providerRequest = this.request(body, controller.signal, context, emitModelRound)
+    const providerRequest = this.request(body, controller.signal, context, emitModelRound, steerQueue)
     void Promise.race([providerRequest, rejectOnAbort(controller.signal)]).then((response) => {
       if (turnTimedOut) {
         throw new ProviderLoopError(
@@ -286,6 +382,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       if (cancellationRequested || controller.signal.aborted) {
         throw controller.signal.reason ?? new Error('Turn cancelled by user')
       }
+      steerQueue.close()
       events.push({
         eventId: `${this.provider}:response:${response.responseId}`,
         type: 'response/completed',
@@ -295,6 +392,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       events.end()
       resolveTerminal({ status: 'completed', usage: response.usage })
     }).catch((error: unknown) => {
+      steerQueue.close()
       events.end()
       const message = turnTimedOut
         ? `${this.provider} turn exceeded time limit (${context.limits.turnTimeoutMs}ms)`
@@ -317,7 +415,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
               },
             })
     }).finally(() => {
-      clearTimeout(timeout)
+      if (timeout !== null) clearTimeout(timeout)
       context.signal.removeEventListener('abort', abort)
       this.active.delete(controller)
     })
@@ -325,11 +423,14 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     return {
       events,
       terminal,
+      steer: (steerRequest) => steerQueue.steer(steerRequest),
       cancel: async () => {
         cancellationRequested = true
+        steerQueue.close()
         controller.abort(new Error('Turn cancelled by user'))
       },
       dispose: async () => {
+        steerQueue.close()
         context.signal.removeEventListener('abort', abort)
       },
     }
@@ -371,6 +472,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
             assistant: continuation.assistant,
             toolResults: continuation.toolResults,
             ...(continuation.followUp ? { followUp: continuation.followUp } : {}),
+            ...(continuation.liveFollowUps ? { liveFollowUps: continuation.liveFollowUps } : {}),
           },
         })
         if (round.stopReason === 'max_tokens' || round.stopReason === 'model_context_window_exceeded') {
@@ -389,6 +491,26 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
                 modelProvenance: round.reportedModel === null ? 'unreported' : 'provider_reported',
                 incomplete: true,
                 continuationIndex: round.round,
+              },
+            })
+          }
+        }
+        if (continuation.liveFollowUps?.length
+          && (round.stopReason === 'end_turn' || round.stopReason.toLowerCase() === 'stop')) {
+          const intermediateText = providerMessageText(continuation.assistant)
+          if (intermediateText) {
+            items.push({
+              kind: 'assistant_message',
+              visibility: 'portable',
+              provider: this.provider,
+              nativeId: round.responseId,
+              payload: {
+                text: intermediateText,
+                requestedModel: round.requestedModel,
+                reportedModel: round.reportedModel,
+                modelFallback: round.reportedModel !== null && round.requestedModel !== round.reportedModel,
+                modelProvenance: round.reportedModel === null ? 'unreported' : 'provider_reported',
+                continuation: true,
               },
             })
           }
@@ -447,11 +569,12 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       usage: JsonObject,
       continuation?: ProviderContinuationState,
     ) => Promise<void>,
+    steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
     if (!this.connection) throw new Error(`${this.provider} proxy connection is unavailable`)
     return this.provider === 'claude'
-      ? this.requestClaude(body, signal, context, onModelRound)
-      : this.requestGemini(body, signal, context, onModelRound)
+      ? this.requestClaude(body, signal, context, onModelRound, steerQueue)
+      : this.requestGemini(body, signal, context, onModelRound, steerQueue)
   }
 
   private async requestClaude(
@@ -463,8 +586,13 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       usage: JsonObject,
       continuation?: ProviderContinuationState,
     ) => Promise<void>,
+    steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
-    const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
+    const messages: ProviderMessage[] = body.messages.map((message) => hydrateProviderMessage(
+      message,
+      'claude',
+      this.imageArtifacts,
+    ))
     const tools = context.toolDefinitions.map(toClaudeTool)
     const usage: JsonObject = {}
     const seenProviderCallIds = new Set<string>()
@@ -472,7 +600,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     let outputContinuations = 0
     let requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
 
-    for (let round = 1; round <= context.limits.maxModelRoundTrips; round += 1) {
+    for (let round = 1; context.limits.maxModelRoundTrips === null
+      || round <= context.limits.maxModelRoundTrips; round += 1) {
       const response = await fetchWithRetry(this.fetchImpl, `${this.connection!.baseUrl}/v1/messages`, {
         method: 'POST',
         headers: {
@@ -483,6 +612,10 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         body: JSON.stringify({
           model: body.model,
           max_tokens: requestMaxTokens,
+          // Anthropic automatic prompt caching advances the breakpoint with
+          // the growing canonical history. No provider-visible thread ID is
+          // needed; cache reuse remains prefix-bound by the Messages API.
+          cache_control: { type: 'ephemeral' },
           ...(body.developerInstructions ? { system: body.developerInstructions } : {}),
           messages,
           ...(tools.length > 0 ? { tools } : {}),
@@ -562,7 +695,21 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           await recordRound()
           throw new ProviderLoopError('provider_invalid_terminal', 'Claude end_turn response did not contain text')
         }
-        await recordRound()
+        const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips, true)
+        if (steers.length > 0) {
+          await recordRound({
+            assistant: assistantMessage,
+            toolResults: [],
+            liveFollowUps: steerQueue.continuation(steers),
+          })
+          messages.push(assistantMessage)
+          if (steerQueue.appendAndAccept(messages, steers) > 0) {
+            requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
+            continue
+          }
+        } else {
+          await recordRound()
+        }
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
@@ -573,9 +720,15 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         }
       }
       if (stopReason === 'pause_turn') {
-        await recordRound({ assistant: assistantMessage, toolResults: [] })
+        const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
+        await recordRound({
+          assistant: assistantMessage,
+          toolResults: [],
+          ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
+        })
         assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude pause_turn')
         messages.push(assistantMessage)
+        steerQueue.appendAndAccept(messages, steers)
         continue
       }
       if (stopReason === 'max_tokens') {
@@ -585,14 +738,18 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         }
         outputContinuations += 1
         const canContinue = outputContinuations <= CLAUDE_OUTPUT_CONTINUATION_LIMIT
-          && round < context.limits.maxModelRoundTrips
+          && (context.limits.maxModelRoundTrips === null || round < context.limits.maxModelRoundTrips)
         const followUp = canContinue
           ? { role: 'user', content: 'Please continue from where you left off.' }
           : undefined
+        const steers = canContinue
+          ? steerQueue.claim(round, context.limits.maxModelRoundTrips)
+          : []
         await recordRound({
           assistant: assistantMessage,
           toolResults: [],
           ...(followUp ? { followUp } : {}),
+          ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
         })
         if (outputContinuations > CLAUDE_OUTPUT_CONTINUATION_LIMIT) {
           throw new ProviderLoopError(
@@ -603,6 +760,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         assertAnotherModelRound(round, context.limits.maxModelRoundTrips, 'Claude max_tokens')
         if (!followUp) throw new Error('Claude continuation follow-up was not materialized')
         messages.push(assistantMessage, followUp)
+        steerQueue.appendAndAccept(messages, steers)
         continue
       }
       if (stopReason !== 'tool_use') {
@@ -620,7 +778,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         await recordRound()
         throw new ProviderLoopError('provider_invalid_terminal', 'Claude returned tool_use without a tool_use block')
       }
-      if (round >= context.limits.maxModelRoundTrips) {
+      if (context.limits.maxModelRoundTrips !== null && round >= context.limits.maxModelRoundTrips) {
         await recordRound({
           assistant: { role: 'assistant', content },
           toolResults: [],
@@ -634,19 +792,24 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         throw error
       }
       const results = await executeToolBatch(body.turnId, toolUses, context, signal)
-      const toolResultMessage = {
+      const durableToolResultMessage = {
         role: 'user',
         content: results.map((result, index) => claudeToolResult(
           toolUses[index]!.providerCallId,
           result,
           context.limits.toolOutputBytes,
+          this.imageArtifacts,
         )),
       }
+      const toolResultMessage = hydrateProviderMessage(durableToolResultMessage, 'claude', this.imageArtifacts)
+      const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
       await recordRound({
         assistant: assistantMessage,
-        toolResults: [toolResultMessage],
+        toolResults: [durableToolResultMessage],
+        ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
       })
       messages.push(assistantMessage, toolResultMessage)
+      steerQueue.appendAndAccept(messages, steers)
       requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
     }
     throw new ProviderLoopError(
@@ -664,14 +827,20 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       usage: JsonObject,
       continuation?: ProviderContinuationState,
     ) => Promise<void>,
+    steerQueue: LiveSteerQueue,
   ): Promise<NormalizedResponse> {
-    const messages: ProviderMessage[] = body.messages.map((message) => ({ ...message }))
+    const messages: ProviderMessage[] = body.messages.map((message) => hydrateProviderMessage(
+      message,
+      'gemini',
+      this.imageArtifacts,
+    ))
     const tools = context.toolDefinitions.map(toOpenAiTool)
     const usage: JsonObject = {}
     const seenProviderCallIds = new Set<string>()
     const retryBudget = createRetryBudget(context.limits.maxProviderRetries)
 
-    for (let round = 1; round <= context.limits.maxModelRoundTrips; round += 1) {
+    for (let round = 1; context.limits.maxModelRoundTrips === null
+      || round <= context.limits.maxModelRoundTrips; round += 1) {
       const response = await fetchWithRetry(this.fetchImpl, `${this.connection!.baseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: {
@@ -727,7 +896,19 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           )
         }
         if (!text) throw new ProviderLoopError('provider_invalid_terminal', 'Gemini stop response did not contain text')
-        await onModelRound(roundRecord, usage)
+        const assistantMessage = { role: 'assistant', content: text }
+        const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips, true)
+        if (steers.length > 0) {
+          await onModelRound(roundRecord, usage, {
+            assistant: assistantMessage,
+            toolResults: [],
+            liveFollowUps: steerQueue.continuation(steers),
+          })
+          messages.push(assistantMessage)
+          if (steerQueue.appendAndAccept(messages, steers) > 0) continue
+        } else {
+          await onModelRound(roundRecord, usage)
+        }
         return {
           responseId: stringValue(payload.id) ?? `${body.turnId}:response`,
           requestedModel: body.model,
@@ -760,18 +941,50 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
           name: toolCalls[index]!.name,
           content: serializeToolResult(result, context.limits.toolOutputBytes).content,
         })
+        const images = result.success ? result.images ?? [] : []
+        if (images.length > 0) {
+          toolResultMessages.push({
+            role: 'user',
+            content: [
+              { type: 'text', text: `Image output from ${toolCalls[index]!.name}` },
+              ...images.map((image) => ({
+                type: 'baton_image',
+                artifact: image,
+              })),
+            ],
+          })
+        }
       }
+      const steers = steerQueue.claim(round, context.limits.maxModelRoundTrips)
       await onModelRound(roundRecord, usage, {
         assistant: assistantMessage,
         toolResults: toolResultMessages,
+        ...(steers.length > 0 ? { liveFollowUps: steerQueue.continuation(steers) } : {}),
       })
-      messages.push(assistantMessage, ...toolResultMessages)
+      messages.push(
+        assistantMessage,
+        ...toolResultMessages.map((message) => hydrateProviderMessage(message, 'gemini', this.imageArtifacts)),
+      )
+      steerQueue.appendAndAccept(messages, steers)
     }
     throw new ProviderLoopError(
       'model_round_limit',
       `Gemini exceeded model round-trip limit (${context.limits.maxModelRoundTrips})`,
     )
   }
+}
+
+function withSkillInstructions(
+  existing: string | null,
+  resources: readonly ProviderSkillResource[],
+): string | null {
+  if (resources.length === 0) return existing
+  const skillNames = resources.map(({ id }) => id).join(', ')
+  const instructions = `Provider-global skills available in this Baton turn: ${skillNames}.
+When the user names one or the request clearly matches one, first call read_skill_resource with the
+skill name and path SKILL.md, read it completely, and follow it. Read referenced files through the
+same tool. Skill instructions do not grant native shell, web, MCP, app, plugin, or connector tools.`
+  return existing ? `${existing}\n\n${instructions}` : instructions
 }
 
 function rejectOnAbort(signal: AbortSignal): Promise<never> {
@@ -894,12 +1107,22 @@ function claudeToolResult(
   providerCallId: string,
   result: AgentToolResult,
   byteLimit: number,
+  _artifacts: ImageArtifactResolver | null,
 ): JsonObject {
   const serialized = serializeToolResult(result, byteLimit)
+  const images = result.success ? result.images ?? [] : []
   return {
     type: 'tool_result',
     tool_use_id: providerCallId,
-    content: serialized.content,
+    content: images.length === 0
+      ? serialized.content
+      : [
+          { type: 'text', text: serialized.content },
+          ...images.map((image) => ({
+            type: 'baton_image',
+            artifact: image,
+          })),
+        ],
     ...(serialized.isError ? { is_error: true } : {}),
   }
 }
@@ -1021,8 +1244,8 @@ function unavailableToolResult(reason: unknown): AgentToolResult {
   }
 }
 
-function assertAnotherModelRound(round: number, limit: number, reason: string): void {
-  if (round >= limit) {
+function assertAnotherModelRound(round: number, limit: number | null, reason: string): void {
+  if (limit !== null && round >= limit) {
     throw new ProviderLoopError(
       'model_round_limit',
       `${reason} requires another model round but reached model round-trip limit (${limit})`,
@@ -1077,7 +1300,11 @@ function parseClaudeHistoryMessage(message: JsonObject): ProviderMessage {
 
 function parseGeminiHistoryMessage(message: JsonObject): ProviderMessage {
   if (message.role === 'user') {
-    return { role: 'user', content: requiredString(message.content, 'Gemini user message content') }
+    if (typeof message.content === 'string') return { role: 'user', content: requiredString(message.content, 'Gemini user message content') }
+    if (!Array.isArray(message.content) || message.content.some((part) => !isObject(part))) {
+      throw new Error('Invalid Gemini structured user content')
+    }
+    return { role: 'user', content: message.content }
   }
   if (message.role === 'tool') {
     return {
@@ -1133,13 +1360,27 @@ function parseProviderContinuation(value: unknown): ProviderContinuationState | 
   if (!Array.isArray(continuation.toolResults) || continuation.toolResults.some((result) => !isObject(result))) {
     throw new Error('Provider continuation tool results must be structured messages')
   }
+  const liveFollowUps = parseLiveFollowUps(continuation.liveFollowUps)
   return {
     assistant,
     toolResults: continuation.toolResults as ProviderMessage[],
     ...(continuation.followUp === undefined
       ? {}
       : { followUp: requiredObject(continuation.followUp, 'provider continuation follow-up') }),
+    ...(liveFollowUps ? { liveFollowUps } : {}),
   }
+}
+
+function parseLiveFollowUps(value: unknown): ProviderContinuationState['liveFollowUps'] {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value)) throw new Error('Provider live follow-ups must be an array')
+  return value.map((entry) => {
+    const parsed = requiredObject(entry, 'provider live follow-up')
+    return {
+      followUpId: requiredString(parsed.followUpId, 'provider live follow-up id'),
+      message: requiredObject(parsed.message, 'provider live follow-up message'),
+    }
+  })
 }
 
 function providerMessageText(message: ProviderMessage): string | null {
@@ -1154,8 +1395,13 @@ function materializeProviderHistory(
   snapshot: ThreadSnapshot,
   provider: SupportedProvider,
 ): ProviderMessage[] {
-  const messages: ProviderMessage[] = []
-  const ordered = [...snapshot.items].sort((left, right) => left.sequence - right.sequence)
+  const nativeCheckpoint = latestNativeContextCheckpoint(snapshot.items, provider)
+  const messages: ProviderMessage[] = nativeCheckpoint?.checkpoint.provider === 'claude'
+    ? [{ role: 'user', content: nativeCheckpoint.checkpoint.summary }]
+    : []
+  const ordered = snapshot.items
+    .filter((item) => nativeCheckpoint === null || item.sequence > nativeCheckpoint.item.sequence)
+    .sort((left, right) => left.sequence - right.sequence)
   for (let index = 0; index < ordered.length;) {
     const first = ordered[index]!
     const turnKey = first.turnId ?? `item:${first.id}`
@@ -1192,16 +1438,29 @@ function materializeProviderHistory(
         continue
       }
       if (item.visibility !== 'portable') continue
-      if (hasExactContinuation && item.kind === 'assistant_message' && item.payload.incomplete === true) {
+      if (hasExactContinuation && item.kind === 'assistant_message'
+        && (item.payload.incomplete === true || item.payload.continuation === true)) {
         continue
       }
       const text = portableHistoryText(item.kind, item.payload)
-      if (text === null) continue
+      const attachments = item.kind === 'user_message' ? imageAttachments(item.payload) : []
+      if (text === null && attachments.length === 0) continue
       const role = item.kind === 'user_message' ? 'user' : 'assistant'
+      const content = role === 'user' && attachments.length > 0
+        ? portableUserContent(item.payload)
+        : text as string
+      if (hasExactContinuation) {
+        messages.push({ role, content })
+        continue
+      }
+      if (typeof content !== 'string') {
+        messages.push({ role, content })
+        continue
+      }
       appendMessage(
         messages,
         role,
-        text,
+        content,
         aggregatePortableContinuation && role === 'assistant' ? '' : '\n\n',
       )
     }
@@ -1217,10 +1476,12 @@ function parseStoredProviderContinuation(payload: JsonObject): ProviderContinuat
   if (payload.followUp !== undefined && !isObject(payload.followUp)) {
     throw new Error('Stored provider continuation follow-up must be a structured message')
   }
+  const liveFollowUps = parseLiveFollowUps(payload.liveFollowUps)
   return {
     assistant: payload.assistant,
     toolResults: payload.toolResults,
     ...(payload.followUp === undefined ? {} : { followUp: payload.followUp }),
+    ...(liveFollowUps ? { liveFollowUps } : {}),
   }
 }
 
@@ -1254,6 +1515,52 @@ function portableText(payload: JsonObject): string | null {
   }
   if (Array.isArray(payload.plan)) return JSON.stringify(payload.plan)
   return null
+}
+
+function portableUserContent(payload: JsonObject): string | JsonObject[] {
+  const text = portableText(payload)
+  const attachments = imageAttachments(payload)
+  if (attachments.length === 0) return text as string
+  return [
+    ...(text === null ? [] : [{ type: 'text', text }]),
+    ...attachments.map((attachment) => ({ type: 'baton_image', artifact: attachment })),
+  ]
+}
+
+function hydrateProviderMessage(
+  message: ProviderMessage,
+  provider: SupportedProvider,
+  artifacts: ImageArtifactResolver | null,
+): ProviderMessage {
+  return hydrateProviderValue(message, provider, artifacts) as ProviderMessage
+}
+
+function hydrateProviderValue(
+  value: unknown,
+  provider: SupportedProvider,
+  artifacts: ImageArtifactResolver | null,
+): unknown {
+  if (Array.isArray(value)) return value.map((entry) => hydrateProviderValue(entry, provider, artifacts))
+  if (!isObject(value)) return value
+  if (value.type === 'baton_image') {
+    if (!artifacts) throw new Error(`${provider} image content requires an artifact resolver`)
+    const artifact = parseImageArtifactRef(value.artifact)
+    const dataUrl = artifacts.dataUrl(artifact)
+    return provider === 'claude'
+      ? {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: artifact.mediaType,
+            data: dataUrl.split(',', 2)[1],
+          },
+        }
+      : { type: 'image_url', image_url: { url: dataUrl } }
+  }
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+    key,
+    hydrateProviderValue(entry, provider, artifacts),
+  ]))
 }
 
 function isObject(value: unknown): value is JsonObject {

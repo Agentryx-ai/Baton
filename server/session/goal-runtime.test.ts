@@ -39,6 +39,9 @@ function goal(overrides: Partial<CanonicalGoal> = {}): CanonicalGoal {
     updatedAt: '2026-07-19T00:00:00.000Z',
     startedAt: '2026-07-19T00:00:00.000Z',
     completedAt: null,
+    verificationProposalId: null,
+    latestCompletionReceiptId: null,
+    latestStopReceiptId: null,
     ...overrides,
   }
 }
@@ -327,4 +330,27 @@ test('stale candidates and provider failures cannot overwrite a newer Goal revis
   })
   assert.equal(stopped.status, 'stale')
   assert.equal(store.current?.status, 'active')
+})
+
+test('context input overflow remains a distinct blocked reason', () => {
+  const store = new FakeGoalStore(goal())
+  const changed: CanonicalGoal[] = []
+  const runtime = new GoalRuntime(store, {
+    ownerId: 'runtime-1',
+    launchContinuation: () => ({ status: 'started', turnId: 'never' }),
+    onGoalChanged: (next) => changed.push(next),
+  })
+
+  const stopped = runtime.stopForProviderFailure({
+    goalId: 'goal-1',
+    goalRevision: 4,
+    category: 'context_input_too_large',
+    message: 'input context exceeds the selected model budget',
+  })
+
+  assert.equal(stopped.status, 'applied')
+  assert.equal(store.current?.status, 'blocked')
+  assert.equal(store.current?.statusReason?.code, 'context_input_too_large')
+  assert.equal(store.current?.statusReason?.source, 'host')
+  assert.deepEqual(changed.map((next) => [next.status, next.revision]), [['blocked', 5]])
 })

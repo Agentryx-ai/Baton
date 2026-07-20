@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import path from 'node:path'
 import test from 'node:test'
 
 import { StatelessHttpCanonicalAdapter } from './stateless-http-adapter.ts'
@@ -6,6 +7,7 @@ import type { ProviderExecutionContext } from './adapter.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type { AgentToolInvocation, AgentToolResult, NewCanonicalItem } from './domain.ts'
 import type { ThreadSnapshot } from './domain.ts'
+import type { ImageArtifactRef } from './image-artifacts.ts'
 
 function executionContext(overrides: Partial<ProviderExecutionContext> = {}): ProviderExecutionContext {
   return {
@@ -31,6 +33,17 @@ const readTool = {
   sideEffect: 'read_only' as const,
 }
 
+const TEST_IMAGE: ImageArtifactRef = {
+  id: `sha256-${'b'.repeat(64)}`,
+  sha256: 'b'.repeat(64),
+  mediaType: 'image/png',
+  byteLength: 67,
+  width: 1,
+  height: 1,
+  fileName: 'screen.png',
+  source: 'upload',
+}
+
 async function collectExecution(adapter: StatelessHttpCanonicalAdapter, execution: Awaited<ReturnType<StatelessHttpCanonicalAdapter['execute']>>) {
   const events = []
   for await (const event of execution.events) events.push(event)
@@ -39,6 +52,12 @@ async function collectExecution(adapter: StatelessHttpCanonicalAdapter, executio
 
 function normalizedItems(adapter: StatelessHttpCanonicalAdapter, events: Array<{ eventId: string | null; type: string; payload: unknown; durability: 'durable' | 'ephemeral' }>) {
   return events.flatMap((event) => adapter.normalize(event))
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((settle) => { resolve = settle })
+  return { promise, resolve }
 }
 
 function snapshotWithPriorTurn(items: NewCanonicalItem[]): ThreadSnapshot {
@@ -73,7 +92,9 @@ function snapshotWithPriorTurn(items: NewCanonicalItem[]): ThreadSnapshot {
 const snapshot: ThreadSnapshot = {
   session: {
     id: 'session-1', title: null, preview: null, activeThreadId: 'thread-1',
-    projectKey: null, cwd: null, schemaVersion: 1,
+    projectKey: null, cwd: null,
+    permissions: { defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global' },
+    schemaVersion: 1,
     createdAt: '2026-07-18T00:00:00.000Z', updatedAt: '2026-07-18T00:00:00.000Z', archivedAt: null,
     workStatus: 'running',
   },
@@ -90,6 +111,64 @@ const snapshot: ThreadSnapshot = {
   }],
   bindings: [],
 }
+
+test('Claude adapter advertises only configured provider-global skills through the canonical read contract', () => {
+  const resource = { id: 'source-command-plan', root: path.resolve('fixture-skill') }
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    skillResources: [resource],
+  })
+  const request = adapter.materialize({
+    turnId: 'skill-turn', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'plan this' } }],
+  }, snapshot)
+  const body = request.body as Record<string, unknown>
+  assert.match(String(body.developerInstructions), /source-command-plan/)
+  assert.match(String(body.developerInstructions), /read_skill_resource/)
+  assert.deepEqual(adapter.skillResources(), [resource])
+})
+
+test('Claude uses its native compact summary plus suffix and never consumes a Codex checkpoint', () => {
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+  })
+  const checkpoint = {
+    ...snapshot.items[0]!, id: 'claude-checkpoint', sequence: 2, kind: 'provider_event' as const,
+    visibility: 'provider_private' as const, provider: 'claude' as const,
+    payload: { nativeContextCheckpoint: {
+      version: 1, provider: 'claude', format: 'claude_compact_summary',
+      summary: 'native summary', metadata: { preTokens: 100 },
+    } },
+  }
+  const suffix = { ...snapshot.items[0]!, id: 'suffix', sequence: 3, payload: { text: 'suffix' } }
+  const body = adapter.materialize({
+    turnId: 'compact-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  }, { ...snapshot, items: [snapshot.items[0]!, checkpoint, suffix] }).body as Record<string, unknown>
+  assert.deepEqual(body.messages, [
+    { role: 'user', content: 'native summary' },
+    { role: 'assistant', content: 'suffix' },
+    { role: 'user', content: 'continue' },
+  ])
+
+  const codexCheckpoint = {
+    ...checkpoint, id: 'codex-checkpoint', provider: 'codex' as const,
+    payload: { nativeContextCheckpoint: {
+      version: 1, provider: 'codex', format: 'codex_replacement_history',
+      history: [{ type: 'compaction', encrypted_content: 'opaque' }], sourceModel: 'gpt-test',
+    } },
+  }
+  const crossProviderBody = adapter.materialize({
+    turnId: 'cross-provider-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  }, { ...snapshot, items: [snapshot.items[0]!, codexCheckpoint, suffix] }).body as Record<string, unknown>
+  assert.deepEqual(crossProviderBody.messages, [
+    { role: 'assistant', content: 'history\n\nsuffix' },
+    { role: 'user', content: 'continue' },
+  ])
+})
 
 test('Claude adapter sends stateless history and records a provider-reported model fallback', async () => {
   const sentBodies: Record<string, unknown>[] = []
@@ -126,6 +205,7 @@ test('Claude adapter sends stateless history and records a provider-reported mod
   const sentBody = sentBodies[0]
   assert.ok(sentBody)
   assert.equal((sentBody.output_config as Record<string, unknown>).effort, 'high')
+  assert.deepEqual(sentBody.cache_control, { type: 'ephemeral' })
   assert.equal(sentBody.system, 'Verify before finishing.')
   assert.deepEqual(sentBody.messages, [
     { role: 'assistant', content: 'history' },
@@ -145,6 +225,48 @@ test('Claude adapter sends stateless history and records a provider-reported mod
   const completed = events.find((event) => event.type === 'response/completed')
   assert.ok(completed)
   assert.equal(adapter.extractBinding(completed)?.modelFamily, 'claude-opus-4-8')
+})
+
+test('Claude and Gemini hydrate canonical image refs only at the outbound multimodal boundary', async () => {
+  for (const provider of ['claude', 'gemini'] as const) {
+    const sentBodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider,
+      proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      imageArtifacts: {
+        pathFor: () => 'C:/Baton/image-artifacts/screen.png',
+        dataUrl: () => 'data:image/png;base64,AAAA',
+      },
+      fetchImpl: async (_url, init) => {
+        sentBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        return provider === 'claude'
+          ? Response.json({
+              id: 'message-image', model: 'claude-opus-4-8', stop_reason: 'end_turn',
+              content: [{ type: 'text', text: 'seen' }], usage: {},
+            })
+          : Response.json({
+              id: 'response-image', model: 'gemini-2.5-pro', usage: {},
+              choices: [{ finish_reason: 'stop', message: { content: 'seen' } }],
+            })
+      },
+    })
+    const materialized = adapter.materialize({
+      turnId: `image-${provider}`,
+      model: provider === 'claude' ? 'claude-opus-4-8' : 'gemini-2.5-pro',
+      input: [{ kind: 'user_message', payload: { attachments: [TEST_IMAGE] } }],
+    }, { ...snapshot, items: [] })
+    assert.match(JSON.stringify(materialized.body), /baton_image/)
+    assert.doesNotMatch(JSON.stringify(materialized.body), /base64,AAAA/)
+    const execution = await adapter.execute(materialized, executionContext())
+    await collectExecution(adapter, execution)
+    const messages = sentBodies[0]?.messages as Array<Record<string, unknown>>
+    const user = messages.find((message) => message.role === 'user')
+    assert.ok(user)
+    const wire = JSON.stringify(user.content)
+    assert.match(wire, /AAAA/)
+    assert.doesNotMatch(wire, /baton_image/)
+    await adapter.shutdown()
+  }
 })
 
 test('stateless adapters preserve portable reasoning, plan, task, and summary history', () => {
@@ -199,6 +321,7 @@ test('Gemini adapter uses the proxy compatibility route without native tools', a
   for await (const _event of execution.events) { /* drain */ }
   assert.equal(requestedUrl, 'http://proxy/v1/chat/completions')
   assert.ok(sentBodies[0])
+  assert.equal(sentBodies[0].cache_control, undefined)
   assert.deepEqual((sentBodies[0].messages as unknown[])[0], {
     role: 'system', content: 'Use the canonical plan.',
   })
@@ -302,6 +425,51 @@ const repliesForAssertionClaudeAssistant = [
   { type: 'text', text: 'I will inspect it.' },
   { type: 'tool_use', id: 'tool-1', name: 'read_file', input: { path: 'README.md' } },
 ]
+
+test('Claude tool screenshots are hydrated on wire while durable continuation keeps only artifact refs', async () => {
+  const bodies: Record<string, unknown>[] = []
+  const replies = [
+    {
+      id: 'tool-image', model: 'claude-opus-4-8', stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'capture-1', name: 'capture_screen', input: {} }], usage: {},
+    },
+    {
+      id: 'tool-image-final', model: 'claude-opus-4-8', stop_reason: 'end_turn',
+      content: [{ type: 'text', text: 'inspected' }], usage: {},
+    },
+  ]
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    imageArtifacts: {
+      pathFor: () => 'C:/Baton/image-artifacts/screen.png',
+      dataUrl: () => 'data:image/png;base64,AAAA',
+    },
+    fetchImpl: async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+      return Response.json(replies.shift())
+    },
+  })
+  const captureTool = { ...readTool, name: 'capture_screen', inputSchema: { type: 'object', properties: {} } }
+  const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
+    turnId: 'tool-image-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'capture' } }],
+  }, snapshot), executionContext({
+    toolDefinitions: [captureTool],
+    async executeTool() {
+      return { success: true, content: { artifact: TEST_IMAGE }, images: [TEST_IMAGE], error: null }
+    },
+  })))
+
+  assert.ok(bodies[1])
+  const secondWire = JSON.stringify((bodies[1].messages as unknown[]).at(-1))
+  assert.match(secondWire, /"type":"image"/)
+  assert.match(secondWire, /AAAA/)
+  const privateState = normalizedItems(adapter, result.events)
+    .find((item) => item.visibility === 'provider_private')?.payload
+  assert.match(JSON.stringify(privateState), /baton_image/)
+  assert.doesNotMatch(JSON.stringify(privateState), /base64,AAAA/)
+})
 
 test('Claude executes parallel tools but returns one ordered tool-result user message', async () => {
   const bodies: Record<string, unknown>[] = []
@@ -810,6 +978,214 @@ test('Gemini re-executes durable assistant tool calls and tool results without f
     { role: 'assistant', content: 'done' },
     { role: 'user', content: 'next' },
   ])
+})
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} accepts FIFO live follow-ups at an end boundary only after starting the next request`, async () => {
+    const firstResponse = deferred<Response>()
+    const bodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider, proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        if (bodies.length === 1) return firstResponse.promise
+        return Response.json(provider === 'claude'
+          ? {
+              id: 'second', model: 'claude-fable-5', stop_reason: 'end_turn',
+              content: [{ type: 'text', text: 'second answer' }], usage: {},
+            }
+          : {
+              id: 'second', model: 'gemini-3.1-pro',
+              choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'second answer' } }],
+              usage: {},
+            })
+      },
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `${provider}-live-end`,
+      model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'initial' } }],
+    }, { ...snapshot, items: [] }), executionContext())
+    assert.ok(execution.steer)
+    const collected = collectExecution(adapter, execution)
+    const firstSteer = execution.steer({
+      followUpId: 'follow-1', text: 'first constraint', expectedTurnId: `${provider}-live-end`,
+    })
+    const secondSteer = execution.steer({
+      followUpId: 'follow-2', text: 'second constraint', expectedTurnId: `${provider}-live-end`,
+    })
+    firstResponse.resolve(Response.json(provider === 'claude'
+      ? {
+          id: 'first', model: 'claude-fable-5', stop_reason: 'end_turn',
+          content: [{ type: 'text', text: 'first answer' }], usage: {},
+        }
+      : {
+          id: 'first', model: 'gemini-3.1-pro',
+          choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'first answer' } }],
+          usage: {},
+        }))
+
+    assert.deepEqual(await firstSteer, { status: 'accepted' })
+    assert.equal(bodies.length, 2, 'accepted must not resolve before the next fetch starts')
+    assert.deepEqual(await secondSteer, { status: 'accepted' })
+    const result = await collected
+    assert.equal(result.terminal.status, 'completed')
+    const continuationBody = bodies[1]
+    assert.ok(continuationBody)
+    assert.deepEqual((continuationBody.messages as unknown[]).slice(-3), [
+      provider === 'claude'
+        ? { role: 'assistant', content: [{ type: 'text', text: 'first answer' }] }
+        : { role: 'assistant', content: 'first answer' },
+      { role: 'user', content: 'first constraint' },
+      { role: 'user', content: 'second constraint' },
+    ])
+    const items = normalizedItems(adapter, result.events)
+    const privateState = items.find((item) => item.visibility === 'provider_private')
+    assert.ok(privateState)
+    assert.deepEqual((privateState.payload.liveFollowUps as unknown[]).map((entry) =>
+      (entry as { followUpId: string }).followUpId), ['follow-1', 'follow-2'])
+    assert.equal(items.filter((item) => item.kind === 'assistant_message'
+      && item.payload.text === 'first answer').length, 1)
+
+    if (provider === 'claude') {
+      const replaySnapshot = snapshotWithPriorTurn(items)
+      const last = replaySnapshot.items.at(-1)!
+      replaySnapshot.items.push(
+        { ...last, id: 'consumed-follow-1', sequence: last.sequence + 1, kind: 'user_message', visibility: 'portable', provider: null, nativeId: null, payload: { text: 'first constraint' } },
+        { ...last, id: 'consumed-follow-2', sequence: last.sequence + 2, kind: 'user_message', visibility: 'portable', provider: null, nativeId: null, payload: { text: 'second constraint' } },
+      )
+      const replay = adapter.materialize({
+        turnId: 'later', model: 'claude-fable-5',
+        input: [{ kind: 'user_message', payload: { text: 'later' } }],
+      }, replaySnapshot)
+      const replayMessages = (replay.body as { messages: Array<Record<string, unknown>> }).messages
+      assert.equal(replayMessages.filter((message) => JSON.stringify(message.content).includes('first answer')).length, 1)
+      assert.equal(replayMessages.filter((message) => message.content === 'first constraint').length, 1)
+      assert.equal(replayMessages.filter((message) => message.content === 'second constraint').length, 1)
+    }
+  })
+}
+
+for (const provider of ['claude', 'gemini'] as const) {
+  test(`${provider} appends FIFO live follow-ups after every tool result`, async () => {
+    const firstResponse = deferred<Response>()
+    const bodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider, proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        if (bodies.length === 1) return firstResponse.promise
+        return Response.json(provider === 'claude'
+          ? { id: 'final', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} }
+          : { id: 'final', model: 'gemini-3.1-pro', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }], usage: {} })
+      },
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `${provider}-live-tool`, model: provider === 'claude' ? 'claude-fable-5' : 'gemini-3.1-pro',
+      input: [{ kind: 'user_message', payload: { text: 'inspect' } }],
+    }, { ...snapshot, items: [] }), executionContext({
+      toolDefinitions: [readTool],
+      async executeTool() { return { success: true, content: { text: 'contents' }, error: null } },
+    }))
+    const collected = collectExecution(adapter, execution)
+    const steers = ['one', 'two'].map((text, index) => execution.steer!({
+      followUpId: `tool-follow-${index}`, text, expectedTurnId: `${provider}-live-tool`,
+    }))
+    firstResponse.resolve(Response.json(provider === 'claude'
+      ? {
+          id: 'tool', model: 'claude-fable-5', stop_reason: 'tool_use', usage: {},
+          content: [{ type: 'tool_use', id: 'call', name: 'read_file', input: { path: 'README.md' } }],
+        }
+      : {
+          id: 'tool', model: 'gemini-3.1-pro', usage: {},
+          choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null,
+            tool_calls: [{ id: 'call', type: 'function', function: { name: 'read_file', arguments: '{"path":"README.md"}' } }] } }],
+        }))
+    assert.deepEqual(await Promise.all(steers), [{ status: 'accepted' }, { status: 'accepted' }])
+    assert.equal(bodies.length, 2)
+    const messages = bodies[1]?.messages as Array<Record<string, unknown>>
+    assert.deepEqual(messages.slice(-2).map((message) => message.content), ['one', 'two'])
+    const toolResultIndex = messages.findLastIndex((message) => provider === 'claude'
+      ? Array.isArray(message.content) && (message.content as Array<Record<string, unknown>>)[0]?.type === 'tool_result'
+      : message.role === 'tool')
+    assert.ok(toolResultIndex >= 0)
+    assert.equal(messages[toolResultIndex + 1]?.content, 'one')
+    assert.equal((await collected).terminal.status, 'completed')
+  })
+}
+
+for (const stopReason of ['pause_turn', 'max_tokens'] as const) {
+  test(`Claude orders live steer after the ${stopReason} continuation protocol`, async () => {
+    const firstResponse = deferred<Response>()
+    const bodies: Record<string, unknown>[] = []
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async (_url, init) => {
+        bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+        if (bodies.length === 1) return firstResponse.promise
+        return Response.json({ id: 'final', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} })
+      },
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `claude-${stopReason}`, model: 'claude-fable-5',
+      input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, { ...snapshot, items: [] }), executionContext())
+    const collected = collectExecution(adapter, execution)
+    const steer = execution.steer!({ followUpId: 'live', text: 'live constraint', expectedTurnId: `claude-${stopReason}` })
+    firstResponse.resolve(Response.json({
+      id: 'boundary', model: 'claude-fable-5', stop_reason: stopReason,
+      content: [{ type: 'text', text: 'boundary text' }], usage: {},
+    }))
+    assert.deepEqual(await steer, { status: 'accepted' })
+    const continuationBody = bodies[1]
+    assert.ok(continuationBody)
+    const tail = (continuationBody.messages as Array<Record<string, unknown>>)
+      .slice(stopReason === 'max_tokens' ? -3 : -2)
+    assert.deepEqual(tail.map((message) => message.content), stopReason === 'max_tokens'
+      ? [[{ type: 'text', text: 'boundary text' }], 'Please continue from where you left off.', 'live constraint']
+      : [[{ type: 'text', text: 'boundary text' }], 'live constraint'])
+    assert.equal((await collected).terminal.status, 'completed')
+  })
+}
+
+test('stateless steer closes at the final round and across cancel, dispose, and terminal races', async () => {
+  const finalGate = deferred<Response>()
+  let finalRequests = 0
+  const finalAdapter = new StatelessHttpCanonicalAdapter({
+    provider: 'gemini', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    fetchImpl: async () => { finalRequests += 1; return finalGate.promise },
+  })
+  const finalExecution = await finalAdapter.execute(finalAdapter.materialize({
+    turnId: 'final-round', model: 'gemini-3.1-pro', input: [{ kind: 'user_message', payload: { text: 'go' } }],
+  }, { ...snapshot, items: [] }), executionContext({ limits: { ...DEFAULT_AGENT_LOOP_LIMITS, maxModelRoundTrips: 1 } }))
+  const finalCollected = collectExecution(finalAdapter, finalExecution)
+  const finalSteer = finalExecution.steer!({ followUpId: 'final', text: 'too late', expectedTurnId: 'final-round' })
+  finalGate.resolve(Response.json({ id: 'final', model: 'gemini-3.1-pro', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'done' } }], usage: {} }))
+  assert.deepEqual(await finalSteer, { status: 'closed' })
+  assert.equal((await finalCollected).terminal.status, 'completed')
+  assert.equal(finalRequests, 1)
+  assert.deepEqual(await finalExecution.steer!({ followUpId: 'terminal', text: 'late', expectedTurnId: 'final-round' }), { status: 'closed' })
+
+  for (const action of ['cancel', 'dispose'] as const) {
+    const gate = deferred<Response>()
+    const adapter = new StatelessHttpCanonicalAdapter({
+      provider: 'claude', proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+      fetchImpl: async () => gate.promise,
+    })
+    const execution = await adapter.execute(adapter.materialize({
+      turnId: `race-${action}`, model: 'claude-fable-5', input: [{ kind: 'user_message', payload: { text: 'go' } }],
+    }, { ...snapshot, items: [] }), executionContext())
+    const collected = collectExecution(adapter, execution)
+    const steer = execution.steer!({ followUpId: action, text: 'pending', expectedTurnId: `race-${action}` })
+    await execution[action]()
+    assert.deepEqual(await steer, { status: 'closed' })
+    if (action === 'dispose') {
+      gate.resolve(Response.json({ id: 'done', model: 'claude-fable-5', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }], usage: {} }))
+      assert.equal((await collected).terminal.status, 'completed')
+    } else {
+      assert.equal((await collected).terminal.status, 'cancelled')
+    }
+  }
 })
 
 for (const provider of ['claude', 'gemini'] as const) {

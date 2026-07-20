@@ -4,8 +4,10 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { Router } from 'express'
 import { parse as parseToml } from 'smol-toml'
-import { loadProxyConnection } from '../client-integration.ts'
+import { loadNativeCodexProxyConnection } from '../codex-native-runtime.ts'
+import { loadNativeClaudeProxyConnection } from '../claude-native-runtime.ts'
 import { AdapterRegistry } from './adapter-registry.ts'
+import { CanonicalContextRuntime } from './canonical-context-runtime.ts'
 import { CodexCanonicalAdapter } from './codex-adapter.ts'
 import { StatelessHttpCanonicalAdapter } from './stateless-http-adapter.ts'
 import { buildProviderModelCatalog } from './model-catalog.ts'
@@ -17,6 +19,8 @@ import { runSessionRetentionSweep, SESSION_RETENTION_INTERVAL_MS } from './reten
 import { CodexLocalSourceReader } from './native-import/codex-source.ts'
 import { ClaudeLocalSourceReader } from './native-import/claude-source.ts'
 import { NativeSessionImportService } from './native-import/service.ts'
+import { LocalImageArtifactStore } from './image-artifacts.ts'
+import { discoverSkillResources } from './tools/skill-resource-runtime.ts'
 
 export interface ConversationRuntimeOptions {
   dataDir: string
@@ -34,40 +38,50 @@ export interface ConversationRuntime {
 export function createConversationRuntime(options: ConversationRuntimeOptions): ConversationRuntime {
   mkdirSync(options.dataDir, { recursive: true })
   const store = new SqliteSessionStore(path.join(options.dataDir, 'canonical-conversations.sqlite3'))
+  const imageArtifacts = new LocalImageArtifactStore(path.join(options.dataDir, 'image-artifacts'))
+  const nativeNamespaceSecret = store.getNativeImportNamespaceKey()
   const adapters = new AdapterRegistry()
   adapters.register(new CodexCanonicalAdapter({
     executable: options.codexExecutable,
+    cacheIdentitySecret: nativeNamespaceSecret,
+    imageArtifacts,
     proxyConnection: async () => {
-      const connection = await loadProxyConnection(false)
+      const connection = await loadNativeCodexProxyConnection(false)
       return { baseUrl: connection.baseUrl, token: connection.token }
     },
   }))
-  const statelessProxyConnection = async () => {
-    const connection = await loadProxyConnection(false)
+  const claudeProxyConnection = async () => {
+    const connection = await loadNativeClaudeProxyConnection(false)
     return { baseUrl: connection.baseUrl, token: connection.token }
   }
   adapters.register(new StatelessHttpCanonicalAdapter({
     provider: 'claude',
-    proxyConnection: statelessProxyConnection,
-  }))
-  adapters.register(new StatelessHttpCanonicalAdapter({
-    provider: 'gemini',
-    proxyConnection: statelessProxyConnection,
+    proxyConnection: claudeProxyConnection,
+    imageArtifacts,
+    skillResources: discoverSkillResources([
+      path.join(homedir(), '.claude', 'skills'),
+      path.join(homedir(), '.agents', 'skills'),
+    ]),
   }))
   const events = new ConversationEventHub()
-  const service = new TurnOrchestrator(store, adapters, events)
-  const nativeNamespaceSecret = store.getNativeImportNamespaceKey()
+  const contextRuntime = new CanonicalContextRuntime(store)
+  const service = new TurnOrchestrator(store, adapters, events, 10_000, contextRuntime, {
+    artifacts: imageArtifacts,
+  })
   const nativeImport = new NativeSessionImportService(store, [
     new CodexLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),
     new ClaudeLocalSourceReader({ namespaceSecret: nativeNamespaceSecret }),
   ])
   const router = createConversationRouter(service, {
     nativeImport,
+    imageArtifacts,
     listModels: async (provider) => {
-      const connection = await loadProxyConnection(true)
-      const configuredDefault = provider === 'codex'
-        ? await configuredDefaultModel(connection.models)
-        : null
+      const connection = provider === 'codex'
+        ? await loadNativeCodexProxyConnection(true)
+        : provider === 'claude'
+          ? await loadNativeClaudeProxyConnection(true)
+          : { models: [] }
+      const configuredDefault = provider === 'codex' ? await configuredDefaultModel(connection.models) : null
       const catalog = buildProviderModelCatalog(provider, connection.models, configuredDefault)
       return { models: catalog.models, defaultModel: catalog.defaultModel }
     },

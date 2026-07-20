@@ -9,16 +9,20 @@ import type {
   CreateSessionInput,
   GoalObservation,
   NewCanonicalItem,
+  PermissionProfile,
 } from './domain.ts'
 import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
 import { WorkspaceRootError } from './workspace-root.ts'
-import type { ConversationService, StartTurnInput } from './service.ts'
-import { GoalStoreError, SessionStoreError } from './store.ts'
+import { ProviderReadinessError } from './service.ts'
+import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput } from './service.ts'
+import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
 import type { CreateGoalInput, EditGoalInput, ReconcileToolInput } from './store.ts'
 import type { ProviderModelDescriptor } from './model-catalog.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
 import { NativeImportError } from './native-import/service.ts'
 import type { CodexNativeScanFilter, NativeSourceClient } from './native-import/contracts.ts'
+import { ContextInputTooLargeError } from './canonical-context-runtime.ts'
+import { hasPortableUserContent, ImageArtifactError, MAX_IMAGE_ARTIFACT_BYTES, type LocalImageArtifactStore } from './image-artifacts.ts'
 
 const PROVIDERS = new Set<CanonicalProvider>(['claude', 'codex', 'gemini'])
 const ITEM_KINDS = new Set<CanonicalItemKind>([
@@ -37,7 +41,9 @@ const ITEM_KINDS = new Set<CanonicalItemKind>([
   'provider_event',
 ])
 const SSE_HEARTBEAT_MS = 15_000
+const MAX_SNAPSHOT_ITEM_LIMIT = 1_000
 const VISIBILITIES = new Set(['portable', 'provider_private', 'baton_private'])
+const PERMISSION_PROFILES = new Set<PermissionProfile>(['read_only', 'workspace', 'full_access'])
 
 export interface ConversationRouter extends Router {
   closeStreams(): void
@@ -49,6 +55,7 @@ export interface ConversationRouterOptions {
     defaultModel: string | null
   }>
   nativeImport?: NativeSessionImportService
+  imageArtifacts?: LocalImageArtifactStore
 }
 
 class RequestValidationError extends Error {
@@ -118,6 +125,15 @@ function safeDisplayAlias(value: string | null): string | null {
   return trimmed
 }
 
+function decodeUploadFileName(value: string | undefined): string {
+  if (!value) return 'image'
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
 function optionalNullableString(
   body: Record<string, unknown>,
   key: string,
@@ -163,6 +179,14 @@ function requiredProvider(body: Record<string, unknown>, key = 'provider'): Cano
     throw new RequestValidationError(`${key} must be claude, codex, or gemini`)
   }
   return value as CanonicalProvider
+}
+
+function permissionProfile(value: unknown, nullable = false): PermissionProfile | null {
+  if (nullable && value === null) return null
+  if (typeof value !== 'string' || !PERMISSION_PROFILES.has(value as PermissionProfile)) {
+    throw new RequestValidationError('profile must be read_only, workspace, full_access, or null')
+  }
+  return value as PermissionProfile
 }
 
 function parseGoalObservation(value: unknown): GoalObservation {
@@ -329,6 +353,87 @@ function parseStartTurnInput(threadId: string, value: unknown): StartTurnInput {
   }
 }
 
+function parseStartSessionInput(sessionId: string, value: unknown): StartSessionInput {
+  const body = bodyRecord(value)
+  requireOnlyKeys(body, [
+    'clientRequestId',
+    'cwd',
+    'instructionSnapshot',
+    'provider',
+    'model',
+    'effort',
+    'input',
+  ])
+  const provider = requiredNonEmptyString(body, 'provider')
+  if (!PROVIDERS.has(provider as CanonicalProvider)) {
+    throw new RequestValidationError('provider must be claude, codex, or gemini')
+  }
+  const cwd = optionalNullableString(body, 'cwd')
+  if (cwd === undefined || (cwd !== null && cwd.trim().length === 0)) {
+    throw new RequestValidationError('cwd must be null or a non-empty string')
+  }
+  const effort = optionalNullableString(body, 'effort')
+  if (effort !== undefined && effort !== null && effort.trim().length === 0) {
+    throw new RequestValidationError('effort must be null or a non-empty string')
+  }
+  const instructionSnapshot = optionalRecord(body, 'instructionSnapshot')
+  let normalizedInstructions: ReturnType<typeof normalizeInstructionSnapshot> | undefined
+  try {
+    normalizedInstructions = instructionSnapshot === undefined
+      ? undefined
+      : normalizeInstructionSnapshot(instructionSnapshot)
+  } catch (error) {
+    throw new RequestValidationError(error instanceof Error ? error.message : String(error))
+  }
+  if (!Array.isArray(body.input) || body.input.length === 0) {
+    throw new RequestValidationError('input must be a non-empty array')
+  }
+  const input = body.input.map(parseNewItem)
+  if (input.some((item) => item.kind !== 'user_message'
+    || (item.visibility !== undefined && item.visibility !== 'portable')
+    || (item.provider !== undefined && item.provider !== null)
+    || (item.nativeId !== undefined && item.nativeId !== null)
+    || !hasPortableUserContent(item.payload))) {
+    throw new RequestValidationError('input must contain non-empty portable provider-neutral user messages')
+  }
+  return {
+    sessionId,
+    clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
+    cwd,
+    ...(normalizedInstructions === undefined ? {} : { instructionSnapshot: normalizedInstructions }),
+    provider: provider as CanonicalProvider,
+    model: requiredNonEmptyString(body, 'model'),
+    effort,
+    input,
+  }
+}
+
+function parseFollowUpInput(threadId: string, value: unknown): SubmitFollowUpInput {
+  const body = bodyRecord(value)
+  requireOnlyKeys(body, ['clientRequestId', 'expectedTurnId', 'delivery', 'input'])
+  if (body.delivery !== 'steer_or_queue' && body.delivery !== 'next_turn') {
+    throw new RequestValidationError('delivery must be steer_or_queue or next_turn')
+  }
+  if (!Array.isArray(body.input) || body.input.length === 0) {
+    throw new RequestValidationError('input must be a non-empty array')
+  }
+  const input = body.input.map(parseNewItem)
+  if (input.some((item) => item.kind !== 'user_message'
+    || (item.visibility !== undefined && item.visibility !== 'portable')
+    || (item.provider !== undefined && item.provider !== null)
+    || (item.nativeId !== undefined && item.nativeId !== null)
+    || item.payload.attachments !== undefined)) {
+    throw new RequestValidationError('follow-up input must contain text-only portable provider-neutral user messages')
+  }
+  return {
+    threadId,
+    clientRequestId: requiredNonEmptyString(body, 'clientRequestId'),
+    expectedTurnId: requiredNonEmptyString(body, 'expectedTurnId'),
+    delivery: body.delivery,
+    input,
+  }
+}
+
 function parseReconcileToolInput(turnId: string, value: unknown): ReconcileToolInput {
   const body = bodyRecord(value)
   requireOnlyKeys(body, ['callId', 'resolution', 'note'])
@@ -423,7 +528,48 @@ export function createConversationRouter(
     } catch (error) { next(error) }
   })
   router.use('/native-import', express.json({ limit: '8mb' }))
+  router.post('/artifacts/images', express.raw({
+    type: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+    limit: MAX_IMAGE_ARTIFACT_BYTES,
+  }), route((req, res) => {
+    if (!options.imageArtifacts) {
+      res.status(503).json({ code: 'image_artifacts_unavailable', error: 'image attachments are unavailable' })
+      return
+    }
+    if (req.get('X-Baton-Interaction') !== 'image-upload') {
+      throw new RequestValidationError('image upload requires an explicit user interaction header')
+    }
+    if (!Buffer.isBuffer(req.body)) throw new RequestValidationError('image upload body is required')
+    const mediaType = req.get('content-type')?.split(';', 1)[0]
+    if (mediaType !== 'image/png' && mediaType !== 'image/jpeg'
+      && mediaType !== 'image/webp' && mediaType !== 'image/gif') {
+      throw new RequestValidationError('image content type is unsupported')
+    }
+    const fileName = decodeUploadFileName(req.get('X-Baton-Filename'))
+    res.status(201).json(options.imageArtifacts.put(req.body, mediaType, fileName, 'upload'))
+  }))
+  router.get('/artifacts/images/:artifactId', route((req, res) => {
+    if (!options.imageArtifacts) {
+      res.status(404).end()
+      return
+    }
+    const artifact = options.imageArtifacts.readById(pathParam(req, 'artifactId'))
+    res.setHeader('Content-Type', artifact.mediaType)
+    res.setHeader('Cache-Control', 'private, immutable, max-age=31536000')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.send(artifact.buffer)
+  }))
   router.use(express.json({ limit: '2mb' }))
+
+  router.get('/permissions', route((_req, res) => {
+    res.json(service.getPermissionSettings())
+  }))
+
+  router.put('/permissions', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['defaultProfile'])
+    res.json(service.updateDefaultPermissionProfile(permissionProfile(body.defaultProfile) as PermissionProfile))
+  }))
 
   router.post(
     '/sessions',
@@ -432,6 +578,15 @@ export function createConversationRouter(
       res.status(201).json(session)
     }),
   )
+
+  router.put('/sessions/:sessionId/first-turn', route(async (req, res) => {
+    const result = await service.startSession(parseStartSessionInput(
+      pathParam(req, 'sessionId'),
+      req.body,
+    ))
+    res.location(`/baton/v1/sessions/${encodeURIComponent(result.session.id)}`)
+    res.status(result.duplicate ? 200 : 202).json(result)
+  }))
 
   router.get('/sessions', route((req, res) => {
     const value = req.query.scope
@@ -448,6 +603,15 @@ export function createConversationRouter(
 
   router.post('/sessions/:sessionId/restore', route((req, res) => {
     res.json(service.restoreSession(pathParam(req, 'sessionId')))
+  }))
+
+  router.put('/sessions/:sessionId/permissions', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['profile'])
+    res.json(service.updateSessionPermissionProfile(
+      pathParam(req, 'sessionId'),
+      permissionProfile(body.profile, true),
+    ))
   }))
 
   router.put('/sessions/:sessionId/workspace', route((req, res) => {
@@ -593,14 +757,24 @@ export function createConversationRouter(
     res.json(session)
   })
 
-  router.get('/threads/:threadId', (req, res) => {
+  router.get('/threads/:threadId', route((req, res) => {
     const snapshot = service.getSnapshot(pathParam(req, 'threadId'))
     if (!snapshot) {
       res.status(404).json({ code: 'not_found', error: 'thread not found' })
       return
     }
-    res.json(snapshot)
-  })
+    const itemLimit = req.query.itemLimit === undefined
+      ? undefined
+      : parseRequiredQueryInteger(req.query.itemLimit, 'itemLimit')
+    if (itemLimit !== undefined && itemLimit > MAX_SNAPSHOT_ITEM_LIMIT) {
+      throw new RequestValidationError(`itemLimit must not exceed ${MAX_SNAPSHOT_ITEM_LIMIT}`)
+    }
+    res.json(itemLimit === undefined ? snapshot : {
+      ...snapshot,
+      items: snapshot.items.slice(-itemLimit),
+      itemsTruncated: snapshot.items.length > itemLimit,
+    })
+  }))
 
   router.get('/threads/:threadId/goal', (req, res) => {
     const threadId = pathParam(req, 'threadId')
@@ -620,9 +794,15 @@ export function createConversationRouter(
     res.json(await service.editGoal(parseEditGoalInput(pathParam(req, 'goalId'), req.body)))
   }))
 
+  router.get('/goals/:goalId/verifications', (req, res) => {
+    res.json(service.getGoalVerificationHistory(pathParam(req, 'goalId')))
+  })
+
   router.post('/goals/:goalId/status', route(async (req, res) => {
     const body = bodyRecord(req.body)
-    requireOnlyKeys(body, ['expectedRevision', 'status', 'resetLimitCounters'])
+    requireOnlyKeys(body, [
+      'expectedRevision', 'status', 'provider', 'model', 'effort', 'resetLimitCounters',
+    ])
     if (body.status !== 'active' && body.status !== 'paused') {
       throw new RequestValidationError('status must be active or paused')
     }
@@ -633,6 +813,9 @@ export function createConversationRouter(
       goalId: pathParam(req, 'goalId'),
       expectedRevision: requiredPositiveInteger(body, 'expectedRevision'),
       status: body.status,
+      ...(body.provider === undefined ? {} : { provider: requiredProvider(body) }),
+      ...(body.model === undefined ? {} : { model: requiredNonEmptyString(body, 'model') }),
+      ...(body.effort === undefined ? {} : { effort: optionalNullableString(body, 'effort') }),
       ...(body.resetLimitCounters === undefined ? {} : { resetLimitCounters: body.resetLimitCounters }),
     }))
   }))
@@ -662,6 +845,20 @@ export function createConversationRouter(
       res.status(result.duplicate ? 200 : 202).json(result)
     }),
   )
+
+  router.post('/threads/:threadId/follow-ups', route(async (req, res) => {
+    const followUp = await service.submitFollowUp(parseFollowUpInput(pathParam(req, 'threadId'), req.body))
+    res.status(202).json(followUp)
+  }))
+
+  router.delete('/follow-ups/:followUpId', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['expectedRevision'])
+    res.json(service.cancelFollowUp(
+      pathParam(req, 'followUpId'),
+      requiredPositiveInteger(body, 'expectedRevision'),
+    ))
+  }))
 
   router.get(
     '/threads/:threadId/items',
@@ -781,6 +978,35 @@ export function createConversationRouter(
       res.status(error.code === 'workspace_disconnected' ? 409 : 400).json({ code: error.code, error: error.message })
       return
     }
+    if (error instanceof ProviderReadinessError) {
+      res.status(503).json({ code: error.code, error: error.message })
+      return
+    }
+    if (error instanceof ContextInputTooLargeError) {
+      res.status(413).json({
+        code: error.code,
+        error: error.message,
+        estimatedInputTokens: error.estimatedInputTokens,
+        usableInputTokens: error.usableInputTokens,
+        contextWindowTokens: error.contextWindowTokens,
+        provider: error.provider,
+        model: error.model,
+        compactionReason: error.compactionReason,
+      })
+      return
+    }
+    if (error instanceof ImageArtifactError) {
+      const status = error.code === 'artifact_not_found' ? 404
+        : error.code === 'invalid_image_size' ? 413
+          : error.code === 'artifact_integrity_error' ? 409
+            : 400
+      res.status(status).json({ code: error.code, error: error.message })
+      return
+    }
+    if (error instanceof FollowUpStoreError) {
+      res.status(error.code === 'follow_up_lease_lost' ? 409 : 400).json({ code: error.code, error: error.message })
+      return
+    }
     if (error instanceof NativeImportSecurityError) {
       res.status(403).json({ code: 'native_import_forbidden', error: error.message })
       return
@@ -805,6 +1031,7 @@ export function createConversationRouter(
         turn_not_running: 409,
         invalid_fork: 400,
         duplicate_request: 409,
+        initial_session_conflict: 409,
         session_busy: 409,
         session_archived: 409,
         invalid_reconciliation: 409,

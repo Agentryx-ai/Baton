@@ -1,6 +1,6 @@
 /**
  * Shared API contract types for Baton SPA.
- * Sourced from live gateway responses — see docs/DESIGN.md §2.4.
+ * Shared by the Baton Native server and SPA.
  * OWNED BY FOUNDATION. Do not edit in parallel tasks (read-only).
  */
 
@@ -15,8 +15,13 @@ export interface Account {
   isDefault: boolean
   email: string
   nickname: string
-  /** Paused = excluded from CLIProxy rotation (manual or by policy engine). */
+  /** Paused = excluded from the provider's account rotation. */
   paused?: boolean
+  /** Lower values are attempted first by Baton Native account routing. */
+  priority?: number
+  revision?: number
+  /** This Codex account supplies remote plugin catalog and connector authorization. */
+  isPluginReference?: boolean
   createdAt?: string
   lastUsedAt?: string
 }
@@ -40,7 +45,7 @@ export interface AccountQuota {
   success: boolean
   /** Empty array = provider exposes no limit info for this account (a first-class state). */
   windows: QuotaWindow[]
-  /** epoch ms when the gateway fetched this (server cache TTL is 2 min). */
+  /** epoch ms when Baton Native fetched this value. */
   lastUpdated: number
   accountId: string
 }
@@ -53,6 +58,39 @@ export interface ProxyStatus {
   startedAt: string
   version: string
   target?: string
+}
+
+export interface BatonRuntimeStatus {
+  checkedAt: string
+  proxy: {
+    running: boolean | null
+    port: number | null
+    version: string | null
+    strategy: string | null
+    sessionAffinity: boolean | null
+  }
+  codex: {
+    integrationMode: CodexIntegrationMode | null
+    configuration: string
+    modelProvider: 'baton' | 'openai' | 'unknown'
+    providerAuth: 'available' | 'missing-or-conflicting' | 'unknown'
+    openAiLogin: {
+      kind: 'native-vault' | 'none' | 'unknown'
+      label: string
+    }
+    remotePluginCatalog: {
+      state: 'eligible' | 'unavailable' | 'unknown'
+      reason: string
+    }
+    configuredHome: string
+    notice: string
+  }
+  inferenceAccount: {
+    label: string
+    observedAt: string | null
+    basis: 'native-priority' | 'unavailable'
+  } | null
+  warnings: string[]
 }
 
 export type RoutingStrategyName = 'round-robin' | 'fill-first'
@@ -79,7 +117,8 @@ export type ClientKind =
   | 'unknown-codex-desktop'
 
 export type ClientIntegrationTarget = 'claude-cli' | 'claude-desktop' | 'codex'
-export type CodexIntegrationMode = 'custom-provider' | 'native-openai'
+export type CodexIntegrationMode = 'native-openai'
+export type ClaudeProxyMode = 'native'
 
 export interface ClientProcess {
   pid: number
@@ -105,6 +144,7 @@ export interface ClientIntegrationTargetStatus {
   configuration: ClientIntegrationConfigurationState
   configurationDetail?: string
   codexMode?: CodexIntegrationMode
+  claudeProxyMode?: ClaudeProxyMode
 }
 
 export type ClientIntegrationConfigurationState =
@@ -136,6 +176,36 @@ export interface AddStart {
   state: string
 }
 
+export interface ActiveModelFallback {
+  preferredModel: string
+  effectiveModel: string
+  reason: 'quota' | 'safety_refusal'
+  activatedAt: number
+  resetHint: number | null
+  lastProbeAt: number | null
+  accountAlias?: string
+}
+
+export interface ModelFallbackEvent {
+  id: number
+  at: number
+  type: 'available' | 'activated' | 'recovered' | 'disabled' | 'failed' | 'server_event'
+  preferredModel: string
+  effectiveModel: string
+  reason: 'quota' | 'safety_refusal'
+  direction?: 'retry' | 'revert' | 'sticky'
+  category?: string
+  accountId?: string
+}
+
+export interface ModelFallbackStatus {
+  enabled: boolean
+  promptDismissed: boolean
+  userMappings: Record<string, string[]>
+  active: ActiveModelFallback[]
+  events: ModelFallbackEvent[]
+}
+
 // ---- Policy engine (BFF /baton/*) ----
 
 export type PolicyId = 'reset-imminent-first'
@@ -144,7 +214,7 @@ export interface SteerLogEntry {
   /** epoch ms */
   ts: number
   provider: string
-  /** 'target' = engine picked this account to spend first (enacted via pause/resume; no default routing lever). */
+  /** 'target' = calculated policy rank 1; it does not assert the actual request destination. */
   action: 'target' | 'pause' | 'resume' | 'info' | 'error'
   accountId?: string
   reason: string
@@ -152,11 +222,11 @@ export interface SteerLogEntry {
 
 export interface PolicyProviderState {
   provider: string
-  /** account id the engine spends first (soonest reset), or null when not steering. */
+  /** calculated rank-1 account id (soonest reset), not an enforced request destination. */
   target: string | null
-  /** account id kept active as failover reserve. */
+  /** calculated rank-2 account id; every non-manually-paused account remains in the failover pool. */
   reserve: string | null
-  /** account ids the ENGINE paused this tick (vs. user-paused) — drives card state badges. */
+  /** legacy engine-owned pauses pending restoration; new policy ticks do not add ids. */
   enginePaused: string[]
 }
 

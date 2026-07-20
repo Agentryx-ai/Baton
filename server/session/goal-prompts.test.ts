@@ -16,7 +16,7 @@ function goal(overrides: Partial<CanonicalGoal> = {}): CanonicalGoal {
     automaticTurnsUsed: 3, maxActiveSeconds: 7_200, noProgressCount: 0,
     lastProgressDigest: null, createdAt: '2026-07-19T00:00:00.000Z',
     updatedAt: '2026-07-19T00:00:00.000Z', startedAt: '2026-07-19T00:00:00.000Z',
-    completedAt: null, ...overrides,
+    completedAt: null, verificationProposalId: null, latestCompletionReceiptId: null, latestStopReceiptId: null, ...overrides,
   }
 }
 

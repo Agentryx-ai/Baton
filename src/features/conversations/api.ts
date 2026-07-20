@@ -1,11 +1,17 @@
 import type {
   BeginTurnResultDto,
+  CanonicalProvider,
   CanonicalItemDto,
   CanonicalGoalDto,
+  CanonicalFollowUpDto,
   CanonicalSessionDto,
   CreateSessionDto,
   CreateGoalDto,
   EditGoalDto,
+  EnqueueFollowUpDto,
+  FirstTurnDto,
+  FirstTurnResultDto,
+  NativeFolderPickResultDto,
   StartTurnDto,
   ThreadSnapshotDto,
   ProviderModelDescriptorDto,
@@ -15,6 +21,10 @@ import type {
   NativeImportSourceClient,
   ReconcileUnknownMutationDto,
   ReconcileUnknownMutationResultDto,
+  ImageArtifactRefDto,
+  PermissionProfile,
+  PermissionSettingsDto,
+  GoalVerificationHistoryDto,
 } from './types.ts'
 
 const BASE_PATH = '/baton/v1'
@@ -48,6 +58,28 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     } catch {
       parsed = undefined
     }
+  }
+  if (!response.ok) {
+    const error = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+    throw new ConversationApiError(
+      response.status,
+      typeof error?.error === 'string' ? error.error : `Request failed with status ${response.status}`,
+      typeof error?.code === 'string' ? error.code : null,
+    )
+  }
+  return parsed as T
+}
+
+async function hostRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json', ...init.headers },
+  })
+  const raw = await response.text()
+  let parsed: unknown
+  if (raw) {
+    try { parsed = JSON.parse(raw) } catch { parsed = undefined }
   }
   if (!response.ok) {
     const error = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
@@ -97,6 +129,19 @@ async function nativeImportPost<T>(path: string, body: unknown, retried = false)
 }
 
 export const conversationApi = {
+  getPermissionSettings: (): Promise<PermissionSettingsDto> => request('/permissions'),
+
+  updatePermissionSettings: (defaultProfile: PermissionProfile): Promise<PermissionSettingsDto> =>
+    request('/permissions', jsonRequest('PUT', { defaultProfile })),
+
+  updateSessionPermission: (
+    sessionId: string,
+    profile: PermissionProfile | null,
+  ): Promise<CanonicalSessionDto> => request(
+    `/sessions/${encodeURIComponent(sessionId)}/permissions`,
+    jsonRequest('PUT', { profile }),
+  ),
+
   listModels: (provider: string): Promise<{
     provider: string
     models: ProviderModelDescriptorDto[]
@@ -111,6 +156,32 @@ export const conversationApi = {
   createSession: (input: CreateSessionDto): Promise<CanonicalSessionDto> =>
     request('/sessions', jsonRequest('POST', input)),
 
+  createFirstTurn: (
+    sessionId: string,
+    input: FirstTurnDto,
+  ): Promise<FirstTurnResultDto> =>
+    request(`/sessions/${encodeURIComponent(sessionId)}/first-turn`, jsonRequest('PUT', input)),
+
+  pickNativeFolder: (): Promise<NativeFolderPickResultDto> =>
+    hostRequest('/baton/host/folders/pick', {
+      method: 'POST',
+      headers: { 'X-Baton-Interaction': 'native-folder-picker' },
+    }),
+
+  uploadImage: (file: File): Promise<ImageArtifactRefDto> =>
+    hostRequest('/baton/v1/artifacts/images', {
+      method: 'POST',
+      headers: {
+        'Content-Type': file.type,
+        'X-Baton-Interaction': 'image-upload',
+        'X-Baton-Filename': encodeURIComponent(file.name),
+      },
+      body: file,
+    }),
+
+  imageUrl: (artifactId: string): string =>
+    `${BASE_PATH}/artifacts/images/${encodeURIComponent(artifactId)}`,
+
   archiveSession: (sessionId: string): Promise<CanonicalSessionDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),
 
@@ -123,8 +194,8 @@ export const conversationApi = {
   disconnectWorkspace: (sessionId: string, expectedRevision: number): Promise<CanonicalSessionDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}/workspace`, jsonRequest('DELETE', { expectedRevision })),
 
-  getThread: (threadId: string): Promise<ThreadSnapshotDto> =>
-    request(`/threads/${encodeURIComponent(threadId)}`),
+  getThread: (threadId: string, itemLimit?: number): Promise<ThreadSnapshotDto> =>
+    request(`/threads/${encodeURIComponent(threadId)}${itemLimit === undefined ? '' : `?itemLimit=${itemLimit}`}`),
 
   getGoal: async (threadId: string): Promise<CanonicalGoalDto | null> => {
     const result = await request<{ goal: CanonicalGoalDto | null }>(`/threads/${encodeURIComponent(threadId)}/goal`)
@@ -137,9 +208,19 @@ export const conversationApi = {
   editGoal: (goalId: string, input: EditGoalDto): Promise<CanonicalGoalDto> =>
     request(`/goals/${encodeURIComponent(goalId)}`, jsonRequest('PATCH', input)),
 
+  getGoalVerificationHistory: (goalId: string): Promise<GoalVerificationHistoryDto> =>
+    request(`/goals/${encodeURIComponent(goalId)}/verifications`),
+
   setGoalStatus: (
     goalId: string,
-    input: { expectedRevision: number; status: 'active' | 'paused'; resetLimitCounters?: boolean },
+    input: {
+      expectedRevision: number
+      status: 'active' | 'paused'
+      provider?: CanonicalProvider
+      model?: string
+      effort?: string | null
+      resetLimitCounters?: boolean
+    },
   ): Promise<{ status: 'applied' | 'stale'; goal: CanonicalGoalDto | null }> =>
     request(`/goals/${encodeURIComponent(goalId)}/status`, jsonRequest('POST', input)),
 
@@ -155,6 +236,15 @@ export const conversationApi = {
 
   startTurn: (threadId: string, input: StartTurnDto): Promise<BeginTurnResultDto> =>
     request(`/threads/${encodeURIComponent(threadId)}/turns`, jsonRequest('POST', input)),
+
+  enqueueFollowUp: (
+    threadId: string,
+    input: EnqueueFollowUpDto,
+  ): Promise<{ followUp: CanonicalFollowUpDto; duplicate: boolean }> =>
+    request(`/threads/${encodeURIComponent(threadId)}/follow-ups`, jsonRequest('POST', input)),
+
+  cancelFollowUp: (followUpId: string, expectedRevision: number): Promise<CanonicalFollowUpDto> =>
+    request(`/follow-ups/${encodeURIComponent(followUpId)}`, jsonRequest('DELETE', { expectedRevision })),
 
   cancelTurn: (turnId: string): Promise<void> =>
     request(`/turns/${encodeURIComponent(turnId)}/cancel`, { method: 'POST' }),

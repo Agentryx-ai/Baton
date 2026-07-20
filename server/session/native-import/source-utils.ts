@@ -93,6 +93,18 @@ export function cwdAlias(cwd: string | null, fallback: string): string {
   return cwd ? safeAlias(path.basename(cwd), fallback) : fallback
 }
 
+/**
+ * Strip Windows verbatim prefixes that native CLIs record via canonicalize
+ * (\\?\C:\... and \\?\UNC\host\share\...). They are valid filesystem paths but
+ * render confusingly in the UI and never match user-entered paths.
+ */
+export function normalizeNativeCwd(cwd: string | null | undefined): string | null {
+  if (!cwd) return null
+  if (cwd.startsWith('\\\\?\\UNC\\')) return `\\\\${cwd.slice(8)}`
+  if (cwd.startsWith('\\\\?\\')) return cwd.slice(4)
+  return cwd
+}
+
 export async function readStableFile(filePath: string): Promise<{ text: string, head: NativeSourceHead }> {
   const before = await stat(filePath)
   if (before.size > MAX_NATIVE_FILE_BYTES) throw new Error('native_source_file_size_limit')
@@ -143,10 +155,12 @@ export class NativeRecordAccumulator {
   readonly #records: NativePortableRecord[] = []
   #prefixDigest = sha256('')
   #count = 0
+  #portableCount = 0
 
   constructor(includeRecords: boolean) { this.#includeRecords = includeRecords }
 
   get count(): number { return this.#count }
+  get portableCount(): number { return this.#portableCount }
   get contentDigest(): string { return this.#prefixDigest }
   get records(): NativePortableRecord[] { return this.#records }
 
@@ -154,6 +168,7 @@ export class NativeRecordAccumulator {
     if (this.#count >= MAX_NATIVE_PORTABLE_RECORDS) throw new Error('native_source_portable_record_limit')
     this.#prefixDigest = sha256(`${this.#prefixDigest}\0${record.digest}`)
     this.#count += 1
+    if (record.item.visibility === 'portable') this.#portableCount += 1
     if (this.#includeRecords) this.#records.push({ ...record, prefixDigest: this.#prefixDigest })
   }
 }

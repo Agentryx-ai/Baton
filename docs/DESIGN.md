@@ -60,7 +60,7 @@
 |---|---|---|
 | 요청 도착 | 전략에 따라 계정 선택 (round-robin: 매 요청 순환 / fill-first: 소진까지 유지) | `routing.strategy` |
 | 429 수신 | 다음 계정으로 즉시 전환 + 같은 요청 재시도 (클라이언트 무감지) | `quota-exceeded.switch-project: true` |
-| (없음) | 쿨다운 예측 스케줄링은 비활성 — 오직 실제 429에만 반응 | `disable-cooling: true` |
+| 실제 429 | CLIProxy가 해당 credential의 cooling과 같은 요청의 다음 credential failover를 담당 | CLIProxy 기본 cooling/failover 설정 |
 | 옵션 | 같은 세션을 같은 계정에 고정 (TTL 기본 1h) | `session-affinity` |
 
 ### 2.3 쿼터 데이터의 출처와 한계
@@ -91,7 +91,7 @@
 | `POST /api/auth/login` | `{username, password}` → `connect.sid` 쿠키. **레이트리밋 5회/15분** |
 | `POST /api/cliproxy/auth/accounts/:provider/:id/pause` · `resume` | (본문 없음) → `{paused: true/false}` |
 | `DELETE /api/cliproxy/auth/accounts/:provider/:id` | → `{deleted: true}` |
-| `POST /api/cliproxy/routing/strategy` | `{strategy}` (또는 `{value}`) |
+| `PUT /api/cliproxy/routing/strategy` | `{value: 'round-robin'|'fill-first'}` — 현재 설치본의 확정 계약 |
 | `POST /api/cliproxy/routing/session-affinity` | `{enabled, ttl}` |
 | `POST /api/cliproxy/restart` | — |
 
@@ -151,11 +151,18 @@ single-flight + 최소 간격 가드가 필수라는 것도 확인.
 | 이전 내성 | Docker → 네이티브 전환 시 `.env`의 `GATEWAY_URL`만 변경 |
 
 **ADR-3. 왜 "조향(steering)"인가 — 커스텀 프록시가 아니고?**
+
+> **2026-07-20 후속 결정:** 이 ADR은 초기 구현의 역사적 결정으로 보존한다. 사용자가 외부 proxy
+> core에 종속되지 않는 방향을 확정함에 따라 Claude 요청 경로는
+> [`BATON_NATIVE_CLAUDE_PROXY_ROADMAP.md`](./BATON_NATIVE_CLAUDE_PROXY_ROADMAP.md)의 단계별
+> Baton native proxy 전환 결정이 대체한다. 해당 단계가 검증되기 전까지는 아래 CLIProxy 경로를
+> rollback 가능한 현재 동작으로 유지한다. Codex 및 다른 provider에는 이 대체 결정이 자동 적용되지 않는다.
+
 | 대안 | 평가 |
 |---|---|
 | Baton이 8317 앞단 프록시가 되어 요청마다 계정 선택 | 계정 선택은 CLIProxy 내부 로직이라 외부 프록시가 요청 단위로 지정 불가. 전체 재구현 필요. **기각** |
 | CLIProxy(Go) 포크에 정책 추가 | Go 코드베이스 유지 부담 + 업스트림 추적. **기각** |
-| **pause/resume API로 활성 계정 집합을 틱 단위 조정** | 포크 없음. 코스 그레인(60s)이지만 리셋 타이밍은 시간 단위로 변하므로 충분. `default`는 CLIProxy 요청 라우팅 레버가 아니므로 사용하지 않음. 엔진이 죽어도 CLIProxy 기본 동작으로 자연 퇴행. **활성 풀 제어로 채택했으나 target 우선순위는 미해결** |
+| **CLIProxy fill-first + 전체 유효 계정 풀** | 엔진 시작 전에 `fill-first`를 확정하고, 요청 단위 429/cooling/failover는 CLIProxy에 위임한다. Baton은 쿼터 비율로 계정을 pause하지 않는다. 사용자의 명시적 pause만 풀에서 제외한다. |
 
 ### 3.3 현재 프로젝트 구조 (핵심 경로)
 
@@ -200,12 +207,12 @@ Baton/
 │                                                            │
 │  ── 스마트 로테이션 ──────────────────────────── [ON ●]    │
 │  정책: 리셋 임박 우선 소진                                 │
-│  현재 타깃: claude → claude-main (1h 42m 후 리셋)         │
-│  ▸ 조향 로그 (접힘, 펼치면 최근 20건)                      │
+│  정책 1순위: claude → claude-main (1h 42m 후 리셋)        │
+│  ▸ 정책 로그 (접힘, 펼치면 최근 20건)                      │
 │                                                            │
 │  ── Claude (2) ──────────────────────── [+ 계정 추가]      │
 │  ┌──────────────────────┐  ┌──────────────────────┐        │
-│  │ claude-main ⛳타깃    │  │ claude-reserve ★기본 │        │
+│  │ claude-main ⛳1순위   │  │ claude-reserve 2순위 │        │
 │  │ 5h  ████████░░  70%  │  │ 한도 정보 미제공     │        │
 │  │     2h 후 리셋       │  │ (구독 정보 없음)     │        │
 │  │ 7d  █████████░  88%⚠ │  │                      │        │
@@ -218,7 +225,7 @@ Baton/
 │                                                            │
 │  ── 설정 ──────────────────────────────────────────        │
 │  CLIProxy 전략   (●) round-robin  ( ) fill-first           │
-│                  ⓘ 스마트 로테이션 ON일 땐 엔진이 우선     │
+│                  ⓘ 정책 ON 동안 fill-first 고정            │
 │  세션 고정       [OFF] · TTL [1h]                          │
 │  연결 정보       ANTHROPIC_BASE_URL=... [복사]             │
 │  프록시          [재시작]                                  │
@@ -233,7 +240,7 @@ Baton은 **계정 카드에 모든 상태를 집약**:
 ```
 ┌────────────────────────────────────┐
 │ user@example.com                   │ ← 이메일 (닉네임은 보조 표기)
-│ ⛳ 정책 타깃  ·  ⏸ 일시정지됨      │ ← 상태 배지 행 (해당 시에만)
+│ ⛳ 정책 1순위 ·  ⏸ 일시정지됨      │ ← 상태 배지 행 (해당 시에만)
 │                                    │
 │ 5h   ████████████░░░░  70%         │ ← 쿼터 바 ×2 (5h/7d)
 │      ↻ 2h 14m 후 리셋              │    색상: <60% 기본 / 60-85% 주의 /
@@ -301,40 +308,42 @@ tick(provider):
   quotas   ← GET /quota/:provider/:id  (각 계정)
 
   분류:
-    ACTIVE    = 5h 윈도우 살아있고 usedPercent < 95
+    ACTIVE    = primary usage window가 있음 (usedPercent 95/100도 포함)
     FRESH     = windows가 비었거나 미사용 (윈도우 앵커 없음)
-    EXHAUSTED = usedPercent ≥ 95
     BLIND     = 쿼터 조회 실패 or 한도 미제공 (claude-reserve 유형)
 
   순위: ACTIVE를 resetAt 오름차순(임박 우선)
         → FRESH (새 윈도우를 여는 비용이 있으므로 후순위)
         → BLIND (판단 불가 — 최후순위지만 배제하지 않음)
-        → EXHAUSTED는 순위 제외
 
-  목표 상태:
-    target  = 순위 1위 → 우선 라우팅되어야 하는 계정
-    reserve = 순위 2위 → 활성 유지 (429 페일오버 예비)
-    나머지   → pause
+  관측 상태:
+    target  = 계산상 순위 1위 (실제 요청 대상이라는 뜻은 아님)
+    reserve = 계산상 순위 2위
+    active pool = 사용자가 pause하지 않은 모든 계정
 
-  적용(멱등): 현재 상태와 목표 상태의 차이만 API 호출
+  적용:
+    enable/start 전 PUT /routing/strategy {value:'fill-first'}; 실패하면 엔진 OFF
+    계정 pause는 하지 않음; 과거 엔진 장부의 pause만 복구
 ```
 
-> **현재 구현 갭:** CLIProxy에는 target 우선순위를 지정하는 요청 라우팅 레버가 없고,
-> `default`도 라우팅에 효과가 없다. 현재 엔진은 target과 reserve를 모두 활성화하므로
-> `round-robin`에서는 두 계정이 순환한다. 따라서 순위 계산과 활성 풀 제어는 구현됐지만
-> “리셋 임박 계정 우선 소진”이라는 목표는 아직 실제 트래픽에서 보장되지 않는다.
+> **권한 경계:** `usedPercent`는 UI 경고/순위 관측값일 뿐 pause 또는 소진 판정 근거가 아니다.
+> 실제 429, cooling, 같은 요청의 다음 계정 failover는 CLIProxy의 권한이다. Baton이 풀을
+> target/reserve 두 개로 줄이면 세 번째 유효 계정 failover를 막으므로 전체 유효 풀을 유지한다.
+> CLIProxy에는 계산 순위를 credential order로 반영하는 계약이 없어 “리셋 임박 우선”은 아직
+> 관측 순위이며 실제 전송 순서를 보장하지 않는다.
 
 ### 5.3 엣지케이스 (설계 시점에 확정)
 
 | 상황 | 처리 |
 |---|---|
-| 순위 가능 계정 = 0 | **조향 해제**: 엔진이 pause한 계정 전부 resume, 로그 남김 |
-| 순위 가능 계정 = 1 | 해당 계정을 **단독 타깃**으로 지정, EXHAUSTED 계정은 pause, 상태에 `예비 없음` 표시 |
-| 쿼터 조회 실패(일시) | 해당 계정은 이번 틱에서 BLIND 취급. **연속 2틱 동일 판단일 때만 조향 변경** (플래핑 방지 디바운스) |
+| 순위 가능 계정 = 0 | 계산 순위를 비우고 과거 엔진 장부의 pause를 resume, 로그 남김 |
+| 순위 가능 계정 = 1 | 해당 계정을 계산상 1순위로 표시하고 `예비 없음` 표시; 자동 pause 없음 |
+| 쿼터 조회 실패(일시) | 해당 계정은 이번 틱에서 BLIND 취급. active pool은 변경하지 않음 |
 | 타깃의 리셋 통과 | 다음 틱에서 자연 재순위 (앵커 이동으로 캐스케이드) |
-| 사용자가 수동 pause한 계정 | 엔진은 **자기가 pause한 계정만** resume (자체 장부로 구분) — 사용자 의사 존중 |
-| 엔진 OFF 전환 | 엔진이 pause한 계정 전부 resume 후 정지 (fail-safe 복원) |
-| BFF 재시작 | 장부(`.baton-state.json`)에서 enabled + 엔진-pause 목록 복원. enabled면 즉시 틱 |
+| 사용자가 수동 pause한 계정 | 순위와 풀에서 제외하며 resume하지 않음. 엔진 장부에 기록된 과거 엔진 pause만 복구 |
+| 엔진 OFF 전환 | `recoveryPending`을 먼저 영속화하고 과거 엔진 pause를 전부 resume; 중간 crash는 다음 시작에서 재개 |
+| BFF 재시작 | OFF 복구 journal을 먼저 처리. enabled 복원은 `fill-first` PUT 성공 시에만 tick; 실패 시 OFF 유지 |
+| ON 중 routing 변경·계약 상실 | UI에서 전략 변경을 잠그고 매 tick `fill-first`를 재확인; 실패하면 즉시 OFF |
 | the gateway/CLIProxy 다운 | 틱 실패 로그만 남기고 다음 틱 재시도. 조향 상태 변경 없음 |
 
 ### 5.4 제약의 정직한 명시
@@ -342,11 +351,13 @@ tick(provider):
 - **요청 단위 개입 불가**: 트래픽이 Baton을 경유하지 않음. 틱(60s)이 유일한 제어점.
   리셋 타이밍은 시간 단위로 변하므로 이 해상도로 충분하다고 판단 (리뷰 포인트 §10-Q3)
 - **데이터 신선도 하한 2분**: the gateway 캐시(§2.3). 엔진 판단·UI 표기 모두 이 한계 위에서 동작
-- **관측성**: 모든 조향 행위는 링버퍼 로그(최근 50건)에 "무엇을 왜"와 함께 기록, UI 노출.
+- **관측성**: 모든 정책 계산·복구 행위는 링버퍼 로그(최근 50건)에 "무엇을 왜"와 함께 기록, UI 노출.
   블랙박스면 신뢰할 수 없는 기능이 됨
-- **target 의미 갭**: 현재 UI의 `현재 타깃`은 정책 순위 1위이며 실제 요청이 그 계정으로
-  우선 전송된다는 뜻이 아니다. 우선순위 지원, 단독 target+동적 failover, 또는 정책 명칭 변경 중
-  하나를 결정해야 한다.
+- **403 자동 추정 금지**: 현재 accounts/quota 계약은 durable `INELIGIBLE` 또는 마지막 403 상태를
+  노출하지 않는다. Baton은 사용량이나 과거 메시지로 403을 추정하지 않으며, 관리자가 수동 pause하거나
+  CLIProxy가 명시적 durable eligibility 상태를 제공하기 전까지 자동 제외하지 않는다.
+- **순위 적용 갭**: UI는 이를 `정책 1순위`로 명시해 실제 요청 계정과 구분한다. 설치된 CLIProxy가
+  credential ordering 계약을 제공하기 전에는 계산 순위를 전송 순서에 적용하지 않는다.
 
 ### 5.5 확장 구조 (v2 대비)
 
@@ -414,7 +425,7 @@ SPA          BFF              gateway            Provider(브라우저 새탭)
 | M1 | BFF: 세션+프록시 | `curl :4400/api/cliproxy/auth/accounts/claude` → 실계정 JSON (완료) |
 | M2 | SPA 골격 + Accounts 섹션 | 실데이터 4계정 카드 + 쿼터 바 + 카운트다운 렌더 |
 | M3 | 계정 액션 + 추가 마법사 | 실 OAuth 1왕복 E2E |
-| M4 | 정책 엔진 + 정책 패널 | 조향 로그에 의도된 target/pause/resume 기록 확인, ON→OFF 복원 확인 |
+| M4 | 정책 엔진 + 정책 패널 | 정책 순위/복구 로그, `fill-first` fail-closed, ON→OFF journal 복원 확인 |
 | M5 | Settings + 테마 + 마감 | 빌드 산출물로 BFF 단독 서빙 |
 
 M1~M5는 완료되었습니다. 이후 canonical runtime은
@@ -427,8 +438,8 @@ M1~M5는 완료되었습니다. 이후 canonical runtime은
 | 리스크 | 심각도 | 대응 |
 |---|---|---|
 | the gateway's management API 비공식 — 버전업 시 파손 | 중 | `src/api/` 한 층에 격리 + 기동 시 스모크 체크(계약 어긋나면 배너) |
-| 조향과 사용자 수동 조작 충돌 | 중 | 엔진 장부로 자기 행위만 되돌림 + 로그 투명화 (§5.3) |
-| reserve까지 소진 시 페일오버 공백 | 중 | 순위 가능 <2 → 조향 해제 규칙. 추가로 "전 계정 위험" 배너 |
+| 과거 엔진 pause와 사용자 수동 조작 충돌 | 중 | crash-safe 장부로 과거 자기 행위만 되돌림 + 로그 투명화 (§5.3) |
+| 세 번째 이후 계정 failover 공백 | 중 | 전체 비수동-pause 계정을 풀에 유지하고 429 failover를 CLIProxy에 위임 |
 | 쿼터 API가 봇 차단 등으로 막힘 | 저 | BLIND 분류로 퇴행 — 엔진은 보수적으로 동작 |
 | Docker→네이티브 이전 시 예상외 차이 | 저 | BFF 절연 + 이전 후 M1 검증 재실행 |
 
@@ -436,13 +447,12 @@ M1~M5는 완료되었습니다. 이후 canonical runtime은
 
 ## 10. 초기 리뷰 포인트와 현재 결정
 
-- **Q1 소진 임계값**: 95%로 구현.
+- **Q1 소진 임계값**: 라우팅 임계값 없음. 95/100%도 실제 429 전에는 유효하며 UI 경고로만 표시.
 - **Q2 FRESH 순위**: ACTIVE 뒤, BLIND 앞의 후순위로 구현.
 - **Q3 틱 주기**: 60초로 구현.
-- **Q4 CLIProxy 전략**: 현재 엔진은 전략을 강제 변경하지 않고 target/reserve 활성 풀만
-  pause/resume으로 조정한다. 이 상태는 엄밀한 target 우선 소진을 충족하지 못한다.
-  프록시 우선순위 지원, 단독 target 운용과 429 시 reserve 재개, 또는 정책을 “상위 2계정 풀”로
-  재정의하는 선택은 아직 미결이다.
+- **Q4 CLIProxy 전략**: enable/start 전에 설치 계약 `PUT /api/cliproxy/routing/strategy`
+  `{value:'fill-first'}`를 성공시켜야 한다. 실패 시 엔진은 OFF로 남는다. 모든 유효 계정을 풀에
+  유지하고 실제 429/cooling/failover는 CLIProxy 기본 동작에 위임한다.
 - **Q5 접근 보안**: BFF는 `127.0.0.1`에만 바인딩하고 gateway 자격 증명은 `.env`에 보관.
   LAN 공유 필요 시 인증 추가 필요. **로컬 전용으로 확정?**
 - **Q6. Codex Spark 쿼터**: Codex 계정에 별도 "Spark(5h)" 윈도우가 실측됨(현재 100%).

@@ -10,6 +10,10 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml'
+import {
+  loadNativeClaudeProxyConnection,
+  type NativeClaudeProxyConnection,
+} from './claude-native-runtime.ts'
 
 export type ClientKind =
   | 'claude-cli'
@@ -20,7 +24,8 @@ export type ClientKind =
   | 'unknown-codex-desktop'
 
 export type ClientIntegrationTarget = 'claude-cli' | 'claude-desktop' | 'codex'
-export type CodexIntegrationMode = 'custom-provider' | 'native-openai'
+export type CodexIntegrationMode = 'native-openai'
+export type ClaudeProxyMode = 'native'
 
 export interface ClientProcess {
   pid: number
@@ -46,6 +51,7 @@ export interface ClientIntegrationTargetStatus {
   configuration: ClientIntegrationConfigurationState
   configurationDetail?: string
   codexMode?: CodexIntegrationMode
+  claudeProxyMode?: ClaudeProxyMode
 }
 
 export type ClientIntegrationConfigurationState =
@@ -104,7 +110,8 @@ export class ClientIntegrationError extends Error {
 
 const FAMILY_ORDER = ['opus', 'sonnet', 'haiku', 'fable'] as const
 const POWERSHELL = 'powershell.exe'
-const DEFAULT_CODEX_MODE: CodexIntegrationMode = 'custom-provider'
+const DEFAULT_CODEX_MODE: CodexIntegrationMode = 'native-openai'
+const DEFAULT_CLAUDE_PROXY_MODE: ClaudeProxyMode = 'native'
 export const CODEX_NATIVE_PROXY_PATH = '/baton/inference/openai/v1'
 const TARGET_DEFINITIONS: ReadonlyArray<{
   target: ClientIntegrationTarget
@@ -124,6 +131,16 @@ export function codexNativeProxyBaseUrl(
   port: number = Number(process.env.BATON_PORT ?? 4400),
 ): string {
   return `http://127.0.0.1:${port}${CODEX_NATIVE_PROXY_PATH}`
+}
+
+interface ProxyConnection {
+  baseUrl: string
+  token: string
+  models: string[]
+}
+
+function asProxyConnection(connection: NativeClaudeProxyConnection): ProxyConnection {
+  return connection
 }
 
 function executableName(record: ProcessRecord): string {
@@ -151,6 +168,9 @@ export function classifyProcessRecords(records: ProcessRecord[]): ClientProcess[
         label = desktop ? 'Claude Desktop' : 'Claude CLI'
       }
     } else if (name === 'codex.exe') {
+      if (evidence.includes('app-server --stdio') && evidence.includes('baton-model-catalog.json')) {
+        continue
+      }
       if (!evidence.trim()) {
         client = 'unknown-codex-desktop'
         label = 'Codex CLI/Desktop 여부 확인 불가'
@@ -202,8 +222,9 @@ export async function getClientIntegrationStatus(): Promise<ClientIntegrationSta
 
   let targets = buildTargetStatuses(running, processError === undefined)
   try {
-    const proxy = await loadProxyConnection(false)
-    const configurations = await inspectTargetConfigurations(proxy.baseUrl, proxy.token)
+    const configurations = await inspectTargetConfigurations(
+      asProxyConnection(await loadNativeClaudeProxyConnection(false)),
+    )
     targets = targets.map((target) => ({ ...target, ...configurations.get(target.target) }))
   } catch (error) {
     const detail = `실제 설정 상태를 확인하지 못했습니다: ${errorMessage(error)}`
@@ -255,30 +276,39 @@ function compactProcessError(error: unknown): string {
 export async function applyClientIntegration(
   inputTargets?: unknown,
   inputCodexMode?: unknown,
+  inputClaudeProxyMode?: unknown,
 ): Promise<ClientIntegrationApplyResult> {
   const targets = parseIntegrationTargets(inputTargets)
-  const codexMode = parseCodexIntegrationMode(inputCodexMode)
+  parseCodexIntegrationMode(inputCodexMode)
+  parseClaudeProxyMode(inputClaudeProxyMode)
   await requireTargetsStopped(targets)
 
+  const hasClaudeTarget = targets.includes('claude-cli') || targets.includes('claude-desktop')
   const needsClaudeModels = targets.includes('claude-desktop')
-  const needsCodexEnvironment = targets.includes('codex') && codexMode === 'custom-provider'
-  const proxy = await loadProxyConnection(needsClaudeModels)
-  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'applyable', codexMode)
-  const models = needsClaudeModels ? selectClaudeModels(proxy.models) : []
+  const claudeConnection = hasClaudeTarget
+    ? asProxyConnection(await loadNativeClaudeProxyConnection(needsClaudeModels))
+    : null
+  await requireConfigurationState(
+    targets,
+    claudeConnection,
+    'applyable',
+  )
+  const models = needsClaudeModels ? selectClaudeModels(claudeConnection?.models ?? []) : []
   if (needsClaudeModels && models.length === 0) {
     throw new ClientIntegrationError(502, '프록시 모델 목록에서 Claude 모델을 찾지 못했습니다.')
   }
 
-  const files = await prepareFiles(targets, proxy.baseUrl, proxy.token, models, codexMode)
+  const files = await prepareFiles(
+    targets,
+    claudeConnection,
+    models,
+  )
   await assertFilesUnlocked(files)
 
   // Close the race window as much as possible: process state is checked again
   // after all parsing/validation and immediately before the first replacement.
   await requireTargetsStopped(targets)
 
-  const previousEnv = needsCodexEnvironment
-    ? await getUserEnvironmentVariable('BATON_PROXY_TOKEN')
-    : undefined
   const committed: PreparedFile[] = []
   let preserveBackups = false
   try {
@@ -286,15 +316,9 @@ export async function applyClientIntegration(
       await commitFile(file)
       committed.push(file)
     }
-    if (needsCodexEnvironment) {
-      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', proxy.token)
-    }
   } catch (error) {
     const rollbackErrors = await rollbackFiles(committed)
     preserveBackups = rollbackErrors.length > 0
-    if (previousEnv !== undefined) {
-      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', previousEnv).catch(() => {})
-    }
     const rollbackSuffix = rollbackErrors.length
       ? ` 롤백 오류: ${rollbackErrors.join('; ')}`
       : ''
@@ -319,20 +343,19 @@ export async function removeClientIntegration(
   const targets = parseIntegrationTargets(inputTargets)
   await requireTargetsStopped(targets)
 
-  const proxy = await loadProxyConnection(false)
-  const current = await inspectTargetConfigurations(proxy.baseUrl, proxy.token)
-  const codexMode = targets.includes('codex')
-    ? current.get('codex')?.codexMode ?? DEFAULT_CODEX_MODE
-    : DEFAULT_CODEX_MODE
-  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'applied', codexMode)
-  const files = await prepareRemovalFiles(targets, proxy.baseUrl, proxy.token, codexMode)
+  const claudeConnection = asProxyConnection(await loadNativeClaudeProxyConnection(false))
+  await requireConfigurationState(
+    targets,
+    claudeConnection,
+    'applied',
+  )
+  const files = await prepareRemovalFiles(
+    targets,
+    claudeConnection,
+  )
   await assertFilesUnlocked(files)
   await requireTargetsStopped(targets)
 
-  const removeCodexEnvironment = targets.includes('codex') && codexMode === 'custom-provider'
-  const previousEnv = removeCodexEnvironment
-    ? await getUserEnvironmentVariable('BATON_PROXY_TOKEN')
-    : undefined
   const committed: PreparedFile[] = []
   let preserveBackups = false
   try {
@@ -340,15 +363,9 @@ export async function removeClientIntegration(
       await commitFile(file)
       committed.push(file)
     }
-    if (removeCodexEnvironment) {
-      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', null)
-    }
   } catch (error) {
     const rollbackErrors = await rollbackFiles(committed)
     preserveBackups = rollbackErrors.length > 0
-    if (previousEnv !== undefined) {
-      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', previousEnv).catch(() => {})
-    }
     const rollbackSuffix = rollbackErrors.length
       ? ` 롤백 오류: ${rollbackErrors.join('; ')}`
       : ''
@@ -387,8 +404,14 @@ export function parseIntegrationTargets(input: unknown): ClientIntegrationTarget
 
 export function parseCodexIntegrationMode(input: unknown): CodexIntegrationMode {
   if (input === undefined) return DEFAULT_CODEX_MODE
-  if (input === 'custom-provider' || input === 'native-openai') return input
+  if (input === 'native-openai') return input
   throw new ClientIntegrationError(400, `올바르지 않은 Codex 통합 모드입니다: ${String(input)}`)
+}
+
+export function parseClaudeProxyMode(input: unknown): ClaudeProxyMode {
+  if (input === undefined) return DEFAULT_CLAUDE_PROXY_MODE
+  if (input === 'native') return input
+  throw new ClientIntegrationError(400, `올바르지 않은 Claude 프록시 모드입니다: ${String(input)}`)
 }
 
 export function blockedProcessesForTargets(
@@ -432,76 +455,9 @@ async function requireTargetsStopped(targets: ClientIntegrationTarget[]): Promis
   }
 }
 
-export async function loadProxyConnection(includeModels: boolean): Promise<{
-  baseUrl: string
-  token: string
-  models: string[]
-}> {
-  const { fetchGateway } = await import('./gateway-session.ts')
-  const [statusResponse, tokenResponse] = await Promise.all([
-    fetchGateway('/api/cliproxy/proxy-status', { method: 'GET' }),
-    fetchGateway('/api/settings/auth/tokens/raw', { method: 'GET' }),
-  ])
-  const status = parseGatewayJson(statusResponse.status, statusResponse.body, '프록시 상태')
-  const tokenBody = parseGatewayJson(tokenResponse.status, tokenResponse.body, '프록시 토큰')
-  const port = Number(status.port)
-  const token = nestedString(tokenBody, ['apiKey', 'value'])
-
-  if (status.running !== true || !Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw new ClientIntegrationError(502, '실행 중인 로컬 프록시의 포트를 확인하지 못했습니다.')
-  }
-  if (!token) {
-    throw new ClientIntegrationError(502, '게이트웨이에서 프록시 토큰을 읽지 못했습니다.')
-  }
-
-  const baseUrl = `http://127.0.0.1:${port}`
-  if (!includeModels) return { baseUrl, token, models: [] }
-  let response: Response
-  try {
-    response = await fetch(`${baseUrl}/v1/models`, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(5_000),
-    })
-  } catch (error) {
-    throw new ClientIntegrationError(502, `프록시 모델 목록 요청에 실패했습니다: ${errorMessage(error)}`)
-  }
-  if (!response.ok) {
-    throw new ClientIntegrationError(502, `프록시 모델 목록 요청이 HTTP ${response.status}로 실패했습니다.`)
-  }
-  const body = await response.json() as { data?: Array<{ id?: unknown }> }
-  const models = Array.from(new Set(
-    (Array.isArray(body.data) ? body.data : [])
-      .map((item) => item.id)
-      .filter((id): id is string => typeof id === 'string' && id.length > 0),
-  )).sort(compareText)
-  return { baseUrl, token, models }
-}
-
-function parseGatewayJson(status: number, body: Buffer, label: string): Record<string, unknown> {
-  if (status < 200 || status >= 300) {
-    throw new ClientIntegrationError(502, `${label} 조회가 HTTP ${status}로 실패했습니다.`)
-  }
-  try {
-    const parsed = JSON.parse(body.toString('utf8'))
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('object expected')
-    return parsed as Record<string, unknown>
-  } catch {
-    throw new ClientIntegrationError(502, `${label} 응답이 올바른 JSON 객체가 아닙니다.`)
-  }
-}
-
-function nestedString(object: Record<string, unknown>, keys: string[]): string | null {
-  let value: unknown = object
-  for (const key of keys) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
-    value = (value as Record<string, unknown>)[key]
-  }
-  return typeof value === 'string' && value.length > 0 ? value : null
-}
-
 type ConfigurationInspection = Pick<
   ClientIntegrationTargetStatus,
-  'configuration' | 'configurationDetail' | 'codexMode'
+  'configuration' | 'configurationDetail' | 'codexMode' | 'claudeProxyMode'
 >
 
 /** Applying is a deterministic repair for partial/stale Baton-owned fields. */
@@ -513,19 +469,15 @@ export function canApplyConfiguration(
 
 async function requireConfigurationState(
   targets: ClientIntegrationTarget[],
-  baseUrl: string,
-  token: string,
+  claudeConnection: ProxyConnection | null,
   expected: 'applied' | 'applyable',
-  codexMode?: CodexIntegrationMode,
 ): Promise<void> {
-  const inspections = await inspectTargetConfigurations(baseUrl, token, codexMode)
+  const inspections = await inspectTargetConfigurations(claudeConnection)
   const invalid = targets
     .map((target) => ({ target, inspection: inspections.get(target)! }))
-    .filter(({ target, inspection }) => expected === 'applied'
+    .filter(({ inspection }) => expected === 'applied'
       ? inspection.configuration !== 'applied'
-      : codexMode === 'native-openai' && target === 'codex'
-        ? inspection.configuration !== 'not-applied'
-        : !canApplyConfiguration(inspection.configuration))
+      : !canApplyConfiguration(inspection.configuration))
   if (invalid.length === 0) return
 
   const expectedLabel = expected === 'applied' ? '적용된' : '미적용 또는 복구 가능한 충돌'
@@ -540,9 +492,7 @@ async function requireConfigurationState(
 }
 
 async function inspectTargetConfigurations(
-  baseUrl: string,
-  token: string,
-  codexMode?: CodexIntegrationMode,
+  claudeConnection: ProxyConnection | null,
 ): Promise<Map<ClientIntegrationTarget, ConfigurationInspection>> {
   const home = homedir()
   const claudeCli = path.join(home, '.claude', 'settings.json')
@@ -565,16 +515,26 @@ async function inspectTargetConfigurations(
 
   await Promise.all([
     inspect('claude-cli', async () => {
+      if (!claudeConnection) {
+        return { configuration: 'unknown', configurationDetail: 'Claude 프록시 연결을 확인하지 못했습니다.' }
+      }
       const source = await readOptional(claudeCli)
       return source.existed
-        ? inspectClaudeCliConfig(source.content, baseUrl, token)
+        ? inspectClaudeCliConfig(
+          source.content,
+          claudeConnection.baseUrl,
+          null,
+        )
         : { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
     }),
     inspect('claude-desktop', async () => {
+      if (!claudeConnection) {
+        return { configuration: 'unknown', configurationDetail: 'Claude 프록시 연결을 확인하지 못했습니다.' }
+      }
       const file = await findClaudeDesktopConfig()
       const source = await readOptional(file)
       return source.existed
-        ? inspectClaudeDesktopConfig(source.content, baseUrl, token)
+        ? inspectClaudeDesktopConfig(source.content, claudeConnection.baseUrl, claudeConnection.token)
         : { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
     }),
     inspect('codex', async () => {
@@ -582,76 +542,16 @@ async function inspectTargetConfigurations(
       if (!source.existed) {
         return { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
       }
-      const environmentToken = await getUserEnvironmentVariable('BATON_PROXY_TOKEN')
-      return inspectCodexIntegration(
-        source.content,
-        `${baseUrl}/v1`,
-        token,
-        environmentToken,
-        codexNativeProxyBaseUrl(),
-        codexMode,
-      )
+      return { ...inspectCodexNativeConfig(source.content, codexNativeProxyBaseUrl()), codexMode: 'native-openai' }
     }),
   ])
 
+  for (const target of ['claude-cli', 'claude-desktop'] as const) {
+    const value = result.get(target)
+    if (value) result.set(target, { ...value, claudeProxyMode: 'native' })
+  }
+
   return result
-}
-
-function inspectCodexIntegration(
-  content: string,
-  customBaseUrl: string,
-  token: string,
-  environmentToken: string | null,
-  nativeBaseUrl: string,
-  desiredMode?: CodexIntegrationMode,
-): ConfigurationInspection {
-  const custom = inspectCodexConfig(content, customBaseUrl, token, environmentToken)
-  const native = inspectCodexNativeConfig(content, nativeBaseUrl)
-
-  if (desiredMode === 'custom-provider') {
-    if (native.configuration === 'applied') {
-      return {
-        configuration: 'conflict',
-        configurationDetail: 'Codex 네이티브 OpenAI 모드가 이미 적용되어 있습니다. 먼저 해제하세요.',
-        codexMode: 'native-openai',
-      }
-    }
-    return custom
-  }
-
-  if (desiredMode === 'native-openai') {
-    if (custom.configuration !== 'not-applied') {
-      return {
-        configuration: 'conflict',
-        configurationDetail: 'Baton custom provider 모드가 남아 있습니다. 먼저 해당 모드를 해제하세요.',
-        codexMode: 'custom-provider',
-      }
-    }
-    if (native.configuration !== 'not-applied') return native
-    try {
-      const parsed = parseToml(content) as Record<string, unknown>
-      if (parsed.model_provider !== undefined && parsed.model_provider !== 'openai') {
-        return {
-          configuration: 'conflict',
-          configurationDetail: '기존 model_provider가 openai가 아니어서 네이티브 모드를 적용할 수 없습니다.',
-        }
-      }
-      if (parsed.openai_base_url !== undefined) {
-        return {
-          configuration: 'conflict',
-          configurationDetail: '사용자가 설정한 openai_base_url이 있어 덮어쓰지 않습니다.',
-        }
-      }
-    } catch (error) {
-      return { configuration: 'unknown', configurationDetail: `TOML 파싱 실패: ${errorMessage(error)}` }
-    }
-    return native
-  }
-
-  if (native.configuration === 'applied') return native
-  if (custom.configuration !== 'not-applied') return custom
-  if (native.configuration === 'conflict' && native.codexMode) return native
-  return { configuration: 'not-applied' }
 }
 
 function inspection(
@@ -667,7 +567,7 @@ function inspection(
 export function inspectClaudeCliConfig(
   content: string,
   baseUrl: string,
-  token: string,
+  token: string | null,
 ): ConfigurationInspection {
   const config = parseJsonObject(content, 'Claude CLI 설정')
   const env = config.env
@@ -678,7 +578,10 @@ export function inspectClaudeCliConfig(
   const present = 'ANTHROPIC_BASE_URL' in values || 'ANTHROPIC_AUTH_TOKEN' in values
   return inspection(
     present,
-    values.ANTHROPIC_BASE_URL === baseUrl && values.ANTHROPIC_AUTH_TOKEN === token,
+    values.ANTHROPIC_BASE_URL === baseUrl
+      && (token === null
+        ? !('ANTHROPIC_AUTH_TOKEN' in values)
+        : values.ANTHROPIC_AUTH_TOKEN === token),
     'Baton 소유 항목이 부분 적용되었거나 현재 프록시와 다릅니다.',
   )
 }
@@ -705,36 +608,39 @@ export function inspectClaudeDesktopConfig(
   )
 }
 
-export function inspectCodexConfig(
+export function patchClaudeCliConfig(content: string, baseUrl: string, token: string | null): string {
+  const config = parseJsonObject(content || '{}', 'Claude CLI 설정')
+  const existingEnv = config.env
+  if (existingEnv !== undefined && (!existingEnv || typeof existingEnv !== 'object' || Array.isArray(existingEnv))) {
+    throw new ClientIntegrationError(422, 'Claude CLI 설정의 env 값이 객체가 아니어서 안전하게 병합할 수 없습니다.')
+  }
+  const nextEnv: Record<string, unknown> = {
+    ...(existingEnv as Record<string, unknown> | undefined),
+    ANTHROPIC_BASE_URL: baseUrl,
+  }
+  if (token === null) delete nextEnv.ANTHROPIC_AUTH_TOKEN
+  else nextEnv.ANTHROPIC_AUTH_TOKEN = token
+  config.env = nextEnv
+  const result = `${JSON.stringify(config, null, 2)}\n`
+  parseJsonObject(result, '변경된 Claude CLI 설정')
+  return result
+}
+
+export function patchClaudeDesktopConfig(
   content: string,
   baseUrl: string,
   token: string,
-  environmentToken: string | null,
-): ConfigurationInspection {
-  let parsed: Record<string, unknown>
-  try {
-    parsed = parseToml(content) as Record<string, unknown>
-  } catch (error) {
-    return { configuration: 'unknown', configurationDetail: `TOML 파싱 실패: ${errorMessage(error)}` }
-  }
-  const providers = parsed.model_providers
-  const baton = providers && typeof providers === 'object' && !Array.isArray(providers)
-    ? (providers as Record<string, unknown>).baton
-    : undefined
-  const provider = baton && typeof baton === 'object' && !Array.isArray(baton)
-    ? baton as Record<string, unknown>
-    : undefined
-  const present = parsed.model_provider === 'baton' || provider !== undefined
-  const result = inspection(
-    present,
-    parsed.model_provider === 'baton'
-      && provider?.base_url === baseUrl
-      && provider?.env_key === 'BATON_PROXY_TOKEN'
-      && provider?.wire_api === 'responses'
-      && environmentToken === token,
-    'Baton provider 항목이 부분 적용되었거나 현재 프록시/토큰과 다릅니다.',
-  )
-  return present ? { ...result, codexMode: 'custom-provider' } : result
+  models: ClaudeDesktopModel[],
+): string {
+  const config = parseJsonObject(content, 'Claude Desktop 설정')
+  config.inferenceProvider = 'gateway'
+  config.inferenceCredentialKind = 'static'
+  config.inferenceGatewayBaseUrl = baseUrl
+  config.inferenceGatewayApiKey = token
+  config.inferenceModels = models
+  const result = `${JSON.stringify(config, null, 2)}\n`
+  parseJsonObject(result, '변경된 Claude Desktop 설정')
+  return result
 }
 
 export function inspectCodexNativeConfig(
@@ -750,17 +656,24 @@ export function inspectCodexNativeConfig(
 
   const configuredBaseUrl = parsed.openai_base_url
   const provider = parsed.model_provider
-  if (configuredBaseUrl === baseUrl && (provider === undefined || provider === 'openai')) {
+  const batonProvider = codexProvider(parsed, 'baton')
+  if (
+    configuredBaseUrl === baseUrl
+    && (provider === undefined || provider === 'openai')
+    && isManagedBatonCompatProvider(batonProvider, baseUrl)
+  ) {
     return {
       configuration: 'applied',
-      configurationDetail: '적용됨 · 기존 OpenAI 세션 목록 유지',
+      configurationDetail: '적용됨 · OpenAI identity 및 기존 Baton 세션 resume 호환 유지',
       codexMode: 'native-openai',
     }
   }
   if (configuredBaseUrl === baseUrl) {
     return {
       configuration: 'conflict',
-      configurationDetail: 'Baton openai_base_url이 있으나 model_provider가 openai가 아닙니다.',
+      configurationDetail: provider !== undefined && provider !== 'openai'
+        ? 'Baton openai_base_url이 있으나 model_provider가 openai가 아닙니다.'
+        : 'Baton openai_base_url이 있으나 기존 Baton 세션 resume 호환 provider가 없습니다.',
       codexMode: 'native-openai',
     }
   }
@@ -804,10 +717,8 @@ function compareModelVersion(a: string, b: string): number {
 
 async function prepareFiles(
   targets: ClientIntegrationTarget[],
-  baseUrl: string,
-  token: string,
+  claudeConnection: ProxyConnection | null,
   models: ClaudeDesktopModel[],
-  codexMode: CodexIntegrationMode,
 ): Promise<PreparedFile[]> {
   const home = homedir()
   const claudeCli = path.join(home, '.claude', 'settings.json')
@@ -815,19 +726,13 @@ async function prepareFiles(
   const files: PreparedFile[] = []
 
   if (targets.includes('claude-cli')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const claudeSource = await readOptional(claudeCli)
-    const claudeConfig = parseJsonObject(claudeSource.content || '{}', 'Claude CLI 설정')
-    const existingEnv = claudeConfig.env
-    if (existingEnv !== undefined && (!existingEnv || typeof existingEnv !== 'object' || Array.isArray(existingEnv))) {
-      throw new ClientIntegrationError(422, 'Claude CLI 설정의 env 값이 객체가 아니어서 안전하게 병합할 수 없습니다.')
-    }
-    claudeConfig.env = {
-      ...(existingEnv as Record<string, unknown> | undefined),
-      ANTHROPIC_BASE_URL: baseUrl,
-      ANTHROPIC_AUTH_TOKEN: token,
-    }
-    const content = `${JSON.stringify(claudeConfig, null, 2)}\n`
-    parseJsonObject(content, '변경된 Claude CLI 설정')
+    const content = patchClaudeCliConfig(
+      claudeSource.content,
+      claudeConnection.baseUrl,
+      null,
+    )
     files.push({
       label: 'Claude CLI',
       target: claudeCli,
@@ -837,19 +742,18 @@ async function prepareFiles(
   }
 
   if (targets.includes('claude-desktop')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const claudeDesktop = await findClaudeDesktopConfig()
     const desktopSource = await readOptional(claudeDesktop)
     if (!desktopSource.existed) {
       throw new ClientIntegrationError(422, 'Claude Desktop의 적용 대상 설정 파일이 사라졌습니다.')
     }
-    const desktopConfig = parseJsonObject(desktopSource.content, 'Claude Desktop 설정')
-    desktopConfig.inferenceProvider = 'gateway'
-    desktopConfig.inferenceCredentialKind = 'static'
-    desktopConfig.inferenceGatewayBaseUrl = baseUrl
-    desktopConfig.inferenceGatewayApiKey = token
-    desktopConfig.inferenceModels = models
-    const content = `${JSON.stringify(desktopConfig, null, 2)}\n`
-    parseJsonObject(content, '변경된 Claude Desktop 설정')
+    const content = patchClaudeDesktopConfig(
+      desktopSource.content,
+      claudeConnection.baseUrl,
+      claudeConnection.token,
+      models,
+    )
     files.push({
       label: 'Claude Desktop',
       target: claudeDesktop,
@@ -860,9 +764,7 @@ async function prepareFiles(
 
   if (targets.includes('codex')) {
     const codexSource = await readOptional(codex)
-    const content = codexMode === 'native-openai'
-      ? patchCodexNativeConfig(codexSource.content, codexNativeProxyBaseUrl())
-      : patchCodexConfig(codexSource.content, `${baseUrl}/v1`)
+    const content = patchCodexNativeConfig(codexSource.content, codexNativeProxyBaseUrl())
     parseToml(content)
     files.push({
       label: 'Codex CLI/Desktop',
@@ -877,9 +779,7 @@ async function prepareFiles(
 
 async function prepareRemovalFiles(
   targets: ClientIntegrationTarget[],
-  baseUrl: string,
-  token: string,
-  codexMode: CodexIntegrationMode,
+  claudeConnection: ProxyConnection | null,
 ): Promise<PreparedFile[]> {
   const home = homedir()
   const claudeCli = path.join(home, '.claude', 'settings.json')
@@ -887,24 +787,30 @@ async function prepareRemovalFiles(
   const files: PreparedFile[] = []
 
   if (targets.includes('claude-cli')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const source = await readOptional(claudeCli)
     if (!source.existed) throw new ClientIntegrationError(409, 'Claude CLI 설정이 이미 없습니다.')
     files.push({
       label: 'Claude CLI',
       target: claudeCli,
-      content: removeClaudeCliConfig(source.content, baseUrl, token),
+      content: removeClaudeCliConfig(
+        source.content,
+        claudeConnection.baseUrl,
+        null,
+      ),
       existed: true,
     })
   }
 
   if (targets.includes('claude-desktop')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const file = await findClaudeDesktopConfig()
     const source = await readOptional(file)
     if (!source.existed) throw new ClientIntegrationError(409, 'Claude Desktop 설정이 이미 없습니다.')
     files.push({
       label: 'Claude Desktop',
       target: file,
-      content: removeClaudeDesktopConfig(source.content, baseUrl, token),
+      content: removeClaudeDesktopConfig(source.content, claudeConnection.baseUrl, claudeConnection.token),
       existed: true,
     })
   }
@@ -915,9 +821,7 @@ async function prepareRemovalFiles(
     files.push({
       label: 'Codex CLI/Desktop',
       target: codex,
-      content: codexMode === 'native-openai'
-        ? unpatchCodexNativeConfig(source.content, codexNativeProxyBaseUrl())
-        : unpatchCodexConfig(source.content, `${baseUrl}/v1`),
+      content: unpatchCodexNativeConfig(source.content, codexNativeProxyBaseUrl()),
       existed: true,
     })
   }
@@ -925,7 +829,7 @@ async function prepareRemovalFiles(
   return files
 }
 
-export function removeClaudeCliConfig(content: string, baseUrl: string, token: string): string {
+export function removeClaudeCliConfig(content: string, baseUrl: string, token: string | null): string {
   const config = parseJsonObject(content, 'Claude CLI 설정')
   const current = inspectClaudeCliConfig(content, baseUrl, token)
   if (current.configuration !== 'applied') {
@@ -1008,95 +912,9 @@ function parseJsonObject(content: string, label: string): Record<string, unknown
 }
 
 /**
- * Preserve all unrelated TOML bytes/comments. We only accept Codex's canonical
- * spelling for an existing owned key/table; unusual equivalent spellings fail
- * instead of risking a duplicate or editing the wrong range.
- */
-export function patchCodexConfig(content: string, baseUrl: string): string {
-  let parsed: Record<string, unknown>
-  try {
-    parsed = parseToml(content) as Record<string, unknown>
-  } catch (error) {
-    throw new ClientIntegrationError(422, `Codex 설정 TOML을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
-  }
-
-  const newline = content.includes('\r\n') ? '\r\n' : '\n'
-  const endedWithNewline = content.endsWith('\n')
-  const lines = content.length ? content.replace(/\r\n/g, '\n').split('\n') : []
-  if (endedWithNewline) lines.pop()
-
-  const firstTable = lines.findIndex((line) => isTableHeader(line))
-  const preambleEnd = firstTable === -1 ? lines.length : firstTable
-  const rootMatches = lines
-    .slice(0, preambleEnd)
-    .map((line, index) => canonicalRootModelProvider(line) ? index : -1)
-    .filter((index) => index >= 0)
-  if ('model_provider' in parsed && rootMatches.length !== 1) {
-    throw new ClientIntegrationError(422, 'Codex의 기존 model_provider가 비표준 표기라 안전하게 교체할 수 없습니다.')
-  }
-  if (rootMatches.length > 1) {
-    throw new ClientIntegrationError(422, 'Codex 설정에 model_provider가 중복되어 있습니다.')
-  }
-
-  const providers = parsed.model_providers
-  const hasBatonProvider = Boolean(
-    providers && typeof providers === 'object' && !Array.isArray(providers) && 'baton' in providers,
-  )
-  const ownedHeaders = lines.filter((line) => isOwnedProviderHeader(line)).length
-  if (hasBatonProvider && ownedHeaders === 0) {
-    throw new ClientIntegrationError(422, '기존 model_providers.baton이 비표준 표기라 안전하게 교체할 수 없습니다.')
-  }
-
-  const output: string[] = []
-  let skipOwnedTable = false
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]
-    if (index < preambleEnd && canonicalRootModelProvider(line)) {
-      output.push('model_provider = "baton"')
-      continue
-    }
-    if (isTableHeader(line)) skipOwnedTable = isOwnedProviderHeader(line)
-    if (!skipOwnedTable) output.push(line)
-  }
-
-  if (rootMatches.length === 0) {
-    const insertion = output.findIndex((line) => isTableHeader(line))
-    const at = insertion === -1 ? output.length : insertion
-    const prefix = at > 0 && output[at - 1].trim() !== '' ? [''] : []
-    output.splice(at, 0, ...prefix, 'model_provider = "baton"', '')
-  }
-
-  while (output.length > 0 && output[output.length - 1].trim() === '') output.pop()
-  const providerBlock = stringifyToml({
-    model_providers: {
-      baton: {
-        name: 'Baton CLIProxy',
-        base_url: baseUrl,
-        env_key: 'BATON_PROXY_TOKEN',
-        wire_api: 'responses',
-      },
-    },
-  }).trimEnd().split('\n')
-  output.push('', ...providerBlock)
-
-  const result = `${output.join(newline)}${newline}`
-  const next = parseToml(result) as Record<string, unknown>
-  const nextProviders = next.model_providers as Record<string, unknown> | undefined
-  const baton = nextProviders?.baton as Record<string, unknown> | undefined
-  if (
-    next.model_provider !== 'baton'
-    || baton?.base_url !== baseUrl
-    || baton?.env_key !== 'BATON_PROXY_TOKEN'
-    || baton?.wire_api !== 'responses'
-  ) {
-    throw new ClientIntegrationError(422, '변경된 Codex 설정의 검증 결과가 예상과 다릅니다.')
-  }
-  return result
-}
-
-/**
- * Keep Codex's reserved built-in `openai` provider identity and change only its
- * transport URL. Existing user/provider values are never overwritten.
+ * Keep Codex's reserved built-in `openai` provider identity, change its
+ * transport URL, and retain a Baton-owned alias for resuming legacy threads
+ * whose session metadata pins `model_provider = "baton"`.
  */
 export function patchCodexNativeConfig(content: string, baseUrl: string): string {
   let parsed: Record<string, unknown>
@@ -1106,8 +924,20 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
     throw new ClientIntegrationError(422, `Codex 설정 TOML을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
   }
 
-  if (parsed.model_provider !== undefined && parsed.model_provider !== 'openai') {
-    throw new ClientIntegrationError(409, '기존 model_provider가 openai가 아니므로 네이티브 모드를 적용하지 않았습니다.')
+  const batonProvider = codexProvider(parsed, 'baton')
+  const managedCompat = isManagedBatonCompatProvider(batonProvider, baseUrl)
+  const migratesLegacyBaton = batonProvider?.env_key === 'BATON_PROXY_TOKEN'
+    && batonProvider?.wire_api === 'responses'
+    && typeof batonProvider?.base_url === 'string'
+  if (batonProvider !== undefined && !managedCompat && !migratesLegacyBaton) {
+    throw new ClientIntegrationError(409, '사용자가 정의한 model_providers.baton이 있어 Baton Native 설정을 적용하지 않았습니다.')
+  }
+  if (
+    parsed.model_provider !== undefined
+    && parsed.model_provider !== 'openai'
+    && !(parsed.model_provider === 'baton' && (managedCompat || migratesLegacyBaton))
+  ) {
+    throw new ClientIntegrationError(409, '사용자가 지정한 model_provider가 있어 Baton Native 설정을 적용하지 않았습니다.')
   }
   if (parsed.openai_base_url !== undefined && parsed.openai_base_url !== baseUrl) {
     throw new ClientIntegrationError(409, '사용자가 설정한 openai_base_url이 있어 덮어쓰지 않았습니다.')
@@ -1117,6 +947,22 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
   const endedWithNewline = content.endsWith('\n')
   const lines = content.length ? content.replace(/\r\n/g, '\n').split('\n') : []
   if (endedWithNewline) lines.pop()
+  const legacyRootMatches = lines.filter((line) => canonicalRootModelProvider(line)).length
+  const legacyTableMatches = lines.filter((line) => isOwnedProviderHeader(line)).length
+  if (
+    parsed.model_provider === 'baton'
+    && (legacyRootMatches !== 1 || legacyTableMatches < 1)
+  ) {
+    throw new ClientIntegrationError(422, '기존 Baton provider가 비표준 표기라 안전하게 Native 설정으로 이전할 수 없습니다.')
+  }
+  const migratedLines: string[] = []
+  let skipLegacyTable = false
+  for (const line of lines) {
+    if (parsed.model_provider === 'baton' && canonicalRootModelProvider(line)) continue
+    if (isTableHeader(line)) skipLegacyTable = (managedCompat || migratesLegacyBaton) && isOwnedProviderHeader(line)
+    if (!skipLegacyTable) migratedLines.push(line)
+  }
+  lines.splice(0, lines.length, ...migratedLines)
   const firstTable = lines.findIndex((line) => isTableHeader(line))
   const preambleEnd = firstTable === -1 ? lines.length : firstTable
   const matches = lines
@@ -1128,16 +974,22 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
   if (matches > 1) {
     throw new ClientIntegrationError(422, 'Codex 설정의 openai_base_url이 중복되어 있습니다.')
   }
-  if (matches === 1) return content
+  if (matches === 1 && managedCompat && parsed.model_provider !== 'baton') return content
 
-  const insertion = firstTable === -1 ? lines.length : firstTable
-  const setting = stringifyToml({ openai_base_url: baseUrl }).trimEnd()
-  lines.splice(insertion, 0, setting)
+  if (matches === 0) {
+    const insertion = firstTable === -1 ? lines.length : firstTable
+    const setting = stringifyToml({ openai_base_url: baseUrl }).trimEnd()
+    lines.splice(insertion, 0, setting)
+  }
+  while (lines.length > 0 && lines.at(-1) === '') lines.pop()
+  if (lines.length > 0) lines.push('')
+  lines.push(...managedBatonCompatProviderLines(baseUrl))
   const result = `${lines.join(newline)}${endedWithNewline ? newline : ''}`
   const next = parseToml(result) as Record<string, unknown>
   if (
     next.openai_base_url !== baseUrl
     || (next.model_provider !== undefined && next.model_provider !== 'openai')
+    || !isManagedBatonCompatProvider(codexProvider(next, 'baton'), baseUrl)
   ) {
     throw new ClientIntegrationError(422, '변경된 Codex 네이티브 설정의 검증 결과가 예상과 다릅니다.')
   }
@@ -1155,6 +1007,7 @@ export function unpatchCodexNativeConfig(content: string, baseUrl: string): stri
   if (
     parsed.openai_base_url !== baseUrl
     || (parsed.model_provider !== undefined && parsed.model_provider !== 'openai')
+    || !isManagedBatonCompatProvider(codexProvider(parsed, 'baton'), baseUrl)
   ) {
     throw new ClientIntegrationError(409, 'Codex 네이티브 Baton 설정이 현재 값과 달라 안전하게 해제할 수 없습니다.')
   }
@@ -1172,71 +1025,20 @@ export function unpatchCodexNativeConfig(content: string, baseUrl: string): stri
     throw new ClientIntegrationError(422, 'Codex openai_base_url이 비표준 또는 중복 표기라 안전하게 해제할 수 없습니다.')
   }
 
-  const output = lines.filter((line, index) => (
-    index >= preambleEnd || !canonicalRootOpenAiBaseUrl(line)
-  ))
+  const output: string[] = []
+  let skipCompatTable = false
+  for (const [index, line] of lines.entries()) {
+    if (isTableHeader(line)) skipCompatTable = isOwnedProviderHeader(line)
+    if (skipCompatTable || (index < preambleEnd && canonicalRootOpenAiBaseUrl(line))) continue
+    output.push(line)
+  }
+  while (output.length > 0 && output.at(-1) === '') output.pop()
   const result = output.length > 0
     ? `${output.join(newline)}${endedWithNewline ? newline : ''}`
     : ''
   const next = parseToml(result) as Record<string, unknown>
-  if (next.openai_base_url !== undefined) {
+  if (next.openai_base_url !== undefined || codexProvider(next, 'baton') !== undefined) {
     throw new ClientIntegrationError(422, '해제된 Codex 네이티브 설정의 검증 결과가 예상과 다릅니다.')
-  }
-  return result
-}
-
-/** Remove only Baton's canonical Codex root key and provider table. */
-export function unpatchCodexConfig(content: string, baseUrl: string): string {
-  let parsed: Record<string, unknown>
-  try {
-    parsed = parseToml(content) as Record<string, unknown>
-  } catch (error) {
-    throw new ClientIntegrationError(422, `Codex 설정 TOML을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
-  }
-  const providers = parsed.model_providers
-  const baton = providers && typeof providers === 'object' && !Array.isArray(providers)
-    ? (providers as Record<string, unknown>).baton
-    : undefined
-  const provider = baton && typeof baton === 'object' && !Array.isArray(baton)
-    ? baton as Record<string, unknown>
-    : undefined
-  if (
-    parsed.model_provider !== 'baton'
-    || provider?.base_url !== baseUrl
-    || provider?.env_key !== 'BATON_PROXY_TOKEN'
-    || provider?.wire_api !== 'responses'
-  ) {
-    throw new ClientIntegrationError(409, 'Codex Baton 설정이 부분 적용되었거나 현재 프록시와 달라 안전하게 해제할 수 없습니다.')
-  }
-
-  const newline = content.includes('\r\n') ? '\r\n' : '\n'
-  const endedWithNewline = content.endsWith('\n')
-  const lines = content.length ? content.replace(/\r\n/g, '\n').split('\n') : []
-  if (endedWithNewline) lines.pop()
-  const firstTable = lines.findIndex((line) => isTableHeader(line))
-  const preambleEnd = firstTable === -1 ? lines.length : firstTable
-  const rootMatches = lines
-    .slice(0, preambleEnd)
-    .filter((line) => canonicalRootModelProvider(line)).length
-  const ownedHeaders = lines.filter((line) => isOwnedProviderHeader(line)).length
-  if (rootMatches !== 1 || ownedHeaders === 0) {
-    throw new ClientIntegrationError(422, 'Codex Baton 설정이 비표준 표기라 안전하게 해제할 수 없습니다.')
-  }
-
-  const output: string[] = []
-  let skipOwnedTable = false
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]
-    if (index < preambleEnd && canonicalRootModelProvider(line)) continue
-    if (isTableHeader(line)) skipOwnedTable = isOwnedProviderHeader(line)
-    if (!skipOwnedTable) output.push(line)
-  }
-  while (output.length > 0 && output[output.length - 1].trim() === '') output.pop()
-  const result = output.length > 0 ? `${output.join(newline)}${newline}` : ''
-  const next = parseToml(result) as Record<string, unknown>
-  const nextProviders = next.model_providers as Record<string, unknown> | undefined
-  if (next.model_provider === 'baton' || nextProviders?.baton !== undefined) {
-    throw new ClientIntegrationError(422, '해제한 Codex 설정의 검증 결과가 예상과 다릅니다.')
   }
   return result
 }
@@ -1255,6 +1057,42 @@ function isTableHeader(line: string): boolean {
 
 function isOwnedProviderHeader(line: string): boolean {
   return /^\s*\[\s*model_providers\s*\.\s*baton(?:\s*\.[^\]]+)?\s*\]\s*(?:#.*)?$/.test(line)
+}
+
+function codexProvider(parsed: Record<string, unknown>, id: string): Record<string, unknown> | undefined {
+  const providers = parsed.model_providers
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) return undefined
+  const provider = (providers as Record<string, unknown>)[id]
+  return provider && typeof provider === 'object' && !Array.isArray(provider)
+    ? provider as Record<string, unknown>
+    : undefined
+}
+
+function isManagedBatonCompatProvider(
+  provider: Record<string, unknown> | undefined,
+  baseUrl: string,
+): boolean {
+  return provider?.name === 'Baton Native (resume compatibility)'
+    && provider.base_url === baseUrl
+    && provider.wire_api === 'responses'
+    && provider.request_max_retries === 0
+    && provider.stream_max_retries === 0
+    && provider.env_key === undefined
+    && provider.requires_openai_auth === undefined
+}
+
+function managedBatonCompatProviderLines(baseUrl: string): string[] {
+  return stringifyToml({
+    model_providers: {
+      baton: {
+        name: 'Baton Native (resume compatibility)',
+        base_url: baseUrl,
+        wire_api: 'responses',
+        request_max_retries: 0,
+        stream_max_retries: 0,
+      },
+    },
+  }).trimEnd().split('\n')
 }
 
 async function assertFilesUnlocked(files: PreparedFile[]): Promise<void> {
@@ -1330,40 +1168,6 @@ async function cleanupPreparedFile(file: PreparedFile, removeBackup: boolean): P
       ? rm(file.backup, { force: true }).catch(() => {})
       : Promise.resolve(),
   ])
-}
-
-async function getUserEnvironmentVariable(name: string): Promise<string | null> {
-  const result = await runPowerShell<{ exists: boolean; value: string | null }>(
-    String.raw`$item = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$value = [Environment]::GetEnvironmentVariable([string]$item.name, 'User')
-[Console]::Out.Write((ConvertTo-Json -Compress @{ exists = ($null -ne $value); value = $value }))`,
-    { name },
-  )
-  return result.exists ? result.value ?? '' : null
-}
-
-async function setUserEnvironmentVariable(name: string, value: string | null): Promise<void> {
-  await runPowerShell(
-    String.raw`$item = [Console]::In.ReadToEnd() | ConvertFrom-Json
-[Environment]::SetEnvironmentVariable([string]$item.name, $item.value, 'User')
-try {
-  Add-Type -Namespace Baton -Name NativeMethods -MemberDefinition @'
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern IntPtr SendMessageTimeout(
-      IntPtr hWnd, uint msg, UIntPtr wParam, string lParam,
-      uint flags, uint timeout, out UIntPtr result);
-'@
-  $broadcastResult = [UIntPtr]::Zero
-  [Baton.NativeMethods]::SendMessageTimeout(
-    [IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, 'Environment', 0x0002, 5000,
-    [ref]$broadcastResult
-  ) | Out-Null
-} catch {
-  # Registry update already succeeded. The clients are required to be relaunched.
-}
-[Console]::Out.Write('{}')`,
-    { name, value },
-  )
 }
 
 async function readOptional(file: string): Promise<{ existed: boolean; content: string }> {

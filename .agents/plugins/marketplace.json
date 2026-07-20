@@ -1,0 +1,20 @@
+{
+  "name": "baton-local",
+  "interface": {
+    "displayName": "Baton Local Plugins"
+  },
+  "plugins": [
+    {
+      "name": "baton-codex-runtime-bridge",
+      "source": {
+        "source": "local",
+        "path": "./plugins/baton-codex-runtime-bridge"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -9,11 +9,14 @@ import {
   ListFilter,
   Menu,
   MessageSquarePlus,
+  Paperclip,
   RefreshCw,
   Send,
+  ShieldCheck,
   Square,
   Trash2,
   Undo2,
+  X,
 } from 'lucide-react'
 
 import { AppNavigation, type AppView } from '@/components/AppNavigation'
@@ -31,7 +34,24 @@ import { cn } from '@/lib/utils'
 import { ConversationApiError, conversationApi } from './api'
 import { composerKeyAction } from './composer-keyboard'
 import { ConversationItem } from './ConversationItem'
-import { conversationEntries, latestUsageSummary } from './conversation-presentation'
+import { conversationEntries, latestUsageSummary, tailConversationEntries } from './conversation-presentation'
+import {
+  clearConversationDraft,
+  applyDraftFolderSelection,
+  classifyFirstTurnFailure,
+  conversationRouteFromUrl,
+  conversationRouteUrl,
+  conversationRouteWithoutSelection,
+  createConversationDraft,
+  editableAfterKnownFailure,
+  freezeFirstTurn,
+  loadConversationDraft,
+  markDeliveryUnknown,
+  markInitialSessionConflict,
+  resolveInitialConversationRoute,
+  saveConversationDraft,
+  type ConversationDraft,
+} from './draft-conversation'
 import {
   GOAL_OBJECTIVE_MAX_CHARS,
   limitGoalObjectiveDraft,
@@ -49,6 +69,7 @@ import {
 } from './session-view-preferences'
 import { isNearScrollBottom } from './conversation-scroll'
 import type {
+  CanonicalFollowUpDto,
   CanonicalGoalDto,
   CanonicalProvider,
   CanonicalSessionDto,
@@ -56,12 +77,44 @@ import type {
   ProviderModelDescriptorDto,
   UnknownMutationResolution,
   ThreadSnapshotDto,
+  ImageArtifactRefDto,
+  PermissionProfile,
 } from './types'
 import { useConversationEvents } from './useConversationEvents'
 
 function errorMessage(error: unknown): string {
   if (error instanceof ConversationApiError) return error.message
   return error instanceof Error ? error.message : String(error)
+}
+
+function loadDraftSafely(): ConversationDraft | null {
+  try {
+    return loadConversationDraft(window.sessionStorage)
+  } catch {
+    return null
+  }
+}
+
+interface InitialConversationState {
+  draft: ConversationDraft | null
+  draftOpen: boolean
+  selectedSessionId: string | null
+  invalidDraftRoute: boolean
+}
+
+function loadInitialConversationState(): InitialConversationState {
+  const draft = loadDraftSafely()
+  return { draft, ...resolveInitialConversationRoute(window.location.href, draft) }
+}
+
+export function folderPickerErrorMessage(error: unknown): string {
+  if (!(error instanceof ConversationApiError)) return errorMessage(error)
+  if (error.code === 'unsupported_os') return '이 운영체제에서는 폴더 선택기를 사용할 수 없습니다.'
+  if (error.code === 'picker_unavailable') return '폴더 선택기를 열 수 없습니다. Baton을 데스크톱 세션에서 실행해 주세요.'
+  if (error.code === 'picker_timeout') return '폴더 선택 시간이 만료됐습니다. 다시 선택해 주세요.'
+  if (error.code === 'invalid_picker_response') return '선택한 폴더 경로를 확인할 수 없습니다.'
+  if (error.code === 'interaction_required') return '폴더는 사용자가 직접 누른 선택 버튼으로만 열 수 있습니다.'
+  return error.message
 }
 
 function latestActiveTurn(turns: CanonicalTurnDto[]): CanonicalTurnDto | null {
@@ -71,6 +124,11 @@ function latestActiveTurn(turns: CanonicalTurnDto[]): CanonicalTurnDto | null {
 }
 
 const PROVIDERS: CanonicalProvider[] = ['codex', 'claude', 'gemini']
+const PERMISSION_LABEL: Record<PermissionProfile, string> = {
+  read_only: '읽기 전용',
+  workspace: '작업공간',
+  full_access: '전체 액세스',
+}
 const PROVIDER_NAME: Record<CanonicalProvider, string> = {
   codex: 'Codex',
   claude: 'Claude',
@@ -85,6 +143,7 @@ const EFFORT_NAME: Record<string, string> = {
 }
 
 const SESSION_PROJECTION_POLL_MS = 10_000
+const TRANSCRIPT_PAGE_SIZE = 200
 
 interface SessionProjectionPollHost {
   setInterval(callback: () => void, delayMs: number): number
@@ -134,11 +193,62 @@ export function requireAppliedGoalStatus(result: GoalStatusMutationResult): void
 
 export function goalEditDescription(status: CanonicalGoalDto['status']): string {
   if (status === 'active') return 'Goal 내용을 저장합니다. 현재 진행 상태와 누적 사용량은 유지됩니다.'
+  if (status === 'verifying') return '진행 중인 완료 검증을 무효화하고 수정된 Goal로 작업을 다시 시작합니다.'
   if (status === 'complete') return 'Goal 내용을 저장하고 같은 Goal을 다시 시작합니다. 누적 사용량은 유지됩니다.'
   if (status === 'budget_limited') {
     return '예산 제한 상태를 유지하려면 내용을 저장할 수 없습니다. 먼저 Goal을 다시 시작한 뒤 수정해 주세요.'
   }
   return 'Goal 내용만 저장합니다. 현재 정지 상태와 누적 사용량은 유지됩니다.'
+}
+
+export interface FollowUpPresentation {
+  label: string
+  tone: 'muted' | 'info' | 'warning'
+  cancellable: boolean
+}
+
+export function followUpPresentation(
+  followUp: Pick<CanonicalFollowUpDto, 'status' | 'targetTurnId' | 'delivery'>,
+  activeTurnId: string | null,
+): FollowUpPresentation {
+  if (followUp.status === 'delivery_unknown') {
+    return { label: '전달 확인 필요', tone: 'warning', cancellable: false }
+  }
+  if (followUp.status === 'stale_goal') {
+    return { label: 'Goal 변경으로 제외', tone: 'muted', cancellable: false }
+  }
+  const targetsCurrent = followUp.targetTurnId !== null && followUp.targetTurnId === activeTurnId
+  if (followUp.status === 'dispatching') {
+    return {
+      label: targetsCurrent ? '현재 턴 전달 중' : '다음 턴 전달 중',
+      tone: 'info',
+      cancellable: false,
+    }
+  }
+  if (followUp.status === 'queued' && targetsCurrent && followUp.delivery === 'steer_or_queue') {
+    return { label: '현재 턴 전달 대기', tone: 'info', cancellable: true }
+  }
+  return { label: '다음 턴 대기', tone: 'muted', cancellable: followUp.status === 'queued' }
+}
+
+export function pendingFollowUps(followUps: readonly CanonicalFollowUpDto[]): CanonicalFollowUpDto[] {
+  return followUps
+    .filter((followUp) => followUp.status !== 'consumed' && followUp.status !== 'cancelled')
+    .toSorted((left, right) => left.sequence - right.sequence)
+}
+
+export function followUpText(followUp: Pick<CanonicalFollowUpDto, 'input'>): string {
+  const text = followUp.input[0]?.payload.text
+  return typeof text === 'string' && text.trim() ? text : '추가 요청'
+}
+
+export function composerSubmissionKind(
+  prompt: string,
+  goalComposerMode: boolean,
+  activeTurnId: string | null,
+): 'goal' | 'follow_up' | 'turn' {
+  if (goalComposerMode || parseGoalComposerCommand(prompt) !== null) return 'goal'
+  return activeTurnId === null ? 'turn' : 'follow_up'
 }
 
 export function replaceSessionProjection(
@@ -149,11 +259,41 @@ export function replaceSessionProjection(
   return sessions.map((session) => session.id === projection.id ? projection : session)
 }
 
+export function retainExplicitSessionSelection(
+  selectedSessionId: string | null,
+  sessions: readonly Pick<CanonicalSessionDto, 'id'>[],
+): string | null {
+  return selectedSessionId !== null && sessions.some((session) => session.id === selectedSessionId)
+    ? selectedSessionId
+    : null
+}
+
+export function isConversationSelectionPending(
+  selectedSessionId: string | null,
+  snapshotSessionId: string | null,
+): boolean {
+  return selectedSessionId !== null && snapshotSessionId !== selectedSessionId
+}
+
+export function shouldApplyThreadSnapshot(
+  selectedSessionId: string | null,
+  snapshotSessionId: string,
+): boolean {
+  return selectedSessionId === snapshotSessionId
+}
+
+export function shouldResetThreadSnapshot(
+  selectedSessionId: string | null,
+  routeSessionId: string,
+): boolean {
+  return selectedSessionId !== routeSessionId
+}
+
 export interface UnknownMutationCall {
   turnId: string
   callId: string
   toolName: string
-  sideEffect: 'workspace_mutation' | 'workspace_command'
+  sideEffect: 'workspace_mutation' | 'workspace_command' | 'host_mutation'
 }
 
 export function unresolvedUnknownMutations(snapshot: ThreadSnapshotDto | null): UnknownMutationCall[] {
@@ -172,7 +312,8 @@ export function unresolvedUnknownMutations(snapshot: ThreadSnapshotDto | null): 
     const toolName = typeof item.payload.name === 'string' ? item.payload.name : null
     const sideEffect = item.payload.sideEffect
     if (!callId || !toolName || completed.has(`${item.turnId}\0${callId}`)
-      || (sideEffect !== 'workspace_mutation' && sideEffect !== 'workspace_command')) return []
+      || (sideEffect !== 'workspace_mutation' && sideEffect !== 'workspace_command'
+        && sideEffect !== 'host_mutation')) return []
     return [{ turnId: item.turnId, callId, toolName, sideEffect }]
   })
 }
@@ -448,6 +589,8 @@ export const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: 
   waiting_tool: { label: '도구 실행', dot: 'bg-info' },
   running: { label: '진행 중', dot: 'bg-ok' },
   queued: { label: '대기 중', dot: 'bg-info' },
+  awaiting_goal_turn: { label: '다음 작업 준비 중', dot: 'bg-info' },
+  verifying: { label: '목표 검증 중', dot: 'bg-info' },
   usage_limited: { label: '사용량 제한', dot: 'bg-warning' },
   budget_limited: { label: '실행 제한', dot: 'bg-warning' },
   blocked: { label: '차단됨', dot: 'bg-destructive' },
@@ -471,7 +614,7 @@ function SessionStatus({ status }: { status: CanonicalSessionDto['workStatus'] |
   const presentation = sessionStatusPresentation(status)
   return (
     <span className="inline-flex shrink-0 items-center gap-1 text-[0.625rem] font-normal text-muted-foreground">
-      <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
+      <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'awaiting_goal_turn' || status === 'verifying' || status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
       {presentation.label}
     </span>
   )
@@ -499,32 +642,47 @@ export function ConversationWorkspace({
   viewPreferences: SessionViewPreferences
   onViewPreferencesChange: (preferences: SessionViewPreferences) => void
 }) {
+  const [initialConversation] = useState(loadInitialConversationState)
   const [sessions, setSessions] = useState<CanonicalSessionDto[] | null>(null)
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initialConversation.selectedSessionId)
   const [snapshot, setSnapshot] = useState<ThreadSnapshotDto | null>(null)
-  const [provider, setProvider] = useState<CanonicalProvider>('codex')
-  const [model, setModel] = useState('')
-  const [effort, setEffort] = useState<string | null>('high')
+  const [draft, setDraft] = useState<ConversationDraft | null>(initialConversation.draft)
+  const [draftOpen, setDraftOpen] = useState(initialConversation.draftOpen)
+  const [provider, setProvider] = useState<CanonicalProvider>(
+    initialConversation.draft?.frozenRequest?.provider ?? initialConversation.draft?.provider ?? 'codex',
+  )
+  const [model, setModel] = useState(
+    initialConversation.draft?.frozenRequest?.model ?? initialConversation.draft?.model ?? '',
+  )
+  const [effort, setEffort] = useState<string | null>(
+    initialConversation.draft?.frozenRequest?.effort ?? initialConversation.draft?.effort ?? 'high',
+  )
   const [catalogs, setCatalogs] = useState<Record<CanonicalProvider, ModelCatalogState | null>>({
     codex: null,
     claude: null,
     gemini: null,
   })
   const [modelCatalogErrors, setModelCatalogErrors] = useState<Partial<Record<CanonicalProvider, string>>>({})
-  const [prompt, setPrompt] = useState('')
+  const [prompt, setPrompt] = useState(
+    initialConversation.draft?.frozenRequest?.input[0]?.payload.text as string
+      ?? initialConversation.draft?.message
+      ?? '',
+  )
   const [error, setError] = useState<string | null>(null)
   const [loadingSessions, setLoadingSessions] = useState(false)
   const [loadingThread, setLoadingThread] = useState(false)
-  const [creating, setCreating] = useState(false)
-  const [createDialogOpen, setCreateDialogOpen] = useState(false)
-  const [createCwd, setCreateCwd] = useState('')
-  const [createInstructions, setCreateInstructions] = useState('')
+  const [folderPickerBusy, setFolderPickerBusy] = useState(false)
   const [workspaceDialogOpen, setWorkspaceDialogOpen] = useState(false)
   const [workspaceCwd, setWorkspaceCwd] = useState('')
   const [workspaceBusy, setWorkspaceBusy] = useState(false)
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
+  const [permissionDialogOpen, setPermissionDialogOpen] = useState(false)
+  const [permissionSelection, setPermissionSelection] = useState<PermissionProfile | 'global'>('global')
+  const [permissionBusy, setPermissionBusy] = useState(false)
+  const [permissionError, setPermissionError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  const [cancellingFollowUpId, setCancellingFollowUpId] = useState<string | null>(null)
   const [goalBusyAction, setGoalBusyAction] = useState<GoalAction | 'create' | null>(null)
   const [goalDialog, setGoalDialog] = useState<'create' | 'replace' | 'edit' | 'resume' | 'clear' | null>(null)
   const [goalDraft, setGoalDraft] = useState('')
@@ -537,24 +695,46 @@ export function ConversationWorkspace({
   const [reconcileNotice, setReconcileNotice] = useState<string | null>(null)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
+  const [attachments, setAttachments] = useState<ImageArtifactRefDto[]>([])
+  const [uploadingImages, setUploadingImages] = useState(false)
+  const [transcriptWindow, setTranscriptWindow] = useState<{ threadId: string | null; limit: number }>({
+    threadId: null,
+    limit: TRANSCRIPT_PAGE_SIZE,
+  })
   const [sessionScope, setSessionScope] = useState<'active' | 'trash'>('active')
   const [pendingArchive, setPendingArchive] = useState<CanonicalSessionDto | null>(null)
   const [changingSessionId, setChangingSessionId] = useState<string | null>(null)
   const threadRequest = useRef(0)
   const sessionListRequest = useRef(0)
   const sessionListBusy = useRef(false)
+  const fullHistoryThreadId = useRef<string | null>(null)
+  const selectedSessionIdRef = useRef<string | null>(selectedSessionId)
+  const draftSessionIdRef = useRef<string | null>(draft?.sessionId ?? null)
+  const draftRef = useRef<ConversationDraft | null>(draft)
+  const draftOpenRef = useRef(draftOpen)
   const transcriptScroller = useRef<HTMLDivElement | null>(null)
   const lastPositionedThread = useRef<string | null>(null)
   const followOutput = useRef(true)
+  const imageInput = useRef<HTMLInputElement | null>(null)
 
   const selectedSession = useMemo(
     () => sessions?.find((session) => session.id === selectedSessionId) ?? null,
     [selectedSessionId, sessions],
   )
+  selectedSessionIdRef.current = selectedSessionId
+  const selectionPending = isConversationSelectionPending(selectedSessionId, snapshot?.session.id ?? null)
+  const isDraft = sessionScope === 'active' && draftOpen && draft !== null && selectedSessionId === null
+  const draftSessionId = draft?.sessionId ?? null
+  draftSessionIdRef.current = draftSessionId
+  draftRef.current = draft
+  draftOpenRef.current = draftOpen
   const threadId = selectedSession?.activeThreadId ?? null
   const currentCatalog = catalogs[provider]
   const models = currentCatalog?.models ?? null
   const selectedModel = models?.find((option) => option.id === model) ?? null
+  const frozenDraftRequest = isDraft ? draft?.frozenRequest ?? null : null
+  const frozenModelMissing = Boolean(frozenDraftRequest
+    && !(catalogs[frozenDraftRequest.provider]?.models ?? []).some((option) => option.id === frozenDraftRequest.model))
   const modelDisplayNames = useMemo(() => Object.fromEntries(
     PROVIDERS.flatMap((candidate) => (catalogs[candidate]?.models ?? []).map((option) => [
       option.id,
@@ -562,6 +742,8 @@ export function ConversationWorkspace({
     ])),
   ), [catalogs])
   const unknownMutations = useMemo(() => unresolvedUnknownMutations(snapshot), [snapshot])
+  const activeTurn = snapshot ? latestActiveTurn(snapshot.turns) : null
+  const visibleFollowUps = pendingFollowUps(snapshot?.followUps ?? [])
 
   const refreshSessions = useCallback(async (background = false) => {
     if (background && sessionListBusy.current) return
@@ -573,8 +755,8 @@ export function ConversationWorkspace({
       if (requestId !== sessionListRequest.current) return
       setSessions(result)
       setSelectedSessionId((current) => {
-        if (current && result.some((session) => session.id === current)) return current
-        return result[0]?.id ?? null
+        if (draftOpenRef.current && draftSessionIdRef.current && sessionScope === 'active' && current === null) return null
+        return retainExplicitSessionSelection(current, result)
       })
       if (!background) setError(null)
     } catch (cause) {
@@ -613,16 +795,34 @@ export function ConversationWorkspace({
   }, [])
 
   useEffect(() => {
+    if (draftOpen && draft?.frozenRequest) {
+      setProvider(draft.frozenRequest.provider)
+      setModel(draft.frozenRequest.model)
+      setEffort(draft.frozenRequest.effort ?? null)
+      const text = draft.frozenRequest.input[0]?.payload.text
+      if (typeof text === 'string') setPrompt(text)
+      return
+    }
     if (!currentCatalog) return
-    const option = currentCatalog.models.find((candidate) => candidate.id === model)
+    const preferredModel = draftOpen && draft ? draft.model : model
+    const option = currentCatalog.models.find((candidate) => candidate.id === preferredModel)
       ?? currentCatalog.models.find((candidate) => candidate.id === currentCatalog.defaultModel)
       ?? currentCatalog.models[0]
       ?? null
+    const optionEffort = draftOpen && draft && option
+      && (draft.effort === null || option.effortLevels.includes(draft.effort))
+      ? draft.effort
+      : option?.defaultEffort ?? null
     setModel(option?.id ?? '')
-    setEffort(option?.defaultEffort ?? null)
-  }, [currentCatalog, model, provider])
+    setEffort(optionEffort)
+    if (draftOpen && draft && option && (draft.model !== option.id || draft.effort !== optionEffort)) {
+      const next = { ...draft, model: option.id, effort: optionEffort }
+      setDraft(next)
+      try { saveConversationDraft(window.sessionStorage, next) } catch { /* storage unavailable */ }
+    }
+  }, [currentCatalog, draft, draftOpen, model, provider])
 
-  const refreshThread = useCallback(async (): Promise<boolean> => {
+  const refreshThread = useCallback(async (fullHistory = false): Promise<boolean> => {
     const requestId = ++threadRequest.current
     if (!threadId) {
       setSnapshot(null)
@@ -631,8 +831,12 @@ export function ConversationWorkspace({
     }
     setLoadingThread(true)
     try {
-      const result = await conversationApi.getThread(threadId)
-      if (requestId === threadRequest.current) {
+      if (fullHistory) fullHistoryThreadId.current = threadId
+      const itemLimit = fullHistory || fullHistoryThreadId.current === threadId
+        ? undefined
+        : TRANSCRIPT_PAGE_SIZE
+      const result = await conversationApi.getThread(threadId, itemLimit)
+      if (shouldApplyThreadSnapshot(selectedSessionIdRef.current, result.session.id)) {
         setSnapshot(result)
         setSessions((current) => replaceSessionProjection(current, result.session))
         setError(null)
@@ -660,36 +864,164 @@ export function ConversationWorkspace({
   }, [refreshModels])
 
   useEffect(() => {
-    void refreshThread()
-    return () => {
-      threadRequest.current += 1
+    if (!isDraft || !draftSessionId) return
+    window.history.replaceState(
+      { batonConversation: { kind: 'draft', sessionId: draftSessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'draft', sessionId: draftSessionId }),
+    )
+  }, [draftSessionId, isDraft])
+
+  useEffect(() => {
+    if (!initialConversation.invalidDraftRoute) return
+    window.history.replaceState(
+      { batonConversation: null },
+      '',
+      conversationRouteWithoutSelection(window.location.href),
+    )
+  }, [initialConversation])
+
+  useEffect(() => {
+    const onPopState = () => {
+      const route = conversationRouteFromUrl(window.location.href)
+      const currentDraft = draftRef.current
+      if (route.kind === 'draft' && currentDraft?.sessionId === route.sessionId) {
+        const frozen = currentDraft.frozenRequest
+        setDraftOpen(true)
+        setSessionScope('active')
+        setSelectedSessionId(null)
+        setSnapshot(null)
+        setProvider(frozen?.provider ?? currentDraft.provider)
+        setModel(frozen?.model ?? currentDraft.model)
+        setEffort(frozen?.effort ?? currentDraft.effort)
+        const text = frozen?.input[0]?.payload.text
+        setPrompt(typeof text === 'string' ? text : currentDraft.message)
+        return
+      }
+      setDraftOpen(false)
+      setPrompt('')
+      if (route.kind === 'session') {
+        setSessionScope('active')
+        if (shouldResetThreadSnapshot(selectedSessionIdRef.current, route.sessionId)) setSnapshot(null)
+        setSelectedSessionId(route.sessionId)
+        return
+      }
+      setSnapshot(null)
+      if (route.kind === 'draft') {
+        window.history.replaceState(
+          { batonConversation: null },
+          '',
+          conversationRouteWithoutSelection(window.location.href),
+        )
+      }
+      setSelectedSessionId(null)
     }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
+  useEffect(() => {
+    // refreshThread increments its own generation, so the next thread request
+    // already invalidates the previous one. Cleanup must not invalidate the
+    // only request issued by a StrictMode remount (home -> conversation).
+    void refreshThread()
   }, [refreshThread])
 
   const onStreamEvent = useCallback(() => refreshThread(), [refreshThread])
   useConversationEvents(threadId, onStreamEvent)
 
-  const createSession = async () => {
-    setCreating(true)
+  const persistDraft = useCallback((next: ConversationDraft) => {
+    setDraft(next)
     try {
-      const cwd = createCwd.trim()
-      const developerInstructions = createInstructions.trim()
-      const created = await conversationApi.createSession({
-        title: null,
-        cwd: cwd || null,
-        ...(developerInstructions ? { instructionSnapshot: { developerInstructions } } : {}),
-      })
-      setSessions((current) => [created, ...(current ?? []).filter((item) => item.id !== created.id)])
-      setSelectedSessionId(created.id)
-      setMobileSidebarOpen(false)
-      setCreateDialogOpen(false)
-      setCreateCwd('')
-      setCreateInstructions('')
-      setError(null)
+      saveConversationDraft(window.sessionStorage, next)
+    } catch {
+      // The in-memory draft remains usable when browser storage is unavailable.
+    }
+  }, [])
+
+  const beginDraft = () => {
+    const next = draft ?? createConversationDraft({ provider, model, effort })
+    persistDraft(next)
+    setDraftOpen(true)
+    setSessionScope('active')
+    setSelectedSessionId(null)
+    setSnapshot(null)
+    setProvider(next.provider)
+    setModel(next.model)
+    setEffort(next.effort)
+    setPrompt(next.message)
+    setAttachments([])
+    setGoalComposerMode(false)
+    setMobileSidebarOpen(false)
+    setError(null)
+    window.history.pushState(
+      { batonConversation: { kind: 'draft', sessionId: next.sessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'draft', sessionId: next.sessionId }),
+    )
+  }
+
+  const discardConflictedDraft = () => {
+    if (!draft?.conflict) return
+    const frozen = draft.frozenRequest
+    const frozenText = frozen?.input[0]?.payload.text
+    const next = {
+      ...createConversationDraft({
+        provider: frozen?.provider ?? draft.provider,
+        model: frozen?.model ?? draft.model,
+        effort: frozen?.effort ?? draft.effort,
+      }),
+      cwd: frozen?.cwd ?? draft.cwd,
+      message: typeof frozenText === 'string' ? frozenText : draft.message,
+    }
+    persistDraft(next)
+    setDraftOpen(true)
+    setSelectedSessionId(null)
+    setProvider(next.provider)
+    setModel(next.model)
+    setEffort(next.effort)
+    setPrompt(next.message)
+    setError(null)
+    window.history.replaceState(
+      { batonConversation: { kind: 'draft', sessionId: next.sessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'draft', sessionId: next.sessionId }),
+    )
+  }
+
+  const updateDraft = (patch: Partial<Pick<ConversationDraft, 'cwd' | 'provider' | 'model' | 'effort' | 'message'>>) => {
+    setDraft((current) => {
+      if (!current || current.frozenRequest) return current
+      const next = { ...current, ...patch }
+      try { saveConversationDraft(window.sessionStorage, next) } catch { /* storage unavailable */ }
+      return next
+    })
+  }
+
+  const pickFolder = async (target: 'draft' | 'workspace') => {
+    const requestedDraftSessionId = target === 'draft' ? draftRef.current?.sessionId ?? null : null
+    setFolderPickerBusy(true)
+    if (target === 'workspace') setWorkspaceError(null)
+    else setError(null)
+    try {
+      const result = await conversationApi.pickNativeFolder()
+      if (result.status === 'cancelled') return
+      if (target === 'workspace') setWorkspaceCwd(result.cwd)
+      else if (requestedDraftSessionId) {
+        setDraft((current) => {
+          const next = applyDraftFolderSelection(current, requestedDraftSessionId, result.cwd)
+          if (next !== current && next) {
+            try { saveConversationDraft(window.sessionStorage, next) } catch { /* storage unavailable */ }
+          }
+          return next
+        })
+      }
     } catch (cause) {
-      setError(errorMessage(cause))
+      const message = folderPickerErrorMessage(cause)
+      if (target === 'workspace') setWorkspaceError(message)
+      else setError(message)
     } finally {
-      setCreating(false)
+      setFolderPickerBusy(false)
     }
   }
 
@@ -725,6 +1057,58 @@ export function ConversationWorkspace({
       setWorkspaceError(errorMessage(cause))
     } finally {
       setWorkspaceBusy(false)
+    }
+  }
+
+  const openPermissionDialog = () => {
+    if (!snapshot) return
+    setPermissionSelection(snapshot.session.permissions.override ?? 'global')
+    setPermissionError(null)
+    setPermissionDialogOpen(true)
+  }
+
+  const updateSessionPermission = async () => {
+    if (!snapshot) return
+    setPermissionBusy(true)
+    setPermissionError(null)
+    try {
+      await conversationApi.updateSessionPermission(
+        snapshot.session.id,
+        permissionSelection === 'global' ? null : permissionSelection,
+      )
+      setPermissionDialogOpen(false)
+      await Promise.all([refreshThread(), refreshSessions(true)])
+    } catch (cause) {
+      setPermissionError(errorMessage(cause))
+    } finally {
+      setPermissionBusy(false)
+    }
+  }
+
+  const addImageFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0 || uploadingImages) return
+    const available = Math.max(0, 8 - attachments.length)
+    const selected = Array.from(files).slice(0, available)
+    if (selected.length === 0) {
+      setError('이미지는 한 메시지에 최대 8개까지 첨부할 수 있습니다.')
+      return
+    }
+    if (selected.some((file) => !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type))) {
+      setError('PNG, JPEG, WebP, GIF 이미지만 첨부할 수 있습니다.')
+      return
+    }
+    setUploadingImages(true)
+    try {
+      const uploaded = await Promise.all(selected.map((file) => conversationApi.uploadImage(file)))
+      setAttachments((current) => [...new Map(
+        [...current, ...uploaded].map((attachment) => [attachment.id, attachment]),
+      ).values()].slice(0, 8))
+      setError(null)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setUploadingImages(false)
+      if (imageInput.current) imageInput.current.value = ''
     }
   }
 
@@ -795,6 +1179,7 @@ export function ConversationWorkspace({
       const result = await conversationApi.setGoalStatus(current.id, {
         expectedRevision: current.revision,
         status: action === 'pause' ? 'paused' : 'active',
+        ...(action === 'resume' ? { provider, model, effort } : {}),
       })
       requireAppliedGoalStatus(result)
       setError(null)
@@ -843,7 +1228,64 @@ export function ConversationWorkspace({
 
   const startTurn = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (!snapshot || !prompt.trim() || !model.trim()) return
+    if ((!snapshot && !isDraft) || (!prompt.trim() && attachments.length === 0)) return
+    if (activeTurn && attachments.length > 0) {
+      setError('이미지는 현재 응답이 끝난 뒤 새 턴에 첨부해 주세요.')
+      return
+    }
+    if (isDraft && draft) {
+      if (!model.trim()) return
+      setSubmitting(true)
+      let frozen = draft
+      try {
+        frozen = draft.frozenRequest
+          ? draft
+          : freezeFirstTurn({ ...draft, provider, model, effort, message: prompt }, attachments)
+        persistDraft(frozen)
+        const result = await conversationApi.createFirstTurn(frozen.sessionId, frozen.frozenRequest!)
+        try { clearConversationDraft(window.sessionStorage) } catch { /* storage unavailable */ }
+        setDraft(null)
+        setDraftOpen(false)
+        setPrompt('')
+        setAttachments([])
+        setSessions((current) => [result.session, ...(current ?? []).filter((item) => item.id !== result.session.id)])
+        setSelectedSessionId(result.session.id)
+        setSnapshot({
+          session: result.session,
+          thread: result.thread,
+          turns: [result.turn],
+          items: result.initialItems,
+          bindings: [],
+          followUps: [],
+          goal: null,
+        })
+        window.history.replaceState(
+          { batonConversation: { kind: 'session', sessionId: result.session.id } },
+          '',
+          conversationRouteUrl(window.location.href, { kind: 'session', sessionId: result.session.id }),
+        )
+        setError(null)
+        void refreshSessions(true)
+      } catch (cause) {
+        const disposition = classifyFirstTurnFailure(cause)
+        const next = disposition === 'editable'
+          ? editableAfterKnownFailure(frozen)
+          : disposition === 'conflict'
+            ? markInitialSessionConflict(frozen)
+            : markDeliveryUnknown(frozen)
+        persistDraft(next)
+        setError(disposition === 'editable'
+          ? errorMessage(cause)
+          : disposition === 'conflict'
+            ? '이 draft ID가 다른 첫 요청에 이미 사용됐습니다. draft를 폐기하고 새 ID로 다시 시작해야 합니다.'
+            : '응답을 확인하지 못했습니다. 아래 버튼은 같은 요청 ID와 본문을 다시 전송해 중복 생성 없이 결과를 확인합니다.')
+      } finally {
+        setSubmitting(false)
+      }
+      return
+    }
+    if (!snapshot) return
+    const submissionKind = composerSubmissionKind(prompt, goalComposerMode, activeTurn?.id ?? null)
     if (goalComposerMode) {
       const objective = prompt.trim()
       const accepted = await handleGoalCommand({ type: 'set', objective })
@@ -853,7 +1295,7 @@ export function ConversationWorkspace({
       }
       return
     }
-    const goalCommand = parseGoalComposerCommand(prompt)
+    const goalCommand = submissionKind === 'goal' ? parseGoalComposerCommand(prompt) : null
     if (goalCommand) {
       if (goalCommand.type === 'open') {
         setGoalComposerMode(true)
@@ -866,21 +1308,31 @@ export function ConversationWorkspace({
     }
     setSubmitting(true)
     try {
-      await conversationApi.startTurn(snapshot.thread.id, {
-        provider,
-        model: model.trim(),
-        effort,
-        clientRequestId: crypto.randomUUID(),
-        expectedRevision: snapshot.thread.revision,
-        input: [
-          {
-            kind: 'user_message',
-            visibility: 'portable',
-            payload: { text: prompt.trim() },
-          },
-        ],
-      })
+      const input = [{
+        kind: 'user_message' as const,
+        visibility: 'portable' as const,
+        payload: { text: prompt.trim(), ...(attachments.length ? { attachments } : {}) },
+      }]
+      if (submissionKind === 'follow_up' && activeTurn) {
+        await conversationApi.enqueueFollowUp(snapshot.thread.id, {
+          clientRequestId: crypto.randomUUID(),
+          expectedTurnId: activeTurn.id,
+          delivery: 'steer_or_queue',
+          input,
+        })
+      } else {
+        if (!model.trim()) return
+        await conversationApi.startTurn(snapshot.thread.id, {
+          provider,
+          model: model.trim(),
+          effort,
+          clientRequestId: crypto.randomUUID(),
+          expectedRevision: snapshot.thread.revision,
+          input,
+        })
+      }
       setPrompt('')
+      setAttachments([])
       setError(null)
       await refreshThread()
     } catch (cause) {
@@ -891,10 +1343,16 @@ export function ConversationWorkspace({
     }
   }
 
-  const activeTurn = snapshot ? latestActiveTurn(snapshot.turns) : null
   const latestTurn = snapshot?.turns.at(-1) ?? null
   const latestUsage = latestUsageSummary(snapshot?.turns ?? [])
-  const visibleEntries = conversationEntries(snapshot?.items ?? [])
+  const visibleEntries = useMemo(
+    () => conversationEntries(snapshot?.items ?? []),
+    [snapshot?.items],
+  )
+  const transcriptLimit = transcriptWindow.threadId === threadId
+    ? transcriptWindow.limit
+    : TRANSCRIPT_PAGE_SIZE
+  const transcriptEntries = tailConversationEntries(visibleEntries, transcriptLimit)
   const turnsById = useMemo(
     () => new Map((snapshot?.turns ?? []).map((turn) => [turn.id, turn] as const)),
     [snapshot?.turns],
@@ -929,17 +1387,40 @@ export function ConversationWorkspace({
     }
   }
 
+  const cancelFollowUp = async (followUp: CanonicalFollowUpDto) => {
+    setCancellingFollowUpId(followUp.id)
+    try {
+      await conversationApi.cancelFollowUp(followUp.id, followUp.revision)
+      setError(null)
+      await refreshThread()
+    } catch (cause) {
+      await refreshThread()
+      setError(errorMessage(cause))
+    } finally {
+      setCancellingFollowUpId(null)
+    }
+  }
+
   const canSubmit = Boolean(
-    snapshot
-      && !selectedSession?.archivedAt
-      && snapshot.thread.status === 'idle'
-      && prompt.trim()
-      && model.trim()
-      && !submitting,
+    (prompt.trim() || attachments.length > 0)
+      && !submitting
+      && !folderPickerBusy
+      && !uploadingImages
+      && !(activeTurn && attachments.length > 0)
+      && (isDraft
+        ? draft && !draft.conflict && model.trim()
+        : snapshot
+          && !selectedSession?.archivedAt
+          && (activeTurn !== null || (snapshot.thread.status === 'idle' && Boolean(model.trim())))),
   )
 
   const selectSession = (sessionId: string) => {
+    setDraftOpen(false)
+    if (sessionId !== selectedSessionId) fullHistoryThreadId.current = null
     setSelectedSessionId(sessionId)
+    setSnapshot(null)
+    setPrompt('')
+    setAttachments([])
     setGoalPanelVersion(0)
     setGoalDialog(null)
     setGoalComposerMode(false)
@@ -948,11 +1429,17 @@ export function ConversationWorkspace({
     setReconcileNote('')
     setReconcileNotice(null)
     setMobileSidebarOpen(false)
+    window.history.replaceState(
+      { batonConversation: { kind: 'session', sessionId } },
+      '',
+      conversationRouteUrl(window.location.href, { kind: 'session', sessionId }),
+    )
   }
 
   const changeScope = (scope: 'active' | 'trash') => {
     if (scope === sessionScope) return
     setSessionScope(scope)
+    setDraftOpen(false)
     setSessions(null)
     setSelectedSessionId(null)
     setSnapshot(null)
@@ -1011,6 +1498,9 @@ export function ConversationWorkspace({
         const result = await conversationApi.setGoalStatus(current.id, {
           expectedRevision: current.revision,
           status: 'active',
+          provider,
+          model,
+          effort,
           resetLimitCounters: true,
         })
         requireAppliedGoalStatus(result)
@@ -1062,14 +1552,12 @@ export function ConversationWorkspace({
       sessions={sessions}
       selectedSessionId={selectedSessionId}
       loading={loadingSessions}
-      creating={creating}
+      creating={submitting && isDraft}
       scope={sessionScope}
       preferences={viewPreferences}
       onSelect={selectSession}
       onCreate={() => {
-        setMobileSidebarOpen(false)
-        setError(null)
-        setCreateDialogOpen(true)
+        beginDraft()
       }}
       onRefresh={() => void refreshSessions()}
       onPreferencesChange={onViewPreferencesChange}
@@ -1114,37 +1602,36 @@ export function ConversationWorkspace({
         onImported={refreshSessions}
       />
 
-      <Dialog open={createDialogOpen} onOpenChange={(open) => { if (!creating) setCreateDialogOpen(open) }}>
+      <Dialog open={permissionDialogOpen} onOpenChange={(open) => { if (!permissionBusy) setPermissionDialogOpen(open) }}>
         <DialogContent className="max-w-md">
-          <DialogTitle>새 대화</DialogTitle>
+          <DialogTitle>대화 권한</DialogTitle>
           <DialogDescription>
-            프로젝트 폴더를 연결하면 Baton이 그 폴더 안에서만 파일 도구를 사용할 수 있습니다.
+            이 대화의 다음 턴부터 적용합니다. 실행 중인 턴은 시작할 때 고정된 권한을 유지합니다.
           </DialogDescription>
-          {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
-          <label className="space-y-1.5 text-sm">
-            <span className="font-medium">프로젝트 폴더 <span className="font-normal text-muted-foreground">선택</span></span>
-            <input
-              value={createCwd}
-              onChange={(event) => setCreateCwd(event.target.value)}
-              placeholder="C:\\projects\\my-app"
-              autoFocus
-              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            />
-          </label>
-          <details className="rounded-xl border px-3 py-2 text-sm">
-            <summary className="cursor-pointer select-none font-medium">대화 지침</summary>
-            <textarea
-              value={createInstructions}
-              onChange={(event) => setCreateInstructions(event.target.value)}
-              rows={5}
-              className="mt-2 w-full resize-y bg-transparent text-sm leading-6 outline-none"
-              placeholder="이 대화에서 항상 따라야 할 지침"
-            />
-          </details>
+          <div className="space-y-2">
+            <label className="flex items-start gap-2 rounded-xl border p-3 text-sm">
+              <input type="radio" name="session-permission" value="global" checked={permissionSelection === 'global'} onChange={() => setPermissionSelection('global')} />
+              <span><span className="block font-medium">전역 설정 따름</span><span className="text-xs text-muted-foreground">현재 {snapshot ? PERMISSION_LABEL[snapshot.session.permissions.defaultProfile] : ''}</span></span>
+            </label>
+            {(['read_only', 'workspace', 'full_access'] as const).map((profile) => (
+              <label key={profile} className="flex items-start gap-2 rounded-xl border p-3 text-sm">
+                <input type="radio" name="session-permission" value={profile} checked={permissionSelection === profile} onChange={() => setPermissionSelection(profile)} />
+                <span>
+                  <span className="block font-medium">{PERMISSION_LABEL[profile]}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {profile === 'read_only' ? '프로젝트 읽기·검색만 허용'
+                      : profile === 'workspace' ? '프로젝트 파일 변경과 샌드박스 명령 허용'
+                        : 'OS 샌드박스 없이 adb를 포함한 로컬 명령·네트워크 허용'}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+          {permissionError ? <p role="alert" className="text-sm text-destructive">{permissionError}</p> : null}
           <div className="flex justify-end gap-2">
-            <Button type="button" variant="ghost" disabled={creating} onClick={() => setCreateDialogOpen(false)}>취소</Button>
-            <Button type="button" disabled={creating} onClick={() => void createSession()}>
-              {creating ? '만드는 중…' : '대화 시작'}
+            <Button type="button" variant="ghost" disabled={permissionBusy} onClick={() => setPermissionDialogOpen(false)}>취소</Button>
+            <Button type="button" disabled={permissionBusy || snapshot?.thread.status !== 'idle'} onClick={() => void updateSessionPermission()}>
+              {permissionBusy ? '적용 중…' : snapshot?.thread.status !== 'idle' ? '현재 턴 종료 후 변경' : '적용'}
             </Button>
           </div>
         </DialogContent>
@@ -1159,14 +1646,25 @@ export function ConversationWorkspace({
           {workspaceError ? <p role="alert" className="text-sm text-destructive">{workspaceError}</p> : null}
           <label className="space-y-1.5 text-sm">
             <span className="font-medium">프로젝트 폴더</span>
-            <input
-              value={workspaceCwd}
-              onChange={(event) => setWorkspaceCwd(event.target.value)}
-              placeholder="C:\\projects\\my-app"
-              autoFocus
-              disabled={workspaceBusy}
-              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            />
+            <div className="flex gap-2">
+              <input
+                value={workspaceCwd}
+                onChange={(event) => setWorkspaceCwd(event.target.value)}
+                placeholder="폴더를 선택하세요"
+                autoFocus
+                disabled={workspaceBusy || folderPickerBusy}
+                className="min-w-0 flex-1 rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              <Button
+                type="button"
+                variant="outline"
+                disabled={workspaceBusy || folderPickerBusy}
+                onClick={() => void pickFolder('workspace')}
+              >
+                <FolderOpen aria-hidden />
+                {folderPickerBusy ? '여는 중…' : '폴더 선택'}
+              </Button>
+            </div>
           </label>
           <div className="flex items-center justify-end gap-2">
             {snapshot?.session.cwd ? (
@@ -1336,18 +1834,37 @@ export function ConversationWorkspace({
           </Button>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-sm font-semibold">
-              {selectedSession?.title || selectedSession?.preview || (sessionScope === 'trash' ? '휴지통' : '새 대화')}
+              {selectedSession?.title || selectedSession?.preview || (selectionPending ? '대화를 불러오는 중…' : sessionScope === 'trash' ? '휴지통' : '새 대화')}
             </h1>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             {sessionScope === 'trash'
               ? <span>읽기 전용</span>
-              : snapshot ? <SessionStatus status={snapshot.session.workStatus} /> : <span>준비됨</span>}
+              : isDraft ? <span>저장 전</span>
+                : snapshot ? <SessionStatus status={snapshot.session.workStatus} /> : <span>준비됨</span>}
             {sessionScope === 'active' ? <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge> : null}
+            {snapshot && sessionScope === 'active' ? (
+              <Button type="button" variant="ghost" size="xs" onClick={openPermissionDialog}>
+                <ShieldCheck aria-hidden />
+                {PERMISSION_LABEL[snapshot.session.permissions.effectiveProfile]}
+              </Button>
+            ) : null}
             {snapshot && sessionScope === 'active' ? (
               <Button type="button" variant="ghost" size="xs" onClick={openWorkspaceDialog}>
                 <FolderOpen aria-hidden />
                 {snapshot.session.cwd ? '폴더 연결됨' : '폴더 연결'}
+              </Button>
+            ) : null}
+            {isDraft ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="xs"
+                disabled={folderPickerBusy || Boolean(draft?.frozenRequest)}
+                onClick={() => void pickFolder('draft')}
+              >
+                <FolderOpen aria-hidden />
+                {draft?.cwd ? '폴더 연결됨' : '폴더 선택'}
               </Button>
             ) : null}
           </div>
@@ -1414,13 +1931,26 @@ export function ConversationWorkspace({
               </section>
             ) : null}
 
-            {loadingThread && !snapshot ? (
-              <p className="m-auto text-sm text-muted-foreground">대화를 불러오는 중…</p>
+            {selectionPending || (loadingThread && !snapshot) ? (
+              <div className="m-auto space-y-3 text-center">
+                <p className="text-sm text-muted-foreground">대화를 불러오는 중…</p>
+                {error && threadId ? (
+                  <Button type="button" size="sm" variant="outline" onClick={() => void refreshThread()}>
+                    다시 시도
+                  </Button>
+                ) : null}
+              </div>
             ) : !snapshot ? (
               <div className="m-auto max-w-md py-16 text-center">
                 <h2 className="text-2xl font-semibold tracking-tight">{sessionScope === 'trash' ? '휴지통이 비어 있습니다' : '무엇을 도와드릴까요?'}</h2>
                 <p className="mt-3 text-sm text-muted-foreground">
-                  {sessionScope === 'trash' ? '삭제한 대화는 30일 동안 여기에 보관됩니다.' : '왼쪽에서 대화를 선택하거나 새 대화를 시작하세요.'}
+                  {sessionScope === 'trash'
+                    ? '삭제한 대화는 30일 동안 여기에 보관됩니다.'
+                    : isDraft
+                      ? draft?.cwd
+                        ? `${draft.cwd}에서 파일 도구를 사용합니다. 첫 메시지를 보내면 대화가 저장됩니다.`
+                        : '일반 대화로 시작합니다. 파일 도구가 필요하면 폴더를 선택하세요.'
+                      : '왼쪽에서 대화를 선택하거나 새 대화를 시작하세요.'}
                 </p>
               </div>
             ) : visibleEntries.length === 0 ? (
@@ -1430,9 +1960,38 @@ export function ConversationWorkspace({
               </div>
             ) : (
               <div>
-                {visibleEntries.map(({ item, toolResult }, index) => {
+                {snapshot.itemsTruncated || transcriptEntries.hiddenCount > 0 ? (
+                  <div className="mb-6 flex flex-col items-center gap-2 text-center">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={loadingThread}
+                      onClick={() => {
+                        if (snapshot.itemsTruncated) {
+                          void refreshThread(true)
+                          return
+                        }
+                        setTranscriptWindow({
+                          threadId,
+                          limit: transcriptLimit + TRANSCRIPT_PAGE_SIZE,
+                        })
+                      }}
+                    >
+                      {snapshot.itemsTruncated
+                        ? '이전 기록 불러오기'
+                        : `이전 기록 ${Math.min(TRANSCRIPT_PAGE_SIZE, transcriptEntries.hiddenCount)}개 더 보기`}
+                    </Button>
+                    <p className="text-xs text-muted-foreground">
+                      {snapshot.itemsTruncated
+                        ? '빠른 표시를 위해 최근 기록부터 불러왔습니다.'
+                        : `빠른 표시를 위해 이전 기록 ${transcriptEntries.hiddenCount}개를 접었습니다.`}
+                    </p>
+                  </div>
+                ) : null}
+                {transcriptEntries.entries.map(({ item, toolResult }, index) => {
                   const compact = isCompactTranscriptItem(item)
-                  const previousCompact = index > 0 && isCompactTranscriptItem(visibleEntries[index - 1]!.item)
+                  const previousCompact = index > 0 && isCompactTranscriptItem(transcriptEntries.entries[index - 1]!.item)
                   return (
                     <div key={item.id} className={cn(index > 0 && (compact && previousCompact ? 'mt-2' : 'mt-7'))}>
                       <ConversationItem
@@ -1467,15 +2026,73 @@ export function ConversationWorkspace({
           </div>
         ) : (
         <div className="shrink-0 bg-gradient-to-t from-background via-background to-background/0 px-3 pb-4 pt-2 sm:px-6 sm:pb-6">
+          {visibleFollowUps.length > 0 ? (
+            <section
+              className="mx-auto mb-2 w-full max-w-3xl rounded-xl border bg-background/95 px-3 py-2 shadow-sm"
+              aria-label="대기 중인 추가 요청"
+            >
+              <div className="mb-1 flex items-center gap-2 text-xs font-medium">
+                <span>추가 요청</span>
+                <span className="tabular-nums text-muted-foreground">{visibleFollowUps.length}</span>
+              </div>
+              <div className="space-y-1">
+                {visibleFollowUps.map((followUp) => {
+                  const presentation = followUpPresentation(followUp, activeTurn?.id ?? null)
+                  return (
+                    <div key={followUp.id} className="flex min-w-0 items-center gap-2 rounded-lg px-1 py-1 text-xs">
+                      <span className="w-5 shrink-0 text-right tabular-nums text-muted-foreground">{followUp.sequence}</span>
+                      <span className="min-w-0 flex-1 truncate" title={followUpText(followUp)}>{followUpText(followUp)}</span>
+                      <span className={cn(
+                        'shrink-0 rounded-md px-1.5 py-0.5',
+                        presentation.tone === 'warning' && 'bg-warning/15 text-warning-foreground',
+                        presentation.tone === 'info' && 'bg-info/10 text-info',
+                        presentation.tone === 'muted' && 'bg-muted text-muted-foreground',
+                      )}>
+                        {presentation.label}
+                      </span>
+                      {presentation.cancellable ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-xs"
+                          disabled={cancellingFollowUpId === followUp.id}
+                          onClick={() => void cancelFollowUp(followUp)}
+                          aria-label={`추가 요청 ${followUp.sequence} 취소`}
+                        >
+                          ×
+                        </Button>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+            </section>
+          ) : null}
           {snapshot?.goal ? (
             <GoalControl
               key={`${snapshot.goal.id}:${goalPanelVersion}`}
               goal={snapshot.goal}
+              workStatus={['awaiting_goal_turn', 'queued', 'running', 'waiting_tool'].includes(snapshot.session.workStatus)
+                ? snapshot.session.workStatus as 'awaiting_goal_turn' | 'queued' | 'running' | 'waiting_tool'
+                : undefined}
               busyAction={goalBusyAction === 'create' ? null : goalBusyAction}
               defaultExpanded={goalPanelVersion > 0}
               className="mx-auto mb-2 w-full max-w-3xl"
               onAction={(action) => { void applyGoalAction(action) }}
             />
+          ) : null}
+          {isDraft && draft?.deliveryUnknown ? (
+            <p className="mx-auto mb-2 w-full max-w-3xl rounded-xl border border-warning/50 bg-warning/10 px-3 py-2 text-xs leading-5" role="status">
+              첫 요청의 응답을 확인하지 못했습니다. 입력값을 고정했으며 다시 보내면 같은 요청으로 결과만 확인합니다.
+            </p>
+          ) : null}
+          {isDraft && draft?.conflict ? (
+            <div className="mx-auto mb-2 flex w-full max-w-3xl items-center gap-3 rounded-xl border border-destructive/40 bg-destructive/10 px-3 py-2">
+              <p className="min-w-0 flex-1 text-xs leading-5">이 draft ID는 다른 요청에 이미 사용됐습니다.</p>
+              <Button type="button" size="sm" variant="outline" onClick={discardConflictedDraft}>
+                draft 폐기하고 새 대화
+              </Button>
+            </div>
           ) : null}
           <form
             className="mx-auto w-full max-w-3xl rounded-2xl border bg-background p-2 shadow-lg shadow-black/5"
@@ -1498,11 +2115,36 @@ export function ConversationWorkspace({
                 </button>
               </div>
             ) : null}
+            {attachments.length > 0 ? (
+              <div className="flex gap-2 overflow-x-auto px-2 pt-2" aria-label="첨부 이미지">
+                {attachments.map((attachment) => (
+                  <div key={attachment.id} className="group relative size-20 shrink-0 overflow-hidden rounded-xl border bg-muted">
+                    <img
+                      src={conversationApi.imageUrl(attachment.id)}
+                      alt={attachment.fileName}
+                      className="size-full object-cover"
+                    />
+                    <button
+                      type="button"
+                      className="absolute right-1 top-1 rounded-full bg-background/90 p-1 opacity-90 shadow-sm hover:opacity-100"
+                      aria-label={`${attachment.fileName} 첨부 제거`}
+                      onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}
+                    >
+                      <X className="size-3" aria-hidden />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <textarea
               value={prompt}
-              onChange={(event) => setPrompt(goalComposerMode
-                ? limitGoalObjectiveDraft(event.target.value)
-                : event.target.value)}
+              onChange={(event) => {
+                const value = goalComposerMode
+                  ? limitGoalObjectiveDraft(event.target.value)
+                  : event.target.value
+                setPrompt(value)
+                if (isDraft) updateDraft({ message: value })
+              }}
               onKeyDown={(event) => {
                 const action = composerKeyAction({
                   key: event.key,
@@ -1515,18 +2157,64 @@ export function ConversationWorkspace({
                 if (canSubmit) event.currentTarget.form?.requestSubmit()
               }}
               rows={2}
-              placeholder={goalComposerMode ? 'Goal 내용 입력' : '메시지 보내기'}
+              disabled={Boolean(isDraft && draft?.frozenRequest)}
+              placeholder={goalComposerMode ? 'Goal 내용 입력' : activeTurn ? '추가 요청 보내기' : '메시지 보내기'}
               aria-label="메시지"
               aria-keyshortcuts="Enter Shift+Enter"
               className="max-h-48 min-h-14 w-full resize-none bg-transparent px-2 py-2 text-[0.9375rem] leading-6 text-foreground outline-none placeholder:text-muted-foreground"
             />
 
             <div className="flex flex-wrap items-center gap-2 px-1 pb-1">
-              {!snapshot?.goal && !goalComposerMode ? (
+              <input
+                ref={imageInput}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                multiple
+                className="hidden"
+                onChange={(event) => void addImageFiles(event.currentTarget.files)}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                title="이미지 첨부"
+                aria-label="이미지 첨부"
+                disabled={uploadingImages || goalComposerMode || Boolean(activeTurn) || attachments.length >= 8}
+                onClick={() => imageInput.current?.click()}
+              >
+                <Paperclip aria-hidden />
+              </Button>
+              {isDraft ? (
+                <div className="flex items-center gap-1">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    title={draft?.cwd ?? '파일 도구는 폴더를 선택한 대화에서만 사용할 수 있습니다.'}
+                    disabled={folderPickerBusy || Boolean(draft?.frozenRequest)}
+                    onClick={() => void pickFolder('draft')}
+                  >
+                    <FolderOpen aria-hidden />
+                    {folderPickerBusy ? '여는 중…' : draft?.cwd ? '폴더 변경' : '폴더 선택'}
+                  </Button>
+                  {draft?.cwd ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      disabled={Boolean(draft.frozenRequest)}
+                      onClick={() => updateDraft({ cwd: null })}
+                    >
+                      일반 대화
+                    </Button>
+                  ) : null}
+                </div>
+              ) : !snapshot?.goal && !goalComposerMode ? (
                 <Button
                   type="button"
                   variant="ghost"
                   size="xs"
+                  disabled={attachments.length > 0}
                   onClick={() => {
                     setPrompt((current) => limitGoalObjectiveDraft(current))
                     setGoalComposerMode(true)
@@ -1548,12 +2236,22 @@ export function ConversationWorkspace({
                   setProvider(nextProvider)
                   setModel(next.id)
                   setEffort(next?.defaultEffort ?? null)
+                  if (isDraft) updateDraft({
+                    provider: nextProvider,
+                    model: next.id,
+                    effort: next.defaultEffort ?? null,
+                  })
                 }}
-                disabled={PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
+                disabled={Boolean(activeTurn) || Boolean(isDraft && draft?.frozenRequest) || PROVIDERS.every((candidate) => (catalogs[candidate]?.models.length ?? 0) === 0)}
                 aria-label="모델"
                 className="min-w-0 max-w-64 rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs font-medium text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {!model ? <option value="">모델 불러오는 중…</option> : null}
+                >
+                  {!model ? <option value="">모델 불러오는 중…</option> : null}
+                  {frozenModelMissing && frozenDraftRequest ? (
+                    <option value={`${frozenDraftRequest.provider}:${frozenDraftRequest.model}`}>
+                      {frozenDraftRequest.model}
+                    </option>
+                  ) : null}
                 {PROVIDERS.map((candidate) => {
                   const catalog = catalogs[candidate]
                   const unavailable = catalog !== null && catalog.models.length === 0
@@ -1565,7 +2263,9 @@ export function ConversationWorkspace({
                     >
                       {(catalog?.models ?? []).map((option) => (
                         <option key={option.id} value={`${candidate}:${option.id}`}>
-                          {option.displayName}
+                          {option.displayName} · {option.contextWindowTokens >= 1_000_000
+                            ? `${option.contextWindowTokens / 1_000_000}M`
+                            : `${Math.round(option.contextWindowTokens / 1_000)}K`}
                         </option>
                       ))}
                     </optgroup>
@@ -1573,14 +2273,21 @@ export function ConversationWorkspace({
                 })}
               </select>
 
-              {selectedModel && selectedModel.effortLevels.length > 0 ? (
+              {(selectedModel && selectedModel.effortLevels.length > 0) || (frozenDraftRequest && effort) ? (
                 <select
                   value={effort ?? ''}
-                  onChange={(event) => setEffort(event.target.value || null)}
+                  onChange={(event) => {
+                    const nextEffort = event.target.value || null
+                    setEffort(nextEffort)
+                    if (isDraft) updateDraft({ effort: nextEffort })
+                  }}
+                  disabled={Boolean(activeTurn) || Boolean(isDraft && draft?.frozenRequest)}
                   aria-label="Reasoning effort"
                   className="rounded-lg border-0 bg-muted/70 px-2 py-1.5 text-xs text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
                 >
-                  {selectedModel.effortLevels.map((level) => (
+                  {(selectedModel?.effortLevels.length
+                    ? selectedModel.effortLevels
+                    : effort ? [effort] : []).map((level) => (
                     <option key={level} value={level}>{EFFORT_NAME[level] ?? level}</option>
                   ))}
                 </select>
@@ -1594,9 +2301,17 @@ export function ConversationWorkspace({
               />
 
               <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-                {snapshot?.thread.status === 'running' ? '응답을 생성하고 있습니다' : ''}
+                {activeTurn ? '응답 생성 중 · 추가 요청 가능' : ''}
               </span>
 
+              <Button
+                type="submit"
+                size="icon-sm"
+                disabled={!canSubmit}
+                aria-label={isDraft && draft?.deliveryUnknown ? '같은 첫 요청 다시 확인' : activeTurn ? '추가 요청 보내기' : '메시지 보내기'}
+              >
+                <Send aria-hidden />
+              </Button>
               {activeTurn ? (
                 <Button
                   type="button"
@@ -1608,11 +2323,7 @@ export function ConversationWorkspace({
                 >
                   <Square className="size-3 fill-current" aria-hidden />
                 </Button>
-              ) : (
-                <Button type="submit" size="icon-sm" disabled={!canSubmit} aria-label="메시지 보내기">
-                  <Send aria-hidden />
-                </Button>
-              )}
+              ) : null}
             </div>
           </form>
           {modelCatalogErrors[provider] ? (

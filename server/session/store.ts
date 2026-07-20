@@ -1,10 +1,20 @@
 import type {
   AppendEventInput,
+  BeginSessionResult,
   BeginTurnInput,
   BeginTurnResult,
   CanonicalItem,
   CanonicalFollowUp,
   CanonicalGoal,
+  GoalCompletionProposal,
+  GoalCompletionReceipt,
+  GoalEvidenceBundle,
+  GoalRequirementClaim,
+  GoalVerificationDecision,
+  GoalVerificationHistory,
+  GoalVerificationAttempt,
+  GoalStopReceipt,
+  GoalVerifierLease,
   CanonicalProvider,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -27,6 +37,8 @@ import type {
   TurnId,
   UpsertProviderBindingInput,
   ProviderBinding,
+  GlobalPermissionSettings,
+  PermissionProfile,
 } from './domain.ts'
 import type { NativeImportStore } from './native-import/contracts.ts'
 
@@ -91,6 +103,9 @@ export interface UpdateGoalStatusInput {
   goalId: GoalId
   expectedRevision: number
   status: GoalStatus
+  provider?: CanonicalProvider
+  model?: string
+  effort?: string | null
   reason?: GoalStatusReason | null
   resetLimitCounters?: boolean
 }
@@ -150,6 +165,53 @@ export interface GoalTurnContext {
   leaseId: string
 }
 
+export interface BeginGoalVerificationInput {
+  goalId: GoalId
+  goalRevision: number
+  turnId: TurnId
+  summary: string
+  requirements: GoalRequirementClaim[]
+  evidenceBundle: GoalEvidenceBundle
+}
+
+export interface FinishGoalVerificationInput {
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  evaluatorProvider: CanonicalProvider
+  evaluatorModel: string
+  decision: GoalVerificationDecision
+  usage?: Record<string, unknown> | null
+  leaseId: string
+  leaseOwner: string
+}
+
+export interface ClaimGoalVerifierLeaseInput {
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  ownerId: string
+  leaseDurationMs?: number
+}
+
+export interface HeartbeatGoalVerifierLeaseInput extends ClaimGoalVerifierLeaseInput {
+  leaseId: string
+}
+
+export interface ReleaseGoalVerifierLeaseInput {
+  proposalId: string
+  leaseId: string
+  ownerId: string
+}
+
+export interface FinishGoalVerificationResult {
+  status: 'applied' | 'stale'
+  goal: CanonicalGoal | null
+  attempt: GoalVerificationAttempt | null
+  receipt: GoalCompletionReceipt | null
+  stopReceipt: GoalStopReceipt | null
+}
+
 export interface EnqueueFollowUpInput {
   threadId: ThreadId
   clientRequestId: string
@@ -195,8 +257,36 @@ export interface CloseFollowUpWindowResult {
   inFlight: number
 }
 
+export type BeginTurnFromFollowUpInput = Omit<BeginTurnInput,
+  'clientRequestId' | 'requestHash' | 'expectedRevision' | 'input'> & {
+    followUpId: FollowUpId
+    ownerId: string
+  }
+
 export type GoalAwareBeginTurnInput = BeginTurnInput & {
   goalContext?: GoalTurnContext | null
+}
+
+export interface BeginSessionInput {
+  sessionId: SessionId
+  clientRequestId: string
+  requestHash: string
+  cwd: string | null
+  instructionSnapshot: Record<string, unknown>
+  provider: CanonicalProvider
+  model: string
+  effort: string | null
+  input: BeginTurnInput['input']
+  adapterVersion: string
+  policySnapshot: BeginTurnInput['policySnapshot']
+  budget?: Record<string, unknown>
+  leaseExpiresAt?: string | null
+}
+
+export interface InitialSessionRequestIdentity {
+  sessionId: SessionId
+  clientRequestId: string
+  requestHash: string
 }
 
 export interface UpdateWorkspaceInput {
@@ -206,8 +296,18 @@ export interface UpdateWorkspaceInput {
   cwd: string | null
 }
 
+export interface UpdateSessionPermissionProfileInput {
+  sessionId: SessionId
+  profile: PermissionProfile | null
+}
+
 export interface SessionStore extends NativeImportStore {
+  getPermissionSettings(): GlobalPermissionSettings
+  updateDefaultPermissionProfile(profile: PermissionProfile): GlobalPermissionSettings
+  updateSessionPermissionProfile(input: UpdateSessionPermissionProfileInput): CanonicalSession
   createSession(input: CreateSessionInput): CanonicalSession
+  getInitialSessionResult(input: InitialSessionRequestIdentity): BeginSessionResult | null
+  beginSession(input: BeginSessionInput): BeginSessionResult
   listSessions(scope?: SessionListScope): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null
   archiveSession(sessionId: SessionId): CanonicalSession
@@ -219,6 +319,7 @@ export interface SessionStore extends NativeImportStore {
   forkThread(input: ForkThreadInput): CanonicalThread
 
   beginTurn(input: GoalAwareBeginTurnInput): BeginTurnResult
+  beginTurnFromFollowUp(input: BeginTurnFromFollowUpInput): BeginTurnResult
   getTurn(turnId: TurnId): CanonicalTurn | null
   setTurnActivity(turnId: TurnId, status: Extract<CanonicalTurn['status'], 'running' | 'waiting_tool'>): CanonicalTurn
   appendProviderEvent(input: AppendEventInput): CanonicalItem[]
@@ -226,12 +327,16 @@ export interface SessionStore extends NativeImportStore {
   finishTurn(input: FinishTurnInput): CanonicalTurn
   enqueueFollowUp(input: EnqueueFollowUpInput): EnqueueFollowUpResult
   listFollowUps(threadId: ThreadId): CanonicalFollowUp[]
+  getFollowUpByClientRequest(threadId: ThreadId, clientRequestId: string): CanonicalFollowUp | null
   claimFollowUp(input: ClaimFollowUpInput): CanonicalFollowUp | null
   consumeFollowUp(input: ConsumeFollowUpInput): ConsumeFollowUpResult
   requeueFollowUp(input: RequeueFollowUpInput): CanonicalFollowUp
   closeFollowUpWindow(turnId: TurnId): CloseFollowUpWindowResult
   markStaleGoalFollowUps(threadId: ThreadId): number
   recoverExpiredFollowUpClaims(cutoffIso?: string): number
+  cancelFollowUp(followUpId: FollowUpId, expectedRevision: number): CanonicalFollowUp
+  markFollowUpDeliveryUnknown(followUpId: FollowUpId, ownerId: string): CanonicalFollowUp
+  markTurnFollowUpsDeliveryUnknown(turnId: TurnId): number
   upsertProviderBinding(input: UpsertProviderBindingInput): ProviderBinding
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]
   listEvents(threadId: ThreadId, afterSequence?: number): CanonicalStreamEvent[]
@@ -241,6 +346,8 @@ export interface SessionStore extends NativeImportStore {
   getGoalById(goalId: GoalId): CanonicalGoal | null
   listActiveGoals(): CanonicalGoal[]
   listGoalEvents(threadId: ThreadId, afterSequence?: number): GoalEvent[]
+  listPendingGoalCompletionProposals(): GoalCompletionProposal[]
+  getGoalVerificationHistory(goalId: GoalId): GoalVerificationHistory
   createGoal(input: CreateGoalInput): CanonicalGoal
   editGoal(input: EditGoalInput): CanonicalGoal
   updateGoalStatus(input: UpdateGoalStatusInput): GoalCasResult
@@ -250,6 +357,11 @@ export interface SessionStore extends NativeImportStore {
   releaseGoalLease(input: ReleaseGoalLeaseInput): boolean
   checkpointGoalTurn(input: CheckpointGoalTurnInput): GoalCasResult
   recordGoalTurn(input: RecordGoalTurnInput): GoalCasResult
+  beginGoalVerification(input: BeginGoalVerificationInput): GoalCompletionProposal | null
+  claimGoalVerifierLease(input: ClaimGoalVerifierLeaseInput): GoalVerifierLease | null
+  heartbeatGoalVerifierLease(input: HeartbeatGoalVerifierLeaseInput): GoalVerifierLease | null
+  releaseGoalVerifierLease(input: ReleaseGoalVerifierLeaseInput): boolean
+  finishGoalVerification(input: FinishGoalVerificationInput): FinishGoalVerificationResult
 
   close(): void
 }
@@ -261,6 +373,7 @@ export class SessionStoreError extends Error {
     | 'turn_not_running'
     | 'invalid_fork'
     | 'duplicate_request'
+    | 'initial_session_conflict'
     | 'session_busy'
     | 'session_archived'
     | 'invalid_reconciliation'
@@ -273,6 +386,7 @@ export class SessionStoreError extends Error {
       | 'turn_not_running'
       | 'invalid_fork'
       | 'duplicate_request'
+      | 'initial_session_conflict'
       | 'session_busy'
       | 'session_archived'
       | 'invalid_reconciliation'

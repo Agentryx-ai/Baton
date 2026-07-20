@@ -124,6 +124,36 @@ test('metadata-only inventory materializes and commits selected sessions one at 
   store.close()
 })
 
+test('materialization accepts provider-private records without counting them as portable items', async () => {
+  const store = await newStore()
+  const value = candidate(['visible'])
+  const records = finalizeRecords([
+    ...value.records.map(({ prefixDigest: _prefixDigest, ...record }) => record),
+    {
+      key: 'native-checkpoint', ordinal: 2, digest: sha256('native-checkpoint'), createdAt: null,
+      item: {
+        kind: 'provider_event', provider: 'codex', visibility: 'provider_private',
+        payload: { nativeContextCheckpoint: { version: 1, provider: 'codex' } },
+      },
+    },
+  ])
+  Object.assign(value, {
+    records,
+    contentDigest: contentDigest(records),
+    prefixDigest: contentDigest(records),
+    portableItemCount: 1,
+  })
+  const service = new NativeSessionImportService(store, [new MutableReader(value)])
+
+  const preview = await service.preview({ sources: ['codex_local'] })
+  const receipt = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+
+  assert.equal(receipt.results[0]?.status, 'imported')
+  const snapshot = store.getSnapshot(store.listSessions()[0]!.activeThreadId)
+  assert.deepEqual(snapshot?.items.map((item) => item.visibility), ['portable', 'provider_private'])
+  store.close()
+})
+
 test('preview rejects an inventory above the supported cap before tokenization', async () => {
   const store = await newStore()
   const base = candidate(['one'])
@@ -226,6 +256,72 @@ test('preview and commit are idempotent and append only a valid native delta', a
   store.close()
 })
 
+test('native imports atomically restore unresolved Goals as paused and duplicate import backfills are idempotent', async () => {
+  const store = await newStore()
+  const importedWithGoal = candidate(['one'], 'goal-candidate', 'goal-native')
+  importedWithGoal.goal = {
+    objective: 'finish the imported work', model: 'gpt-5.6-sol', effort: 'high',
+    detectedAt: '2026-07-18T00:00:00.000Z', evidence: 'slash_command',
+  }
+  const reader = new MutableReader(importedWithGoal)
+  const service = new NativeSessionImportService(store, [reader])
+
+  let preview = await service.preview({ sources: ['codex_local'] })
+  const first = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const firstThread = store.getSession(first.results[0]!.sessionId!)!.activeThreadId
+  assert.equal(store.getGoal(firstThread)?.status, 'paused')
+  assert.equal(store.getGoal(firstThread)?.objective, 'finish the imported work')
+  assert.equal(store.listActiveGoals().length, 0)
+  assert.equal(store.listGoalEvents(firstThread).filter((event) => event.type === 'goal_created').length, 1)
+
+  preview = await service.preview({ sources: ['codex_local'] })
+  await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  assert.equal(store.listGoalEvents(firstThread).filter((event) => event.type === 'goal_created').length, 1)
+
+  reader.candidate = candidate(['two'], 'late-goal-candidate', 'late-goal-native')
+  preview = await service.preview({ sources: ['codex_local'] })
+  const withoutGoal = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const secondThread = store.getSession(withoutGoal.results[0]!.sessionId!)!.activeThreadId
+  assert.equal(store.getGoal(secondThread), null)
+
+  reader.candidate.goal = {
+    objective: 'restore this on duplicate', model: 'gpt-5.6-sol', effort: 'high',
+    detectedAt: '2026-07-18T00:00:00.000Z', evidence: 'codex_goal_tool',
+  }
+  preview = await service.preview({ sources: ['codex_local'] })
+  const backfill = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  assert.equal(backfill.results[0]?.status, 'duplicate')
+  assert.equal(store.getGoal(secondThread)?.status, 'paused')
+  assert.equal(store.getGoal(secondThread)?.objective, 'restore this on duplicate')
+  store.close()
+})
+
+test('native Goal reconciliation never overwrites a manually restored Goal', async () => {
+  const store = await newStore()
+  const imported = candidate(['next meal'], 'next-meal-candidate', 'next-meal-native')
+  const reader = new MutableReader(imported)
+  const service = new NativeSessionImportService(store, [reader])
+  let preview = await service.preview({ sources: ['codex_local'] })
+  const receipt = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const threadId = store.getSession(receipt.results[0]!.sessionId!)!.activeThreadId
+  const manual = store.createGoal({
+    threadId, objective: 'manually restored next-meal Goal', provider: 'codex',
+    model: 'gpt-5.6-sol', effort: 'high', expected: { kind: 'none' },
+  })
+
+  reader.candidate.goal = {
+    objective: 'native objective must not overwrite', model: 'gpt-5.6-sol', effort: 'high',
+    detectedAt: null, evidence: 'slash_command',
+  }
+  const dryRun = store.reconcileNativeGoal(reader.candidate, false)
+  assert.equal(dryRun.status, 'existing_goal')
+  preview = await service.preview({ sources: ['codex_local'] })
+  await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  assert.equal(store.getGoal(threadId)?.id, manual.id)
+  assert.equal(store.getGoal(threadId)?.objective, 'manually restored next-meal Goal')
+  store.close()
+})
+
 test('additive parser metadata preserves a v1 prefix and permits an append update', async () => {
   const store = await newStore()
   const legacy = candidate(['question', 'answer'])
@@ -277,12 +373,21 @@ test('additive parser metadata preserves a v1 prefix and permits an append updat
   store.close()
 })
 
-test('commit reports stale after source changes and rejects a rewritten prefix', async () => {
+test('commit reports stale after source changes and safely replaces an untouched rewritten import', async () => {
   const store = await newStore()
   const reader = new MutableReader(candidate(['one']))
   const service = new NativeSessionImportService(store, [reader], { secret: Buffer.alloc(32, 9) })
   let preview = await service.preview()
-  await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const imported = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const importedSessionId = imported.results[0]!.sessionId!
+  const importedThreadId = store.listSessions()[0]!.activeThreadId
+  store.createGoal({
+    threadId: importedThreadId,
+    expected: { kind: 'none' },
+    objective: 'user resumed the imported Goal without sending chat',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
 
   reader.candidate = candidate(['one', 'two'])
   preview = await service.preview()
@@ -293,8 +398,17 @@ test('commit reports stale after source changes and rejects a rewritten prefix',
   reader.candidate = candidate(['rewritten', 'two'])
   preview = await service.preview()
   const rewritten = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
-  assert.equal(rewritten.results[0]?.status, 'failed')
-  assert.match(rewritten.results[0]?.error ?? '', /source_rewritten/)
+  assert.equal(rewritten.results[0]?.status, 'updated', rewritten.results[0]?.error)
+  assert.equal(rewritten.results[0]?.sessionId, importedSessionId)
+  assert.equal(store.listSessions().length, 1)
+  const replacedSession = store.listSessions()[0]!
+  assert.equal(replacedSession.id, importedSessionId)
+  assert.equal(replacedSession.activeThreadId, importedThreadId)
+  assert.deepEqual(
+    store.getSnapshot(replacedSession.activeThreadId)?.items.map((item) => item.payload.text),
+    ['rewritten', 'two'],
+  )
+  assert.equal(store.getGoal(replacedSession.activeThreadId), null)
   store.close()
 })
 
@@ -414,6 +528,12 @@ test('native delta is rejected after a fork even when the fork added no items', 
   const receipt = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
   assert.equal(receipt.results[0]?.status, 'failed')
   assert.match(receipt.results[0]?.error ?? '', /update_conflict_after_fork/)
+
+  reader.candidate = candidate(['rewritten', 'two'])
+  preview = await service.preview()
+  const rewritten = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  assert.equal(rewritten.results[0]?.status, 'failed')
+  assert.match(rewritten.results[0]?.error ?? '', /source_rewritten_conflict/)
   store.close()
 })
 

@@ -21,27 +21,29 @@
 |---|---|---|---|
 | Account control plane | 구현됨 | 계정·quota·OAuth·pause/resume/delete UI와 API, 정책 엔진, 관련 테스트 | 없음 |
 | 수동 계정 고정 | 설계 변경 | CLIProxy의 `default`는 요청 라우팅 레버가 아님. 현재 UI의 **이 계정만**은 다른 활성 계정을 pause해 실제 단독 풀을 만듦 | `default` 중심의 과거 설명을 사용하지 않음 |
-| Smart rotation | **부분 구현·의미 불일치** | 60초 provider별 틱, ACTIVE/FRESH/BLIND/EXHAUSTED 분류, target/reserve, debounce, 엔진 장부 복원 | target과 reserve가 모두 활성이라 `round-robin`에서는 순환됨. “리셋 임박 우선 소진”을 실제 요청 라우팅에서 보장하지 못함 |
-| Smart rotation 타깃 표시 | **구현 결함** | UI와 로그가 계산상 1순위를 `현재 타깃`으로 표시 | 실제 트래픽 타깃으로 오해되지 않도록 `정책 1순위` 등으로 표시하거나, 프록시가 우선순위를 강제하도록 구현해야 함 |
+| Smart rotation | **안전 경계 구현·순위 적용 미지원** | enable/start 및 매 tick `fill-first` PUT fail-closed, 전환 직렬화, OFF crash-recovery journal, 60초 provider별 ACTIVE/FRESH/BLIND 관측, 95/100% 자동 pause 제거, 사용자 pause 불변, 전체 유효 풀 유지 | 실제 429/cooling/failover는 CLIProxy 권한. 계산한 리셋 임박 순위를 credential order에 적용할 관리 API는 없음 |
+| Smart rotation 순위 표시 | **관측값** | target/reserve는 쿼터 기반 계산 순위이며 UI도 `정책 1순위/2순위`로 실제 전송 대상과 구분 | credential ordering 관리 계약이 생기기 전까지 실제 요청 순위 적용은 미지원 |
+| Claude 403 eligibility | **외부 계약 차단** | 현재 accounts/quota API에 durable ineligible/last-403 상태가 없음. 사용량으로 추정하지 않고 수동 pause를 fail-safe로 사용 | CLIProxy가 계정별 durable eligibility 상태/API를 제공해야 자동 제외 가능 |
 | Quota freshness 표시 | 부분 구현 | `lastUpdated` 타입과 `useQuota`의 age 계산은 존재 | 현재 `App`의 quota 경로는 해당 hook을 사용하지 않아 설계의 “n초 전 기준” UI가 노출되지 않음 |
 | 클라이언트 프록시 통합 | **구현됨·native live 검증 대기** | Claude CLI/Desktop와 Codex CLI/Desktop의 적용·해제·충돌·프로세스·lock 검사, Codex `native-openai`와 격리 `custom-provider` 모드의 결정론적 round-trip 테스트 | 기존 OpenAI task 가시성을 유지하는 `openai_base_url` loopback bridge는 구현됐다. ChatGPT/API-key 인증별 실제 inference 경유와 proxy failure 시 no-direct-fallback은 live smoke 전 자동 배포하지 않으며, 적용/해제 후 대상 클라이언트 완전 재시작이 필요하다. |
 | Canonical domain과 SQLite | 구현됨 | session/thread/turn/item/execution/binding 스키마, WAL, transaction, idempotency, fork lineage, 재시작 recovery 테스트 | 없음 |
-| Canonical item/content 계약 | 부분 구현 | Preview enum과 자유형 `payload` JSON은 존재 | 설계의 ordered content parts, artifact digest store, command/web/compaction/diagnostic 표현은 아직 없음 |
-| Context builder와 compaction | 부분 구현 | fork lineage와 portable text replay는 구현됨 | model context budget, immutable compaction range, artifact-aware materialization은 미구현 |
+| Canonical item/content 계약 | 부분 구현 | ordered canonical item, reasoning/tool/summary/provider-private 표현과 turn별 provenance, immutable digest가 존재 | attachment/blob artifact 저장소와 모든 multimodal content part는 아직 없음 |
+| Context builder와 compaction | **V1 구현** | pre-turn model budget, 보수적 token 추정, immutable exact-prefix artifact chain, provider-private retirement, uncovered suffix materialization, execution manifest, v14 head CAS와 원자 reservation/reclaim을 구현. summary prompt cap은 200k input budget의 70%로 제한해 대형 문맥의 직렬 chunk 수를 줄임 | 실제 장문 live turn의 provider별 품질·cache hit/cost 계측은 운영 검증으로 남음. derived row가 있는 과거 실험용 v13 DB는 의미를 추측하지 않고 fail-closed |
+| Canonical cache identity | **구현됨·계측 대기** | 설치 비밀+canonical thread HMAC으로 대화별 안정 identity 생성, Codex loopback Responses bridge의 `prompt_cache_key` 강제 교체, Claude top-level ephemeral cache control, no-direct-fallback unit 계약 | 실제 provider A/B cache hit/miss 수치와 proxy 장애 live smoke는 남음 |
 | Canonical REST/SSE | 구현됨 | session/thread/turn/item과 Goal 생성·수정·상태·삭제, unknown-mutation 명시 reconciliation API, Goal 상태 cursor replay SSE | child execution API는 아직 없음 |
-| Codex adapter | V1 구현 | app-server ephemeral thread, Baton dynamic tools, web/MCP/plugin/subagent 차단, ID·timeout·model provenance 검증 | 공식적으로 끌 수 없는 provider-local `update_plan` metadata tool 예외가 있음 |
-| Canonical UI | 부분 구현 | 2-column 대화, 상태 표시, transcript, provider/model/effort, Goal panel과 `/goal` 명령 | fork와 cwd/project/instruction 선택 UI는 아직 없음 |
+| Codex adapter | V1 구현 | app-server persisted transient thread, Baton dynamic tools, provider-native subagent audit/archive, web/MCP/plugin/shell 차단, ID·timeout·model provenance 검증 | native child는 Baton-owned lineage/budget/join을 제공하지 않는 provider-managed 실행이며 live 검증이 필요 |
+| Canonical UI | 부분 구현 | 2-column 대화, 상태 표시, transcript, provider/model/effort, Goal panel과 `/goal`, native 폴더 선택, 첫 전송 전 browser draft와 원자 first-turn API. 4400에서 새로고침·홈↔대화·Claude/Codex 응답·폴더 file tool live 확인 | fork와 instruction 선택 UI는 아직 없음. OS native picker의 실제 사용자 선택은 수동 확인 항목 |
 | UI provider 선택 | 구현됨 | 서버 모델 catalog를 provider별로 조회하고 모델이 0개인 provider는 비활성화 | Gemini 인증 복구 후 live catalog 표시 검증 필요 |
 | Provider 전환 | 부분 구현 | Codex·Claude·Gemini adapter가 같은 portable history 계약을 사용; Claude Fable 5 live 검증 완료 | Gemini는 현재 proxy 인증 문제로 모델 0개이며 live 실행 미검증 |
 | Claude adapter | **V1 구현** | `/v1/messages` stateless history, Baton tool loop, effort, round별 reported model/fallback, structured provider-private continuation durability, bounded retry/timeout, Fable 5 live 응답 | streaming은 아직 미구현 |
 | Gemini adapter | **V1 구현·live 차단** | `/v1/chat/completions` 호환 history/tool loop, reasoning effort, round provenance와 structured provider-private continuation durability, bounded retry/timeout | 현재 인증 버그로 live catalog/turn 검증 불가; 인증 복구 전 UI 비활성화 유지 |
-| 일반 tool 실행 | 부분 구현 | provider-neutral broker가 call 선기록, read 병렬·mutation 직렬화, result 후속 기록을 강제하며 read/list/search/write/replace와 Goal tools를 제공 | 이 Windows 환경은 cwd 밖 read 제한에 elevated backend가 필요해 `run_command`를 fail-closed로 미노출. approval/user-input wait도 미구현 |
+| 일반 tool 실행 | 부분 구현 | provider-neutral broker가 call 선기록, read 병렬·mutation 직렬화, result 후속 기록을 강제하며 read/list/search/write/replace와 Goal tools를 제공. 4400의 허용 폴더에서 Codex `write_file`→`read_file` 실제 E2E 통과 | `run_command`는 strict sandbox 검증 전 fail-closed로 미노출. approval/user-input wait도 미구현 |
 | Persistent Goal runtime | V1 구현 | Goal projection/event, CAS, 30초 lease/10초 heartbeat, 24턴·2시간·3회 no-progress, 자동 continuation, pause/resume/edit/clear, `/goal` UI | Gemini live 검증은 인증 복구 전까지 차단 |
 | Provider opaque state | 부분 구현 | binding 스키마와 invalidation은 구현됨 | at-rest encryption이 없어 non-null opaque state 저장을 fail-closed로 거부함 |
 | Provider binding freshness | 설계 변경 | 구현은 `last_turn_id` 대신 `synced_revision`과 `context_digest`로 exact context compatibility를 판정 | 공통 설계 문서의 binding 필드를 이 결정에 맞춰 갱신 |
-| Baton-managed child execution | 부분 구현·비활성 | execution 기록과 `delegationMode: disabled`, native child capability 검증이 있음 | child API, scheduler/executor, budget/depth/join/cancel 구현 필요 |
+| Child execution | provider-native 허용·Baton-managed 비활성 | Codex는 `delegationMode: provider-native`와 private collaboration audit/archive를 사용. Baton execution 기록 기반 managed mode는 foundation만 존재 | Baton child API, scheduler/executor, budget/depth/join/cancel 구현 필요 |
 | Native session bridge/import | **fork-copy import 구현·authority migration 미구현** | Codex Desktop과 Claude Desktop/Code의 local task를 alias·project·provider provenance와 함께 read-only preview하고, 명시 승인 뒤 별도 Baton logical-work fork로 멱등 import함. project grouping, source-scoped dedupe, delta CAS/fork guard, CSRF·realpath 보호, durable receipt와 대규모 metadata-only scan이 구현됨. one-shot package도 유지 | native 원본과 Baton 사이의 SSOT 전환·동기화·`/goal` mutation은 하지 않음. 같은 logical work를 승계하는 authority epoch workflow는 [`NATIVE_SESSION_CONTINUITY_BRIDGE.md`](NATIVE_SESSION_CONTINUITY_BRIDGE.md)의 후속 범위이며 bulk import 계약은 [`NATIVE_SESSION_IMPORT_AND_GROUPING.md`](NATIVE_SESSION_IMPORT_AND_GROUPING.md)에 있음 |
-| Live Codex 검증 | 검증 공백 | 단위·통합 테스트와 `smoke:codex-adapter` handshake는 존재 | 실제 model turn → BFF 재시작 → Baton history 재개 E2E를 추가해야 Phase 1 exit를 완전히 충족 |
+| Live Codex 검증 | 부분 완료 | 4400에서 GPT-5.6 Sol/High 응답과 허용 폴더 `write_file`→`read_file`, canonical model/usage/tool 표시를 확인 | 같은 Baton thread를 BFF 재시작 뒤 이어서 실행하는 history-resume E2E와 proxy failure/no-direct-fallback은 남음 |
 
 ## 현재 구현된 canonical API
 

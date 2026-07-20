@@ -77,12 +77,27 @@ export function usageSummary(payload: JsonObject): string {
 }
 
 export function transcriptItems(items: CanonicalItemDto[]): CanonicalItemDto[] {
-  return items.filter((item) => item.kind !== 'usage')
+  return items.filter((item) => item.kind !== 'usage' && !isInternalGoalContinuation(item))
+}
+
+function isInternalGoalContinuation(item: CanonicalItemDto): boolean {
+  return item.kind === 'user_message'
+    && item.visibility === 'baton_private'
+    && item.payload.goalContinuation === true
 }
 
 export interface ConversationDisplayEntry {
   item: CanonicalItemDto
   toolResult: CanonicalItemDto | null
+}
+
+export function tailConversationEntries(
+  entries: ConversationDisplayEntry[],
+  limit: number,
+): { entries: ConversationDisplayEntry[]; hiddenCount: number } {
+  const visibleCount = Math.max(0, Math.floor(limit))
+  const hiddenCount = Math.max(0, entries.length - visibleCount)
+  return { entries: entries.slice(hiddenCount), hiddenCount }
 }
 
 export function conversationEntries(items: CanonicalItemDto[]): ConversationDisplayEntry[] {

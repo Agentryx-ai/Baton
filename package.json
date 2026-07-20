@@ -3,16 +3,24 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "bin": {
+    "baton": "scripts/baton-cli.mjs"
+  },
   "scripts": {
     "dev": "concurrently -n web,bff -c cyan,magenta \"vite\" \"tsx watch server/index.ts\"",
     "dev:web": "vite",
     "dev:server": "tsx watch server/index.ts",
     "build": "tsc -b && vite build",
     "start": "tsx server/index.ts",
+    "status": "node scripts/baton-cli.mjs status",
     "test": "tsx --test \"server/**/*.test.ts\"",
     "typecheck": "tsc -b --noEmit",
     "lint": "oxlint",
     "smoke:codex-adapter": "tsx scripts/codex-adapter-smoke.ts",
+    "smoke:claude-native": "tsx scripts/claude-native-canary.ts",
+    "smoke:codex-plugins": "tsx scripts/codex-plugin-account-canary.ts",
+    "migrate:legacy-accounts": "tsx scripts/migrate-legacy-cliproxy-accounts.ts",
+    "restore:native-goals": "tsx scripts/restore-native-goals.ts",
     "preview": "vite preview"
   },
   "dependencies": {

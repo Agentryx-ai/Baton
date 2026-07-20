@@ -34,33 +34,52 @@ export function createConversationEventBatcher(
   let cursor = threadCursors.get(threadId) ?? 0
   let pendingEvent: CanonicalStreamEventDto | null = null
   let timer: TimerHandle | null = null
+  let flushing = false
+  let cancelled = false
+  const schedulePending = (): void => {
+    if (cancelled || flushing || timer || !pendingEvent) return
+    timer = schedule(flush, quietWindowMs)
+  }
+  const finishFlush = (): void => {
+    flushing = false
+    schedulePending()
+  }
   const flush = (): void => {
     timer = null
+    if (cancelled || flushing) return
     const event = pendingEvent
     pendingEvent = null
     if (!event) return
+    flushing = true
     const flushedCursor = cursor
     const remember = (refreshed: boolean): void => {
-      if (!refreshed) return
+      if (cancelled || !refreshed) return
       threadCursors.set(threadId, Math.max(threadCursors.get(threadId) ?? 0, flushedCursor))
     }
     try {
       const refreshed = onFlush(event, flushedCursor)
-      if (typeof refreshed === 'boolean') remember(refreshed)
-      else void refreshed.then(remember, () => undefined)
+      if (typeof refreshed === 'boolean') {
+        remember(refreshed)
+        finishFlush()
+      } else {
+        void refreshed.then(remember, () => undefined).finally(finishFlush)
+      }
     } catch {
       // A failed projection refresh must not advance the durable cursor cache.
+      finishFlush()
     }
   }
   return {
     push(event, nextCursor) {
-      if (nextCursor <= cursor) return
+      if (cancelled || nextCursor <= cursor) return
       cursor = nextCursor
       pendingEvent = event
+      if (flushing) return
       if (timer) cancelScheduled(timer)
       timer = schedule(flush, quietWindowMs)
     },
     cancel() {
+      cancelled = true
       if (timer) cancelScheduled(timer)
       timer = null
       pendingEvent = null

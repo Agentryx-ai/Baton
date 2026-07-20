@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 
 import express from 'express'
 
 import type {
+  BeginSessionResult,
   BeginTurnResult,
   CanonicalExecution,
   CanonicalGoal,
+  CanonicalFollowUp,
   CanonicalItem,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -21,7 +26,9 @@ import {
   type ConversationRouter,
   type ConversationRouterOptions,
 } from './router.ts'
-import type { ConversationService, StartTurnInput, UserGoalStatusInput } from './service.ts'
+import { ProviderReadinessError } from './service.ts'
+import { ContextInputTooLargeError } from './canonical-context-runtime.ts'
+import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput } from './service.ts'
 import { SessionStoreError } from './store.ts'
 import type {
   ClearGoalInput,
@@ -34,6 +41,7 @@ import type {
 } from './store.ts'
 import type { SessionListScope } from './store.ts'
 import type { NativeSessionImportService } from './native-import/service.ts'
+import { LocalImageArtifactStore } from './image-artifacts.ts'
 
 const now = '2026-07-18T00:00:00.000Z'
 
@@ -57,6 +65,9 @@ const session: CanonicalSession = {
   activeThreadId: thread.id,
   projectKey: null,
   cwd: null,
+  permissions: {
+    defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global',
+  },
   schemaVersion: 1,
   createdAt: now,
   updatedAt: now,
@@ -129,6 +140,12 @@ const beginResult: BeginTurnResult = {
   duplicate: false,
 }
 
+const beginSessionResult: BeginSessionResult = {
+  session,
+  thread,
+  ...beginResult,
+}
+
 function streamEvent(sequence: number): CanonicalStreamEvent {
   return {
     sequence,
@@ -150,15 +167,26 @@ class TestConversationService implements ConversationService {
   createdInput: CreateSessionInput | null = null
   forkInput: ForkThreadInput | null = null
   startInput: StartTurnInput | null = null
+  startSessionInput: StartSessionInput | null = null
+  startSessionResult: BeginSessionResult = beginSessionResult
   cancelledTurnId: string | null = null
   reconciledInput: ReconcileToolInput | null = null
   listedScope: SessionListScope | null = null
   workspaceInput: { sessionId: string; expectedRevision: number; cwd: string | null } | null = null
+  permissionInput: { sessionId: string; profile: 'read_only' | 'workspace' | 'full_access' | null } | null = null
+  permissionDefault: 'read_only' | 'workspace' | 'full_access' = 'workspace'
   goal: CanonicalGoal | null = null
+  goalStatusInput: UserGoalStatusInput | null = null
+  followUpInput: SubmitFollowUpInput | null = null
 
   createSession(input: CreateSessionInput): CanonicalSession {
     this.createdInput = input
     return session
+  }
+
+  async startSession(input: StartSessionInput): Promise<BeginSessionResult> {
+    this.startSessionInput = input
+    return this.startSessionResult
   }
 
   listSessions(scope: SessionListScope = 'active'): CanonicalSession[] {
@@ -169,6 +197,33 @@ class TestConversationService implements ConversationService {
 
   getSession(sessionId: string): CanonicalSession | null {
     return this.sessions.find((candidate) => candidate.id === sessionId) ?? null
+  }
+
+  getPermissionSettings() {
+    return { defaultProfile: this.permissionDefault, updatedAt: now }
+  }
+
+  updateDefaultPermissionProfile(profile: 'read_only' | 'workspace' | 'full_access') {
+    this.permissionDefault = profile
+    return this.getPermissionSettings()
+  }
+
+  updateSessionPermissionProfile(
+    sessionId: string,
+    profile: 'read_only' | 'workspace' | 'full_access' | null,
+  ): CanonicalSession {
+    this.permissionInput = { sessionId, profile }
+    const found = this.getSession(sessionId)
+    if (!found) throw new SessionStoreError('not_found', 'session not found')
+    return {
+      ...found,
+      permissions: {
+        defaultProfile: this.permissionDefault,
+        override: profile,
+        effectiveProfile: profile ?? this.permissionDefault,
+        source: profile === null ? 'global' : 'session_override',
+      },
+    }
   }
 
   archiveSession(sessionId: string): CanonicalSession {
@@ -206,6 +261,30 @@ class TestConversationService implements ConversationService {
     return { session, thread, turns: [turn], items: this.items, bindings: [] }
   }
 
+  async submitFollowUp(input: SubmitFollowUpInput): Promise<{ followUp: CanonicalFollowUp; duplicate: boolean }> {
+    this.followUpInput = input
+    return {
+      duplicate: false,
+      followUp: {
+        id: 'follow-up-1', sessionId: session.id, threadId: input.threadId,
+        clientRequestId: input.clientRequestId, requestHash: 'hash', sequence: 1, afterTurnSequence: 1,
+        delivery: input.delivery, status: 'queued', targetTurnId: input.expectedTurnId,
+        consumedTurnId: null, consumedItemIds: [], scope: { kind: 'conversation' }, input: input.input,
+        dispatchOwner: null, leaseExpiresAt: null, revision: 1, createdAt: now, updatedAt: now, consumedAt: null,
+      },
+    }
+  }
+
+  cancelFollowUp(followUpId: string, expectedRevision: number): CanonicalFollowUp {
+    if (followUpId !== 'follow-up-1' || expectedRevision !== 1) throw new SessionStoreError('revision_conflict', 'stale')
+    return {
+      id: followUpId, sessionId: session.id, threadId: thread.id, clientRequestId: 'request', requestHash: 'hash',
+      sequence: 1, afterTurnSequence: 1, delivery: 'next_turn', status: 'cancelled', targetTurnId: null,
+      consumedTurnId: null, consumedItemIds: [], scope: { kind: 'conversation' }, input: [{ kind: 'user_message', payload: { text: 'x' } }],
+      dispatchOwner: null, leaseExpiresAt: null, revision: 2, createdAt: now, updatedAt: now, consumedAt: null,
+    }
+  }
+
   forkThread(input: ForkThreadInput): CanonicalThread {
     this.forkInput = input
     return { ...thread, id: 'thread-2', parentThreadId: input.threadId, forkItemId: input.forkItemId }
@@ -222,6 +301,7 @@ class TestConversationService implements ConversationService {
   }
 
   getGoal(threadId: string): CanonicalGoal | null { return threadId === thread.id ? this.goal : null }
+  getGoalVerificationHistory(_goalId: string) { return { proposals: [], attempts: [], receipts: [], stopReceipts: [] } }
 
   async createGoal(input: CreateGoalInput): Promise<CanonicalGoal> {
     this.goal = testGoal({ objective: input.objective, provider: input.provider, model: input.model })
@@ -235,8 +315,16 @@ class TestConversationService implements ConversationService {
   }
 
   async updateGoalStatus(input: UserGoalStatusInput): Promise<GoalCasResult> {
+    this.goalStatusInput = input
     if (!this.goal || this.goal.revision !== input.expectedRevision) return { status: 'stale', goal: this.goal }
-    this.goal = { ...this.goal, status: input.status, revision: this.goal.revision + 1 }
+    this.goal = {
+      ...this.goal,
+      status: input.status,
+      provider: input.provider ?? this.goal.provider,
+      model: input.model ?? this.goal.model,
+      effort: Object.prototype.hasOwnProperty.call(input, 'effort') ? (input.effort ?? null) : this.goal.effort,
+      revision: this.goal.revision + 1,
+    }
     return { status: 'applied', goal: this.goal }
   }
 
@@ -277,6 +365,7 @@ function testGoal(overrides: Partial<CanonicalGoal> = {}): CanonicalGoal {
     tokensUsed: 0, timeUsedSeconds: 0, maxAutomaticTurns: 24, automaticTurnsUsed: 0,
     maxActiveSeconds: 7_200, noProgressCount: 0, lastProgressDigest: null,
     createdAt: now, updatedAt: now, startedAt: now, completedAt: null,
+    verificationProposalId: null, latestCompletionReceiptId: null, latestStopReceiptId: null,
     ...overrides,
   }
 }
@@ -321,6 +410,9 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
           description: '기본 모델',
           effortLevels: ['low', 'high'],
           defaultEffort: 'high',
+          contextWindowTokens: 272_000,
+          usableInputTokens: 258_400,
+          autoCompactTokens: 244_800,
         },
       ],
       defaultModel: 'gpt-5.6-sol',
@@ -340,12 +432,171 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
           description: '기본 모델',
           effortLevels: ['low', 'high'],
           defaultEffort: 'high',
+          contextWindowTokens: 272_000,
+          usableInputTokens: 258_400,
+          autoCompactTokens: 244_800,
         }],
         defaultModel: 'gpt-5.6-sol',
       }
     },
   })
 })
+
+test('image upload requires explicit interaction and serves immutable verified bytes', async (t) => {
+  const service = new TestConversationService()
+  const directory = mkdtempSync(path.join(tmpdir(), 'baton-router-images-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const artifacts = new LocalImageArtifactStore(directory)
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')
+  await withServer(service, async (baseUrl) => {
+    const rejected = await fetch(`${baseUrl}/artifacts/images`, {
+      method: 'POST', headers: { 'content-type': 'image/png' }, body: png,
+    })
+    assert.equal(rejected.status, 400)
+
+    const uploaded = await fetch(`${baseUrl}/artifacts/images`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'image/png',
+        'x-baton-interaction': 'image-upload',
+        'x-baton-filename': encodeURIComponent('화면.png'),
+      },
+      body: png,
+    })
+    assert.equal(uploaded.status, 201)
+    const ref = await json(uploaded) as { id: string; fileName: string }
+    assert.equal(ref.fileName, '화면.png')
+    const served = await fetch(`${baseUrl}/artifacts/images/${ref.id}`)
+    assert.equal(served.status, 200)
+    assert.equal(served.headers.get('cache-control'), 'private, immutable, max-age=31536000')
+    assert.equal(Buffer.from(await served.arrayBuffer()).equals(png), true)
+  }, { imageArtifacts: artifacts })
+})
+
+test('first-turn route parses the immutable draft payload and reports idempotent replay', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl) => {
+    const body = {
+      clientRequestId: 'client-request-1',
+      cwd: 'C:\\repo',
+      instructionSnapshot: { developerInstructions: 'verify' },
+      provider: 'codex',
+      model: 'gpt-5',
+      effort: 'high',
+      input: [{ kind: 'user_message', visibility: 'portable', payload: { text: 'hello' } }],
+    }
+    const started = await fetch(`${baseUrl}/sessions/client-session-1/first-turn`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    assert.equal(started.status, 202)
+    assert.equal(started.headers.get('location'), `/baton/v1/sessions/${session.id}`)
+    assert.equal((await json(started)).duplicate, false)
+    assert.deepEqual(service.startSessionInput, {
+      sessionId: 'client-session-1',
+      clientRequestId: 'client-request-1',
+      cwd: 'C:\\repo',
+      instructionSnapshot: { schemaVersion: 1, developerInstructions: 'verify' },
+      provider: 'codex',
+      model: 'gpt-5',
+      effort: 'high',
+      input: [{
+        kind: 'user_message',
+        visibility: 'portable',
+        payload: { text: 'hello' },
+        provider: undefined,
+        nativeId: undefined,
+      }],
+    })
+
+    service.startSessionResult = { ...beginSessionResult, duplicate: true }
+    const replay = await fetch(`${baseUrl}/sessions/client-session-1/first-turn`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    assert.equal(replay.status, 200)
+    assert.equal((await json(replay)).duplicate, true)
+  })
+})
+
+test('first-turn route rejects malformed drafts and maps conflict/readiness failures', async () => {
+  const malformedService = new TestConversationService()
+  await withServer(malformedService, async (baseUrl) => {
+    const malformed = await fetch(`${baseUrl}/sessions/client-session/first-turn`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientRequestId: 'request', cwd: null, provider: 'codex', model: 'gpt-5',
+        input: [{ kind: 'user_message', payload: { text: '   ' } }], extra: true,
+      }),
+    })
+    assert.equal(malformed.status, 400)
+    assert.equal((await json(malformed)).code, 'invalid_request')
+    assert.equal(malformedService.startSessionInput, null)
+  })
+
+  const conflictService = new TestConversationService()
+  conflictService.startSession = async () => {
+    throw new SessionStoreError('initial_session_conflict', 'different initial request')
+  }
+  await withServer(conflictService, async (baseUrl) => {
+    const conflict = await firstTurnRequest(baseUrl)
+    assert.equal(conflict.status, 409)
+    assert.equal((await json(conflict)).code, 'initial_session_conflict')
+  })
+
+  const unavailableService = new TestConversationService()
+  unavailableService.startSession = async () => {
+    throw new ProviderReadinessError('codex')
+  }
+  await withServer(unavailableService, async (baseUrl) => {
+    const unavailable = await firstTurnRequest(baseUrl)
+    assert.equal(unavailable.status, 503)
+    assert.equal((await json(unavailable)).code, 'provider_not_ready')
+  })
+
+  const oversizedService = new TestConversationService()
+  oversizedService.startSession = async () => {
+    throw new ContextInputTooLargeError({
+      estimatedInputTokens: 900,
+      usableInputTokens: 800,
+      contextWindowTokens: 1_000,
+      provider: 'codex',
+      model: 'gpt-test',
+      compactionReason: 'generator_failed',
+    })
+  }
+  await withServer(oversizedService, async (baseUrl) => {
+    const oversized = await firstTurnRequest(baseUrl)
+    assert.equal(oversized.status, 413)
+    assert.deepEqual(await json(oversized), {
+      code: 'context_input_too_large',
+      error: 'Upcoming input requires approximately 900 tokens; usable input budget is 800 for gpt-test (1000 context tokens); compaction=generator_failed',
+      estimatedInputTokens: 900,
+      usableInputTokens: 800,
+      contextWindowTokens: 1_000,
+      provider: 'codex',
+      model: 'gpt-test',
+      compactionReason: 'generator_failed',
+    })
+  })
+})
+
+function firstTurnRequest(baseUrl: string): Promise<Response> {
+  return fetch(`${baseUrl}/sessions/client-session/first-turn`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      clientRequestId: 'request',
+      cwd: null,
+      provider: 'codex',
+      model: 'gpt-5',
+      input: [{ kind: 'user_message', payload: { text: 'hello' } }],
+    }),
+  })
+}
 
 async function json(response: Response): Promise<Record<string, unknown>> {
   return (await response.json()) as Record<string, unknown>
@@ -417,6 +668,16 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
     assert.equal(snapshot.status, 200)
     assert.equal(((await json(snapshot)).thread as Record<string, unknown>).revision, 0)
 
+    service.items = [
+      { ...item, id: 'item-1', sequence: 1 },
+      { ...item, id: 'item-2', sequence: 2 },
+    ]
+    const boundedSnapshot = await fetch(`${baseUrl}/threads/${thread.id}?itemLimit=1`)
+    assert.equal(boundedSnapshot.status, 200)
+    assert.deepEqual((await json(boundedSnapshot)).items, [service.items[1]])
+    const invalidSnapshotLimit = await fetch(`${baseUrl}/threads/${thread.id}?itemLimit=1001`)
+    assert.equal(invalidSnapshotLimit.status, 400)
+
     const missingThread = await fetch(`${baseUrl}/threads/missing`)
     assert.equal(missingThread.status, 404)
     assert.deepEqual(await json(missingThread), { code: 'not_found', error: 'thread not found' })
@@ -439,6 +700,38 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
       code: 'invalid_json',
       error: 'request body is not valid JSON',
     })
+  })
+})
+
+test('permission routes validate global defaults and nullable session overrides', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl) => {
+    const initial = await fetch(`${baseUrl}/permissions`)
+    assert.deepEqual(await initial.json(), { defaultProfile: 'workspace', updatedAt: now })
+    const global = await fetch(`${baseUrl}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ defaultProfile: 'full_access' }),
+    })
+    assert.equal(global.status, 200)
+    assert.equal((await json(global)).defaultProfile, 'full_access')
+    const override = await fetch(`${baseUrl}/sessions/${session.id}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ profile: 'read_only' }),
+    })
+    assert.equal(override.status, 200)
+    assert.deepEqual(service.permissionInput, { sessionId: session.id, profile: 'read_only' })
+    const inherit = await fetch(`${baseUrl}/sessions/${session.id}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ profile: null }),
+    })
+    assert.equal(inherit.status, 200)
+    assert.deepEqual(service.permissionInput, { sessionId: session.id, profile: null })
+    const invalid = await fetch(`${baseUrl}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ defaultProfile: 'unsafe' }),
+    })
+    assert.equal(invalid.status, 400)
+    assert.equal((await json(invalid)).code, 'invalid_request')
   })
 })
 
@@ -466,6 +759,10 @@ test('Goal routes validate revisions and expose create, edit, pause, resume, and
     const edited = await editedResponse.json() as CanonicalGoal
     assert.equal(edited.objective, 'ship verified work')
 
+    const verificationHistory = await fetch(`${baseUrl}/goals/${created.id}/verifications`)
+    assert.equal(verificationHistory.status, 200)
+    assert.deepEqual(await verificationHistory.json(), { proposals: [], attempts: [], receipts: [], stopReceipts: [] })
+
     const paused = await fetch(`${baseUrl}/goals/${created.id}/status`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ expectedRevision: edited.revision, status: 'paused' }),
@@ -474,7 +771,22 @@ test('Goal routes validate revisions and expose create, edit, pause, resume, and
     const pausedResult = await paused.json() as GoalCasResult
     assert.equal(pausedResult.goal?.status, 'paused')
 
-    const cleared = await fetch(`${baseUrl}/goals/${created.id}?expectedRevision=${pausedResult.goal?.revision}`, {
+    const resumed = await fetch(`${baseUrl}/goals/${created.id}/status`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: pausedResult.goal?.revision, status: 'active',
+        provider: 'claude', model: 'claude-opus-4-8', effort: 'max',
+      }),
+    })
+    assert.equal(resumed.status, 200)
+    const resumedResult = await resumed.json() as GoalCasResult
+    assert.equal(resumedResult.goal?.provider, 'claude')
+    assert.deepEqual(service.goalStatusInput, {
+      goalId: created.id, expectedRevision: pausedResult.goal?.revision, status: 'active',
+      provider: 'claude', model: 'claude-opus-4-8', effort: 'max',
+    })
+
+    const cleared = await fetch(`${baseUrl}/goals/${created.id}?expectedRevision=${resumedResult.goal?.revision}`, {
       method: 'DELETE',
     })
     assert.equal(cleared.status, 204)
@@ -617,6 +929,32 @@ test('fork, turn, item cursor, and cancellation routes pass validated contracts'
       ],
     })
 
+    const followed = await fetch(`${baseUrl}/threads/${thread.id}/follow-ups`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientRequestId: 'follow-1', expectedTurnId: turn.id, delivery: 'steer_or_queue',
+        input: [{ kind: 'user_message', payload: { text: 'more' } }],
+      }),
+    })
+    assert.equal(followed.status, 202)
+    assert.equal(((await json(followed)).followUp as { id: string }).id, 'follow-up-1')
+    assert.equal(service.followUpInput?.expectedTurnId, turn.id)
+    const followCancelled = await fetch(`${baseUrl}/follow-ups/follow-up-1`, {
+      method: 'DELETE', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: 1 }),
+    })
+    assert.equal(followCancelled.status, 200)
+    assert.equal((await json(followCancelled)).status, 'cancelled')
+
+    const invalidFollow = await fetch(`${baseUrl}/threads/${thread.id}/follow-ups`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientRequestId: 'bad', expectedTurnId: turn.id, delivery: 'steer_or_queue',
+        input: [{ kind: 'assistant_message', payload: { text: 'no' } }],
+      }),
+    })
+    assert.equal(invalidFollow.status, 400)
+
     const listed = await fetch(`${baseUrl}/threads/${thread.id}/items?after=0`)
     assert.equal(listed.status, 200)
     assert.deepEqual((await json(listed)).items, [item])
@@ -694,6 +1032,21 @@ test('SessionStoreError codes map to stable HTTP statuses', async () => {
       assert.deepEqual(await json(response), { code, error: code })
     })
   }
+})
+
+test('core exposes no product-specific emulator routes', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl) => {
+    const paths = [
+      '/host/ldplayer/instances',
+      `/sessions/${session.id}/ldplayer`,
+    ]
+    for (const path of paths) {
+      assert.equal((await fetch(`${baseUrl}${path}`)).status, 404)
+      assert.equal((await fetch(`${baseUrl}${path}`, { method: 'PUT' })).status, 404)
+      assert.equal((await fetch(`${baseUrl}${path}`, { method: 'DELETE' })).status, 404)
+    }
+  })
 })
 
 test('SSE subscribes before replay and resumes from the greatest durable cursor', async () => {

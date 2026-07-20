@@ -28,3 +28,5 @@ dist-ssr
 .baton-state.json
 .baton-session.json
 .playwright-mcp/
+.serena/
+.codex-tmp/

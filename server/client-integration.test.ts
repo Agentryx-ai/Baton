@@ -8,16 +8,16 @@ import {
   classifyProcessRecords,
   inspectClaudeCliConfig,
   inspectClaudeDesktopConfig,
-  inspectCodexConfig,
   inspectCodexNativeConfig,
-  patchCodexConfig,
+  patchClaudeCliConfig,
+  patchClaudeDesktopConfig,
   patchCodexNativeConfig,
   parseCodexIntegrationMode,
+  parseClaudeProxyMode,
   parseIntegrationTargets,
   removeClaudeCliConfig,
   removeClaudeDesktopConfig,
   selectClaudeModels,
-  unpatchCodexConfig,
   unpatchCodexNativeConfig,
 } from './client-integration.ts'
 
@@ -28,73 +28,7 @@ test('configuration conflicts are repairable but applied and unknown states are 
   assert.equal(canApplyConfiguration('unknown'), false)
 })
 
-test('patchCodexConfig deterministically replaces only owned settings', () => {
-  const source = [
-    '# user comment must survive',
-    'model = "gpt-5.6-sol"',
-    'model_provider = "old"',
-    '',
-    '[projects."C:\\\\work"]',
-    'trust_level = "trusted"',
-    '',
-    '[model_providers.baton]',
-    'name = "old baton"',
-    'base_url = "http://old.invalid/v1"',
-    'env_key = "OLD_TOKEN"',
-    'wire_api = "chat"',
-    '',
-    '[features]',
-    'example = true',
-    '',
-  ].join('\r\n')
-
-  const first = patchCodexConfig(source, 'http://127.0.0.1:8317/v1')
-  const second = patchCodexConfig(first, 'http://127.0.0.1:8317/v1')
-  const parsed = parseToml(first) as Record<string, unknown>
-  const providers = parsed.model_providers as Record<string, Record<string, unknown>>
-
-  assert.equal(first, second)
-  assert.match(first, /# user comment must survive/)
-  assert.match(first, /\[projects\."C:\\\\work"\]/)
-  assert.match(first, /\[features\]/)
-  assert.equal(parsed.model, 'gpt-5.6-sol')
-  assert.equal(parsed.model_provider, 'baton')
-  assert.deepEqual(providers.baton, {
-    name: 'Baton CLIProxy',
-    base_url: 'http://127.0.0.1:8317/v1',
-    env_key: 'BATON_PROXY_TOKEN',
-    wire_api: 'responses',
-  })
-})
-
-test('patchCodexConfig refuses an equivalent non-canonical owned key', () => {
-  assert.throws(
-    () => patchCodexConfig('"model_provider" = "old"\n', 'http://127.0.0.1:8317/v1'),
-    /비표준 표기/,
-  )
-})
-
-test('unpatchCodexConfig removes only Baton-owned settings', () => {
-  const original = [
-    '# user comment must survive',
-    'model = "gpt-5.6-sol"',
-    '',
-    '[features]',
-    'example = true',
-    '',
-  ].join('\n')
-  const applied = patchCodexConfig(original, 'http://127.0.0.1:8317/v1')
-  const removed = unpatchCodexConfig(applied, 'http://127.0.0.1:8317/v1')
-  const parsed = parseToml(removed) as Record<string, unknown>
-
-  assert.match(removed, /# user comment must survive/)
-  assert.match(removed, /\[features\]/)
-  assert.equal(parsed.model, 'gpt-5.6-sol')
-  assert.equal(parsed.model_provider, undefined)
-  assert.equal((parsed.model_providers as Record<string, unknown> | undefined)?.baton, undefined)
-})
-
-test('native Codex mode changes only openai_base_url and round-trips bytes safely', () => {
+test('native Codex mode keeps openai identity plus a legacy resume alias and round-trips safely', () => {
   const original = [
     '# keep provider identity and comments',
     'model_provider = "openai"',
@@ -111,6 +45,13 @@ test('native Codex mode changes only openai_base_url and round-trips bytes safel
   assert.equal(patchCodexNativeConfig(applied, baseUrl), applied)
   assert.equal(parsed.model_provider, 'openai')
   assert.equal(parsed.openai_base_url, baseUrl)
+  assert.deepEqual((parsed.model_providers as Record<string, unknown>).baton, {
+    name: 'Baton Native (resume compatibility)',
+    base_url: baseUrl,
+    wire_api: 'responses',
+    request_max_retries: 0,
+    stream_max_retries: 0,
+  })
   assert.match(applied, /# keep provider identity and comments/)
   assert.match(applied, /\[projects\."C:\\\\work"\]/)
   assert.equal(unpatchCodexNativeConfig(applied, baseUrl), original)
@@ -125,7 +66,56 @@ test('native Codex mode refuses to overwrite user transport or another provider'
   )
   assert.throws(
     () => patchCodexNativeConfig('model_provider = "custom"\n', baseUrl),
-    /openai가 아니므로/,
+    /사용자가 지정한 model_provider/,
+  )
+})
+
+test('native Codex mode migrates the exact Baton-owned legacy provider to an unauthenticated Native resume alias', () => {
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  const source = [
+    '# keep me',
+    'model_provider = "baton"',
+    'model = "gpt-5.6-sol"',
+    '',
+    '[features]',
+    'example = true',
+    '',
+    '[model_providers.baton]',
+    'name = "Baton Legacy"',
+    'base_url = "http://127.0.0.1:8317/v1"',
+    'env_key = "BATON_PROXY_TOKEN"',
+    'wire_api = "responses"',
+    '',
+  ].join('\n')
+  const migrated = patchCodexNativeConfig(source, baseUrl)
+  const parsed = parseToml(migrated) as Record<string, unknown>
+  assert.equal(parsed.model_provider, undefined)
+  assert.equal(parsed.openai_base_url, baseUrl)
+  assert.deepEqual((parsed.model_providers as Record<string, unknown>).baton, {
+    name: 'Baton Native (resume compatibility)',
+    base_url: baseUrl,
+    wire_api: 'responses',
+    request_max_retries: 0,
+    stream_max_retries: 0,
+  })
+  assert.equal(parsed.model, 'gpt-5.6-sol')
+  assert.match(migrated, /# keep me/)
+  assert.match(migrated, /\[features\]/)
+})
+
+test('native Codex mode repairs a removed resume alias and rejects a user-owned baton provider', () => {
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  const repaired = patchCodexNativeConfig(`openai_base_url = "${baseUrl}"\n`, baseUrl)
+  assert.equal(inspectCodexNativeConfig(repaired, baseUrl).configuration, 'applied')
+  assert.throws(
+    () => patchCodexNativeConfig([
+      '[model_providers.baton]',
+      'name = "My provider"',
+      'base_url = "https://example.invalid/v1"',
+      'wire_api = "responses"',
+      '',
+    ].join('\n'), baseUrl),
+    /사용자가 정의한 model_providers\.baton/,
   )
 })
 
@@ -141,7 +131,6 @@ test('configuration inspection distinguishes applied, absent, and conflicting va
     inferenceGatewayApiKey: token,
     inferenceModels: [],
   })
-  const codex = patchCodexConfig('model = "gpt-5.6-sol"\n', `${baseUrl}/v1`)
 
   assert.equal(inspectClaudeCliConfig(cli, baseUrl, token).configuration, 'applied')
   assert.equal(inspectClaudeCliConfig('{}', baseUrl, token).configuration, 'not-applied')
@@ -151,8 +140,6 @@ test('configuration inspection distinguishes applied, absent, and conflicting va
     inferenceProvider: 'firstParty',
     inferenceModels: [],
   }), baseUrl, token).configuration, 'not-applied')
-  assert.equal(inspectCodexConfig(codex, `${baseUrl}/v1`, token, token).configuration, 'applied')
-  assert.equal(inspectCodexConfig(codex, `${baseUrl}/v1`, token, null).configuration, 'conflict')
 })
 
 test('JSON removers preserve unrelated user settings', () => {
@@ -173,6 +160,37 @@ test('JSON removers preserve unrelated user settings', () => {
     user: 1,
   })
   assert.deepEqual(JSON.parse(removeClaudeDesktopConfig(desktop, baseUrl, token)), { keep: true })
+})
+
+test('Claude CLI Native settings apply, inspect, and remove without touching user values', () => {
+  const original = JSON.stringify({ env: { KEEP: 'yes', ANTHROPIC_AUTH_TOKEN: 'stale' }, user: 1 })
+  const nativeBaseUrl = 'http://127.0.0.1:4400/baton/inference/anthropic'
+
+  const native = patchClaudeCliConfig(original, nativeBaseUrl, null)
+  assert.equal(inspectClaudeCliConfig(native, nativeBaseUrl, null).configuration, 'applied')
+  assert.deepEqual(JSON.parse(native), {
+    env: { KEEP: 'yes', ANTHROPIC_BASE_URL: nativeBaseUrl },
+    user: 1,
+  })
+  assert.deepEqual(JSON.parse(removeClaudeCliConfig(native, nativeBaseUrl, null)), {
+    env: { KEEP: 'yes' },
+    user: 1,
+  })
+})
+
+test('Claude Desktop uses the Baton Native static client token and round-trips user values', () => {
+  const original = JSON.stringify({ keep: true, inferenceProvider: 'firstParty' })
+  const models = [{
+    name: 'claude-fable-5',
+    anthropicFamilyTier: 'fable',
+    labelOverride: 'Fable 5',
+    isFamilyDefault: true as const,
+  }]
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/anthropic'
+  const token = 'native-token'
+  const applied = patchClaudeDesktopConfig(original, baseUrl, token, models)
+  assert.equal(inspectClaudeDesktopConfig(applied, baseUrl, token).configuration, 'applied')
+  assert.deepEqual(JSON.parse(removeClaudeDesktopConfig(applied, baseUrl, token)), { keep: true })
 })
 
 test('selectClaudeModels is input-order independent and selects newest families', () => {
@@ -223,6 +241,15 @@ test('classifyProcessRecords does not guess CLI when executable evidence is unav
   ])
 })
 
+test('classifyProcessRecords excludes Baton-owned internal Codex app-server processes', () => {
+  assert.deepEqual(classifyProcessRecords([{
+    ProcessId: 41,
+    Name: 'codex.exe',
+    ExecutablePath: 'C:\\tools\\codex.exe',
+    CommandLine: 'codex.exe --config model_catalog_json="C:\\Temp\\baton-model-catalog.json" app-server --stdio',
+  }]), [])
+})
+
 test('parseIntegrationTargets validates and canonicalizes partial selections', () => {
   assert.deepEqual(parseIntegrationTargets(['codex', 'claude-cli']), [
     'claude-cli',
@@ -234,9 +261,17 @@ test('parseIntegrationTargets validates and canonicalizes partial selections', (
 })
 
 test('parseCodexIntegrationMode accepts only declared modes', () => {
-  assert.equal(parseCodexIntegrationMode(undefined), 'custom-provider')
+  assert.equal(parseCodexIntegrationMode(undefined), 'native-openai')
   assert.equal(parseCodexIntegrationMode('native-openai'), 'native-openai')
+  assert.throws(() => parseCodexIntegrationMode('custom-provider'), /올바르지 않은/)
   assert.throws(() => parseCodexIntegrationMode('openai'), /올바르지 않은/)
+})
+
+test('parseClaudeProxyMode accepts Baton Native only', () => {
+  assert.equal(parseClaudeProxyMode(undefined), 'native')
+  assert.equal(parseClaudeProxyMode('native'), 'native')
+  assert.throws(() => parseClaudeProxyMode('legacy-proxy'), /올바르지 않은/)
+  assert.throws(() => parseClaudeProxyMode('gateway'), /올바르지 않은/)
 })
 
 test('blockedProcessesForTargets ignores running unselected clients', () => {

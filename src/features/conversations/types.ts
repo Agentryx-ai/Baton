@@ -5,6 +5,7 @@ export interface JsonObject {
 }
 
 export type CanonicalProvider = 'claude' | 'codex' | 'gemini'
+export type PermissionProfile = 'read_only' | 'workspace' | 'full_access'
 export type ThreadStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'archived'
 export type TurnStatus =
   | 'queued'
@@ -22,6 +23,8 @@ export type VisibleWorkStatus =
   | 'waiting_tool'
   | 'running'
   | 'queued'
+  | 'awaiting_goal_turn'
+  | 'verifying'
   | 'usage_limited'
   | 'budget_limited'
   | 'blocked'
@@ -56,12 +59,36 @@ export interface CanonicalSessionDto {
   activeThreadId: string
   projectKey: string | null
   cwd: string | null
+  permissions: SessionPermissionStateDto
   schemaVersion: number
   createdAt: string
   updatedAt: string
   archivedAt: string | null
   workStatus: VisibleWorkStatus
   source?: NativeSessionSourceSummaryDto | null
+}
+
+export interface PermissionSettingsDto {
+  defaultProfile: PermissionProfile
+  updatedAt: string
+}
+
+export interface SessionPermissionStateDto {
+  defaultProfile: PermissionProfile
+  override: PermissionProfile | null
+  effectiveProfile: PermissionProfile
+  source: 'global' | 'session_override'
+}
+
+export interface ImageArtifactRefDto extends JsonObject {
+  id: string
+  sha256: string
+  mediaType: 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+  byteLength: number
+  width: number | null
+  height: number | null
+  fileName: string
+  source: 'upload' | 'tool_capture'
 }
 
 export type NativeImportSourceClient = 'codex_local' | 'claude_desktop' | 'claude_code'
@@ -198,15 +225,53 @@ export interface ThreadSnapshotDto {
   thread: CanonicalThreadDto
   turns: CanonicalTurnDto[]
   items: CanonicalItemDto[]
+  itemsTruncated?: boolean
   bindings: JsonValue[]
+  followUps?: CanonicalFollowUpDto[]
   goal?: CanonicalGoalDto | null
+}
+
+export type FollowUpDeliveryDto = 'steer_or_queue' | 'next_turn'
+export type FollowUpStatusDto =
+  | 'queued'
+  | 'dispatching'
+  | 'consumed'
+  | 'cancelled'
+  | 'stale_goal'
+  | 'delivery_unknown'
+
+export interface CanonicalFollowUpDto {
+  id: string
+  sessionId: string
+  threadId: string
+  clientRequestId: string
+  requestHash: string
+  sequence: number
+  afterTurnSequence: number
+  delivery: FollowUpDeliveryDto
+  status: FollowUpStatusDto
+  targetTurnId: string | null
+  consumedTurnId: string | null
+  consumedItemIds: string[]
+  scope: { kind: 'conversation' } | { kind: 'goal'; goalId: string; revision: number }
+  input: Array<{
+    kind: 'user_message'
+    visibility?: 'portable'
+    payload: JsonObject
+  }>
+  dispatchOwner: string | null
+  leaseExpiresAt: string | null
+  revision: number
+  createdAt: string
+  updatedAt: string
+  consumedAt: string | null
 }
 
 export interface CanonicalGoalDto {
   id: string
   threadId: string
   objective: string
-  status: 'active' | 'paused' | 'blocked' | 'usage_limited' | 'budget_limited' | 'complete'
+  status: 'active' | 'verifying' | 'paused' | 'blocked' | 'usage_limited' | 'budget_limited' | 'complete'
   statusReason: {
     code: string
     source: 'user' | 'host' | 'provider' | 'model'
@@ -229,6 +294,16 @@ export interface CanonicalGoalDto {
   updatedAt: string
   startedAt: string
   completedAt: string | null
+  verificationProposalId: string | null
+  latestCompletionReceiptId: string | null
+  latestStopReceiptId: string | null
+}
+
+export interface GoalVerificationHistoryDto {
+  proposals: Array<Record<string, unknown>>
+  attempts: Array<Record<string, unknown>>
+  receipts: Array<Record<string, unknown>>
+  stopReceipts: Array<Record<string, unknown>>
 }
 
 export type CanonicalStreamEventType =
@@ -241,6 +316,7 @@ export type CanonicalStreamEventType =
   | 'turn_failed'
   | 'turn_interrupted'
   | 'workspace_changed'
+  | 'host_capability_changed'
   | 'goal_changed'
 
 export interface CanonicalStreamEventDto {
@@ -260,12 +336,53 @@ export interface CreateSessionDto {
   instructionSnapshot?: JsonObject
 }
 
+export interface FirstTurnDto {
+  clientRequestId: string
+  cwd: string | null
+  instructionSnapshot?: JsonObject
+  provider: CanonicalProvider
+  model: string
+  effort?: string | null
+  input: Array<{
+    kind: 'user_message'
+    visibility: 'portable'
+    payload: JsonObject
+  }>
+}
+
+export interface FirstTurnResultDto {
+  session: CanonicalSessionDto
+  thread: CanonicalThreadDto
+  turn: CanonicalTurnDto
+  execution: {
+    id: string
+    status: string
+  }
+  initialItems: CanonicalItemDto[]
+  duplicate: boolean
+}
+
+export type NativeFolderPickResultDto =
+  | { status: 'selected'; cwd: string }
+  | { status: 'cancelled' }
+
 export interface StartTurnDto {
   provider: CanonicalProvider
   model: string
   effort?: string | null
   clientRequestId: string
   expectedRevision: number
+  input: Array<{
+    kind: 'user_message'
+    visibility: 'portable'
+    payload: JsonObject
+  }>
+}
+
+export interface EnqueueFollowUpDto {
+  clientRequestId: string
+  expectedTurnId: string
+  delivery: FollowUpDeliveryDto
   input: Array<{
     kind: 'user_message'
     visibility: 'portable'
@@ -316,6 +433,9 @@ export interface ProviderModelDescriptorDto {
   description: string
   effortLevels: string[]
   defaultEffort: string | null
+  contextWindowTokens: number
+  usableInputTokens: number | null
+  autoCompactTokens: number | null
 }
 
 export interface BeginTurnResultDto {

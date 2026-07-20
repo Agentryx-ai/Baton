@@ -79,6 +79,13 @@ export interface ProviderBindingPatch {
   modelFamily?: string
 }
 
+export interface ProviderSkillResource {
+  /** Stable provider-local identifier exposed to the model (for example, openai-docs). */
+  id: string
+  /** Immutable root that the Baton read-only skill resource tool may access. */
+  root: string
+}
+
 export interface SessionProviderAdapter {
   readonly provider: CanonicalProvider
 
@@ -91,16 +98,22 @@ export interface SessionProviderAdapter {
   ): Promise<ProviderTurnExecution>
   normalize(event: NativeProviderEvent): NewCanonicalItem[]
   extractBinding(event: NativeProviderEvent): ProviderBindingPatch | null
+  /** Provider-selected skill resources. These never grant execution or general filesystem access. */
+  skillResources?(): readonly ProviderSkillResource[]
   shutdown(): Promise<void>
 }
 
 export function assertCanonicalAdapterHandshake(handshake: AdapterHandshake): void {
-  if (handshake.capabilities.nativeChildExecution !== 'disabled') {
-    throw new Error('Canonical mode requires native child execution to be disabled')
-  }
-  if (handshake.exposedNativeAgentTools.length > 0) {
+  const tools = handshake.exposedNativeAgentTools
+  if (handshake.capabilities.nativeChildExecution === 'disabled' && tools.length > 0) {
     throw new Error(
-      `Canonical mode rejected native agent tools: ${handshake.exposedNativeAgentTools.join(', ')}`,
+      `Adapter declared disabled native child execution but exposed native agent tools: ${tools.join(', ')}`,
     )
+  }
+  if (handshake.capabilities.nativeChildExecution === 'exposed' && tools.length === 0) {
+    throw new Error('Adapter declared exposed native child execution without native agent tools')
+  }
+  if (tools.some((tool) => tool.trim().length === 0) || new Set(tools).size !== tools.length) {
+    throw new Error('Adapter exposed invalid or duplicate native agent tool names')
   }
 }

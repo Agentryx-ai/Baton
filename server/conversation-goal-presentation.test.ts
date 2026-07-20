@@ -12,6 +12,10 @@ import {
 
 test('goal statuses have stable labels and semantic tones', () => {
   assert.deepEqual(goalStatusPresentation('active'), { label: '진행 중', tone: 'active' })
+  assert.deepEqual(goalStatusPresentation('active', 'awaiting_goal_turn'), { label: '다음 작업 준비 중', tone: 'active' })
+  assert.deepEqual(goalStatusPresentation('active', 'queued'), { label: '대기 중', tone: 'active' })
+  assert.deepEqual(goalStatusPresentation('active', 'waiting_tool'), { label: '도구 실행 중', tone: 'active' })
+  assert.deepEqual(goalStatusPresentation('verifying'), { label: '완료 검증 중', tone: 'active' })
   assert.deepEqual(goalStatusPresentation('paused'), { label: '일시 정지', tone: 'muted' })
   assert.deepEqual(goalStatusPresentation('blocked'), { label: '확인 필요', tone: 'warning' })
   assert.deepEqual(goalStatusPresentation('usage_limited'), { label: '사용량 제한', tone: 'warning' })
@@ -56,4 +60,20 @@ test('goal reason prefers sanitized display text and falls back to a stable labe
     message: '   ',
     at: '2026-07-19T00:00:00.000Z',
   }), '계속하려면 상태를 확인해 주세요.')
+})
+
+test('goal reason turns context-limit failures into an actionable localized warning', () => {
+  assert.equal(formatGoalReason({
+    code: 'context_input_too_large',
+    source: 'host',
+    message: 'Upcoming input requires approximately 1364559 tokens; usable input budget is 247424 for gpt-5.6-sol (272000 context tokens); compaction=generator_failed',
+    at: '2026-07-19T00:00:00.000Z',
+  }), '대화 컨텍스트가 gpt-5.6-sol의 입력 한도를 초과했습니다(약 1,364,559 / 247,424 토큰). 자동 압축을 완료하지 못해 작업을 멈췄습니다.')
+
+  assert.equal(formatGoalReason({
+    code: 'provider_failure',
+    source: 'host',
+    message: 'Upcoming input requires approximately 1364559 tokens; usable input budget is 104000',
+    at: '2026-07-19T00:00:00.000Z',
+  }), '대화 컨텍스트가 선택한 모델의 입력 한도를 초과했습니다(약 1,364,559 / 104,000 토큰). 자동 압축을 완료하지 못해 작업을 멈췄습니다.')
 })

@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import type {
   AdapterHandshake,
@@ -13,16 +13,24 @@ import type {
   ProviderSteerResult,
   ProviderTerminalResult,
   ProviderTurnExecution,
+  ProviderSkillResource,
   SessionProviderAdapter,
 } from './adapter.ts'
 import type { AgentToolResult, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import {
+  canonicalConversationCacheKey,
+  startCanonicalResponsesBridge,
+  type CanonicalResponsesBridge,
+} from './canonical-cache-identity.ts'
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
+import { hasPortableUserContent, imageAttachments, type ImageArtifactResolver } from './image-artifacts.ts'
+import { latestNativeContextCheckpoint } from './native-context-checkpoint.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
   project_doc_max_bytes: 0,
-  'features.multi_agent': false,
-  'features.multi_agent_v2': false,
+  'features.multi_agent': true,
+  'features.multi_agent_v2': true,
   'features.enable_fanout': false,
   'features.shell_tool': false,
   'features.standalone_web_search': false,
@@ -31,14 +39,30 @@ const HARDENING_OVERRIDES = Object.freeze({
 })
 
 const VERIFIED_FEATURES = [
-  'multi_agent',
-  'multi_agent_v2',
   'enable_fanout',
   'shell_tool',
   'standalone_web_search',
   'apps',
   'plugins',
 ] as const
+
+// Status notifications describe every thread known to the process, including
+// detached/internal threads, and are not execution events for the active turn.
+// thread/started stays enabled because its parentThreadId is the authoritative
+// ownership link for provider-native children that start before the collab item.
+const IGNORED_GLOBAL_NOTIFICATIONS = new Set([
+  'thread/status/changed',
+])
+
+const CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS = `Baton is the canonical execution owner.
+Use the dynamic tools exposed by Baton and Codex-native collaboration/subagent tools. Native child
+agents are provider-managed, inherit this turn's safety and workspace boundaries, and are recorded
+as private provider audit events rather than Baton-owned child executions. Do not invoke Codex-native
+shell, web search, MCP, app, plugin, approval, or other task-execution tools. If requested work requires
+an unavailable capability, continue safely with available tools or report the exact limitation.
+When a selected skill provides a filesystem location, read its files with read_skill_resource using
+the skill name and a skill-relative path (normally SKILL.md). Never pass an absolute skill path to
+read_file.`
 
 const ALLOWED_ITEM_TYPES = new Set([
   'userMessage',
@@ -47,6 +71,16 @@ const ALLOWED_ITEM_TYPES = new Set([
   'plan',
   'dynamicToolCall',
   'contextCompaction',
+  'collabAgentToolCall',
+  'subAgentActivity',
+])
+
+const CODEX_NATIVE_AGENT_TOOLS = Object.freeze([
+  'spawn_agent',
+  'send_input',
+  'resume_agent',
+  'wait',
+  'close_agent',
 ])
 
 type JsonObject = Record<string, unknown>
@@ -78,16 +112,20 @@ export interface CodexAdapterOptions {
   proxyConnection?: () => Promise<CodexProxyConnection>
   /** Test/embedding override. Production defaults to a fresh Baton-owned temporary home. */
   isolatedCodexHome?: string
+  /** Durable installation-local secret; never sent to Codex or the upstream provider. */
+  cacheIdentitySecret?: Uint8Array
+  imageArtifacts?: ImageArtifactResolver
 }
 
 interface MaterializedCodexTurn {
   turnId: string
+  canonicalThreadId: string
   model: string
   effort: string | null
   cwd: string | null
   developerInstructions: string | null
   history: JsonObject[]
-  input: Array<{ type: 'text'; text: string }>
+  input: Array<{ type: 'text'; text: string } | { type: 'localImage'; path: string }>
 }
 
 interface RpcMessage {
@@ -222,8 +260,10 @@ export class CodexJsonlRpcClient {
       }
       buffer += decoder.decode()
       if (buffer.trim().length > 0) this.accept(JSON.parse(buffer) as RpcMessage)
-      this.failPending(new Error('Codex app-server stdout closed'))
-      this.messages.end()
+      const result = await this.process.exited
+      const error = new Error(`Codex app-server exited (${exitLabel(result)})`)
+      this.failPending(error)
+      this.messages.fail(error)
     } catch (error) {
       this.failPending(error)
       this.messages.fail(error)
@@ -257,7 +297,12 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   private readonly proxyConnectionProvider: (() => Promise<CodexProxyConnection>) | undefined
   private readonly isolatedCodexHome: string
   private readonly ownsIsolatedCodexHome: boolean
+  private readonly installsHardenedModelCatalog: boolean
+  private readonly cacheIdentitySecret: Buffer | null
+  private readonly imageArtifacts: ImageArtifactResolver | null
   private proxyConnection: CodexProxyConnection | null = null
+  private modelCatalogPath: string | null = null
+  private modelCatalogModelCount = 0
   private initializePromise: Promise<AdapterHandshake> | null = null
   private mcpDisableOverrides: Record<string, false> = {}
   private readonly active = new Set<ProviderTurnExecution>()
@@ -268,7 +313,15 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     this.processFactory = options.processFactory ?? spawnCodexProcess
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000
     this.proxyConnectionProvider = options.proxyConnection
+    this.cacheIdentitySecret = options.cacheIdentitySecret === undefined
+      ? null
+      : Buffer.from(options.cacheIdentitySecret)
+    this.imageArtifacts = options.imageArtifacts ?? null
+    if (this.cacheIdentitySecret !== null && this.cacheIdentitySecret.byteLength < 32) {
+      throw new TypeError('Codex canonical cache identity secret must contain at least 32 bytes')
+    }
     this.ownsIsolatedCodexHome = options.isolatedCodexHome === undefined && options.processFactory === undefined
+    this.installsHardenedModelCatalog = options.processFactory === undefined
     this.isolatedCodexHome = options.isolatedCodexHome
       ?? (options.processFactory
         ? path.join(tmpdir(), 'baton-codex-test-home')
@@ -283,45 +336,73 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   validate(request: CanonicalTurnRequest, snapshot: ThreadSnapshot): void {
     if (request.model.trim().length === 0) throw new Error('Codex model is required')
     if (snapshot.thread.status === 'archived') throw new Error('Cannot execute an archived thread')
-    if (request.input.length === 0) throw new Error('Codex turn requires text input')
+    if (request.input.length === 0) throw new Error('Codex turn requires input')
     for (const item of request.input) {
-      if (item.kind !== 'user_message' || portableText(item.payload) === null) {
-        throw new Error('Safe Codex mode accepts text user_message input only')
+      if (item.kind !== 'user_message' || !hasPortableUserContent(item.payload)) {
+        throw new Error('Safe Codex mode accepts portable text and image user_message input only')
       }
     }
   }
 
   materialize(request: CanonicalTurnRequest, snapshot: ThreadSnapshot): NativeTurnRequest {
     this.validate(request, snapshot)
-    const history = snapshot.items.flatMap((item): JsonObject[] => {
+    const nativeCheckpoint = latestNativeContextCheckpoint(snapshot.items, 'codex')
+    const replayItems = nativeCheckpoint === null
+      ? snapshot.items
+      : snapshot.items.filter((item) => item.sequence > nativeCheckpoint.item.sequence)
+    const checkpointHistory = nativeCheckpoint?.checkpoint.provider === 'codex'
+      ? nativeCheckpoint.checkpoint.history
+      : []
+    const history = [...checkpointHistory, ...replayItems.flatMap((item): JsonObject[] => {
       if (item.visibility !== 'portable') return []
       const text = portableHistoryText(item.kind, item.payload)
-      if (text === null) return []
+      const attachments = item.kind === 'user_message' ? imageAttachments(item.payload) : []
+      if (text === null && attachments.length === 0) return []
       const role = item.kind === 'user_message' ? 'user' : 'assistant'
+      if (attachments.length > 0 && !this.imageArtifacts) {
+        throw new Error('Codex history contains images without an artifact resolver')
+      }
       return [
         {
           type: 'message',
           role,
           content: [
-            {
+            ...(text === null ? [] : [{
               type: role === 'user' ? 'input_text' : 'output_text',
               text,
-            },
+            }]),
+            ...attachments.map((attachment) => ({
+              type: 'input_image',
+              image_url: this.imageArtifacts!.dataUrl(attachment),
+            })),
           ],
         },
       ]
-    })
+    })]
     const body: MaterializedCodexTurn = {
       turnId: request.turnId,
+      canonicalThreadId: snapshot.thread.id,
       model: request.model,
       effort: request.effort ?? null,
       cwd: snapshot.session.cwd,
-      developerInstructions: canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+      developerInstructions: canonicalToolBoundaryInstructions(
+        canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+      ),
       history,
-      input: request.input.map((item) => ({
-        type: 'text',
-        text: portableText(item.payload) as string,
-      })),
+      input: request.input.flatMap((item) => {
+        const text = portableText(item.payload)
+        const attachments = imageAttachments(item.payload)
+        if (attachments.length > 0 && !this.imageArtifacts) {
+          throw new Error('Codex input contains images without an artifact resolver')
+        }
+        return [
+          ...(text === null ? [] : [{ type: 'text' as const, text }]),
+          ...attachments.map((attachment) => ({
+            type: 'localImage' as const,
+            path: this.imageArtifacts!.pathFor(attachment),
+          })),
+        ]
+      }),
     }
     return { body }
   }
@@ -333,11 +414,32 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     if (this.shuttingDown) throw new Error('Codex adapter is shutting down')
     await this.initialize()
     const body = parseMaterializedRequest(request.body)
-    const process = this.processFactory(
-      this.executable,
-      launchArgs(this.mcpDisableOverrides, this.proxyConnection),
-      proxyEnvironment(this.proxyConnection, this.isolatedCodexHome),
-    )
+    let cacheBridge: CanonicalResponsesBridge | null = null
+    let process: CodexAppServerProcess
+    try {
+      cacheBridge = this.proxyConnection && this.cacheIdentitySecret
+        ? await startCanonicalResponsesBridge({
+            upstreamBaseUrl: this.proxyConnection.baseUrl,
+            upstreamToken: this.proxyConnection.token,
+            promptCacheKey: canonicalConversationCacheKey(
+              this.cacheIdentitySecret,
+              body.canonicalThreadId,
+            ),
+            allowedToolNames: context.toolDefinitions.map((definition) => definition.name),
+          })
+        : null
+      const executionConnection = cacheBridge
+        ? { baseUrl: cacheBridge.baseUrl, token: cacheBridge.token }
+        : this.proxyConnection
+      process = this.processFactory(
+        this.executable,
+        launchArgs(this.mcpDisableOverrides, executionConnection, this.modelCatalogPath),
+        proxyEnvironment(executionConnection, this.isolatedCodexHome),
+      )
+    } catch (error) {
+      await cacheBridge?.close().catch(() => undefined)
+      throw error
+    }
     const client = new CodexJsonlRpcClient(process)
     const eventQueue = new AsyncQueue<NativeProviderEvent>()
     let terminalResult: ProviderTerminalResult | null = null
@@ -346,8 +448,10 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       terminalResolve = resolve
     })
     let disposed = false
+    let disposePromise: Promise<void> | null = null
     let nativeThreadId: string | null = null
     let nativeTurnId: string | null = null
+    const nativeChildThreadIds = new Set<string>()
     let cumulativeUsage: Record<string, unknown> | null = null
     let cancelPromise: Promise<void> | null = null
     let terminalOverride: ProviderTerminalResult | null = null
@@ -427,23 +531,39 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       fail(new Error(message), code)
     }
 
-    const dispose = async (): Promise<void> => {
-      if (disposed) return
-      disposed = true
-      acceptingSteers = false
-      await Promise.race([closeSteers(), delay(this.shutdownTimeoutMs)])
-      await process.closeInput().catch(() => undefined)
-      const exited = await Promise.race([
-        process.exited.then(() => true, () => true),
-        delay(this.shutdownTimeoutMs).then(() => false),
-      ])
-      if (!exited) {
-        await process.kill().catch(() => undefined)
-        await Promise.race([
-          process.exited.catch(() => undefined),
-          delay(this.shutdownTimeoutMs),
+    const dispose = (): Promise<void> => {
+      disposePromise ??= (async () => {
+        disposed = true
+        acceptingSteers = false
+        await Promise.race([closeSteers(), delay(this.shutdownTimeoutMs)])
+        const threadIds = [...nativeChildThreadIds, nativeThreadId].filter(
+          (threadId): threadId is string => threadId !== null,
+        )
+        for (const threadId of threadIds) {
+          await withTimeout(
+            client.request('thread/archive', { threadId }),
+            this.shutdownTimeoutMs,
+            'Codex thread/archive request',
+          ).catch(() => undefined)
+        }
+        const inputClosed = await Promise.race([
+          process.closeInput().then(() => true, () => true),
+          delay(this.shutdownTimeoutMs).then(() => false),
         ])
-      }
+        const exited = inputClosed && await Promise.race([
+          process.exited.then(() => true, () => true),
+          delay(this.shutdownTimeoutMs).then(() => false),
+        ])
+        if (!exited) {
+          await process.kill().catch(() => undefined)
+          await Promise.race([
+            process.exited.catch(() => undefined),
+            delay(this.shutdownTimeoutMs),
+          ])
+        }
+        await cacheBridge?.close().catch(() => undefined)
+      })()
+      return disposePromise
     }
 
     const cancel = async (code = 'user_cancelled', message = 'Codex turn was cancelled'): Promise<void> => {
@@ -510,9 +630,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       void cancel('user_cancelled', 'Codex turn was cancelled by the caller').catch(() => undefined)
     }
     context.signal.addEventListener('abort', abortListener, { once: true })
-    turnTimer = setTimeout(() => {
-      void cancel('turn_time_limit', 'Codex turn exceeded the wall-clock limit').catch(() => undefined)
-    }, context.limits.turnTimeoutMs)
+    if (context.limits.turnTimeoutMs !== null) {
+      turnTimer = setTimeout(() => {
+        void cancel('turn_time_limit', 'Codex turn exceeded the wall-clock limit').catch(() => undefined)
+      }, context.limits.turnTimeoutMs)
+    }
     if (context.signal.aborted) {
       abortListener()
       return execution
@@ -524,6 +646,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           clientInfo: { name: 'baton', title: 'Baton', version: '0.1.0' },
           capabilities: {
             experimentalApi: true,
+            optOutNotificationMethods: [...IGNORED_GLOBAL_NOTIFICATIONS],
             mcpServerOpenaiFormElicitation: false,
           },
         }),
@@ -545,7 +668,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           developerInstructions: body.developerInstructions,
           environments: [],
           runtimeWorkspaceRoots: [],
-          ephemeral: true,
+          ephemeral: false,
           approvalPolicy: 'never',
           approvalsReviewer: 'user',
           dynamicTools: context.toolDefinitions.map(dynamicToolSpec),
@@ -562,8 +685,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         )
       }
       const thread = asObject(start.thread, 'thread/start thread')
-      if (thread.ephemeral !== true || thread.path !== null) {
-        throw new Error('Codex canonical mode requires an ephemeral thread with no rollout path')
+      if (thread.ephemeral !== false || typeof thread.path !== 'string' || thread.path.length === 0) {
+        throw new Error('Codex provider-native delegation requires a persisted thread with a rollout path')
       }
       if (!Array.isArray(start.runtimeWorkspaceRoots) || start.runtimeWorkspaceRoots.length !== 0) {
         throw new Error('Codex canonical mode requires zero execution environment roots')
@@ -609,18 +732,26 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 }
                 rpcRequestIds.add(message.id)
                 const toolCall = parseDynamicToolCall(message.params)
-                if (toolCall.threadId !== nativeThreadId || toolCall.turnId !== nativeTurnId) {
+                const childToolCall = nativeChildThreadIds.has(toolCall.threadId)
+                if ((!childToolCall && toolCall.threadId !== nativeThreadId)
+                  || (!childToolCall && toolCall.turnId !== nativeTurnId)) {
                   throw capabilityViolation('dynamic tool call referenced a foreign thread or turn')
                 }
                 if (!context.toolDefinitions.some((definition) => definition.name === toolCall.tool)) {
                   throw capabilityViolation(`dynamic tool call requested unregistered tool ${toolCall.tool}`)
                 }
                 const signature = canonicalJson([toolCall.tool, toolCall.arguments])
-                const existing = providerCalls.get(toolCall.callId)
+                const providerCallKey = canonicalJson([
+                  toolCall.threadId,
+                  toolCall.turnId,
+                  toolCall.callId,
+                ])
+                const existing = providerCalls.get(providerCallKey)
                 if (existing && existing.signature !== signature) {
                   throw capabilityViolation(`dynamic tool call id ${toolCall.callId} was reused with different input`)
                 }
-                if (!existing && modelRoundTrips + 1 >= context.limits.maxModelRoundTrips) {
+                if (!existing && context.limits.maxModelRoundTrips !== null
+                  && modelRoundTrips + 1 >= context.limits.maxModelRoundTrips) {
                   failLimit(
                     'model_round_limit',
                     'Codex requested a tool after the host model round-trip limit',
@@ -630,17 +761,19 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 let resultPromise = existing?.result
                 if (!resultPromise) {
                   resultPromise = context.executeTool({
-                    callId: `${body.turnId}:${toolCall.callId}`,
+                    callId: childToolCall
+                      ? `${body.turnId}:${toolCall.threadId}:${toolCall.turnId}:${toolCall.callId}`
+                      : `${body.turnId}:${toolCall.callId}`,
                     providerCallId: toolCall.callId,
                     name: toolCall.tool,
                     input: toolCall.arguments,
                   })
-                  providerCalls.set(toolCall.callId, { signature, result: resultPromise })
+                  providerCalls.set(providerCallKey, { signature, result: resultPromise })
                 }
                 const result = await resultPromise
                 if (terminalResult !== null) return
                 await client.respond(message.id, {
-                  contentItems: [{ type: 'inputText', text: JSON.stringify(result) }],
+                  contentItems: codexToolResultContent(result, this.imageArtifacts),
                   success: result.success,
                 })
                 continue
@@ -652,12 +785,27 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               }
               throw capabilityViolation(`unexpected server request ${message.method}`)
             }
+            if (IGNORED_GLOBAL_NOTIFICATIONS.has(message.method)) continue
             const params = asOptionalObject(message.params)
-            assertActiveNativeIds(params, nativeThreadId, nativeTurnId)
-            if (isForbiddenNotification(message.method, params)) {
-              throw capabilityViolation(`unexpected native execution event ${message.method}`)
+            if (message.method === 'thread/started') {
+              trackNativeStartedThread(params, nativeThreadId, nativeChildThreadIds)
+              continue
             }
-            if (message.method === 'thread/tokenUsage/updated') {
+            const eventScope = activeNativeEventScope(
+              params,
+              nativeThreadId,
+              nativeTurnId,
+              nativeChildThreadIds,
+            )
+            if (eventScope === 'foreign') continue
+            trackNativeChildThreads(params, nativeThreadId, nativeChildThreadIds)
+            const forbiddenItemType = forbiddenNotificationItemType(message.method, params)
+            if (forbiddenItemType !== null) {
+              throw capabilityViolation(
+                `unexpected native execution event ${message.method}:${forbiddenItemType}`,
+              )
+            }
+            if (eventScope === 'root' && message.method === 'thread/tokenUsage/updated') {
               const snapshot = codexUsageSnapshot(params)
               cumulativeUsage = snapshot === null
                 ? null
@@ -666,13 +814,14 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               if (!seenUsageTotals.has(roundIdentity)) {
                 seenUsageTotals.add(roundIdentity)
                 modelRoundTrips += 1
-                if (modelRoundTrips > context.limits.maxModelRoundTrips) {
+                if (context.limits.maxModelRoundTrips !== null
+                  && modelRoundTrips > context.limits.maxModelRoundTrips) {
                   failLimit('model_round_limit', 'Codex exceeded the observable model round-trip limit')
                   return
                 }
               }
             }
-            if (message.method === 'model/rerouted') {
+            if (eventScope === 'root' && message.method === 'model/rerouted') {
               const fromModel = requiredString(params?.fromModel, 'Codex reroute source model')
               const toModel = requiredString(params?.toModel, 'Codex reroute target model')
               if (fromModel !== resolvedModel) {
@@ -692,8 +841,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 resolvedProvider: requiredString(resolvedProvider, 'active Codex model provider'),
               }),
             )
-            eventQueue.push(event)
-            if (message.method === 'turn/completed') {
+            const item = asOptionalObject(params?.item)
+            if (eventScope === 'root' || item?.type === 'collabAgentToolCall') {
+              eventQueue.push(event)
+            }
+            if (eventScope === 'root' && message.method === 'turn/completed') {
               const turn = asObject(params?.turn, 'turn/completed turn')
               if (turn.id !== nativeTurnId) {
                 throw capabilityViolation('turn completion referenced a foreign native turn')
@@ -780,6 +932,23 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           nativeId,
         }]
       }
+      if (type === 'collabAgentToolCall') {
+        return [{
+          kind: 'provider_event',
+          visibility: 'baton_private',
+          payload: {
+            event: 'provider_native_collaboration',
+            tool: typeof item.tool === 'string' ? item.tool : null,
+            status: typeof item.status === 'string' ? item.status : 'completed',
+            senderThreadId: typeof item.senderThreadId === 'string' ? item.senderThreadId : null,
+            receiverThreadIds: Array.isArray(item.receiverThreadIds)
+              ? item.receiverThreadIds.filter((value): value is string => typeof value === 'string')
+              : [],
+          },
+          provider: 'codex',
+          nativeId,
+        }]
+      }
     }
     if (event.type === 'turn/plan/updated') {
       return [{
@@ -813,9 +982,14 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     return []
   }
 
-  // Every safe Codex turn owns an ephemeral process/thread that is disposed at
-  // completion. Persisting its native id would create a false resumable binding.
+  // Every Codex turn owns a transient provider thread which is persisted only
+  // long enough for native child threads to resolve, then archived on dispose.
+  // Persisting its native id would create a false resumable Baton binding.
   extractBinding(_event: NativeProviderEvent) { return null }
+
+  skillResources(): readonly ProviderSkillResource[] {
+    return discoverCodexSkillResources(this.isolatedCodexHome)
+  }
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true
@@ -824,6 +998,17 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   }
 
   private async preflight(): Promise<AdapterHandshake> {
+    if (this.ownsIsolatedCodexHome) seedUserCodexSkills(this.isolatedCodexHome)
+    if (this.installsHardenedModelCatalog && this.modelCatalogPath === null) {
+      mkdirSync(this.isolatedCodexHome, { recursive: true })
+      const hardenedCatalog = installHardenedModelCatalog(
+        this.executable,
+        this.isolatedCodexHome,
+        this.shutdownTimeoutMs,
+      )
+      this.modelCatalogPath = hardenedCatalog.path
+      this.modelCatalogModelCount = hardenedCatalog.modelCount
+    }
     this.proxyConnection = this.proxyConnectionProvider
       ? await this.proxyConnectionProvider()
       : null
@@ -839,21 +1024,27 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       adapterVersion: requiredString(hardened.initialized.userAgent, 'Codex userAgent'),
       capabilities: {
         roles: ['user', 'assistant'],
-        contentTypes: ['text'],
+        contentTypes: ['text', 'image'],
         toolCalling: true,
         parallelTools: true,
         contextWindow: null,
         continuation: 'stateless',
         reasoningState: 'portable-summary',
         taskMetadata: true,
-        nativeChildExecution: 'disabled',
+        nativeChildExecution: 'exposed',
       },
-      exposedNativeAgentTools: [],
+      exposedNativeAgentTools: [...CODEX_NATIVE_AGENT_TOOLS],
       enforcementEvidence: {
         ...evidence,
         mcpServersDisabled: Object.keys(this.mcpDisableOverrides).length,
         toolTransport: 'client-owned-dynamic-functions',
         providerLocalMetadataTools: ['update_plan'],
+        modelSelectedMultiAgent: this.modelCatalogPath === null
+          ? 'test-process-factory'
+          : `provider-native-for-${this.modelCatalogModelCount}-models`,
+        canonicalCacheIdentity: this.cacheIdentitySecret
+          ? 'hmac-sha256-loopback-responses-bridge-v1'
+          : 'disabled-no-installation-secret',
       },
     }
   }
@@ -863,7 +1054,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   ): Promise<{ initialized: JsonObject; configRead: JsonObject }> {
     const process = this.processFactory(
       this.executable,
-      launchArgs(overrides, this.proxyConnection),
+      launchArgs(overrides, this.proxyConnection, this.modelCatalogPath),
       proxyEnvironment(this.proxyConnection, this.isolatedCodexHome),
     )
     const client = new CodexJsonlRpcClient(process)
@@ -882,23 +1073,115 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       )
       return { initialized, configRead }
     } finally {
-      await process.closeInput().catch(() => undefined)
-      const exited = await Promise.race([
-        process.exited.then(() => true, () => true),
+      const inputClosed = await Promise.race([
+        process.closeInput().then(() => true, () => true),
         delay(this.shutdownTimeoutMs).then(() => false),
       ])
-      if (!exited) await process.kill().catch(() => undefined)
+      if (!inputClosed) {
+        await process.kill().catch(() => undefined)
+      } else {
+        const exited = await Promise.race([
+          process.exited.then(() => true, () => true),
+          delay(this.shutdownTimeoutMs).then(() => false),
+        ])
+        if (!exited) await process.kill().catch(() => undefined)
+      }
     }
   }
+}
+
+function seedUserCodexSkills(isolatedCodexHome: string): void {
+  const target = path.join(isolatedCodexHome, 'skills')
+  mkdirSync(target, { recursive: true })
+  for (const source of [path.join(homedir(), '.codex', 'skills'), path.join(homedir(), '.agents', 'skills')]) {
+    if (!existsSync(source)) continue
+    for (const entry of readdirSync(source, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === '.system' || existsSync(path.join(target, entry.name))) continue
+      cpSync(path.join(source, entry.name), path.join(target, entry.name), {
+        recursive: true,
+        dereference: false,
+        errorOnExist: false,
+        force: false,
+      })
+    }
+  }
+}
+
+function discoverCodexSkillResources(isolatedCodexHome: string): readonly ProviderSkillResource[] {
+  const roots = [path.join(isolatedCodexHome, 'skills'), path.join(isolatedCodexHome, 'skills', '.system')]
+  const resources = new Map<string, string>()
+  for (const root of roots) {
+    if (!existsSync(root)) continue
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === '.system') continue
+      const skillRoot = path.join(root, entry.name)
+      if (existsSync(path.join(skillRoot, 'SKILL.md')) && !resources.has(entry.name)) {
+        resources.set(entry.name, skillRoot)
+      }
+    }
+  }
+  return Object.freeze([...resources].map(([id, root]) => Object.freeze({ id, root })))
+}
+
+export function hardenCodexModelCatalog(raw: string): { json: string; modelCount: number } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('Codex model catalog was not valid JSON')
+  }
+  const catalog = asObject(parsed, 'Codex model catalog')
+  if (!Array.isArray(catalog.models) || catalog.models.length === 0) {
+    throw new Error('Codex model catalog did not contain any models')
+  }
+  const models = catalog.models.map((value, index) => {
+    const model = asObject(value, `Codex model catalog entry ${String(index)}`)
+    if (typeof model.slug !== 'string' || model.slug.trim().length === 0) {
+      throw new Error(`Codex model catalog entry ${String(index)} omitted its slug`)
+    }
+    return { ...model }
+  })
+  return { json: JSON.stringify({ ...catalog, models }), modelCount: models.length }
+}
+
+function installHardenedModelCatalog(
+  executable: string,
+  isolatedCodexHome: string,
+  timeoutMs: number,
+): { path: string; modelCount: number } {
+  let raw: string | null = null
+  // The installed CLI's bundled catalog is deterministic and does not depend on
+  // the user's provider, credentials, gateway, or network availability.
+  for (const args of [['debug', 'models', '--bundled'], ['debug', 'models']] as const) {
+    try {
+      const invocation = resolveCodexInvocation(executable, args)
+      raw = execFileSync(invocation.executable, invocation.args, {
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: timeoutMs,
+      })
+      break
+    } catch {
+      // The online view is only a bounded compatibility fallback if this CLI
+      // version does not expose its bundled catalog.
+    }
+  }
+  if (raw === null) throw new Error('Codex model catalog could not be read for canonical hardening')
+  const hardened = hardenCodexModelCatalog(raw)
+  const target = path.join(isolatedCodexHome, 'baton-model-catalog.json')
+  writeFileSync(target, hardened.json, { encoding: 'utf8', mode: 0o600 })
+  return { path: target, modelCount: hardened.modelCount }
 }
 
 function launchArgs(
   additional: Record<string, false> = {},
   connection: CodexProxyConnection | null = null,
+  modelCatalogPath: string | null = null,
 ): string[] {
   const providerOverrides = connection ? {
     model_provider: 'baton',
-    'model_providers.baton.name': 'Baton CLIProxy',
+    'model_providers.baton.name': 'Baton Native',
     'model_providers.baton.base_url': `${connection.baseUrl}/v1`,
     'model_providers.baton.env_key': 'BATON_PROXY_TOKEN',
     'model_providers.baton.wire_api': 'responses',
@@ -909,6 +1192,7 @@ function launchArgs(
   } : {}
   const overrides = Object.entries({
     ...HARDENING_OVERRIDES,
+    ...(modelCatalogPath ? { model_catalog_json: modelCatalogPath } : {}),
     ...providerOverrides,
     ...additional,
   }).flatMap(([key, value]) => [
@@ -996,14 +1280,19 @@ function parseMaterializedRequest(value: unknown): MaterializedCodexTurn {
   }
   return {
     turnId: requiredString(body.turnId, 'canonical turn id'),
+    canonicalThreadId: requiredString(body.canonicalThreadId, 'canonical thread id'),
     model: requiredString(body.model, 'Codex model'),
     effort: typeof body.effort === 'string' ? body.effort : null,
     cwd: typeof body.cwd === 'string' ? body.cwd : null,
     developerInstructions: typeof body.developerInstructions === 'string' ? body.developerInstructions : null,
     history: body.history.map((item) => asObject(item, 'Codex history item')),
     input: body.input.map((item) => {
-      const input = asObject(item, 'Codex text input')
-      return { type: 'text', text: requiredString(input.text, 'Codex input text') }
+      const input = asObject(item, 'Codex input')
+      if (input.type === 'text') return { type: 'text', text: requiredString(input.text, 'Codex input text') }
+      if (input.type === 'localImage') {
+        return { type: 'localImage', path: requiredString(input.path, 'Codex local image path') }
+      }
+      throw new Error('Invalid Codex input type')
     }),
   }
 }
@@ -1027,6 +1316,18 @@ function dynamicToolSpec(definition: ProviderExecutionContext['toolDefinitions']
     description: definition.description,
     inputSchema: definition.inputSchema,
   }
+}
+
+function codexToolResultContent(
+  result: AgentToolResult,
+  artifacts: ImageArtifactResolver | null,
+): JsonObject[] {
+  const content: JsonObject[] = [{ type: 'inputText', text: JSON.stringify(result) }]
+  for (const image of result.success ? result.images ?? [] : []) {
+    if (!artifacts) throw new Error('Codex tool returned an image without an artifact resolver')
+    content.push({ type: 'inputImage', imageUrl: artifacts.dataUrl(image) })
+  }
+  return content
 }
 
 function parseDynamicToolCall(value: unknown): {
@@ -1072,16 +1373,56 @@ function codexUsageSnapshot(params: JsonObject | null): {
   return { usage: tokenUsage, source: 'tokenUsage' }
 }
 
-function assertActiveNativeIds(
+function activeNativeEventScope(
   params: JsonObject | null,
   threadId: string,
   turnId: string,
-): void {
-  if (typeof params?.threadId === 'string' && params.threadId !== threadId) {
-    throw capabilityViolation('Codex event referenced a foreign native thread')
+  childThreadIds: ReadonlySet<string>,
+): 'root' | 'child' | 'foreign' {
+  const eventThreadId = typeof params?.threadId === 'string' ? params.threadId : null
+  if (eventThreadId !== null && eventThreadId !== threadId) {
+    return childThreadIds.has(eventThreadId) ? 'child' : 'foreign'
   }
   if (typeof params?.turnId === 'string' && params.turnId !== turnId) {
     throw capabilityViolation('Codex event referenced a foreign native turn')
+  }
+  return 'root'
+}
+
+function trackNativeChildThreads(
+  params: JsonObject | null,
+  rootThreadId: string,
+  threadIds: Set<string>,
+): void {
+  const item = asOptionalObject(params?.item)
+  if (item?.type !== 'collabAgentToolCall' || !Array.isArray(item.receiverThreadIds)) return
+  if (typeof item.senderThreadId !== 'string'
+    || (item.senderThreadId !== rootThreadId && !threadIds.has(item.senderThreadId))) {
+    throw capabilityViolation('Codex collaboration event referenced a foreign native sender thread')
+  }
+  const receivers = item.receiverThreadIds.filter(
+    (threadId): threadId is string => typeof threadId === 'string' && threadId.length > 0,
+  )
+  if (item.tool === 'spawnAgent') {
+    for (const threadId of receivers) threadIds.add(threadId)
+    return
+  }
+  if (receivers.some((threadId) => threadId !== rootThreadId && !threadIds.has(threadId))) {
+    throw capabilityViolation('Codex collaboration event referenced an unowned native receiver thread')
+  }
+}
+
+function trackNativeStartedThread(
+  params: JsonObject | null,
+  rootThreadId: string,
+  threadIds: Set<string>,
+): void {
+  const thread = asOptionalObject(params?.thread)
+  if (thread === null || typeof thread.id !== 'string') return
+  if (thread.id === rootThreadId) return
+  const parentThreadId = typeof thread.parentThreadId === 'string' ? thread.parentThreadId : null
+  if (parentThreadId === rootThreadId || (parentThreadId !== null && threadIds.has(parentThreadId))) {
+    threadIds.add(thread.id)
   }
 }
 
@@ -1104,12 +1445,21 @@ function durableEventId(method: string, params: JsonObject | null): string {
   return `codex:${method}:${identity}`
 }
 
-function isForbiddenNotification(method: string, params: JsonObject | null): boolean {
-  if (method.startsWith('item/autoApprovalReview/')) return true
-  if (method === 'rawResponseItem/completed') return false
-  if (method !== 'item/started' && method !== 'item/completed') return false
+function canonicalToolBoundaryInstructions(userInstructions: string | null): string {
+  return userInstructions === null
+    ? CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS
+    : `${CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS}\n\n${userInstructions}`
+}
+
+function forbiddenNotificationItemType(method: string, params: JsonObject | null): string | null {
+  if (method.startsWith('item/autoApprovalReview/')) return 'autoApprovalReview'
+  if (method === 'rawResponseItem/completed') return null
+  if (method !== 'item/started' && method !== 'item/completed') return null
   const item = asOptionalObject(params?.item)
-  return typeof item?.type !== 'string' || !ALLOWED_ITEM_TYPES.has(item.type)
+  if (typeof item?.type !== 'string') return 'missing'
+  if (ALLOWED_ITEM_TYPES.has(item.type)) return null
+  const kind = typeof item.kind === 'string' ? item.kind : null
+  return kind === null ? item.type : `${item.type}:${kind}`
 }
 
 function isApprovalRequest(method: string): boolean {
@@ -1120,8 +1470,15 @@ function isApprovalRequest(method: string): boolean {
 
 function normalizeTurnError(value: unknown): JsonObject | null {
   const error = asOptionalObject(value)
-  if (error?.codexErrorInfo !== 'usageLimitExceeded') return error
-  return { ...error, code: 'provider_usage_limit' }
+  if (error?.codexErrorInfo === 'usageLimitExceeded') {
+    return { ...error, code: 'provider_usage_limit' }
+  }
+  const message = typeof error?.message === 'string' ? error.message : ''
+  if (/unexpected status (?:408|409|5\d\d)\b/i.test(message)
+    || /(?:connection (?:termination|reset)|stream disconnected before completion)/i.test(message)) {
+    return { ...error, code: 'provider_retry_exhausted' }
+  }
+  return error
 }
 
 function terminalStatus(value: unknown): ProviderTerminalResult['status'] {
@@ -1249,7 +1606,7 @@ interface CodexInvocation {
 }
 
 /** Resolve the npm shim to the native Codex binary so Baton owns one OS process tree. */
-function resolveCodexInvocation(executable: string, args: readonly string[]): CodexInvocation {
+export function resolveCodexInvocation(executable: string, args: readonly string[]): CodexInvocation {
   if (process.platform !== 'win32') return { executable, args: [...args] }
   if (/\.exe$/i.test(executable)) return { executable, args: [...args] }
   if (!/^codex(?:\.cmd)?$/i.test(path.basename(executable))) {

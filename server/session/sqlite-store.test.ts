@@ -7,11 +7,16 @@ import { DatabaseSync } from 'node:sqlite'
 
 import type {
   BeginTurnInput,
+  CanonicalSession,
   ExecutionPolicySnapshot,
+  GoalEvidenceBundle,
   ProviderCapabilities,
 } from './domain.ts'
-import { SqliteSessionStore } from './sqlite-store.ts'
+import { ContextPersistenceError, SqliteSessionStore } from './sqlite-store.ts'
+import { sourceHashForItems } from './context-materializer.ts'
 import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
+import { goalEvidenceHash } from './goal-evidence.ts'
+import type { BeginSessionInput } from './store.ts'
 import type { NativeSessionCandidate } from './native-import/contracts.ts'
 
 const policy: ExecutionPolicySnapshot = {
@@ -56,6 +61,63 @@ function databasePath(_t: TestContext): string {
   return join(directory, 'sessions.sqlite')
 }
 
+function downgradeEmptyDerivedSchemaToV13(path: string): void {
+  const database = new DatabaseSync(path)
+  removeGoalV2Schema(database)
+  database.exec(`
+    DROP INDEX context_compaction_jobs_active_frontier;
+    DROP TRIGGER context_compaction_jobs_immutable_columns;
+    DROP TRIGGER context_compaction_jobs_terminal;
+    DROP TRIGGER context_compaction_jobs_transition;
+    DROP TABLE context_compaction_heads;
+    ALTER TABLE context_compaction_jobs DROP COLUMN view_key;
+    ALTER TABLE context_compaction_jobs DROP COLUMN expected_previous_artifact_id;
+
+    CREATE TRIGGER context_compaction_jobs_immutable_columns BEFORE UPDATE ON context_compaction_jobs
+    WHEN NEW.id IS NOT OLD.id OR NEW.thread_id IS NOT OLD.thread_id
+      OR NEW.request_key IS NOT OLD.request_key OR NEW.request_hash IS NOT OLD.request_hash
+      OR NEW.source_item_ids_json IS NOT OLD.source_item_ids_json
+      OR NEW.source_hash IS NOT OLD.source_hash OR NEW.summary_input_hash IS NOT OLD.summary_input_hash
+      OR NEW.created_at IS NOT OLD.created_at
+    BEGIN SELECT RAISE(ABORT, 'compaction job identity is immutable'); END;
+    CREATE TRIGGER context_compaction_jobs_terminal BEFORE UPDATE ON context_compaction_jobs
+    WHEN OLD.status IN ('completed','failed')
+    BEGIN SELECT RAISE(ABORT, 'terminal compaction jobs are immutable'); END;
+    CREATE TRIGGER context_compaction_jobs_transition BEFORE UPDATE OF status ON context_compaction_jobs
+    WHEN NOT (
+      (OLD.status='queued' AND NEW.status='running')
+      OR (OLD.status='running' AND NEW.status IN ('running','queued','completed','failed'))
+    )
+    BEGIN SELECT RAISE(ABORT, 'invalid compaction job transition'); END;
+    DELETE FROM schema_migrations WHERE version>=14;
+    DROP TABLE permission_settings;
+    ALTER TABLE sessions DROP COLUMN permission_profile_override;
+    ALTER TABLE sessions DROP COLUMN ldplayer_grant_json;
+    PRAGMA user_version=13;
+  `)
+  database.close()
+}
+
+function removeGoalV2Schema(database: DatabaseSync): void {
+  database.exec(`
+    DROP TRIGGER IF EXISTS goal_completion_receipts_no_update;
+    DROP TRIGGER IF EXISTS goal_completion_receipts_no_delete;
+    DROP TRIGGER IF EXISTS goal_verification_attempts_no_update;
+    DROP TRIGGER IF EXISTS goal_verification_attempts_no_delete;
+    DROP TRIGGER IF EXISTS goal_stop_receipts_no_update;
+    DROP TRIGGER IF EXISTS goal_stop_receipts_no_delete;
+    DROP TABLE IF EXISTS goal_stop_receipts;
+    DROP TABLE IF EXISTS goal_completion_receipts;
+    DROP TABLE IF EXISTS goal_verification_attempts;
+    DROP TABLE IF EXISTS goal_verifier_leases;
+    DROP TABLE IF EXISTS goal_completion_proposals;
+    ALTER TABLE goals DROP COLUMN latest_completion_receipt_id;
+    ALTER TABLE goals DROP COLUMN latest_stop_receipt_id;
+    ALTER TABLE goals DROP COLUMN verification_proposal_id;
+    DELETE FROM schema_migrations WHERE version=19;
+  `)
+}
+
 function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): BeginTurnInput {
   return {
     threadId,
@@ -70,6 +132,135 @@ function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): B
     policySnapshot: policy,
   }
 }
+
+function beginSessionInput(
+  overrides: Partial<BeginSessionInput> = {},
+): BeginSessionInput {
+  return {
+    sessionId: 'client-session-1',
+    clientRequestId: 'client-request-1',
+    requestHash: 'initial-hash-1',
+    cwd: 'C:\\verified\\project',
+    instructionSnapshot: { schemaVersion: 1, developerInstructions: 'Keep changes focused.' },
+    provider: 'codex',
+    model: 'gpt-test',
+    effort: 'high',
+    input: [{ kind: 'user_message', payload: { text: '  First\n\nrequest  ' } }],
+    adapterVersion: 'test-adapter/1',
+    policySnapshot: { ...policy, cwd: 'C:\\verified\\project' },
+    budget: { effort: 'high' },
+    ...overrides,
+  }
+}
+
+test('initial session materialization is atomic, idempotent, and keeps schema v19', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  const input = beginSessionInput()
+  const started = store.beginSession(input)
+
+  assert.equal(started.duplicate, false)
+  assert.equal(started.session.id, input.sessionId)
+  assert.equal(started.session.title, null)
+  assert.equal(started.session.preview, 'First request')
+  assert.equal(started.session.projectKey, null)
+  assert.equal(started.session.cwd, input.cwd)
+  assert.equal(started.thread.parentThreadId, null)
+  assert.equal(started.thread.revision, 1)
+  assert.equal(started.thread.status, 'running')
+  assert.deepEqual(started.thread.instructionSnapshot, input.instructionSnapshot)
+  assert.equal(started.turn.sequence, 1)
+  assert.equal(started.execution.kind, 'root_turn')
+  assert.deepEqual(started.initialItems.map((item) => item.kind), ['user_message'])
+  assert.deepEqual(store.listEvents(started.thread.id).map((event) => event.type), [
+    'session_created',
+    'turn_started',
+  ])
+
+  const duplicate = store.beginSession(input)
+  assert.equal(duplicate.duplicate, true)
+  assert.equal(duplicate.thread.id, started.thread.id)
+  assert.equal(duplicate.turn.id, started.turn.id)
+  assert.equal(duplicate.execution.id, started.execution.id)
+  assert.deepEqual(duplicate.initialItems.map((item) => item.id), started.initialItems.map((item) => item.id))
+  assert.throws(
+    () => store.beginSession({ ...input, requestHash: 'different-hash' }),
+    (error) => error instanceof SessionStoreError && error.code === 'initial_session_conflict',
+  )
+
+  const database = new DatabaseSync(path, { readOnly: true })
+  t.after(() => database.close())
+  for (const [table, expected] of [
+    ['sessions', 1],
+    ['threads', 1],
+    ['turns', 1],
+    ['executions', 1],
+    ['items', 1],
+    ['stream_events', 2],
+  ] as const) {
+    const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
+    assert.equal(row.count, expected, table)
+  }
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  const replayAfterReopen = reopened.getInitialSessionResult(input)
+  assert.equal(replayAfterReopen?.duplicate, true)
+  assert.equal(replayAfterReopen?.turn.id, started.turn.id)
+})
+
+test('initial session rolls every row back when canonical serialization fails', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => store.close())
+  const invalidSnapshot = {
+    schemaVersion: 1,
+    developerInstructions: 'valid',
+    invalid: undefined,
+  } as unknown as Record<string, unknown>
+
+  assert.throws(
+    () => store.beginSession(beginSessionInput({ instructionSnapshot: invalidSnapshot })),
+    /Canonical JSON rejects undefined values/,
+  )
+  assert.deepEqual(store.listSessions('all'), [])
+  const database = new DatabaseSync(path, { readOnly: true })
+  t.after(() => database.close())
+  for (const table of ['sessions', 'threads', 'turns', 'executions', 'items', 'stream_events']) {
+    const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
+    assert.equal(row.count, 0, table)
+  }
+})
+
+test('two open SQLite connections observe one idempotent initial graph', async (t) => {
+  const path = databasePath(t)
+  const first = new SqliteSessionStore(path, deterministicOptions())
+  const second = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => {
+    first.close()
+    second.close()
+  })
+  const input = beginSessionInput({ sessionId: 'two-connection-session' })
+
+  // DatabaseSync calls cannot overlap inside one JS isolate, but separate live connections still
+  // prove that the second transaction observes the committed receipt instead of duplicating it.
+  const results = await Promise.all([
+    Promise.resolve().then(() => first.beginSession(input)),
+    Promise.resolve().then(() => second.beginSession(input)),
+  ])
+  assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true])
+  assert.equal(results[0]?.turn.id, results[1]?.turn.id)
+  assert.equal(first.listSessions('all').length, 1)
+  const database = new DatabaseSync(path, { readOnly: true })
+  t.after(() => database.close())
+  for (const [table, expected] of [
+    ['sessions', 1], ['threads', 1], ['turns', 1], ['executions', 1], ['items', 1], ['stream_events', 2],
+  ] as const) {
+    assert.equal((database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count, expected)
+  }
+})
 
 function nativeCandidate(contents: string[], cwd: string, contentDigest: string): NativeSessionCandidate {
   return {
@@ -108,7 +299,7 @@ function nativeCandidate(contents: string[], cwd: string, contentDigest: string)
   }
 }
 
-test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t) => {
+test('schema v1 migrates through v19 with Goal verification storage', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -118,6 +309,7 @@ test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t
     CREATE TABLE sessions(
       id TEXT PRIMARY KEY, archived_at TEXT
     ) STRICT;
+    CREATE TABLE threads(id TEXT PRIMARY KEY) STRICT;
     CREATE TABLE turns(
       id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sequence INTEGER NOT NULL,
       provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
@@ -148,10 +340,10 @@ test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -162,9 +354,14 @@ test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t
     SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'goal%'
   `).all() as Array<{ name: string }>
   assert.deepEqual(goalTables.map((table) => table.name).sort(), [
+    'goal_completion_proposals',
+    'goal_completion_receipts',
     'goal_events',
     'goal_scheduler_leases',
+    'goal_stop_receipts',
     'goal_turn_accounting',
+    'goal_verification_attempts',
+    'goal_verifier_leases',
     'goals',
   ])
   assert.equal((inspected.prepare(`
@@ -178,7 +375,42 @@ test('schema v1 migrates through v10 with durable follow-up turn boundaries', (t
   }).follow_up_window, 'closed')
 })
 
-test('schema v6 migrates to v10 in place and reopens without replaying migrations', (t) => {
+test('legacy emulator grants remain inert and are omitted from canonical sessions', (t) => {
+  const path = databasePath(t)
+  const created = new SqliteSessionStore(path, deterministicOptions())
+  const session = created.createSession({})
+  created.close()
+
+  const database = new DatabaseSync(path)
+  removeGoalV2Schema(database)
+  database.exec(`
+    DELETE FROM schema_migrations WHERE version=18;
+    PRAGMA user_version=17;
+  `)
+  database.prepare('UPDATE sessions SET ldplayer_grant_json=? WHERE id=?').run(
+    JSON.stringify({
+      kind: 'ldplayer',
+      installationRoot: 'C:\\legacy-emulator',
+      instanceIndex: 1,
+      instanceName: 'legacy',
+    }),
+    session.id,
+  )
+  database.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  const canonical = reopened.getSession(session.id) as CanonicalSession & Record<string, unknown>
+  assert.equal(Object.hasOwn(canonical, 'ldPlayer'), false)
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  const legacyValue = inspected.prepare('SELECT ldplayer_grant_json FROM sessions WHERE id=?').get(session.id) as {
+    ldplayer_grant_json: string | null
+  }
+  assert.equal(legacyValue.ldplayer_grant_json, null)
+})
+
+test('schema v6 migrates to v19 in place and reopens without replaying migrations', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -231,11 +463,11 @@ test('schema v6 migrates to v10 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 10)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -245,6 +477,987 @@ test('schema v6 migrates to v10 in place and reopens without replaying migration
     .get() as { count: number }).count, 1)
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=10")
     .get() as { count: number }).count, 1)
+})
+
+test('schema v10 rebuilds follow-up constraints through v19 with foreign keys and reopens once', (t) => {
+  const path = databasePath(t)
+  const legacy = new DatabaseSync(path)
+  legacy.exec(`
+    CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,applied_at TEXT NOT NULL) STRICT;
+    INSERT INTO schema_migrations SELECT value,'v'||value,'2026-07-18T00:00:00.000Z' FROM json_each('[1,2,3,4,5,6,7,8,9,10]');
+    PRAGMA user_version=10;
+    CREATE TABLE sessions(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE threads(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE turns(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE goals(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE native_import_meta(key TEXT PRIMARY KEY,value BLOB NOT NULL) STRICT;
+    INSERT INTO native_import_meta VALUES('identity_hmac_key',zeroblob(32));
+    CREATE TABLE follow_ups(
+      id TEXT PRIMARY KEY,session_id TEXT NOT NULL REFERENCES sessions(id),thread_id TEXT NOT NULL REFERENCES threads(id),
+      client_request_id TEXT NOT NULL,request_hash TEXT NOT NULL,sequence INTEGER NOT NULL,after_turn_sequence INTEGER NOT NULL,
+      delivery TEXT NOT NULL,status TEXT NOT NULL,target_turn_id TEXT REFERENCES turns(id),consumed_turn_id TEXT REFERENCES turns(id),
+      consumed_item_ids_json TEXT NOT NULL,goal_id TEXT,goal_revision INTEGER,input_json TEXT NOT NULL,
+      dispatch_owner TEXT,lease_expires_at TEXT,revision INTEGER NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,consumed_at TEXT,
+      UNIQUE(thread_id,client_request_id),UNIQUE(thread_id,sequence)
+    ) STRICT;
+    CREATE INDEX follow_ups_thread_state_sequence ON follow_ups(thread_id,status,sequence);
+    CREATE INDEX follow_ups_target_state_sequence ON follow_ups(target_turn_id,status,sequence);
+    CREATE INDEX follow_ups_expired_dispatch ON follow_ups(lease_expires_at,id) WHERE status='dispatching';
+    INSERT INTO sessions VALUES('s'); INSERT INTO threads VALUES('th');
+    INSERT INTO follow_ups VALUES('f','s','th','r','h',1,0,'next_turn','queued',NULL,NULL,'[]',NULL,NULL,'[{"kind":"user_message","payload":{"text":"x"}}]',NULL,NULL,1,'2026-07-18','2026-07-18',NULL);
+  `)
+  legacy.close()
+  const first = new SqliteSessionStore(path)
+  first.close()
+  const reopened = new SqliteSessionStore(path)
+  t.after(() => reopened.close())
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
+  assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
+})
+
+test('schema v12 migrates once to immutable derived context tables and preserves canonical rows', (t) => {
+  const path = databasePath(t)
+  const initial = new SqliteSessionStore(path, deterministicOptions())
+  const session = initial.createSession({ title: 'migration sentinel' })
+  initial.close()
+
+  const legacy = new DatabaseSync(path)
+  removeGoalV2Schema(legacy)
+  legacy.exec(`
+    DROP TABLE execution_context_manifest_entries;
+    DROP TABLE execution_context_manifests;
+    DROP TABLE context_compaction_source_items;
+    DROP TABLE context_compaction_job_events;
+    DROP TABLE context_compaction_heads;
+    DROP TABLE context_compactions;
+    DROP TABLE context_compaction_jobs;
+    DELETE FROM schema_migrations WHERE version>=13;
+    DROP TABLE permission_settings;
+    ALTER TABLE sessions DROP COLUMN permission_profile_override;
+    ALTER TABLE sessions DROP COLUMN ldplayer_grant_json;
+    PRAGMA user_version=12;
+  `)
+  legacy.close()
+
+  const migrated = new SqliteSessionStore(path, deterministicOptions())
+  assert.equal(migrated.getSession(session.id)?.title, 'migration sentinel')
+  migrated.close()
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.deepEqual(
+    (inspected.prepare('SELECT version FROM schema_migrations WHERE version>=13 ORDER BY version')
+      .all() as Array<{ version: number }>).map((row) => row.version),
+    [13, 14, 15, 16, 17, 18, 19],
+  )
+  const tables = (inspected.prepare(`
+    SELECT name FROM sqlite_schema WHERE type='table'
+      AND (name LIKE 'context_compaction%' OR name LIKE 'execution_context%')
+    ORDER BY name
+  `).all() as Array<{ name: string }>).map((row) => row.name)
+  assert.deepEqual(tables, [
+    'context_compaction_heads',
+    'context_compaction_job_events',
+    'context_compaction_jobs',
+    'context_compaction_source_items',
+    'context_compactions',
+    'execution_context_manifest_entries',
+    'execution_context_manifests',
+  ])
+})
+
+test('schema v19 reopen fails closed when a derived-context protection trigger is missing', (t) => {
+  const path = databasePath(t)
+  const initial = new SqliteSessionStore(path, deterministicOptions())
+  initial.close()
+  const external = new DatabaseSync(path)
+  external.exec('DROP TRIGGER context_compaction_heads_transition')
+  external.close()
+  assert.throws(
+    () => new SqliteSessionStore(path, deterministicOptions()),
+    (error: unknown) => error instanceof ContextPersistenceError
+      && error.code === 'integrity_violation'
+      && error.message.includes('trigger:context_compaction_heads_transition'),
+  )
+})
+
+test('schema v19 reopen fails closed when a Goal receipt protection trigger is missing', (t) => {
+  const path = databasePath(t)
+  const initial = new SqliteSessionStore(path, deterministicOptions())
+  initial.close()
+  const external = new DatabaseSync(path)
+  external.exec('DROP TRIGGER goal_stop_receipts_no_update')
+  external.close()
+  assert.throws(
+    () => new SqliteSessionStore(path, deterministicOptions()),
+    (error: unknown) => error instanceof ContextPersistenceError
+      && error.code === 'integrity_violation'
+      && error.message.includes('trigger:goal_stop_receipts_no_update'),
+  )
+})
+
+test('an empty released v13 database migrates through v19 and gains the authoritative frontier schema', (t) => {
+  const path = databasePath(t)
+  const initial = new SqliteSessionStore(path, deterministicOptions())
+  const session = initial.createSession({ title: 'old-v13 sentinel' })
+  initial.close()
+  downgradeEmptyDerivedSchemaToV13(path)
+
+  const migrated = new SqliteSessionStore(path, deterministicOptions())
+  assert.equal(migrated.getSession(session.id)?.title, 'old-v13 sentinel')
+  migrated.close()
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.ok((inspected.prepare(`
+    SELECT 1 FROM pragma_table_info('context_compaction_jobs')
+    WHERE name='expected_previous_artifact_id'
+  `).get()))
+  assert.ok(inspected.prepare(`
+    SELECT 1 FROM sqlite_schema WHERE type='table' AND name='context_compaction_heads'
+  `).get())
+  assert.equal((inspected.prepare('SELECT COUNT(*) AS count FROM schema_migrations WHERE version=14')
+    .get() as { count: number }).count, 1)
+})
+
+test('v13 frontier migration fails closed instead of guessing over existing derived rows', (t) => {
+  const path = databasePath(t)
+  const initial = new SqliteSessionStore(path, deterministicOptions())
+  const session = initial.createSession({})
+  initial.close()
+  downgradeEmptyDerivedSchemaToV13(path)
+  const external = new DatabaseSync(path)
+  external.prepare(`
+    INSERT INTO context_compaction_jobs(
+      id,thread_id,request_key,request_hash,source_item_ids_json,source_hash,summary_input_hash,
+      status,revision,lease_owner,lease_expires_at,attempt_count,error_json,created_at,updated_at,completed_at
+    ) VALUES (?,?,?,?,?,?,?,'queued',1,NULL,NULL,0,NULL,?,?,NULL)
+  `).run('legacy-job', session.activeThreadId, 'legacy-request', 'a'.repeat(64), '["legacy-item"]',
+    'b'.repeat(64), 'c'.repeat(64), '2026-07-19T00:00:00.000Z', '2026-07-19T00:00:00.000Z')
+  external.close()
+  assert.throws(
+    () => new SqliteSessionStore(path, deterministicOptions()),
+    (error: unknown) => error instanceof ContextPersistenceError
+      && error.code === 'integrity_violation'
+      && error.message.includes('explicit frontier migration'),
+  )
+})
+
+test('compaction artifacts cover an exact immutable canonical prefix and survive reopen', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  const session = store.createSession({})
+  const first = store.beginTurn(beginInput(session.activeThreadId))
+  store.appendProviderEvent({
+    turnId: first.turn.id,
+    eventId: 'first-reply',
+    items: [{ kind: 'assistant_message', payload: { text: 'answer' } }],
+  })
+  store.finishTurn({ turnId: first.turn.id, status: 'completed' })
+  const source = store.listItems(session.activeThreadId)
+  const created = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'compact-prefix-1',
+    sourceItemIds: source.map((item) => item.id),
+    summaryInputHash: 'a'.repeat(64),
+    expectedPreviousArtifactId: null,
+  })
+  assert.equal(created.duplicate, false)
+  assert.equal(created.job.status, 'queued')
+  assert.deepEqual(created.job.sourceItemIds, source.map((item) => item.id))
+  assert.equal(created.job.sourceHash, sourceHashForItems(source))
+  assert.equal(store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'compact-prefix-1',
+    sourceItemIds: source.map((item) => item.id),
+    summaryInputHash: 'a'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).duplicate, true)
+  assert.throws(() => store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'compact-prefix-1',
+    sourceItemIds: [source[0]!.id],
+    summaryInputHash: 'a'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }), (error: unknown) => error instanceof ContextPersistenceError && error.code === 'idempotency_conflict')
+
+  const claimed = store.claimContextCompactionJob({ jobId: created.job.id, ownerId: 'worker-1' })
+  assert.equal(claimed?.status, 'running')
+  assert.equal(claimed?.attemptCount, 1)
+  const completed = store.completeContextCompactionJob({
+    jobId: created.job.id,
+    ownerId: 'worker-1',
+    summary: { text: 'Derived summary only', format: 'portable-v1', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  })
+  assert.equal(completed.duplicate, false)
+  assert.deepEqual(completed.artifact.sourceItems.map((item) => item.itemId), source.map((item) => item.id))
+  assert.equal(store.completeContextCompactionJob({
+    jobId: created.job.id,
+    ownerId: 'worker-1',
+    summary: { format: 'portable-v1', text: 'Derived summary only', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }).duplicate, true)
+  assert.equal(store.listItems(session.activeThreadId).length, source.length)
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  assert.equal(reopened.getContextCompactionJob(created.job.id)?.artifactId, completed.artifact.id)
+  assert.deepEqual(
+    reopened.getContextCompactionArtifact(completed.artifact.id)?.summary,
+    { format: 'portable-v1', summaryInput: { previousArtifactId: null }, text: 'Derived summary only' },
+  )
+  assert.equal(reopened.getLatestContextCompaction(session.activeThreadId)?.id, completed.artifact.id)
+  assert.deepEqual(reopened.listItems(session.activeThreadId).map((item) => item.id), source.map((item) => item.id))
+})
+
+test('compaction source accepts a safe imported turnless prefix before canonical turns', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const imported = store.commitNativeImport({
+    candidate: nativeCandidate(['imported one', 'imported two'], 'C:\\source', 'turnless-prefix'),
+    previewedState: null,
+  })
+  assert.ok(imported.sessionId)
+  const session = store.getSession(imported.sessionId)
+  assert.ok(session)
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const sourceItemIds = store.listItems(session.activeThreadId).map((item) => item.id)
+
+  assert.throws(() => store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'reject-partial-imported-turnless-prefix',
+    sourceItemIds: [sourceItemIds[0]!],
+    summaryInputHash: 'e'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }), (error: unknown) => error instanceof ContextPersistenceError
+    && error.code === 'invalid_input'
+    && error.message.includes('complete leading turnless prefix'))
+
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'compact-imported-turnless-prefix',
+    sourceItemIds,
+    summaryInputHash: 'f'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+
+  assert.deepEqual(job.sourceItemIds, sourceItemIds)
+})
+
+test('compaction creation is idempotent across connections and rejects source reordering or active turns', async (t) => {
+  const path = databasePath(t)
+  const firstStore = new SqliteSessionStore(path, deterministicOptions())
+  const secondStore = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => {
+    firstStore.close()
+    secondStore.close()
+  })
+  const session = firstStore.createSession({})
+  const firstTurn = firstStore.beginTurn(beginInput(session.activeThreadId))
+  firstStore.appendProviderEvent({
+    turnId: firstTurn.turn.id,
+    eventId: 'reply',
+    items: [{ kind: 'assistant_message', payload: { text: 'done' } }],
+  })
+  firstStore.finishTurn({ turnId: firstTurn.turn.id, status: 'completed' })
+  const completedItems = firstStore.listItems(session.activeThreadId)
+  const activeTurn = firstStore.beginTurn({
+    ...beginInput(session.activeThreadId, 'request-2', 'hash-2'),
+    expectedRevision: 2,
+  })
+  const allItems = firstStore.listItems(session.activeThreadId)
+  assert.throws(() => firstStore.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'includes-active',
+    sourceItemIds: allItems.map((item) => item.id),
+    summaryInputHash: 'b'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }), (error: unknown) => error instanceof ContextPersistenceError && error.code === 'invalid_input')
+  assert.throws(() => firstStore.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'reordered',
+    sourceItemIds: [completedItems[1]!.id, completedItems[0]!.id],
+    summaryInputHash: 'b'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }), (error: unknown) => error instanceof ContextPersistenceError && error.code === 'invalid_input')
+
+  const input = {
+    threadId: session.activeThreadId,
+    requestKey: 'cross-connection',
+    sourceItemIds: completedItems.map((item) => item.id),
+    summaryInputHash: 'c'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }
+  const results = await Promise.all([
+    Promise.resolve().then(() => firstStore.createContextCompactionJob(input)),
+    Promise.resolve().then(() => secondStore.createContextCompactionJob(input)),
+  ])
+  assert.deepEqual(results.map((result) => result.duplicate).sort(), [false, true])
+  assert.equal(results[0]?.job.id, results[1]?.job.id)
+  const jobId = results[0]!.job.id
+  assert.equal(firstStore.claimContextCompactionJob({ jobId, ownerId: 'shared-worker' })?.status, 'running')
+  const completionInput = {
+    jobId,
+    ownerId: 'shared-worker',
+    summary: { text: 'cross-connection summary', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex' as const,
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }
+  const completions = await Promise.all([
+    Promise.resolve().then(() => firstStore.completeContextCompactionJob(completionInput)),
+    Promise.resolve().then(() => secondStore.completeContextCompactionJob(completionInput)),
+  ])
+  assert.deepEqual(completions.map((result) => result.duplicate).sort(), [false, true])
+  assert.equal(completions[0]?.artifact.id, completions[1]?.artifact.id)
+  firstStore.finishTurn({ turnId: activeTurn.turn.id, status: 'cancelled' })
+})
+
+test('compaction head CAS admits only one different writer per frontier and survives reopen', async (t) => {
+  const path = databasePath(t)
+  const firstStore = new SqliteSessionStore(path)
+  const secondStore = new SqliteSessionStore(path)
+  const session = firstStore.createSession({})
+  const turn = firstStore.beginTurn(beginInput(session.activeThreadId))
+  firstStore.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const sourceItemIds = firstStore.listItems(session.activeThreadId).map((item) => item.id)
+  const requests = [
+    {
+      threadId: session.activeThreadId,
+      requestKey: 'writer-a',
+      sourceItemIds,
+      summaryInputHash: 'a'.repeat(64),
+      expectedPreviousArtifactId: null,
+    },
+    {
+      threadId: session.activeThreadId,
+      requestKey: 'writer-b',
+      sourceItemIds,
+      summaryInputHash: 'b'.repeat(64),
+      expectedPreviousArtifactId: null,
+    },
+  ]
+  const raced = await Promise.allSettled([
+    Promise.resolve().then(() => firstStore.createContextCompactionJob(requests[0]!)),
+    Promise.resolve().then(() => secondStore.createContextCompactionJob(requests[1]!)),
+  ])
+  const accepted = raced.filter((result) => result.status === 'fulfilled')
+  const rejected = raced.filter((result) => result.status === 'rejected')
+  assert.equal(accepted.length, 1)
+  assert.equal(rejected.length, 1)
+  assert.equal(
+    (rejected[0] as PromiseRejectedResult).reason instanceof ContextPersistenceError
+      && (rejected[0] as PromiseRejectedResult).reason.code,
+    'stale_frontier',
+  )
+  const acceptedJob = (accepted[0] as PromiseFulfilledResult<
+    ReturnType<SqliteSessionStore['createContextCompactionJob']>
+  >).value.job
+  assert.equal(firstStore.claimContextCompactionJob({
+    jobId: acceptedJob.id,
+    ownerId: 'winner',
+  })?.status, 'running')
+  const artifact = firstStore.completeContextCompactionJob({
+    jobId: acceptedJob.id,
+    ownerId: 'winner',
+    summary: { text: 'winner', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+  assert.equal(secondStore.getLatestContextCompaction(session.activeThreadId)?.id, artifact.id)
+  assert.throws(
+    () => secondStore.createContextCompactionJob({ ...requests[1]!, requestKey: 'stale-after-complete' }),
+    (error: unknown) => error instanceof ContextPersistenceError && error.code === 'stale_frontier',
+  )
+  firstStore.close()
+  secondStore.close()
+
+  const reopened = new SqliteSessionStore(path)
+  t.after(() => reopened.close())
+  assert.equal(reopened.getLatestContextCompaction(session.activeThreadId)?.id, artifact.id)
+  assert.equal(reopened.getContextCompactionJob(acceptedJob.id)?.expectedPreviousArtifactId, null)
+})
+
+test('context view heads advance independently for different model budgets', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const sourceItemIds = store.listItems(session.activeThreadId).map((item) => item.id)
+
+  const completeView = (viewKey: string, requestKey: string, hash: string) => {
+    const job = store.reserveContextCompactionJob({
+      threadId: session.activeThreadId,
+      viewKey,
+      requestKey,
+      sourceItemIds,
+      summaryInputHash: hash.repeat(64),
+      expectedPreviousArtifactId: null,
+      ownerId: `owner-${viewKey}`,
+    }).job
+    return store.completeContextCompactionJob({
+      jobId: job.id,
+      ownerId: `owner-${viewKey}`,
+      summary: { text: viewKey, summaryInput: { previousArtifactId: null } },
+      generatorProvider: 'codex',
+      generatorModel: 'gpt-test',
+      generatorVersion: 'compactor/1',
+    }).artifact
+  }
+
+  const small = completeView('codex-258k-v1', 'small-view', 'a')
+  const large = completeView('codex-1m-v1', 'large-view', 'b')
+  assert.equal(store.getLatestContextCompaction(session.activeThreadId, 'codex-258k-v1')?.id, small.id)
+  assert.equal(store.getLatestContextCompaction(session.activeThreadId, 'codex-1m-v1')?.id, large.id)
+  assert.notEqual(small.id, large.id)
+  assert.equal(small.viewKey, 'codex-258k-v1')
+  assert.equal(large.viewKey, 'codex-1m-v1')
+})
+
+test('atomic compaction reservation retires a queued orphan before a different contract completes', (t) => {
+  const path = databasePath(t)
+  const now = '2026-07-18T00:00:00.000Z'
+  const store = new SqliteSessionStore(path, { ...deterministicOptions(), now: () => now })
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const sourceItemIds = store.listItems(session.activeThreadId).map((item) => item.id)
+  const orphan = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'queued-before-claim',
+    sourceItemIds,
+    summaryInputHash: 'a'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+
+  const replacement = store.reserveContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'different-contract-after-queued-crash',
+    sourceItemIds,
+    summaryInputHash: 'b'.repeat(64),
+    expectedPreviousArtifactId: null,
+    ownerId: 'provider-b',
+  }).job
+  assert.equal(replacement.status, 'running')
+  assert.equal(replacement.leaseOwner, 'provider-b')
+  assert.deepEqual(store.getContextCompactionJob(orphan.id)?.error, {
+    code: 'abandoned_reservation',
+    reason: 'orphaned_queued_reservation',
+  })
+  const artifact = store.completeContextCompactionJob({
+    jobId: replacement.id,
+    ownerId: 'provider-b',
+    summary: { text: 'replacement', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+  assert.equal(store.getLatestContextCompaction(session.activeThreadId)?.id, artifact.id)
+
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.deepEqual(
+    (inspected.prepare(`
+      SELECT status FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence
+    `).all(orphan.id) as Array<{ status: string }>).map((event) => event.status),
+    ['queued', 'running', 'failed'],
+  )
+})
+
+test('atomic compaction reservation retires an expired competing contract before completion', (t) => {
+  const path = databasePath(t)
+  let now = '2026-07-18T00:00:00.000Z'
+  const store = new SqliteSessionStore(path, { ...deterministicOptions(), now: () => now })
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const sourceItemIds = store.listItems(session.activeThreadId).map((item) => item.id)
+  const expired = store.reserveContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'provider-a-running',
+    sourceItemIds,
+    summaryInputHash: 'c'.repeat(64),
+    expectedPreviousArtifactId: null,
+    ownerId: 'provider-a',
+    leaseDurationMs: 1_000,
+  }).job
+  assert.equal(expired.status, 'running')
+
+  now = '2026-07-18T00:00:02.000Z'
+  const replacement = store.reserveContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'provider-b-different-contract',
+    sourceItemIds,
+    summaryInputHash: 'd'.repeat(64),
+    expectedPreviousArtifactId: null,
+    ownerId: 'provider-b',
+  }).job
+  assert.equal(replacement.status, 'running')
+  assert.equal(replacement.leaseOwner, 'provider-b')
+  assert.deepEqual(store.getContextCompactionJob(expired.id)?.error, {
+    code: 'abandoned_reservation',
+    reason: 'expired_competing_reservation',
+  })
+  const artifact = store.completeContextCompactionJob({
+    jobId: replacement.id,
+    ownerId: 'provider-b',
+    summary: { text: 'replacement', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'claude',
+    generatorModel: 'claude-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+  assert.equal(store.getLatestContextCompaction(session.activeThreadId)?.id, artifact.id)
+})
+
+test('an exact failed compaction request is explicitly requeued at the same head frontier', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const request = {
+    threadId: session.activeThreadId,
+    requestKey: 'retry-exact-failure',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '9'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }
+  const job = store.createContextCompactionJob(request).job
+  store.claimContextCompactionJob({ jobId: job.id, ownerId: 'first-worker' })
+  store.failContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'first-worker',
+    error: { code: 'temporary' },
+  })
+  const retried = store.createContextCompactionJob(request)
+  assert.equal(retried.duplicate, true)
+  assert.equal(retried.job.id, job.id)
+  assert.equal(retried.job.status, 'queued')
+  assert.equal(retried.job.error, null)
+  assert.equal(store.claimContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'second-worker',
+  })?.attemptCount, 2)
+  const completed = store.completeContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'second-worker',
+    summary: { text: 'retry succeeded', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'claude',
+    generatorModel: 'claude-test',
+    generatorVersion: 'compactor/1',
+  })
+  assert.equal(store.getLatestContextCompaction(session.activeThreadId)?.id, completed.artifact.id)
+
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.deepEqual(
+    (inspected.prepare(`
+      SELECT status FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence
+    `).all(job.id) as Array<{ status: string }>).map((event) => event.status),
+    ['queued', 'running', 'failed', 'queued', 'running', 'completed'],
+  )
+})
+
+test('chained artifact frontier is immutable, hash-bound, and valid after reopen', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  const session = store.createSession({})
+  const firstTurn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: firstTurn.turn.id, status: 'completed' })
+  const firstJob = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'chain-first',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '7'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+  store.claimContextCompactionJob({ jobId: firstJob.id, ownerId: 'worker' })
+  const firstArtifact = store.completeContextCompactionJob({
+    jobId: firstJob.id,
+    ownerId: 'worker',
+    summary: { text: 'first', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+  assert.throws(() => store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'chain-regression',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '4'.repeat(64),
+    expectedPreviousArtifactId: firstArtifact.id,
+  }), (error: unknown) => error instanceof ContextPersistenceError && error.code === 'invalid_input')
+  const secondTurn = store.beginTurn({
+    ...beginInput(session.activeThreadId, 'request-chain-2', 'hash-chain-2'),
+    expectedRevision: 2,
+  })
+  store.finishTurn({ turnId: secondTurn.turn.id, status: 'completed' })
+  const secondJob = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'chain-second',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '8'.repeat(64),
+    expectedPreviousArtifactId: firstArtifact.id,
+  }).job
+  store.claimContextCompactionJob({ jobId: secondJob.id, ownerId: 'worker' })
+  const secondArtifact = store.completeContextCompactionJob({
+    jobId: secondJob.id,
+    ownerId: 'worker',
+    summary: { text: 'second', summaryInput: { previousArtifactId: firstArtifact.id } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  assert.equal(reopened.getContextCompactionJob(secondJob.id)?.expectedPreviousArtifactId, firstArtifact.id)
+  assert.equal(reopened.getLatestContextCompaction(session.activeThreadId)?.id, secondArtifact.id)
+  const external = new DatabaseSync(path)
+  t.after(() => external.close())
+  assert.throws(
+    () => external.prepare(`
+      UPDATE context_compaction_jobs SET expected_previous_artifact_id=NULL WHERE id=?
+    `).run(secondJob.id),
+    /(?:identity|terminal compaction jobs) (?:is|are) immutable/,
+  )
+  external.exec('DROP TRIGGER context_compaction_jobs_immutable_columns')
+  external.exec('DROP TRIGGER context_compaction_jobs_terminal')
+  external.prepare(`
+    UPDATE context_compaction_jobs SET expected_previous_artifact_id=NULL WHERE id=?
+  `).run(secondJob.id)
+  assert.throws(
+    () => reopened.getContextCompactionJob(secondJob.id),
+    (error: unknown) => error instanceof ContextPersistenceError && error.code === 'integrity_violation',
+  )
+})
+
+test('terminal failed, cancelled, and interrupted turns are compactable but unresolved tools are not', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  for (const [index, status] of (['failed', 'cancelled', 'interrupted'] as const).entries()) {
+    const turn = store.beginTurn({
+      ...beginInput(session.activeThreadId, `terminal-${index}`, `terminal-hash-${index}`),
+      expectedRevision: store.getThread(session.activeThreadId)!.revision,
+    })
+    store.finishTurn({
+      turnId: turn.turn.id,
+      status,
+      ...(status === 'failed' ? { error: { code: 'provider_failed' } } : {}),
+    })
+  }
+  const terminalSource = store.listItems(session.activeThreadId).map((item) => item.id)
+  assert.equal(store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'terminal-prefix',
+    sourceItemIds: terminalSource,
+    summaryInputHash: '6'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job.status, 'queued')
+
+  const other = store.createSession({})
+  const unresolved = store.beginTurn(beginInput(other.activeThreadId))
+  store.appendProviderEvent({
+    turnId: unresolved.turn.id,
+    eventId: 'unresolved-call',
+    items: [{
+      kind: 'tool_call',
+      payload: { callId: 'call-1', name: 'read_file', input: { path: 'x' }, sideEffect: 'read' },
+    }],
+  })
+  store.finishTurn({ turnId: unresolved.turn.id, status: 'interrupted' })
+  assert.throws(() => store.createContextCompactionJob({
+    threadId: other.activeThreadId,
+    requestKey: 'unsafe-tool-prefix',
+    sourceItemIds: store.listItems(other.activeThreadId).map((item) => item.id),
+    summaryInputHash: '5'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }), (error: unknown) => error instanceof ContextPersistenceError && error.code === 'invalid_input')
+})
+
+test('execution manifests preserve exact compaction and uncovered suffix provenance', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  const session = store.createSession({})
+  const first = store.beginTurn(beginInput(session.activeThreadId))
+  store.appendProviderEvent({
+    turnId: first.turn.id,
+    eventId: 'reply-1',
+    items: [{ kind: 'assistant_message', payload: { text: 'first answer' } }],
+  })
+  store.finishTurn({ turnId: first.turn.id, status: 'completed' })
+  const compactedItems = store.listItems(session.activeThreadId)
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'manifest-prefix',
+    sourceItemIds: compactedItems.map((item) => item.id),
+    summaryInputHash: 'd'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+  store.claimContextCompactionJob({ jobId: job.id, ownerId: 'worker' })
+  const artifact = store.completeContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'worker',
+    summary: { text: 'first turn summary', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'claude',
+    generatorModel: 'claude-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+  const second = store.beginTurn({
+    ...beginInput(session.activeThreadId, 'request-2', 'hash-2'),
+    expectedRevision: 2,
+  })
+  const suffix = store.listItems(session.activeThreadId).slice(compactedItems.length)
+  const input = {
+    executionId: second.execution.id,
+    threadId: session.activeThreadId,
+    materializerVersion: 'context-builder/1',
+    materializedContextHash: 'e'.repeat(64),
+    sources: [
+      { kind: 'compaction' as const, compactionId: artifact.id },
+      ...suffix.map((item) => ({ kind: 'canonical_item' as const, itemId: item.id })),
+    ],
+  }
+  const created = store.createExecutionContextManifest(input)
+  assert.equal(created.duplicate, false)
+  assert.deepEqual(created.manifest.entries.map((entry) => entry.kind), ['compaction', 'canonical_item'])
+  assert.equal(store.createExecutionContextManifest(input).duplicate, true)
+  assert.throws(() => store.createExecutionContextManifest({
+    ...input,
+    materializedContextHash: 'f'.repeat(64),
+  }), (error: unknown) => error instanceof ContextPersistenceError && error.code === 'idempotency_conflict')
+  store.finishTurn({ turnId: second.turn.id, status: 'cancelled' })
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  assert.equal(reopened.getExecutionContextManifest(second.execution.id)?.manifestHash, created.manifest.manifestHash)
+})
+
+test('derived context append-only guards reject mutation and hashes detect forced tampering', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'tamper-test',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '1'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+  store.claimContextCompactionJob({ jobId: job.id, ownerId: 'worker' })
+  const artifact = store.completeContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'worker',
+    summary: { text: 'trusted', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+
+  const external = new DatabaseSync(path)
+  t.after(() => external.close())
+  assert.throws(
+    () => external.prepare('UPDATE context_compactions SET summary_json=? WHERE id=?')
+      .run('{"text":"changed"}', artifact.id),
+    /append-only/,
+  )
+  assert.throws(
+    () => external.prepare('DELETE FROM context_compaction_source_items WHERE compaction_id=?').run(artifact.id),
+    /append-only/,
+  )
+  assert.throws(
+    () => external.prepare('DELETE FROM context_compaction_jobs WHERE id=?').run(job.id),
+    /durable/,
+  )
+  external.exec('DROP TRIGGER context_compactions_no_update')
+  external.prepare('UPDATE context_compactions SET summary_json=? WHERE id=?').run('{"text":"tampered"}', artifact.id)
+  assert.throws(
+    () => store.getContextCompactionArtifact(artifact.id),
+    (error: unknown) => error instanceof ContextPersistenceError && error.code === 'integrity_violation',
+  )
+  assert.deepEqual(store.listItems(session.activeThreadId).map((item) => item.payload), [{ text: 'hello' }])
+})
+
+test('expired compaction leases are durably reclaimed and terminal failure survives reopen', (t) => {
+  const path = databasePath(t)
+  let now = '2026-07-18T00:00:00.000Z'
+  const store = new SqliteSessionStore(path, {
+    ...deterministicOptions(),
+    now: () => now,
+  })
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'lease-recovery',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '2'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+  assert.equal(store.claimContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'dead-worker',
+    leaseDurationMs: 1_000,
+  })?.attemptCount, 1)
+  now = '2026-07-18T00:00:02.000Z'
+  const reclaimed = store.claimContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'recovery-worker',
+    leaseDurationMs: 1_000,
+  })
+  assert.equal(reclaimed?.attemptCount, 2)
+  assert.equal(reclaimed?.leaseOwner, 'recovery-worker')
+  const failed = store.failContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'recovery-worker',
+    error: { code: 'generator_unavailable', retryable: true },
+  })
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.revision, 5)
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, { now: () => now })
+  t.after(() => reopened.close())
+  assert.deepEqual(reopened.getContextCompactionJob(job.id)?.error, {
+    code: 'generator_unavailable',
+    retryable: true,
+  })
+  assert.equal(reopened.claimContextCompactionJob({ jobId: job.id, ownerId: 'late-worker' }), null)
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.deepEqual(
+    (inspected.prepare(`
+      SELECT status FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence
+    `).all(job.id) as Array<{ status: string }>).map((row) => row.status),
+    ['queued', 'running', 'queued', 'running', 'failed'],
+  )
+})
+
+test('the current compaction owner heartbeats a long provider generation lease', (t) => {
+  const path = databasePath(t)
+  let now = '2026-07-18T00:00:00.000Z'
+  const store = new SqliteSessionStore(path, { ...deterministicOptions(), now: () => now })
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'heartbeat-lease',
+    sourceItemIds: store.listItems(session.activeThreadId).map((item) => item.id),
+    summaryInputHash: '3'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+  const claimed = store.claimContextCompactionJob({
+    jobId: job.id, ownerId: 'summary-worker', leaseDurationMs: 1_000,
+  })!
+  now = '2026-07-18T00:00:00.500Z'
+  const extended = store.claimContextCompactionJob({
+    jobId: job.id, ownerId: 'summary-worker', leaseDurationMs: 1_000,
+  })!
+  assert.equal(extended.revision, claimed.revision + 1)
+  assert.equal(extended.leaseExpiresAt, '2026-07-18T00:00:01.500Z')
+  now = '2026-07-18T00:00:01.200Z'
+  assert.equal(store.claimContextCompactionJob({
+    jobId: job.id, ownerId: 'competing-worker', leaseDurationMs: 1_000,
+  }), null)
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  assert.deepEqual(
+    (inspected.prepare(`
+      SELECT status FROM context_compaction_job_events WHERE job_id=? ORDER BY sequence
+    `).all(job.id) as Array<{ status: string }>).map((event) => event.status),
+    ['queued', 'running', 'running'],
+  )
+})
+
+test('trash purge removes derived context only inside the authorized retention transaction', (t) => {
+  const path = databasePath(t)
+  let now = '2026-06-01T00:00:00.000Z'
+  const store = new SqliteSessionStore(path, {
+    ...deterministicOptions(),
+    now: () => now,
+  })
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const first = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: first.turn.id, status: 'completed' })
+  const compactedItems = store.listItems(session.activeThreadId)
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'purge-derived',
+    sourceItemIds: compactedItems.map((item) => item.id),
+    summaryInputHash: '3'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+  store.claimContextCompactionJob({ jobId: job.id, ownerId: 'worker' })
+  const artifact = store.completeContextCompactionJob({
+    jobId: job.id,
+    ownerId: 'worker',
+    summary: { text: 'purge with session', summaryInput: { previousArtifactId: null } },
+    generatorProvider: 'codex',
+    generatorModel: 'gpt-test',
+    generatorVersion: 'compactor/1',
+  }).artifact
+  const second = store.beginTurn({
+    ...beginInput(session.activeThreadId, 'request-2', 'hash-2'),
+    expectedRevision: 2,
+  })
+  const suffix = store.listItems(session.activeThreadId).slice(compactedItems.length)
+  store.createExecutionContextManifest({
+    executionId: second.execution.id,
+    threadId: session.activeThreadId,
+    materializerVersion: 'context-builder/1',
+    materializedContextHash: '4'.repeat(64),
+    sources: [
+      { kind: 'compaction', compactionId: artifact.id },
+      ...suffix.map((item) => ({ kind: 'canonical_item' as const, itemId: item.id })),
+    ],
+  })
+  store.finishTurn({ turnId: second.turn.id, status: 'completed' })
+  store.archiveSession(session.id)
+  now = '2026-07-02T00:00:00.000Z'
+  assert.equal(store.purgeExpiredSessions('2026-07-01T00:00:00.000Z'), 1)
+
+  const inspected = new DatabaseSync(path, { readOnly: true })
+  t.after(() => inspected.close())
+  for (const table of [
+    'context_compaction_jobs',
+    'context_compaction_job_events',
+    'context_compaction_heads',
+    'context_compactions',
+    'context_compaction_source_items',
+    'execution_context_manifests',
+    'execution_context_manifest_entries',
+  ]) {
+    assert.equal((inspected.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count, 0, table)
+  }
+  assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
 })
 
 test('sessions move to trash, remain readable for restore, and reject new work while archived', (t) => {
@@ -305,6 +1518,76 @@ test('archiving an active session is rejected and does not interrupt its turn', 
   )
   assert.equal(store.getTurn(started.turn.id)?.status, 'running')
   assert.equal(store.getSession(session.id)?.archivedAt, null)
+})
+
+test('permission profiles inherit the global default, support session overrides, and persist', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  const inherited = store.createSession({ title: 'inherited' })
+  const overridden = store.createSession({ title: 'overridden' })
+  assert.equal(store.getPermissionSettings().defaultProfile, 'workspace')
+  assert.deepEqual(store.getSession(inherited.id)?.permissions, {
+    defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global',
+  })
+
+  store.updateDefaultPermissionProfile('full_access')
+  assert.equal(store.getSession(inherited.id)?.permissions.effectiveProfile, 'full_access')
+  const readOnly = store.updateSessionPermissionProfile({ sessionId: overridden.id, profile: 'read_only' })
+  assert.deepEqual(readOnly.permissions, {
+    defaultProfile: 'full_access', override: 'read_only', effectiveProfile: 'read_only', source: 'session_override',
+  })
+  store.updateDefaultPermissionProfile('workspace')
+  assert.equal(store.getSession(overridden.id)?.permissions.effectiveProfile, 'read_only')
+  assert.equal(store.updateSessionPermissionProfile({ sessionId: overridden.id, profile: null })
+    .permissions.effectiveProfile, 'workspace')
+  assert.throws(() => store.updateDefaultPermissionProfile('unsafe' as never), /unsupported permission profile/i)
+  store.updateSessionPermissionProfile({ sessionId: overridden.id, profile: 'full_access' })
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  assert.equal(reopened.getPermissionSettings().defaultProfile, 'workspace')
+  assert.deepEqual(reopened.getSession(overridden.id)?.permissions, {
+    defaultProfile: 'workspace', override: 'full_access', effectiveProfile: 'full_access', source: 'session_override',
+  })
+})
+
+test('session permission override fails closed while a turn is active', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  assert.throws(
+    () => store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'full_access' }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'session_busy',
+  )
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  assert.equal(store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'full_access' })
+    .permissions.effectiveProfile, 'full_access')
+})
+
+test('turn creation rejects a permission snapshot made stale by a concurrent settings change', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const staleGlobal: ExecutionPolicySnapshot = {
+    ...policy, permissionProfile: 'workspace', permissionProfileSource: 'global',
+  }
+  store.updateDefaultPermissionProfile('full_access')
+  assert.throws(
+    () => store.beginTurn({ ...beginInput(session.activeThreadId), policySnapshot: staleGlobal }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict',
+  )
+
+  store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'read_only' })
+  const staleOverride: ExecutionPolicySnapshot = {
+    ...policy, permissionProfile: 'read_only', permissionProfileSource: 'session_override',
+  }
+  store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'workspace' })
+  assert.throws(
+    () => store.beginTurn({ ...beginInput(session.activeThreadId, 'request-2', 'hash-2'), policySnapshot: staleOverride }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict',
+  )
 })
 
 test('workspace mutation uses thread CAS, invalidates bindings, and blocks active Goals', (t) => {
@@ -580,19 +1863,26 @@ test('Goal status transitions are deterministic and stopped states require expli
     goalId: paused.id,
     expectedRevision: paused.revision,
     status: 'active',
+    provider: 'claude',
+    model: 'claude-opus-4-8',
+    effort: 'max',
   })
   assert.equal(resumedResult.status, 'applied')
   assert.equal(resumedResult.goal?.statusReason, null)
-  const completedResult = store.updateGoalStatus({
-    goalId: created.id,
-    expectedRevision: resumedResult.goal?.revision ?? -1,
-    status: 'complete',
-  })
-  assert.equal(completedResult.goal?.status, 'complete')
-  assert.ok(completedResult.goal?.completedAt)
+  assert.equal(resumedResult.goal?.provider, 'claude')
+  assert.equal(resumedResult.goal?.model, 'claude-opus-4-8')
+  assert.equal(resumedResult.goal?.effort, 'max')
+  assert.throws(
+    () => store.updateGoalStatus({
+      goalId: created.id,
+      expectedRevision: resumedResult.goal?.revision ?? -1,
+      status: 'complete',
+    }),
+    (error: unknown) => error instanceof GoalStoreError && error.code === 'invalid_goal_transition',
+  )
   const reactivated = store.editGoal({
     goalId: created.id,
-    expectedRevision: completedResult.goal?.revision ?? -1,
+    expectedRevision: resumedResult.goal?.revision ?? -1,
     objective: 'complete the expanded task',
   })
   assert.equal(reactivated.status, 'active')
@@ -628,6 +1918,302 @@ test('Goal status transitions are deterministic and stopped states require expli
     expectedRevision: limited.revision,
     tokenBudget: 20,
   }).status, 'active')
+})
+
+test('Goal V2 verifies a frozen proposal before writing an immutable completion receipt', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'produce and verify the answer',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = store.beginTurn(beginInput(session.activeThreadId, 'goal-v2-turn', 'goal-v2-hash'))
+  store.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'goal-v2:assistant',
+    items: [{ kind: 'assistant_message', payload: { text: 'Verified answer' } }],
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id,
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    tokensUsed: 10,
+    timeUsedSeconds: 1,
+    automatic: true,
+    progressDigest: 'progress',
+  })
+  const requirements = [{
+    id: 'requirement-1',
+    requirement: 'produce the answer',
+    evidence: [{ kind: 'current_turn' as const, reference: null, claim: 'The answer is the deliverable' }],
+  }]
+  const content = {
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    objective: goal.objective,
+    proposalSummary: 'answer delivered',
+    requirements,
+    evidence: [{
+      id: 'evidence-1-1',
+      kind: 'current_turn' as const,
+      reference: started.turn.id,
+      claim: 'The answer is the deliverable',
+      authoritative: true,
+      payload: { requirementId: 'requirement-1', terminalStatus: 'completed' },
+    }],
+    terminalTurn: {
+      id: started.turn.id,
+      status: 'completed' as const,
+      provider: 'codex' as const,
+      model: 'gpt-test',
+    },
+    omissions: [] as string[],
+  }
+  const evidenceBundle: GoalEvidenceBundle = { ...content, hash: goalEvidenceHash(content) }
+  const proposal = store.beginGoalVerification({
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    turnId: started.turn.id,
+    summary: 'answer delivered',
+    requirements,
+    evidenceBundle,
+  })
+  assert.ok(proposal)
+  assert.equal(store.getGoal(session.activeThreadId)?.status, 'verifying')
+  assert.deepEqual(store.listActiveGoals(), [])
+  const proposalDatabase = new DatabaseSync(path)
+  try {
+    assert.throws(
+      () => proposalDatabase.prepare(`
+        UPDATE goal_completion_proposals SET summary=?,status='rejected',resolved_at=? WHERE id=?
+      `).run('tampered summary', '2026-07-21T00:00:00.000Z', proposal.id),
+      /immutable/,
+    )
+  } finally {
+    proposalDatabase.close()
+  }
+  const verifierLease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'verifier-test',
+    leaseDurationMs: 3,
+  })
+  assert.ok(verifierLease)
+  assert.equal(store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'competing-verifier',
+  }), null)
+  const heartbeat = store.heartbeatGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    leaseId: verifierLease.leaseId, ownerId: verifierLease.ownerId, leaseDurationMs: 2,
+  })
+  assert.ok(heartbeat)
+  assert.notEqual(heartbeat.expiresAt, verifierLease.expiresAt)
+  assert.equal(store.finishGoalVerification({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    evaluatorProvider: 'codex', evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'indeterminate', reason: 'must hold the verifier lease', requirements: [],
+      missingEvidence: ['lease'], impossibleEvidenceIds: [],
+    },
+    leaseId: 'missing-lease', leaseOwner: 'not-owner',
+  }).status, 'stale')
+  const reclaimedLease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'recovered-verifier',
+  })
+  assert.ok(reclaimedLease)
+  assert.notEqual(reclaimedLease.leaseId, verifierLease.leaseId)
+  const finished = store.finishGoalVerification({
+    proposalId: proposal.id,
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    evaluatorProvider: 'codex',
+    evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'complete',
+      reason: 'The frozen deliverable satisfies the objective',
+      requirements: [{
+        requirementId: 'requirement-1',
+        result: 'satisfied',
+        evidenceIds: ['evidence-1-1'],
+        reason: 'The answer exists in the completed turn',
+      }],
+      missingEvidence: [],
+      impossibleEvidenceIds: [],
+    },
+    leaseId: reclaimedLease.leaseId,
+    leaseOwner: reclaimedLease.ownerId,
+  })
+  assert.equal(finished.status, 'applied')
+  assert.equal(finished.goal?.status, 'complete')
+  assert.equal(finished.goal?.revision, goal.revision)
+  assert.equal(finished.goal?.latestCompletionReceiptId, finished.receipt?.id)
+  assert.ok(finished.receipt)
+  const history = store.getGoalVerificationHistory(goal.id)
+  assert.equal(history.proposals[0]?.status, 'accepted')
+  assert.equal(history.attempts[0]?.outcome, 'complete')
+  assert.equal(history.receipts[0]?.id, finished.receipt?.id)
+  const database = new DatabaseSync(path)
+  t.after(() => database.close())
+  const receiptId = finished.receipt?.id
+  assert.ok(receiptId)
+  assert.throws(
+    () => database.prepare('DELETE FROM goal_completion_receipts WHERE id=?').run(receiptId),
+    /append-only/,
+  )
+  assert.throws(
+    () => database.prepare('UPDATE goal_verification_attempts SET outcome=? WHERE id=?')
+      .run('incomplete', history.attempts[0]?.id),
+    /append-only/,
+  )
+  assert.throws(
+    () => database.prepare('DELETE FROM goal_completion_proposals WHERE id=?').run(proposal.id),
+    /retained/,
+  )
+})
+
+test('Goal V2 records independently confirmed impossibility as a resumable stop receipt', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'perform an operation proven unavailable',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = store.beginTurn(beginInput(session.activeThreadId, 'impossible-turn', 'impossible-hash'))
+  store.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'impossible:evidence',
+    items: [{
+      kind: 'tool_result',
+      payload: {
+        callId: 'capability-check', providerCallId: 'capability-check', toolName: 'inspect_capability',
+        result: { success: true, content: { available: false }, error: null },
+      },
+    }],
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id, goalId: goal.id, goalRevision: goal.revision,
+    tokensUsed: 1, timeUsedSeconds: 1, automatic: true, progressDigest: null,
+  })
+  const requirements = [{
+    id: 'requirement-1', requirement: 'perform the unavailable operation',
+    evidence: [{ kind: 'tool_result' as const, reference: 'capability-check', claim: 'capability check result' }],
+  }]
+  const content = {
+    goalId: goal.id, goalRevision: goal.revision, objective: goal.objective,
+    proposalSummary: 'capability is unavailable', requirements,
+    evidence: [{
+      id: 'evidence-1-1', kind: 'tool_result' as const, reference: 'capability-check',
+      claim: 'capability check result', authoritative: true,
+      payload: { requirementId: 'requirement-1', terminalStatus: 'completed' },
+    }],
+    terminalTurn: {
+      id: started.turn.id, status: 'completed' as const, provider: 'codex' as const, model: 'gpt-test',
+    },
+    omissions: [] as string[],
+  }
+  const proposal = store.beginGoalVerification({
+    goalId: goal.id, goalRevision: goal.revision, turnId: started.turn.id,
+    summary: content.proposalSummary, requirements,
+    evidenceBundle: { ...content, hash: goalEvidenceHash(content) },
+  })
+  assert.ok(proposal)
+  const verifierLease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'verifier-test',
+  })
+  assert.ok(verifierLease)
+  const stopped = store.finishGoalVerification({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    evaluatorProvider: 'codex', evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'impossible', reason: 'authoritative evidence confirms impossibility',
+      requirements: [{
+        requirementId: 'requirement-1', result: 'impossible', evidenceIds: ['evidence-1-1'],
+        reason: 'the required capability is absent',
+      }],
+      missingEvidence: [], impossibleEvidenceIds: ['evidence-1-1'],
+    },
+    leaseId: verifierLease.leaseId,
+    leaseOwner: verifierLease.ownerId,
+  })
+  assert.equal(stopped.goal?.status, 'blocked')
+  assert.equal(stopped.goal?.statusReason?.code, 'confirmed_impossible')
+  assert.equal(stopped.goal?.latestStopReceiptId, stopped.stopReceipt?.id)
+  assert.equal(stopped.stopReceipt?.resumable, true)
+  assert.equal(store.getGoalVerificationHistory(goal.id).stopReceipts.length, 1)
+})
+
+test('Goal V2 rejects impossibility based on a worker deliverable instead of authoritative tool evidence', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'perform the operation',
+    provider: 'codex', model: 'gpt-test',
+  })
+  const started = store.beginTurn(beginInput(session.activeThreadId, 'claimed-impossible', 'claimed-impossible-hash'))
+  store.appendProviderEvent({
+    turnId: started.turn.id, eventId: 'claimed-impossible:assistant',
+    items: [{ kind: 'assistant_message', payload: { text: 'I cannot perform the operation' } }],
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id, goalId: goal.id, goalRevision: goal.revision,
+    tokensUsed: 1, timeUsedSeconds: 1, automatic: true, progressDigest: null,
+  })
+  const requirements = [{
+    id: 'requirement-1', requirement: 'perform the operation',
+    evidence: [{ kind: 'current_turn' as const, reference: null, claim: 'worker says it is impossible' }],
+  }]
+  const content = {
+    goalId: goal.id, goalRevision: goal.revision, objective: goal.objective,
+    proposalSummary: 'worker reports impossibility', requirements,
+    evidence: [{
+      id: 'evidence-1-1', kind: 'current_turn' as const, reference: started.turn.id,
+      claim: 'worker says it is impossible', authoritative: true,
+      payload: { requirementId: 'requirement-1', terminalStatus: 'completed' },
+    }],
+    terminalTurn: {
+      id: started.turn.id, status: 'completed' as const, provider: 'codex' as const, model: 'gpt-test',
+    },
+    omissions: [] as string[],
+  }
+  const proposal = store.beginGoalVerification({
+    goalId: goal.id, goalRevision: goal.revision, turnId: started.turn.id,
+    summary: content.proposalSummary, requirements,
+    evidenceBundle: { ...content, hash: goalEvidenceHash(content) },
+  })
+  assert.ok(proposal)
+  const lease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'verifier-test',
+  })
+  assert.ok(lease)
+  const result = store.finishGoalVerification({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    evaluatorProvider: 'codex', evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'impossible', reason: 'the worker says the operation is impossible',
+      requirements: [{
+        requirementId: 'requirement-1', result: 'impossible', evidenceIds: ['evidence-1-1'],
+        reason: 'worker statement',
+      }],
+      missingEvidence: [], impossibleEvidenceIds: ['evidence-1-1'],
+    },
+    leaseId: lease.leaseId, leaseOwner: lease.ownerId,
+  })
+  assert.equal(result.status, 'applied')
+  assert.equal(result.goal?.status, 'active')
+  assert.equal(result.goal?.statusReason?.code, 'verification_host_rejected')
+  assert.equal(result.stopReceipt, null)
+  assert.equal(store.getGoalVerificationHistory(goal.id).stopReceipts.length, 0)
 })
 
 test('Goal projection mutations append objective-free durable SSE cursors', (t) => {
@@ -1087,14 +2673,14 @@ test('follow-up closing and expired-lease recovery preserve FIFO intent for the 
     status: followUp.status,
     targetTurnId: followUp.targetTurnId,
   })), [
-    { id: first.id, status: 'queued', targetTurnId: null },
+    { id: first.id, status: 'delivery_unknown', targetTurnId: null },
     { id: second.id, status: 'queued', targetTurnId: null },
   ])
   assert.equal(store.claimFollowUp({
     threadId: session.activeThreadId,
     ownerId: 'next-turn-dispatcher',
     purpose: 'next_turn',
-  })?.id, first.id)
+  })?.id, second.id)
 })
 
 test('next-turn follow-ups reject the existing turn and survive lease recovery for a later turn', (t) => {
@@ -1141,7 +2727,16 @@ test('next-turn follow-ups reject the existing turn and survive lease recovery f
     leaseDurationMs: 1_000,
   })?.id, followUp.id)
 
+  assert.throws(() => store.beginTurnFromFollowUp({
+    followUpId: followUp.id, ownerId: 'crashed-dispatcher', threadId: 'foreign-thread',
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  }), (error: unknown) => error instanceof FollowUpStoreError && error.code === 'invalid_follow_up')
+
   now = '2026-07-18T00:00:02.000Z'
+  assert.throws(() => store.beginTurnFromFollowUp({
+    followUpId: followUp.id, ownerId: 'crashed-dispatcher', threadId: session.activeThreadId,
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  }), (error: unknown) => error instanceof FollowUpStoreError && error.code === 'follow_up_lease_lost')
   assert.equal(store.recoverExpiredFollowUpClaims(), 1)
   assert.equal(store.claimFollowUp({
     threadId: session.activeThreadId,
@@ -1156,6 +2751,66 @@ test('next-turn follow-ups reject the existing turn and survive lease recovery f
   assert.equal(consumed.status, 'consumed')
   assert.deepEqual(consumed.items.map((item) => item.payload), [{ text: 'deliver only later' }])
   assert.equal(consumed.followUp.consumedTurnId, later.turn.id)
+})
+
+test('follow-up cancellation CAS and delivery-unknown are terminal and replay-safe', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const queued = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'cancel-me', requestHash: 'cancel-hash',
+    delivery: 'next_turn', targetTurnId: null, scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'cancel' } }],
+  }).followUp
+  assert.equal(store.cancelFollowUp(queued.id, queued.revision).status, 'cancelled')
+  assert.throws(() => store.cancelFollowUp(queued.id, queued.revision),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict')
+
+  const active = store.beginTurn(beginInput(session.activeThreadId))
+  const uncertain = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'unknown', requestHash: 'unknown-hash',
+    delivery: 'steer_or_queue', targetTurnId: active.turn.id, scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'maybe delivered' } }],
+  }).followUp
+  store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'pump', purpose: 'steer', targetTurnId: active.turn.id })
+  assert.equal(store.markFollowUpDeliveryUnknown(uncertain.id, 'pump').status, 'delivery_unknown')
+  assert.equal(store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'retry', purpose: 'steer', targetTurnId: active.turn.id }), null)
+})
+
+test('beginTurnFromFollowUp atomically consumes input and commits stale Goal observation', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const existing = store.beginTurn(beginInput(session.activeThreadId))
+  const next = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'next', requestHash: 'next-hash',
+    delivery: 'next_turn', targetTurnId: null, scope: { kind: 'conversation' },
+    input: [{ kind: 'user_message', payload: { text: 'atomic next' } }],
+  }).followUp
+  store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'next-owner', purpose: 'next_turn' })
+  store.finishTurn({ turnId: existing.turn.id, status: 'completed' })
+  const started = store.beginTurnFromFollowUp({
+    followUpId: next.id, ownerId: 'next-owner', threadId: session.activeThreadId,
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  })
+  assert.equal(started.initialItems[0]?.payload.text, 'atomic next')
+  assert.equal(store.listFollowUps(session.activeThreadId).find((item) => item.id === next.id)?.status, 'consumed')
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  const goal = store.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'old', provider: 'codex', model: 'gpt-test',
+  })
+  const stale = store.enqueueFollowUp({
+    threadId: session.activeThreadId, clientRequestId: 'stale-next', requestHash: 'stale-hash',
+    delivery: 'next_turn', targetTurnId: null, scope: { kind: 'goal', goalId: goal.id, revision: goal.revision },
+    input: [{ kind: 'user_message', payload: { text: 'old goal only' } }],
+  }).followUp
+  store.claimFollowUp({ threadId: session.activeThreadId, ownerId: 'stale-owner', purpose: 'next_turn' })
+  store.editGoal({ goalId: goal.id, expectedRevision: goal.revision, objective: 'new' })
+  assert.throws(() => store.beginTurnFromFollowUp({
+    followUpId: stale.id, ownerId: 'stale-owner', threadId: session.activeThreadId,
+    provider: 'codex', model: 'gpt-test', effort: null, adapterVersion: 'test/1', policySnapshot: policy,
+  }), (error: unknown) => error instanceof GoalStoreError && error.code === 'stale_goal_revision')
+  assert.equal(store.listFollowUps(session.activeThreadId).find((item) => item.id === stale.id)?.status, 'stale_goal')
 })
 
 test('Goal-scoped follow-ups become stale deterministically without appending unseen input', (t) => {
@@ -1253,6 +2908,32 @@ test('turn activity keeps turn, execution, and thread status synchronized and is
   )
 })
 
+test('an active Goal awaiting its next turn is projected distinctly from launch execution', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  assert.equal(store.getSession(session.id)?.workStatus, 'completed')
+
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'continue after the completed turn',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  assert.equal(store.getSession(session.id)?.workStatus, 'awaiting_goal_turn')
+
+  store.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: goal.revision,
+    status: 'blocked',
+    reason: { code: 'context_input_too_large', source: 'host', message: null, at: '2026-07-20T00:00:00.000Z' },
+  })
+  assert.equal(store.getSession(session.id)?.workStatus, 'blocked')
+})
+
 test('fork replay stops at the exact inherited item and branches remain isolated', (t) => {
   const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
   t.after(() => store.close())
@@ -1347,7 +3028,12 @@ test('startup recovery deterministically interrupts durable active turns once', 
     status: candidate.status,
     targetTurnId: candidate.targetTurnId,
     dispatchOwner: candidate.dispatchOwner,
-  })), [{ status: 'queued', targetTurnId: null, dispatchOwner: null }])
+  })), [{ status: 'delivery_unknown', targetTurnId: null, dispatchOwner: null }])
+  assert.equal(recoveredStore.claimFollowUp({
+    threadId: session.activeThreadId,
+    ownerId: 'replacement-runtime',
+    purpose: 'next_turn',
+  }), null)
   assert.equal(
     recoveredStore.listEvents(session.activeThreadId).filter((event) => event.type === 'turn_interrupted').length,
     1,

@@ -24,6 +24,7 @@ function session(
     activeThreadId: `thread-${id}`,
     projectKey: null,
     cwd: null,
+    permissions: { defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global' },
     schemaVersion: 1,
     createdAt: updatedAt,
     updatedAt,

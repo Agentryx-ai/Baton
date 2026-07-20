@@ -8,6 +8,7 @@ import {
   isLongConversationText,
   latestUsageSummary,
   payloadText,
+  tailConversationEntries,
   transcriptItems,
   usageSummary,
 } from '../src/features/conversations/conversation-presentation.ts'
@@ -73,6 +74,26 @@ test('usage stays canonical but is summarized once outside the transcript', () =
   assert.equal(latestUsageSummary([turn]), '합계 12 · 입력 10 · 출력 2')
 })
 
+test('internal Goal continuation stays canonical without appearing as a user chat message', () => {
+  const internal = {
+    ...item({
+      goalContinuation: true,
+      text: 'Continue working toward the active conversation Goal.',
+    }),
+    id: 'goal-continuation',
+    kind: 'user_message' as const,
+    visibility: 'baton_private' as const,
+  }
+  const user = {
+    ...item({ text: '계속 진행해 주세요.' }),
+    id: 'user-message',
+    kind: 'user_message' as const,
+  }
+
+  assert.deepEqual(transcriptItems([internal, user]), [user])
+  assert.deepEqual(conversationEntries([internal, user]).map((entry) => entry.item), [user])
+})
+
 test('tool calls and results become one compact transcript entry', () => {
   const call = {
     ...item({ callId: 'tool-1', name: 'read_file', arguments: { path: 'src/App.tsx' } }),
@@ -88,6 +109,20 @@ test('tool calls and results become one compact transcript entry', () => {
   assert.equal(entries.length, 1)
   assert.equal(entries[0]?.toolResult?.id, 'result')
   assert.equal(activitySummary(call, result), '읽기 · src/App.tsx · 완료')
+})
+
+test('large transcripts render a bounded tail while retaining an explicit hidden count', () => {
+  const entries = conversationEntries([
+    { ...item({ text: 'one' }), id: 'one', kind: 'assistant_message' },
+    { ...item({ text: 'two' }), id: 'two', kind: 'assistant_message' },
+    { ...item({ text: 'three' }), id: 'three', kind: 'assistant_message' },
+  ])
+
+  assert.deepEqual(tailConversationEntries(entries, 2), {
+    entries: entries.slice(1),
+    hiddenCount: 1,
+  })
+  assert.deepEqual(tailConversationEntries(entries, 20), { entries, hiddenCount: 0 })
 })
 
 test('nested canonical tool results preserve success and failure presentation', () => {

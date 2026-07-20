@@ -1,0 +1,4 @@
+interface:
+  display_name: "Resolve Codex Runtime"
+  short_description: "Validate and expose Codex primary runtime paths"
+  default_prompt: "Use $resolve-codex-runtime to load the official Codex workspace dependencies."

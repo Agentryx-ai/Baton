@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto'
 
 export type CanonicalProvider = 'claude' | 'codex' | 'gemini'
+export type PermissionProfile = 'read_only' | 'workspace' | 'full_access'
+export type PermissionProfileSource = 'global' | 'session_override'
 export type SessionId = string
 export type ThreadId = string
 export type TurnId = string
@@ -8,6 +10,9 @@ export type ItemId = string
 export type ExecutionId = string
 export type GoalId = string
 export type FollowUpId = string
+export type ContextCompactionJobId = string
+export type ContextCompactionId = string
+export type ExecutionContextManifestId = string
 
 export type ThreadStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'archived'
 export type TurnStatus =
@@ -29,6 +34,7 @@ export type ExecutionStatus =
 
 export type GoalStatus =
   | 'active'
+  | 'verifying'
   | 'paused'
   | 'blocked'
   | 'usage_limited'
@@ -66,6 +72,126 @@ export interface CanonicalGoal {
   updatedAt: string
   startedAt: string
   completedAt: string | null
+  verificationProposalId: string | null
+  latestCompletionReceiptId: string | null
+  latestStopReceiptId: string | null
+}
+
+export type GoalEvidenceKind = 'tool_result' | 'current_turn'
+
+export interface GoalEvidenceReference {
+  kind: GoalEvidenceKind
+  reference: string | null
+  claim: string
+}
+
+export interface GoalRequirementClaim {
+  id: string
+  requirement: string
+  evidence: GoalEvidenceReference[]
+}
+
+export interface GoalFrozenEvidence {
+  id: string
+  kind: GoalEvidenceKind
+  reference: string
+  claim: string
+  authoritative: boolean
+  payload: Record<string, unknown>
+}
+
+export interface GoalEvidenceBundle {
+  goalId: GoalId
+  goalRevision: number
+  objective: string
+  proposalSummary: string
+  requirements: GoalRequirementClaim[]
+  evidence: GoalFrozenEvidence[]
+  terminalTurn: {
+    id: TurnId
+    status: 'completed'
+    provider: CanonicalProvider
+    model: string
+  }
+  omissions: string[]
+  hash: string
+}
+
+export type GoalVerificationOutcome = 'complete' | 'incomplete' | 'impossible' | 'indeterminate'
+export type GoalRequirementVerificationResult = 'satisfied' | 'unsatisfied' | 'unproven' | 'impossible'
+
+export interface GoalVerificationRequirement {
+  requirementId: string
+  result: GoalRequirementVerificationResult
+  evidenceIds: string[]
+  reason: string
+}
+
+export interface GoalVerificationDecision {
+  outcome: GoalVerificationOutcome
+  reason: string
+  requirements: GoalVerificationRequirement[]
+  missingEvidence: string[]
+  impossibleEvidenceIds: string[]
+}
+
+export interface GoalCompletionProposal {
+  id: string
+  goalId: GoalId
+  goalRevision: number
+  turnId: TurnId
+  summary: string
+  requirements: GoalRequirementClaim[]
+  evidenceBundle: GoalEvidenceBundle
+  status: 'verifying' | 'accepted' | 'rejected' | 'ineligible'
+  createdAt: string
+  resolvedAt: string | null
+}
+
+export interface GoalVerificationAttempt {
+  id: string
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  evaluatorProvider: CanonicalProvider
+  evaluatorModel: string
+  evidenceBundleHash: string
+  outcome: GoalVerificationOutcome
+  decision: GoalVerificationDecision
+  usage: Record<string, unknown> | null
+  startedAt: string
+  completedAt: string
+}
+
+export interface GoalCompletionReceipt {
+  id: string
+  goalId: GoalId
+  goalRevision: number
+  proposalId: string
+  verificationAttemptId: string
+  evidenceBundleHash: string
+  hostChecks: string[]
+  acceptedAt: string
+  acceptancePolicyVersion: string
+}
+
+export interface GoalStopReceipt {
+  id: string
+  goalId: GoalId
+  goalRevision: number
+  verificationAttemptId: string
+  kind: 'confirmed_impossible'
+  reason: string
+  evidenceBundleHash: string
+  decidedAt: string
+  resumable: boolean
+}
+
+export interface GoalVerificationHistory {
+  proposals: GoalCompletionProposal[]
+  attempts: GoalVerificationAttempt[]
+  receipts: GoalCompletionReceipt[]
+  stopReceipts: GoalStopReceipt[]
 }
 
 export type GoalObservation =
@@ -82,6 +208,17 @@ export interface GoalSchedulerLease {
   expiresAt: string
 }
 
+export interface GoalVerifierLease {
+  leaseId: string
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  ownerId: string
+  acquiredAt: string
+  heartbeatAt: string
+  expiresAt: string
+}
+
 export type VisibleWorkStatus =
   | 'archived'
   | 'waiting_user'
@@ -89,6 +226,8 @@ export type VisibleWorkStatus =
   | 'waiting_tool'
   | 'running'
   | 'queued'
+  | 'awaiting_goal_turn'
+  | 'verifying'
   | 'usage_limited'
   | 'budget_limited'
   | 'blocked'
@@ -102,26 +241,29 @@ export type VisibleWorkStatus =
   | 'idle'
 
 export interface AgentLoopLimits {
-  maxModelRoundTrips: number
-  maxToolCalls: number
-  maxIdenticalToolCalls: number
+  maxModelRoundTrips: number | null
+  maxToolCalls: number | null
+  maxIdenticalToolCalls: number | null
   toolTimeoutMs: number
   toolOutputBytes: number
-  turnTimeoutMs: number
+  turnTimeoutMs: number | null
   maxProviderRetries: number
 }
 
 export const DEFAULT_AGENT_LOOP_LIMITS: Readonly<AgentLoopLimits> = Object.freeze({
-  maxModelRoundTrips: 32,
-  maxToolCalls: 128,
-  maxIdenticalToolCalls: 3,
+  // Codex runs until it reaches a terminal response, and Claude Agent SDK's
+  // maxTurns default is undefined. Provider-independent loop ceilings are
+  // therefore opt-in rather than Baton-only defaults.
+  maxModelRoundTrips: null,
+  maxToolCalls: null,
+  maxIdenticalToolCalls: null,
   toolTimeoutMs: 120_000,
   toolOutputBytes: 256 * 1_024,
-  turnTimeoutMs: 30 * 60_000,
+  turnTimeoutMs: null,
   maxProviderRetries: 3,
 })
 
-export type AgentToolSideEffect = 'read_only' | 'workspace_mutation' | 'workspace_command' | 'goal'
+export type AgentToolSideEffect = 'read_only' | 'workspace_mutation' | 'workspace_command' | 'host_mutation' | 'goal'
 
 export interface AgentToolDefinition {
   name: string
@@ -141,6 +283,8 @@ export type AgentToolResult =
   | {
       success: true
       content: Record<string, unknown>
+      /** Immutable local images returned to the current provider without embedding bytes in canonical JSON. */
+      images?: import('./image-artifacts.ts').ImageArtifactRef[]
       metadata?: Record<string, unknown>
       error: null
     }
@@ -173,6 +317,7 @@ export interface CanonicalSession {
   activeThreadId: ThreadId
   projectKey: string | null
   cwd: string | null
+  permissions: SessionPermissionState
   schemaVersion: number
   createdAt: string
   updatedAt: string
@@ -188,6 +333,18 @@ export interface CanonicalSession {
     /** Native metadata only. It is never an authorized tool root until the user connects it. */
     cwd: string | null
   } | null
+}
+
+export interface GlobalPermissionSettings {
+  defaultProfile: PermissionProfile
+  updatedAt: string
+}
+
+export interface SessionPermissionState {
+  defaultProfile: PermissionProfile
+  override: PermissionProfile | null
+  effectiveProfile: PermissionProfile
+  source: PermissionProfileSource
 }
 
 export interface CanonicalThread {
@@ -236,8 +393,130 @@ export interface CanonicalItem {
   createdAt: string
 }
 
+export type ContextCompactionJobStatus = 'queued' | 'running' | 'completed' | 'failed'
+
+/** Durable work receipt for producing a derived summary. Canonical items are never replaced. */
+export interface ContextCompactionJob {
+  id: ContextCompactionJobId
+  threadId: ThreadId
+  /** Provider/budget contract for this independent derived-context branch. */
+  viewKey: string
+  requestKey: string
+  requestHash: string
+  sourceItemIds: ItemId[]
+  sourceHash: string
+  summaryInputHash: string
+  /** Artifact frontier observed by the caller; null means no prior artifact existed. */
+  expectedPreviousArtifactId: ContextCompactionId | null
+  status: ContextCompactionJobStatus
+  revision: number
+  leaseOwner: string | null
+  leaseExpiresAt: string | null
+  attemptCount: number
+  artifactId: ContextCompactionId | null
+  error: Record<string, unknown> | null
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
+}
+
+export interface ContextCompactionSourceItem {
+  ordinal: number
+  itemId: ItemId
+  itemSequence: number
+  itemDigest: string
+}
+
+/** Immutable derived context artifact; it is provenance, never canonical conversation history. */
+export interface ContextCompactionArtifact {
+  id: ContextCompactionId
+  jobId: ContextCompactionJobId
+  threadId: ThreadId
+  viewKey: string
+  sourceHash: string
+  summaryInputHash: string
+  artifactHash: string
+  summary: Record<string, unknown>
+  generatorProvider: CanonicalProvider
+  generatorModel: string
+  generatorVersion: string
+  sourceItems: ContextCompactionSourceItem[]
+  createdAt: string
+}
+
+export type ExecutionContextManifestEntry =
+  | { ordinal: number; kind: 'canonical_item'; itemId: ItemId; digest: string }
+  | { ordinal: number; kind: 'compaction'; compactionId: ContextCompactionId; digest: string }
+
+/** Immutable replay/audit receipt for the exact provider-neutral context selected for an execution. */
+export interface ExecutionContextManifest {
+  id: ExecutionContextManifestId
+  executionId: ExecutionId
+  threadId: ThreadId
+  materializerVersion: string
+  materializedContextHash: string
+  manifestHash: string
+  entries: ExecutionContextManifestEntry[]
+  createdAt: string
+}
+
+export type ExecutionContextSourceRef =
+  | { kind: 'canonical_item'; itemId: ItemId }
+  | { kind: 'compaction'; compactionId: ContextCompactionId }
+
+export interface CreateContextCompactionJobInput {
+  threadId: ThreadId
+  /** Omitted only by legacy low-level callers; new runtime paths must provide it. */
+  viewKey?: string
+  /** Stable caller-generated idempotency key for this exact compaction request. */
+  requestKey: string
+  /** Exact canonical prefix, in lineage order, covered by the derived summary. */
+  sourceItemIds: ItemId[]
+  /** Digest of the visibility-filtered generator input, distinct from the full canonical source hash. */
+  summaryInputHash: string
+  /** Compare-and-set frontier. The job is accepted only while this remains the latest artifact. */
+  expectedPreviousArtifactId: ContextCompactionId | null
+}
+
+export interface ClaimContextCompactionJobInput {
+  jobId: ContextCompactionJobId
+  ownerId: string
+  leaseDurationMs?: number
+}
+
+/** Creates/reclaims and leases one exact compaction request in a single durable transaction. */
+export interface ReserveContextCompactionJobInput extends CreateContextCompactionJobInput {
+  ownerId: string
+  leaseDurationMs?: number
+}
+
+export interface CompleteContextCompactionJobInput {
+  jobId: ContextCompactionJobId
+  ownerId: string
+  summary: Record<string, unknown>
+  generatorProvider: CanonicalProvider
+  generatorModel: string
+  generatorVersion: string
+}
+
+export interface FailContextCompactionJobInput {
+  jobId: ContextCompactionJobId
+  ownerId: string
+  error: Record<string, unknown>
+}
+
+export interface CreateExecutionContextManifestInput {
+  executionId: ExecutionId
+  threadId: ThreadId
+  materializerVersion: string
+  /** Hash of the exact provider-neutral context body produced by the materializer. */
+  materializedContextHash: string
+  /** Either every canonical lineage item, or one prefix compaction followed by its exact uncovered suffix. */
+  sources: ExecutionContextSourceRef[]
+}
+
 export type FollowUpDelivery = 'steer_or_queue' | 'next_turn'
-export type FollowUpStatus = 'queued' | 'dispatching' | 'consumed' | 'cancelled' | 'stale_goal'
+export type FollowUpStatus = 'queued' | 'dispatching' | 'consumed' | 'cancelled' | 'stale_goal' | 'delivery_unknown'
 export type FollowUpScope =
   | { kind: 'conversation' }
   | { kind: 'goal'; goalId: GoalId; revision: number }
@@ -278,6 +557,7 @@ export type CanonicalStreamEventType =
   | 'turn_interrupted'
   | 'follow_up_changed'
   | 'workspace_changed'
+  | 'host_capability_changed'
   | 'goal_changed'
 
 export interface CanonicalStreamEvent {
@@ -320,12 +600,14 @@ export interface CanonicalExecution {
 }
 
 export interface ExecutionPolicySnapshot {
-  delegationMode: 'disabled' | 'baton-managed'
+  delegationMode: 'disabled' | 'provider-native' | 'baton-managed'
   allowedTools: string[]
   approvalPolicy: string
   cwd: string | null
   maxDepth: number
   capabilityGrant: string | null
+  permissionProfile?: PermissionProfile
+  permissionProfileSource?: PermissionProfileSource
 }
 
 export interface ProviderBinding {
@@ -394,6 +676,12 @@ export interface BeginTurnResult {
   execution: CanonicalExecution
   initialItems: CanonicalItem[]
   duplicate: boolean
+}
+
+/** Result of atomically materializing a draft conversation and its first turn. */
+export interface BeginSessionResult extends BeginTurnResult {
+  session: CanonicalSession
+  thread: CanonicalThread
 }
 
 export interface UpsertProviderBindingInput {

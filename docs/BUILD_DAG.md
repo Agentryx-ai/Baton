@@ -100,7 +100,7 @@ usePolicy(): { state: PolicyState|null; setEnabled: (b:boolean)=>Promise<void>; 
              onSetDefault onPause onResume onRemove />  // 콜백은 () => void (I가 client 배선)
 <ProviderSection provider={Provider} accounts={Account[]} quotas={Record<id,AccountQuota>}
                  policyTargets={string[]} on...={} onAddAccount={() => void} />
-<RotationPanel state={PolicyState|null} onToggle={(b)=>void} />   // ON/OFF, 현재 타깃, 조향 로그(접힘)
+<RotationPanel state={PolicyState|null} onToggle={(b)=>void} />   // ON/OFF, 정책 1순위, 정책 로그(접힘)
 // P5
 <AddAccountWizard open={boolean} onOpenChange onAdded={() => void} />   // 내부에서 client.* 직접 호출
 // P6

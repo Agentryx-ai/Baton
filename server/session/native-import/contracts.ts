@@ -50,6 +50,14 @@ export interface NativePortableRecord {
   createdAt: string | null
 }
 
+export interface NativeGoalSnapshot {
+  objective: string
+  model: string
+  effort: string | null
+  detectedAt: string | null
+  evidence: 'slash_command' | 'claude_goal_status' | 'claude_goal_confirmation' | 'codex_goal_tool'
+}
+
 export interface NativeSessionCandidate extends NativeSourceIdentity {
   candidateId: string
   sourceAlias: string
@@ -66,7 +74,7 @@ export interface NativeSessionCandidate extends NativeSourceIdentity {
   nativeArchived?: boolean
   sourceHead: NativeSourceHead
   contentDigest: string
-  /** Prefix digest at portableItemCount, used as the append-only record cursor. */
+  /** Prefix digest across every imported record, used as the append-only record cursor. */
   prefixDigest: string
   /** Zero during inventory scans and populated only after materialization. */
   portableItemCount: number
@@ -74,6 +82,8 @@ export interface NativeSessionCandidate extends NativeSourceIdentity {
   sourceLocator?: { path: string }
   /** Empty during metadata-only scans and populated only by materialize(). */
   records: NativePortableRecord[]
+  /** Last explicitly unresolved native Goal, populated only during materialization. */
+  goal?: NativeGoalSnapshot | null
   skippedItemCount: number
   parserVersion: string
   warnings: string[]
@@ -123,6 +133,24 @@ export interface NativeImportCommitResult {
   error?: string
 }
 
+export type NativeGoalReconcileStatus =
+  | 'would_restore'
+  | 'restored'
+  | 'no_import'
+  | 'no_goal'
+  | 'existing_goal'
+  | 'source_update_required'
+  | 'invalid_goal'
+
+export interface NativeGoalReconcileResult {
+  candidateId: string
+  status: NativeGoalReconcileStatus
+  sessionId?: string
+  threadId?: string
+  goalId?: string
+  error?: string
+}
+
 export interface NativeImportReceipt {
   results: NativeImportCommitResult[]
 }
@@ -169,6 +197,7 @@ export interface NativeImportCommitState {
 export interface NativeImportStore {
   getNativeImportState(identity: NativeSourceIdentity): NativeImportStoredState | null
   commitNativeImport(input: CommitNativeImportInput): NativeImportCommitResult
+  reconcileNativeGoal(candidate: NativeSessionCandidate, apply?: boolean): NativeGoalReconcileResult
   getNativeImportSigningKey(): Buffer
   beginNativeImportCommit(tokenNonceHmac: string, principalKey: string, requestDigest: string, allowCreate?: boolean): NativeImportCommitState
   recordNativeImportCommitResult(checkpoint: NativeImportCommitCheckpoint, result: NativeImportCommitResult): void

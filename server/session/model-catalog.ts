@@ -1,4 +1,5 @@
 import type { CanonicalProvider } from './domain.ts'
+import { modelContextDefaults } from './model-context-window.ts'
 
 export interface ProviderModelDescriptor {
   id: string
@@ -6,6 +7,9 @@ export interface ProviderModelDescriptor {
   description: string
   effortLevels: string[]
   defaultEffort: string | null
+  contextWindowTokens: number
+  usableInputTokens: number | null
+  autoCompactTokens: number | null
 }
 
 export interface ProviderModelCatalog {
@@ -13,6 +17,11 @@ export interface ProviderModelCatalog {
   models: ProviderModelDescriptor[]
   defaultModel: string | null
 }
+
+type ProviderModelBase = Omit<
+  ProviderModelDescriptor,
+  'contextWindowTokens' | 'usableInputTokens' | 'autoCompactTokens'
+>
 
 const CLAUDE_ORDER = ['fable', 'opus', 'sonnet', 'haiku'] as const
 
@@ -22,11 +31,14 @@ export function buildProviderModelCatalog(
   configuredDefault: string | null = null,
 ): ProviderModelCatalog {
   const unique = [...new Set(availableModels)]
-  const models = provider === 'claude'
+  const models = (provider === 'claude'
     ? claudeModels(unique)
     : provider === 'gemini'
       ? geminiModels(unique)
-      : codexModels(unique)
+      : codexModels(unique)).map((model) => ({
+        ...model,
+        ...modelContextDefaults(provider, model.id, null),
+      }))
   return {
     provider,
     models,
@@ -36,8 +48,8 @@ export function buildProviderModelCatalog(
   }
 }
 
-function claudeModels(models: string[]): ProviderModelDescriptor[] {
-  return CLAUDE_ORDER.flatMap((family): ProviderModelDescriptor[] => {
+function claudeModels(models: string[]): ProviderModelBase[] {
+  return CLAUDE_ORDER.flatMap((family): ProviderModelBase[] => {
       const id = models
         .filter((candidate) => candidate.startsWith('claude-') && candidate.includes(`-${family}-`))
         .sort(newestClaudeFirst)[0]
@@ -59,7 +71,7 @@ function claudeModels(models: string[]): ProviderModelDescriptor[] {
     })
 }
 
-function codexModels(models: string[]): ProviderModelDescriptor[] {
+function codexModels(models: string[]): ProviderModelBase[] {
   return models
     .filter((id) => id.startsWith('gpt-') && !id.startsWith('gpt-image-'))
     .sort((left, right) => codexRank(left) - codexRank(right) || newestFirst(left, right))
@@ -78,7 +90,7 @@ function codexModels(models: string[]): ProviderModelDescriptor[] {
     }))
 }
 
-function geminiModels(models: string[]): ProviderModelDescriptor[] {
+function geminiModels(models: string[]): ProviderModelBase[] {
   return models
     .filter((id) => id.startsWith('gemini-'))
     .sort((left, right) => geminiRank(left) - geminiRank(right) || newestFirst(left, right))

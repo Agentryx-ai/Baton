@@ -158,7 +158,8 @@ export class NativeSessionImportService {
           const materialized = await reader.materialize(candidate)
           if (!matchesTokenCandidate(materialized, expected)
             || !materialized.materialized
-            || materialized.records.length !== materialized.portableItemCount
+            || materialized.records.filter((record) => (record.item.visibility ?? 'portable') === 'portable').length
+              !== materialized.portableItemCount
             || materialized.contentDigest !== materialized.prefixDigest
             || (materialized.records.at(-1)?.prefixDigest ?? sha256('')) !== materialized.prefixDigest) {
             const result = { candidateId: id, status: 'stale' as const, error: 'source changed during materialization' }
