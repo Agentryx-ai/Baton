@@ -372,7 +372,7 @@ test('Claude tool screenshots are hydrated on wire while durable continuation ke
   const replies = [
     {
       id: 'tool-image', model: 'claude-opus-4-8', stop_reason: 'tool_use',
-      content: [{ type: 'tool_use', id: 'capture-1', name: 'ldplayer_capture', input: {} }], usage: {},
+      content: [{ type: 'tool_use', id: 'capture-1', name: 'capture_screen', input: {} }], usage: {},
     },
     {
       id: 'tool-image-final', model: 'claude-opus-4-8', stop_reason: 'end_turn',
@@ -391,7 +391,7 @@ test('Claude tool screenshots are hydrated on wire while durable continuation ke
       return Response.json(replies.shift())
     },
   })
-  const captureTool = { ...readTool, name: 'ldplayer_capture', inputSchema: { type: 'object', properties: {} } }
+  const captureTool = { ...readTool, name: 'capture_screen', inputSchema: { type: 'object', properties: {} } }
   const result = await collectExecution(adapter, await adapter.execute(adapter.materialize({
     turnId: 'tool-image-turn', model: 'claude-opus-4-8',
     input: [{ kind: 'user_message', payload: { text: 'capture' } }],

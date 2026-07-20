@@ -115,7 +115,7 @@ Pareto orchestration plugin과 evolving graph의 확장안은
 | Canonical conversation runtime | V1 부분 구현 | provider-neutral model/tool loop, SQLite/WAL, replay SSE, bounded cancel/recovery |
 | Persistent Goal runtime | V1 구현 | CAS/lease, 자동 후속 turn, pause/resume/edit/clear, turn/time/no-progress 한도 |
 | Canonical UI | Preview | draft-first 대화, provider/model/effort, Goal, folder/image, permission profile, fallback notice |
-| Host automation | Preview | `read_only`/`workspace`/`full_access`, direct-argv command, 이미지와 typed LDPlayer adapter |
+| Host automation | Preview | `read_only`/`workspace`/`full_access`, direct-argv command, 범용 ADB와 이미지 artifact |
 | Work-centric DAG runtime | 설계/기반 단계 | V4 명세와 execution 기반만 존재; WorkSet/WorkGraph scheduler와 acceptance runtime은 미구현 |
 | Built-in browser / Computer Use | 미구현 | canonical screenshot/action loop, approval, cancellation, replay 계약부터 필요 |
 

@@ -19,7 +19,6 @@ import { CodexLocalSourceReader } from './native-import/codex-source.ts'
 import { ClaudeLocalSourceReader } from './native-import/claude-source.ts'
 import { NativeSessionImportService } from './native-import/service.ts'
 import { LocalImageArtifactStore } from './image-artifacts.ts'
-import { LdPlayerHost } from './tools/ldplayer-runtime.ts'
 
 export interface ConversationRuntimeOptions {
   dataDir: string
@@ -65,9 +64,7 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
   }))
   const events = new ConversationEventHub()
   const contextRuntime = new CanonicalContextRuntime(store)
-  const ldPlayer = new LdPlayerHost()
   const service = new TurnOrchestrator(store, adapters, events, 10_000, contextRuntime, {
-    ldPlayer,
     artifacts: imageArtifacts,
   })
   const nativeImport = new NativeSessionImportService(store, [

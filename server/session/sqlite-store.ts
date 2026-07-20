@@ -36,7 +36,6 @@ import type {
   GoalStatusReason,
   NewCanonicalItem,
   PermissionProfile,
-  LdPlayerGrant,
   ProviderBinding,
   ProviderCapabilities,
   ReserveContextCompactionJobInput,
@@ -78,7 +77,6 @@ import type {
   SessionStore,
   UpdateWorkspaceInput,
   UpdateSessionPermissionProfileInput,
-  UpdateLdPlayerGrantInput,
   UpdateGoalStatusInput,
 } from './store.ts'
 import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
@@ -95,7 +93,7 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 17
+const SCHEMA_VERSION = 18
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace'
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
@@ -200,22 +198,6 @@ function parseNullableObject(
   value: string | number | bigint | null | Uint8Array,
 ): Record<string, unknown> | null {
   return value === null ? null : parseObject(value)
-}
-
-function parseLdPlayerGrant(value: string | number | bigint | null | Uint8Array): LdPlayerGrant | null {
-  if (value === null) return null
-  const grant = parseObject(value)
-  if (grant.kind !== 'ldplayer' || typeof grant.installationRoot !== 'string'
-    || !Number.isSafeInteger(grant.instanceIndex) || Number(grant.instanceIndex) < 0
-    || typeof grant.instanceName !== 'string' || !grant.instanceName) {
-    throw new Error('Corrupt database: invalid LDPlayer grant')
-  }
-  return {
-    kind: 'ldplayer',
-    installationRoot: grant.installationRoot,
-    instanceIndex: Number(grant.instanceIndex),
-    instanceName: grant.instanceName,
-  }
 }
 
 function parseArray(value: string | number | bigint | null | Uint8Array): unknown[] {
@@ -1264,6 +1246,13 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 17')
         appliedVersion = 17
       }
+      if (appliedVersion < 18) {
+        this.#db.exec('UPDATE sessions SET ldplayer_grant_json=NULL WHERE ldplayer_grant_json IS NOT NULL')
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(18, 'retire-product-specific-emulator-capability', this.#now())
+        this.#db.exec('PRAGMA user_version = 18')
+        appliedVersion = 18
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
@@ -1617,48 +1606,6 @@ export class SqliteSessionStore implements SessionStore {
         capability: 'permission_profile',
         override: profile,
         effectiveProfile: profile ?? this.getPermissionSettings().defaultProfile,
-      }, now)
-      return this.getSession(session.id) as CanonicalSession
-    })
-  }
-
-  updateLdPlayerGrant(input: UpdateLdPlayerGrantInput): CanonicalSession {
-    return this.#transaction('IMMEDIATE', () => {
-      const session = this.getSession(input.sessionId)
-      if (!session) throw new SessionStoreError('not_found', `Session not found: ${input.sessionId}`)
-      if (session.archivedAt) throw new SessionStoreError('session_archived', 'Cannot change an archived session capability')
-      const thread = this.getThread(session.activeThreadId)
-      if (!thread) throw new Error('Corrupt database: active thread is missing')
-      if (thread.revision !== input.expectedThreadRevision) {
-        throw new SessionStoreError('revision_conflict', 'Thread revision changed after the host capability was observed')
-      }
-      if (thread.status !== 'idle') {
-        throw new SessionStoreError('session_busy', 'Host capabilities can only change while the session is idle')
-      }
-      const activeGoal = this.#optional(this.#db.prepare(
-        "SELECT id FROM goals WHERE thread_id=? AND status='active' LIMIT 1",
-      ), thread.id)
-      if (activeGoal) throw new SessionStoreError('session_busy', 'Pause or finish the active Goal before changing host capabilities')
-      if (canonicalJson(session.ldPlayer) === canonicalJson(input.grant)) return session
-
-      const now = this.#now()
-      const updated = this.#db.prepare(`
-        UPDATE threads SET revision=revision+1,updated_at=? WHERE id=? AND revision=? AND status='idle'
-      `).run(now, thread.id, input.expectedThreadRevision)
-      if (updated.changes !== 1) {
-        throw new SessionStoreError('revision_conflict', 'Thread changed while the host capability was being updated')
-      }
-      this.#db.prepare('UPDATE sessions SET ldplayer_grant_json=?,updated_at=? WHERE id=?')
-        .run(input.grant ? canonicalJson(input.grant) : null, now, session.id)
-      this.#db.prepare(`
-        UPDATE provider_bindings SET invalidated_at=?,updated_at=?
-        WHERE thread_id=? AND invalidated_at IS NULL
-      `).run(now, now, thread.id)
-      this.#appendStreamEvent(session.id, thread.id, null, 'host_capability_changed', {
-        capability: 'ldplayer',
-        connected: input.grant !== null,
-        previousConnected: session.ldPlayer !== null,
-        revision: thread.revision + 1,
       }, now)
       return this.getSession(session.id) as CanonicalSession
     })
@@ -4795,7 +4742,6 @@ export class SqliteSessionStore implements SessionStore {
         effectiveProfile: permissionOverride ?? defaultProfile,
         source: permissionOverride === null ? 'global' : 'session_override',
       },
-      ldPlayer: parseLdPlayerGrant(row.ldplayer_grant_json),
       schemaVersion: integer(row, 'schema_version'),
       createdAt: text(row, 'created_at'),
       updatedAt: text(row, 'updated_at'),

@@ -13,7 +13,6 @@ import {
   RefreshCw,
   Send,
   ShieldCheck,
-  Smartphone,
   Square,
   Trash2,
   Undo2,
@@ -79,7 +78,6 @@ import type {
   UnknownMutationResolution,
   ThreadSnapshotDto,
   ImageArtifactRefDto,
-  LdPlayerInstanceDto,
   PermissionProfile,
 } from './types'
 import { useConversationEvents } from './useConversationEvents'
@@ -697,11 +695,6 @@ export function ConversationWorkspace({
   const [nativeImportOpen, setNativeImportOpen] = useState(false)
   const [attachments, setAttachments] = useState<ImageArtifactRefDto[]>([])
   const [uploadingImages, setUploadingImages] = useState(false)
-  const [ldPlayerDialogOpen, setLdPlayerDialogOpen] = useState(false)
-  const [ldPlayerInstances, setLdPlayerInstances] = useState<LdPlayerInstanceDto[]>([])
-  const [selectedLdPlayer, setSelectedLdPlayer] = useState('')
-  const [ldPlayerBusy, setLdPlayerBusy] = useState(false)
-  const [ldPlayerError, setLdPlayerError] = useState<string | null>(null)
   const [transcriptWindow, setTranscriptWindow] = useState<{ threadId: string | null; limit: number }>({
     threadId: null,
     limit: TRANSCRIPT_PAGE_SIZE,
@@ -1114,61 +1107,6 @@ export function ConversationWorkspace({
     } finally {
       setUploadingImages(false)
       if (imageInput.current) imageInput.current.value = ''
-    }
-  }
-
-  const openLdPlayerDialog = async () => {
-    if (!snapshot) return
-    setLdPlayerDialogOpen(true)
-    setLdPlayerBusy(true)
-    setLdPlayerError(null)
-    try {
-      const instances = await conversationApi.listLdPlayerInstances()
-      setLdPlayerInstances(instances)
-      const current = snapshot.session.ldPlayer
-      const selected = current
-        ? instances.find((instance) => instance.installationRoot === current.installationRoot
-          && instance.instanceIndex === current.instanceIndex)
-        : instances.find((instance) => instance.instanceName.startsWith('Audit-LD9')) ?? instances[0]
-      setSelectedLdPlayer(selected ? `${selected.installationRoot}|${selected.instanceIndex}` : '')
-    } catch (cause) {
-      setLdPlayerError(errorMessage(cause))
-    } finally {
-      setLdPlayerBusy(false)
-    }
-  }
-
-  const connectLdPlayer = async () => {
-    if (!snapshot) return
-    const instance = ldPlayerInstances.find((candidate) => (
-      `${candidate.installationRoot}|${candidate.instanceIndex}` === selectedLdPlayer
-    ))
-    if (!instance) return
-    setLdPlayerBusy(true)
-    setLdPlayerError(null)
-    try {
-      await conversationApi.connectLdPlayer(snapshot.session.id, instance, snapshot.thread.revision)
-      setLdPlayerDialogOpen(false)
-      await Promise.all([refreshThread(), refreshSessions(true)])
-    } catch (cause) {
-      setLdPlayerError(errorMessage(cause))
-    } finally {
-      setLdPlayerBusy(false)
-    }
-  }
-
-  const disconnectLdPlayer = async () => {
-    if (!snapshot) return
-    setLdPlayerBusy(true)
-    setLdPlayerError(null)
-    try {
-      await conversationApi.disconnectLdPlayer(snapshot.session.id, snapshot.thread.revision)
-      setLdPlayerDialogOpen(false)
-      await Promise.all([refreshThread(), refreshSessions(true)])
-    } catch (cause) {
-      setLdPlayerError(errorMessage(cause))
-    } finally {
-      setLdPlayerBusy(false)
     }
   }
 
@@ -1693,46 +1631,6 @@ export function ConversationWorkspace({
         </DialogContent>
       </Dialog>
 
-      <Dialog open={ldPlayerDialogOpen} onOpenChange={(open) => { if (!ldPlayerBusy) setLdPlayerDialogOpen(open) }}>
-        <DialogContent className="max-w-md">
-          <DialogTitle>LDPlayer 연결</DialogTitle>
-          <DialogDescription>
-            제한 모드에서 화면 조작과 캡처를 구조화된 도구로 제공하는 선택 기능입니다. 전체 액세스에서는 이 연결 없이 adb와 LDPlayer 명령을 사용할 수 있습니다.
-          </DialogDescription>
-          {ldPlayerError ? <p role="alert" className="text-sm text-destructive">{ldPlayerError}</p> : null}
-          <label className="space-y-1.5 text-sm">
-            <span className="font-medium">인스턴스</span>
-            <select
-              value={selectedLdPlayer}
-              onChange={(event) => setSelectedLdPlayer(event.target.value)}
-              disabled={ldPlayerBusy}
-              className="w-full rounded-xl border bg-background px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              {ldPlayerInstances.length === 0 ? <option value="">설치 또는 인스턴스를 찾지 못했습니다</option> : null}
-              {ldPlayerInstances.map((instance) => (
-                <option
-                  key={`${instance.installationRoot}:${instance.instanceIndex}`}
-                  value={`${instance.installationRoot}|${instance.instanceIndex}`}
-                >
-                  {instance.instanceName} · #{instance.instanceIndex} · {instance.androidStarted ? '실행 중' : '종료됨'}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="flex items-center justify-end gap-2">
-            {snapshot?.session.ldPlayer ? (
-              <Button type="button" variant="destructive" className="mr-auto" disabled={ldPlayerBusy} onClick={() => void disconnectLdPlayer()}>
-                연결 해제
-              </Button>
-            ) : null}
-            <Button type="button" variant="ghost" disabled={ldPlayerBusy} onClick={() => setLdPlayerDialogOpen(false)}>취소</Button>
-            <Button type="button" disabled={ldPlayerBusy || !selectedLdPlayer} onClick={() => void connectLdPlayer()}>
-              {ldPlayerBusy ? '확인 중…' : snapshot?.session.ldPlayer ? '변경' : '연결'}
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-
       <Dialog open={workspaceDialogOpen} onOpenChange={(open) => { if (!workspaceBusy) setWorkspaceDialogOpen(open) }}>
         <DialogContent className="max-w-md">
           <DialogTitle>프로젝트 폴더 {snapshot?.session.cwd ? '변경' : '연결'}</DialogTitle>
@@ -1949,12 +1847,6 @@ export function ConversationWorkspace({
               <Button type="button" variant="ghost" size="xs" onClick={openWorkspaceDialog}>
                 <FolderOpen aria-hidden />
                 {snapshot.session.cwd ? '폴더 연결됨' : '폴더 연결'}
-              </Button>
-            ) : null}
-            {snapshot && sessionScope === 'active' ? (
-              <Button type="button" variant="ghost" size="xs" onClick={() => void openLdPlayerDialog()}>
-                <Smartphone aria-hidden />
-                {snapshot.session.ldPlayer ? snapshot.session.ldPlayer.instanceName : 'LDPlayer'}
               </Button>
             ) : null}
             {isDraft ? (

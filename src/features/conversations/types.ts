@@ -59,7 +59,6 @@ export interface CanonicalSessionDto {
   projectKey: string | null
   cwd: string | null
   permissions: SessionPermissionStateDto
-  ldPlayer?: LdPlayerGrantDto | null
   schemaVersion: number
   createdAt: string
   updatedAt: string
@@ -80,18 +79,6 @@ export interface SessionPermissionStateDto {
   source: 'global' | 'session_override'
 }
 
-export interface LdPlayerGrantDto {
-  kind: 'ldplayer'
-  installationRoot: string
-  instanceIndex: number
-  instanceName: string
-}
-
-export interface LdPlayerInstanceDto extends LdPlayerGrantDto {
-  running: boolean
-  androidStarted: boolean
-}
-
 export interface ImageArtifactRefDto extends JsonObject {
   id: string
   sha256: string
@@ -100,7 +87,7 @@ export interface ImageArtifactRefDto extends JsonObject {
   width: number | null
   height: number | null
   fileName: string
-  source: 'upload' | 'ldplayer_capture'
+  source: 'upload' | 'tool_capture'
 }
 
 export type NativeImportSourceClient = 'codex_local' | 'claude_desktop' | 'claude_code'

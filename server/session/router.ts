@@ -633,42 +633,6 @@ export function createConversationRouter(
     ))
   }))
 
-  router.get('/host/ldplayer/instances', route(async (_req, res) => {
-    if (!service.listLdPlayerInstances) {
-      res.status(503).json({ code: 'ldplayer_unavailable', error: 'LDPlayer integration is unavailable' })
-      return
-    }
-    res.json({ instances: await service.listLdPlayerInstances() })
-  }))
-
-  router.put('/sessions/:sessionId/ldplayer', route(async (req, res) => {
-    if (!service.connectLdPlayer) {
-      res.status(503).json({ code: 'ldplayer_unavailable', error: 'LDPlayer integration is unavailable' })
-      return
-    }
-    const body = bodyRecord(req.body)
-    requireOnlyKeys(body, ['installationRoot', 'instanceIndex', 'expectedRevision'])
-    res.json(await service.connectLdPlayer({
-      sessionId: pathParam(req, 'sessionId'),
-      installationRoot: requiredNonEmptyString(body, 'installationRoot'),
-      instanceIndex: requiredNonNegativeInteger(body, 'instanceIndex'),
-      expectedRevision: requiredNonNegativeInteger(body, 'expectedRevision'),
-    }))
-  }))
-
-  router.delete('/sessions/:sessionId/ldplayer', route((req, res) => {
-    if (!service.disconnectLdPlayer) {
-      res.status(503).json({ code: 'ldplayer_unavailable', error: 'LDPlayer integration is unavailable' })
-      return
-    }
-    const body = bodyRecord(req.body)
-    requireOnlyKeys(body, ['expectedRevision'])
-    res.json(service.disconnectLdPlayer(
-      pathParam(req, 'sessionId'),
-      requiredNonNegativeInteger(body, 'expectedRevision'),
-    ))
-  }))
-
   router.get(
     '/native-import/csrf',
     route((req, res) => {

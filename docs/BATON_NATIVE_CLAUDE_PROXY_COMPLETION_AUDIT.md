@@ -44,5 +44,5 @@ rollback 선택지 삭제는 실제 두 계정·유료 fallback·장기 client c
 2. 사용자가 Opus 사용량 1회 소비를 승인해야 실제 Fable → Opus 전환과 banner/복귀 canary를 실행할 수 있다.
 3. 설치된 Browser 플러그인의 `docs/browser-safety.md` 누락이 복구되어야 UI 시각·키보드 검수를 실행할 수 있다.
 
-이 세 항목 전에는 전체 roadmap/active goal을 완료로 선언하지 않는다. LDPlayer 전용 기능 제거도 사용자가
-요청한 순서에 따라 이 Native Proxy 완료 선언 이후 착수한다.
+이 세 항목 전에는 전체 roadmap/active goal을 완료로 선언하지 않는다. 제품 전용 에뮬레이터 기능은
+후속 변경에서 canonical core로부터 제거되었다.

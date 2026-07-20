@@ -1,6 +1,6 @@
 # LDPlayer 전용 기능 제거 작업 목록
 
-> 상태: Native Claude Proxy 목표 완료 후 착수
+> 상태: core 제거 완료, 선택적 플러그인/내부 확장만 허용
 > 작성일: 2026-07-20 (Asia/Seoul)
 
 ## 배경
@@ -11,33 +11,27 @@ device serial/endpoint 계약만 유지한다.
 
 ## 목적과 범위
 
-- 범용 `adb devices`, `adb connect <host:port>`, device serial 선택을 보존한다.
-- screenshot, input, shell 등 기존 Android 작업은 선택된 ADB device에서 계속 동작해야 한다.
+- 범용 `adb devices`, `adb connect <host:port>`, device serial 선택은 Full access의 direct argv로 보존한다.
+- screenshot, input, shell 등 Android 작업은 표준 ADB 명령 또는 선택적 확장에서 수행한다.
 - LDPlayer 실행 파일·설치 경로·instance index·제품명에 의존하는 탐지와 UI를 제거한다.
-- 저장된 LDPlayer 전용 session/config는 범용 ADB target으로 안전하게 migration하거나 명시적으로
-  지원 종료 오류를 제공한다.
+- 저장된 LDPlayer 전용 session/config는 더 이상 읽거나 실행 권한으로 사용하지 않는다.
 - Native Claude Proxy 작업과 무관한 이미지 artifact 기능은 보존한다.
 
 ## 구현 작업
 
-- [ ] `ldplayer-runtime`의 책임을 범용 `adb-runtime` 계약과 제품 전용 탐지로 분류
-- [ ] 범용 ADB로 이미 대체 가능한 tool/API/event/schema 목록 확정
-- [ ] 저장된 session 및 SQLite column의 호환/migration 정책 확정
-- [ ] 서버의 LDPlayer 전용 route, runtime 등록, orchestration branch 제거
-- [ ] UI의 LDPlayer 전용 연결 상태, 버튼, 안내 문구 제거
-- [ ] 범용 ADB device 목록·연결·선택 UX로 기존 진입점 대체
-- [ ] LDPlayer 명칭이 남은 type, test fixture, README 및 운영 문서 정리
-- [ ] clean database와 기존 database migration test 통과
-- [ ] 실제 ADB device/emulator에서 connect, screenshot, input, shell smoke 통과
-- [ ] `rg -i "ldplayer|ld player|LD 플레이어"` 잔여 결과가 migration note 외에는 없음
-- [ ] typecheck, lint, build 및 관련 전체 test 통과
+- [x] 전용 runtime, 제품 탐지 및 structured tool 제거
+- [x] 서버 route, runtime 등록, orchestration branch 제거
+- [x] UI 연결 상태, 버튼, API와 공개 type 제거
+- [x] 범용 ADB는 Full access direct argv로 보존
+- [x] 이미지 artifact 기능 보존 및 capture source를 제품 중립 명칭으로 변경
+- [x] SQLite v18 migration에서 기존 제품 전용 session 저장값 폐기
+- [x] 제품별 편의 기능은 다중 target 선택이 가능한 플러그인/내부 확장 경계로 제한
+- [x] typecheck, lint, build 및 전체 test 통과
 
 ## 현재 발견된 영향 범위
 
-- 서버: `server/session/tools/ldplayer-runtime.ts`, session domain/router/runtime/orchestrator/store
-- UI: conversation API/types/workspace, 설정 화면
-- 문서: `README.md`, `docs/HOST_AUTOMATION.md`, `docs/USER_REQUEST_STATUS.md`
-- 테스트: runtime, SQLite, orchestrator, stateless adapter, image artifact 관련 fixture
+- 과거 schema migration 15의 column은 기존 DB 호환을 위한 inert 자리로만 남고, v18에서 저장값을 모두 비운다.
+- 과거 screenshot reference의 source 문자열은 읽을 때 `tool_capture`로 정규화한다.
+- 이 잔여 데이터는 API 응답, 세션 권한, tool 등록 또는 UI에 노출되지 않는다.
 
-이미지 artifact test의 LDPlayer 문자열은 실제 제품 종속인지 단순 fixture인지 구분한 뒤 수정한다.
-전용 기능 제거를 이유로 범용 이미지 첨부/표시 기능을 삭제하지 않는다.
+전용 기능 제거와 무관한 범용 이미지 첨부/표시 기능은 그대로 유지한다.
