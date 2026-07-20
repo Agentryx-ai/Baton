@@ -151,6 +151,13 @@ single-flight + 최소 간격 가드가 필수라는 것도 확인.
 | 이전 내성 | Docker → 네이티브 전환 시 `.env`의 `GATEWAY_URL`만 변경 |
 
 **ADR-3. 왜 "조향(steering)"인가 — 커스텀 프록시가 아니고?**
+
+> **2026-07-20 후속 결정:** 이 ADR은 초기 구현의 역사적 결정으로 보존한다. 사용자가 외부 proxy
+> core에 종속되지 않는 방향을 확정함에 따라 Claude 요청 경로는
+> [`BATON_NATIVE_CLAUDE_PROXY_ROADMAP.md`](./BATON_NATIVE_CLAUDE_PROXY_ROADMAP.md)의 단계별
+> Baton native proxy 전환 결정이 대체한다. 해당 단계가 검증되기 전까지는 아래 CLIProxy 경로를
+> rollback 가능한 현재 동작으로 유지한다. Codex 및 다른 provider에는 이 대체 결정이 자동 적용되지 않는다.
+
 | 대안 | 평가 |
 |---|---|
 | Baton이 8317 앞단 프록시가 되어 요청마다 계정 선택 | 계정 선택은 CLIProxy 내부 로직이라 외부 프록시가 요청 단위로 지정 불가. 전체 재구현 필요. **기각** |

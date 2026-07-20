@@ -1,55 +1,106 @@
-# Host automation boundary
+# Host access and automation
 
-## Implemented now
+## Purpose
 
-Baton can connect one exact LDPlayer instance to one canonical conversation. The grant is durable,
-revision-CAS guarded, and can be changed or revoked only while the thread is idle and no Goal is
-active.
+Baton uses one generic access policy for local files, commands, network-capable programs, ADB,
+emulators, Git, and future host tools. A new tool must register a capability; it must not add a
+tool-specific permission column to a conversation. Electron is not required: the loopback-only
+Node BFF owns host execution, while the web UI remains the control surface.
 
-The model receives only these Baton-owned tools:
+## Reference products
 
-- inspect or start the granted instance;
-- tap, swipe, bounded ASCII text input, and Android key events;
-- capture the screen;
-- run a bounded declarative UX-flow template made from the same operations plus waits and capture
-  points.
+The design borrows contracts, not product-specific storage layouts.
 
-There is no generic command string, raw ADB tool, arbitrary executable path, or host shell escape.
-Every mutating operation is serialized by the canonical tool coordinator. If Baton stops after a
-host mutation but before durably recording its result, the operation is marked as an unknown
-mutation outcome and is never replayed automatically.
+| Product | Observed contract | Baton conclusion |
+| --- | --- | --- |
+| Codex CLI | Sandbox and approval are separate. Built-ins are `:read-only`, `:workspace`, and `:danger-full-access`; resolved permissions are snapshotted for execution. | Keep a stable profile identity and compile it into a turn snapshot. |
+| Codex Desktop | The installed app maps Read only / Auto / Full access to those profiles and sends the resolved sandbox and approval policy on `thread/start` and `turn/start`. | Desktop UI state is not the authority; the started turn is. |
+| Claude Code | Permission rules use Deny → Ask → Allow, while modes include `default`, `acceptEdits`, `plan`, `dontAsk`, `bypassPermissions`, and `auto`. OS sandboxing is a separate layer. | Access scope and approval are distinct concepts even when Baton currently has no interactive approval prompt. |
+| Claude Desktop | The installed app passes `permissionMode`, allowed/disallowed tools, additional directories, and dangerous-skip support to its Claude Code process per session. | Do not model each external program as a special session attachment. |
 
-## Images are model context, not just files
+Authoritative references:
 
-Uploads and LDPlayer screenshots use the same content-addressed local image store. Canonical JSON
-contains an immutable artifact reference and never embeds the image bytes.
+- Codex manual sections “Sandboxing and approvals”, “Permission profiles”, and subagent permission
+  inheritance: <https://developers.openai.com/codex/security>,
+  <https://developers.openai.com/codex/config-reference>.
+- Current local Codex source:
+  `codex-rs/protocol/src/models.rs`, `codex-rs/protocol/src/request_permissions.rs`,
+  `codex-rs/core/src/config/permissions.rs`,
+  `codex-rs/core/src/config/resolved_permission_profile.rs`, and
+  `codex-rs/app-server-protocol/src/protocol/v2/permissions.rs`.
+- Claude Code permissions: <https://code.claude.com/docs/en/permissions>.
+- Installed Codex Desktop bundles `.vite/build/src-DU0S2Fqi.js` and
+  `.vite/build/main-CmXfwZWv.js`; installed Claude Desktop bundles
+  `.vite/build/index.chunk-CgLXpPH8.js`, `.vite/build/index.chunk-BA3wNZ_K.js`, and
+  `.vite/build/index.chunk-BIMQN2pr.js`.
 
-Provider materialization follows the installed Codex Desktop and current Codex app-server contracts:
+## Baton profiles
 
-- current Codex user attachments become `localImage` turn inputs;
-- prior Codex image history becomes `input_image` content;
-- image-producing Baton tools return app-server dynamic-tool `inputImage` content;
-- Claude receives an Anthropic base64 image block only at its outbound HTTP boundary;
-- Gemini receives an OpenAI-compatible `image_url` part only at its outbound HTTP boundary.
+| Profile | Connected-workspace tools | Commands and host access |
+| --- | --- | --- |
+| `read_only` | Read, list, and literal search | No command execution and no mutating legacy host tool |
+| `workspace` | Read, write, exact replacement, list, and search | Direct argv only through the Codex workspace sandbox; workspace write, bounded minimal system reads, network disabled |
+| `full_access` | Same deterministic workspace file tools when a folder is connected | Direct argv on the host without an OS sandbox; works without a connected folder and may invoke `adb`, `ldconsole`, PowerShell, Git, or any installed executable |
 
-Provider-private continuation records retain Baton artifact references, not base64 payloads. This is
-required for bounded SQLite growth and deterministic replay even though Baton is a personal local
-proxy.
+`run_command` never accepts a shell string. It accepts an argv array, uses `shell: false`, caps output,
+enforces a timeout, and terminates the child process tree on cancellation or timeout. A user can still
+explicitly invoke a shell executable in Full access, so this profile must be treated as equivalent to
+local code execution. Baton-owned `BATON_*` and `GATEWAY_*` environment values are removed before
+launch; Full access can nevertheless read user-accessible host data by design.
 
-The implementation was checked against the local current Codex source clone and the installed
-Codex Desktop bundle, especially the Desktop attachment picker/local-image conversion and the
-app-server `UserInput::LocalImage` and dynamic-tool `InputImage` schemas.
+## Resolution and lifetime
 
-## Explicitly deferred
+```text
+global default
+    └─ session override (nullable)
+          └─ effective profile resolved immediately before turn creation
+                └─ immutable execution policy snapshot
+```
 
-- **Computer Use:** TODO only. Do not expose until its screenshot/action loop, permission scope,
-  cancellation, and replay semantics can be kept under Baton canonical ownership.
-- **Built-in browser:** TODO only. The existing browser capabilities of outer development agents are
-  not part of Baton canonical runtime.
-- **Full Unicode ADB text input:** TODO. Android `input text` is deliberately limited to a safe ASCII
-  subset; Unicode requires a separately installed and explicitly trusted input method.
-- **Orphan image collection:** TODO. Content-addressed images that were uploaded but never attached
-  to a canonical item need a retention-aware mark-and-sweep job before storage growth is unattended.
+- The global default is `workspace` on first migration.
+- A session override is either a profile or `null` (“follow global”).
+- An override can change only while the thread is idle. An active turn is never widened in place.
+- Each root turn, Goal continuation, and queued follow-up stores `permissionProfile`, its source,
+  exact allowed tool names, cwd, and legacy capability receipt in `ExecutionPolicySnapshot`.
+- Changing the global default affects the next turn of sessions without an override. Historical turns
+  retain their stored snapshot.
+- Baton currently has no interactive Ask workflow. Operations inside the resolved profile run without
+  an additional prompt; everything outside it fails closed. A future approval layer must remain
+  separate from profile resolution.
 
-Electron migration is not required for this boundary. The React UI remains the permission and
-visibility surface while the same-origin local Baton BFF owns host process access and artifacts.
+## ADB, LDPlayer, and images
+
+Full access does not require an LDPlayer “connection.” The agent discovers the host in the same way it
+discovers any other installed tool, for example `adb devices -l` or `ldconsole list2`, then uses direct
+argv calls. This also permits multiple emulator instances without adding per-instance permission
+fields.
+
+The older exact-instance LDPlayer grant remains a constrained convenience adapter. It supplies typed
+start/tap/swipe/text/key/capture and declarative UX-flow tools, plus content-addressed screenshot
+artifacts that can be attached to provider context. It is useful in `workspace` mode and for reliable
+image return, but it is not the permission authority and is not required in `full_access`.
+
+Uploads and typed emulator screenshots share the local immutable image store. Canonical JSON stores
+artifact references rather than image bytes. Codex receives local/dynamic-tool images, Claude receives
+an Anthropic image block at its outbound boundary, and Gemini receives an OpenAI-compatible image URL
+part at its outbound boundary.
+
+## Safety and recovery
+
+- Every accepted tool call is durably recorded before execution and its result is recorded before the
+  provider continues.
+- Mutations are serialized. If Baton loses the result of a mutation, it records an unknown outcome and
+  never replays it automatically.
+- Profile and allowed-tool lists are part of the durable execution audit record.
+- Workspace file writes keep path containment, symlink checks, atomic replace, and SHA-256 CAS even in
+  Full access; arbitrary host file access is possible only through the explicitly broader command path.
+- Archived conversations cannot change their override. Invalid profiles and unknown request fields are
+  rejected before mutation.
+
+## Deferred
+
+- Computer Use remains TODO until its screenshot/action loop, cancellation, approvals, and replay
+  semantics can remain under Baton canonical ownership.
+- A built-in browser remains TODO. Browser capabilities of the outer development environment are not
+  Baton conversation tools.
+- Full-Unicode Android text input and orphan image mark-and-sweep remain TODO.

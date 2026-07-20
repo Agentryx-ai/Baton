@@ -260,9 +260,9 @@
 
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
-| HOST-01 | Baton이 로컬 LDPlayer를 실행·조작·캡처 | 구현 완료·live 통과 | 세션별 정확한 인스턴스 grant와 `start/tap/swipe/text/key/capture` 도구를 구현했다. 설치된 `Audit-LD9-Fresh`에서 Android 부팅과 1280×720 PNG 캡처를 확인했다. raw ADB와 임의 shell은 노출하지 않는다. |
+| HOST-01 | 범용 권한으로 로컬 도구·ADB·LDPlayer를 사용 | 구현 완료·typed LD live 통과 | 전역 기본+대화별 `read_only`/`workspace`/`full_access`와 턴별 immutable snapshot을 구현했다. Full access는 별도 인스턴스 grant 없이 direct argv로 ADB·LDPlayer·Git·PowerShell 등 설치 도구를 사용할 수 있다. 기존 exact-instance 도구는 구조화된 조작·이미지 반환용 선택 어댑터로 유지한다. |
 | HOST-02 | UX-flow 캡처와 템플릿 기반 전수조사 | 구현 완료(V1) | 최대 50개의 제한된 조작·대기·캡처 단계와 총 대기 30초 상한을 가진 선언형 `ldplayer_run_flow`를 제공한다. host mutation 선기록·직렬화·unknown-outcome 비재실행 규칙을 적용한다. |
 | HOST-03 | 파일로 저장한 캡처·업로드 이미지를 실제 모델 context에 첨부 | 구현 완료·provider wire 회귀 통과 | content-addressed artifact ref를 정본에 저장하고 Codex `localImage`/dynamic-tool `inputImage`, Claude image block, Gemini `image_url`로 실행 경계에서 변환한다. provider-private continuation에도 base64 대신 artifact ref만 저장한다. |
-| HOST-04 | 실제 Codex Desktop/CLI 구현 참고 | 완료 | 현재 local Codex source와 설치된 Desktop 사본의 picker, local image turn input, app-server dynamic tool image output 계약을 기준으로 구현했다. 자세한 경계는 [`HOST_AUTOMATION.md`](HOST_AUTOMATION.md). |
+| HOST-04 | Claude/Codex CLI·Desktop 권한 구현 참고 | 완료 | Claude Code 공식 permissions 문서, 현재 Codex 공개 소스, 설치된 Codex/Claude Desktop 번들의 turn/session permission 전달 계약을 비교해 Baton의 범용 프로필로 설계했다. 자세한 경계는 [`HOST_AUTOMATION.md`](HOST_AUTOMATION.md). |
 | HOST-05 | Computer Use와 built-in browser | TODO로 명시 | 현재 요구에는 필요하지 않아 실행면을 추가하지 않았다. Baton canonical permission/cancel/replay 계약을 별도 설계하기 전까지 비활성이다. |
 | HOST-06 | Electron 마이그레이션 | 불필요 판정 | same-origin local BFF가 host process와 artifact를 소유하고 React UI가 grant/가시성만 담당하므로 현재 기능에는 Electron이 필요하지 않다. |

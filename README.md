@@ -1,320 +1,236 @@
 # Baton
 
-**여러 AI provider와 여러 계정을 하나의 대화 흐름으로 운용하는 로컬 control plane.**
+**여러 AI provider와 여러 계정을 하나의 작업 흐름으로 운용하는 로컬 control plane.**
 
-Baton이라는 이름은 릴레이의 배턴에서 왔습니다. 계정이 바뀌어도, Claude에서 Codex로
-provider가 바뀌어도 사용자의 대화는 끊기지 않아야 합니다.
+Baton이라는 이름은 릴레이의 배턴에서 왔습니다. 계정이나 provider가 바뀌더라도 사용자가
+진행하던 대화와 작업의 소유권은 끊기지 않아야 한다는 뜻입니다.
 
-> **Baton이 대화의 정본(canonical owner)이고, Claude·Codex·Gemini는 현재 턴을
-> 실행하는 어댑터입니다.** Provider의 네이티브 세션이나 계정은 대화의 소유자가
-> 아닙니다.
+> Baton이 대화와 작업 이력의 정본(canonical owner)입니다. Claude, Codex, Gemini,
+> model, account는 현재 실행을 맡는 교체 가능한 실행자이지 정본의 소유자가 아닙니다.
 
-## AI 에이전트에게 설치 맡기기
+## 빠른 설치
 
-Claude Code, Codex 등에 아래 블록을 그대로 붙여 넣으면 됩니다.
+Claude Code, Codex 같은 AI 에이전트에게 아래 문장만 전달하세요.
 
-```text
-Baton을 이 컴퓨터에 안전하게 설치하고 실행해 주세요.
+> Baton을 설치하고 검증해 주세요. 다음 지침을 정확히 따르세요: https://raw.githubusercontent.com/Agentryx-ai/Baton/feat/canonical-runtime-workspace/docs/installation.md
 
-저장소: https://github.com/Agentryx-ai/Baton.git
+직접 설치하려면 [설치 가이드](docs/installation.md)를 참고하세요.
 
-작업 규칙:
-1. 변경 전에 OS, Git, Node.js, npm, 기존 Baton checkout, gateway 관리 API,
-   CLIProxy 실행 상태를 읽기 전용으로 확인하고 주요 가정을 알려 주세요.
-2. 기존 checkout이 있으면 사용자 변경과 `.env`를 보존하고 그 위치를 재사용하세요.
-   없으면 기존 프로젝트 디렉터리 규칙을 따르고, 발견할 수 없으면 `~/Baton`에
-   clone하세요. 다른 사용자 파일을 덮어쓰거나 삭제하지 마세요.
-3. 저장소의 `README.md`와 적용되는 `AGENTS.md`를 읽고 현재 설치 계약을 확인하세요.
-4. `.env`가 없으면 `.env.example`을 복사하고 `GATEWAY_URL`, `GATEWAY_USER`,
-   `GATEWAY_PASS`를 설정하세요. 기존 설정이나 로컬 실행 환경에서 안전하게 확인할
-   수 없는 비밀값만 저에게 요청하고, 값을 로그나 최종 보고에 출력하지 마세요. 정본 대화
-   저장 위치를 바꿔야 할 때만 선택적으로 `BATON_DATA_DIR`도 설정하세요.
-5. gateway 관리 API(기본 `:3000`)나 CLIProxy(기본 `:8317`)가 없다면 알 수 없는
-   백엔드를 임의로 설치하지 말고, Baton 자체의 의존성 설치·빌드까지 진행한 뒤
-   정확한 부족 조건을 보고하세요.
-6. `npm ci`로 의존성을 설치하고 `npm run typecheck`, `npm run lint`, `npm test`,
-   `npm run build`를 실행하세요. Codex CLI가 설치되어 있으면
-   `npm run smoke:codex-adapter`로 app-server handshake와 안전 설정도 확인하세요.
-   실패하면 설치에 필요한 최소 변경만 하고 재검증하세요.
-7. 검증이 통과하면 `npm start`로 Baton을 실행하고 `http://127.0.0.1:4400/baton/health`
-   응답과 `http://127.0.0.1:4400`의 대시보드 접속을 확인하세요. 운영체제의 부팅
-   자동 시작은 제 명시적 허가 없이 등록하지 마세요.
-8. 현재 실행 중인 Claude Code·Codex 자신의 프록시 설정은 세션 중에 변경하지
-   마세요. 설치 후 사용자가 대상 클라이언트를 모두 종료하고 Baton UI에서
-   프록시 설정을 적용하도록 안내하세요.
-9. 최종에 설치 경로, 실행 상태, 검증 결과, 대시보드 URL, 재실행·종료 명령,
-   사용자가 수동으로 해야 할 남은 작업만 간결히 보고하세요.
-```
+## Baton이 해결하려는 문제
 
-## Why Baton
+여러 AI 코딩 도구를 함께 쓰면 보통 세 층이 서로 분리됩니다.
 
-AI 코딩 도구를 여러 provider와 여러 계정으로 운용하면 두 문제가 생깁니다.
+1. **계정과 한도** — 계정별 quota, reset, OAuth, failover 상태가 흩어집니다.
+2. **대화와 실행 이력** — Claude 세션과 Codex 세션이 서로 다른 정본을 가져 provider를
+   바꾸는 순간 문맥, 도구 결과, 취소와 복구 이력이 끊깁니다.
+3. **작업 자체** — 네이티브 subagent tree는 누가 누구를 호출했는지는 보여주지만, 어떤
+   결과가 어떤 선행 작업과 검수를 통과해야 하는지는 장기적으로 표현하기 어렵습니다.
 
-1. **계정과 사용량이 흩어집니다.** 계정별 quota, reset 시각, 활성 상태와 failover를
-   각각 확인하고 조정해야 합니다.
-2. **대화가 provider에 갇힙니다.** Claude 세션과 Codex 세션은 서로 다른 정본이어서,
-   도구를 바꾸는 순간 문맥·도구 결과·분기 이력이 단절됩니다.
+Baton은 이 문제를 두 control plane으로 나눕니다.
 
-Baton은 이 둘을 하나의 제품 경계에서 해결합니다.
+- **Account control plane**은 어떤 자격 증명과 모델로 요청할지를 결정합니다. Baton Native
+  Proxy가 Claude와 Codex OAuth, token refresh, account failover를 직접 소유하며, 기존
+  CLIProxy 경로도 호환 모드로 남아 있습니다.
+- **Canonical work plane**은 어떤 대화와 작업을 계속하는지를 결정합니다. Provider adapter는
+  정본 history를 현재 요청으로 변환하고 결과를 다시 Baton의 item/event로 정규화합니다.
 
-- **Account control plane** — provider별 여러 계정의 사용량을 보고, 추가·중지·재개하며,
-  CLIProxy의 순차 소진과 failover가 사용할 활성 계정 풀을 안전하게 관리합니다.
-- **Canonical conversation runtime** — Baton이 provider 중립적인 대화와 실행 이력을
-  보존하고, 매 턴에 선택된 provider adapter가 그 턴만 실행합니다. 같은 Baton thread에서
-  `Claude → Codex → Gemini`로 이어갈 수 있고, provider 전환은 새 대화를 만드는 일이
-  아닙니다.
+계정 교체와 provider 교체는 새 대화를 뜻하지 않습니다. 둘은 같은 canonical thread의 새
+execution provenance로 기록됩니다.
 
-두 축은 독립적입니다. 계정 로테이션은 **어떤 자격 증명으로 요청할지** 결정하고,
-canonical session은 **어떤 대화를 계속하는지** 결정합니다. 계정이 바뀌어도 Baton session
-ID는 바뀌지 않습니다.
+## 무엇이 다른가
 
-## Product invariants
+### 프록시보다 넓은 경계
 
-- Baton session/thread/item 기록만이 대화의 정본입니다.
-- provider와 model은 session 속성이 아니라 **turn별 실행 선택**입니다.
-- provider 고유 response ID, reasoning signature, native session ID는 같은 provider에서의
-  최적화를 위한 opaque binding일 뿐 정본이 아닙니다.
-- 완료된 메시지와 도구 결과만 provider 간에 이동합니다. 처리 중인 tool loop가 있으면
-  전환을 거부하거나 먼저 취소합니다.
-- provider 네이티브 subagent/team 실행은 canonical history 밖에 별도 대화를 만들 수
-  있으므로 관리 턴에서 비활성화합니다. 하위 실행은 Baton이 ID·계보·예산·권한·이벤트를
-  소유하는 통제된 child execution으로만 허용합니다.
-- native CLI/Desktop 세션 import와 프록시 캡처는 호환 기능이지 정본 경로가 아닙니다.
+일반적인 multi-account proxy의 책임은 credential 선택과 요청 전달에서 끝납니다. Baton은
+그 기능에 더해 대화, turn, tool call, 결과, 취소, Goal과 향후 WorkGraph를 provider 중립
+형식으로 소유합니다. Proxy가 실패하거나 교체되어도 canonical state의 주인은 바뀌지 않습니다.
 
-## Current status
+### Provider session보다 강한 정본
 
-| 영역 | 상태 | 설명 |
+Provider-native response ID, reasoning signature, session ID는 같은 provider에서 이어갈 때
+유용하지만 다른 provider가 해석할 수 없는 opaque binding입니다. Baton은 이를 최적화 정보로
+보존하되 정본으로 승격하지 않습니다. 이동 가능한 완료 메시지와 도구 결과만 공통 history에
+포함하고, 진행 중인 private tool loop는 조용히 다른 provider로 옮기지 않습니다.
+
+### Agents가 아니라 Work
+
+Baton의 DAG 기반 작업 시스템은 아직 구현 중인 **설계 가설**입니다. 핵심 가설은 “장기 작업의
+정본은 agent tree가 아니라 검증 가능한 작업 그래프여야 한다”는 것입니다.
+
+- `WorkItem`이 목적, 입력, 요구사항과 acceptance 조건을 소유합니다.
+- Agent, provider, model, account는 WorkItem을 수행한 execution provenance입니다.
+- 호출 계보(execution lineage), 작업 dependency, retry, review, resource exclusion은 서로 다른
+  edge로 기록해야 합니다.
+- Worker와 planner는 구조화된 proposal을 제출할 뿐 canonical graph를 직접 수정하지 않습니다.
+- Baton의 결정적 control plane이 revision, 권한, 예산, lease, verifier receipt와 completion
+  gate를 검사한 뒤 상태 전이를 확정합니다.
+- 단순 병렬 작업에는 평면 `WorkSet`을 쓰고, 실제 선후관계와 통합이 필요한 경우에만 versioned
+  `WorkGraph`로 확장합니다. 모든 대화에 DAG를 강제하지 않습니다.
+
+이 구조는 provider-native subagent 기능을 그대로 감싸는 것이 아니라 장기적으로 대체하려는
+시도입니다. Agent가 중단되거나 provider가 바뀌어도 작업 정의, accepted artifact와 미완료
+dependency가 남으므로 다른 실행자가 이어받을 수 있다는 가설을 단계적으로 검증합니다. 현재는
+execution 기록과 delegation 차단 경계까지만 구현됐으며 scheduler, child execution API,
+acceptance receipt와 동적 graph revision은 아직 실행 경로가 없습니다.
+
+최신 명세는 [Work-Centric Orchestration Design V4](docs/WORK_CENTRIC_ORCHESTRATION_DESIGN_V4.md),
+Pareto orchestration plugin과 evolving graph의 확장안은
+[Pareto Orchestration Plugin and Evolving Work Graph](docs/PARETO_ORCHESTRATION_PLUGIN_AND_EVOLVING_WORK_GRAPH.md)에
+있습니다.
+
+## 설계 원칙
+
+1. **Canonical ownership** — Baton의 session, thread, item, event 기록만이 공통 대화의
+   정본입니다.
+2. **Turn-scoped routing** — provider와 model은 session 정체성이 아니라 turn별 실행
+   선택입니다.
+3. **Proposal is not mutation** — LLM, worker, reviewer와 plugin은 변경을 제안할 수 있지만
+   canonical state를 직접 commit하지 않습니다.
+4. **Result is not acceptance** — provider가 응답을 끝냈다는 사실과 WorkItem이 검수를 통과한
+   사실을 분리합니다.
+5. **Portable boundaries only** — 완료된 portable checkpoint에서만 provider failover를
+   허용합니다. 이동 불가능한 내부 상태는 숨기지 않고 pin 또는 cancel합니다.
+6. **Durable before effect** — tool call과 mutation intent를 실행 전에 기록하고 결과를
+   provider 재개 전에 기록합니다. 결과가 불명확한 mutation은 자동 재실행하지 않습니다.
+7. **Least authority** — 권한, 계정 선택, graph mutation, 검수와 완료 권한을 분리합니다.
+   Third-party plugin은 alternate control plane이 될 수 없습니다.
+8. **Fail closed** — lock, credential, model capability, sandbox 또는 state revision을 확신할
+   수 없으면 추측해서 진행하지 않습니다.
+9. **Compatibility is not authority** — native session import와 CLIProxy integration은 호환
+   기능이며 canonical ownership을 provider에 돌려주지 않습니다.
+10. **Honest status** — 설계, 합성 테스트, live canary와 운영 검증을 같은 “완료”로 표시하지
+    않습니다.
+
+## 현재 상태
+
+| 영역 | 상태 | 현재 경계 |
 |---|---|---|
-| 여러 provider/계정 대시보드 | 구현됨 | Claude/Codex 계정, quota, reset, 상태 관리 |
-| Smart rotation | **안전 경계 구현·순위 적용 미지원** | `fill-first`를 강제하고 전체 유효 계정 풀을 보존; quota 기반 정책 순위는 관측값이며 실제 전송 순서에는 미적용 |
-| 클라이언트 프록시 자동 설정 | 구현됨 | Claude/Codex CLI·Desktop별 결정론적 적용/해제, Codex 기존 세션 유지 모드, 종료·lock 검사 |
-| Canonical conversation runtime | **V1 부분 구현** | 한 요청 안에서 완료 경계까지 반복하는 provider-neutral model/tool loop, durable broker, bounded cancel/recovery |
-| Persistent Goal runtime | **V1 구현** | `/goal`, CAS/lease, 자동 후속 턴, pause/resume/edit/clear, 24턴·2시간·no-progress 안전 한도 |
-| Codex turn adapter | **V1 구현** | app-server ephemeral thread, Baton tools, web/MCP/plugin/subagent 차단, model provenance |
-| Canonical conversation UI | **Preview 구현** | 2-column 대화, 첫 전송 전 draft, native 폴더 선택, 작업 상태, provider/model/effort, Goal panel, 턴 실행·취소 |
-| 이미지·LDPlayer 자동화 | **Preview 구현** | 이미지 첨부와 provider별 멀티모달 전달, 세션별 LDPlayer 권한, ADB 캡처·제한 조작·선언형 UX-flow. Computer Use와 내장 브라우저는 TODO |
-| Claude turn adapter | **Preview 구현** | portable text history 기반 stateless 실행; Fable 5 live 검증 완료 |
-| Gemini turn adapter | **Preview 구현·live 차단** | OpenAI 호환 stateless 경로 구현; 현재 proxy 인증 문제로 모델이 0개라 UI에서 비활성화 |
-| Baton-managed child execution | 기반만 구현, 실행 비활성 | execution 기록과 delegation-disabled 정책; child API·실행기는 예정 |
+| 여러 provider/계정 UI | 구현됨 | Claude/Codex 계정, quota, reset, pause/resume/delete |
+| Baton Native Claude Proxy | 부분 완료 | OAuth vault, refresh, quota preflight, same-request failover, SSE 보존; 단일계정 live canary 완료, 2계정/rollback gate 대기 |
+| Baton Native Codex Proxy | 합성 검증 완료 | OAuth, live-claim plan, account별 model catalog, model-aware failover; 실제 OAuth/free→pro/2계정 canary 대기 |
+| CLIProxy 호환 경로 | 유지됨 | 기존 gateway 계정 API와 custom-provider 모드 지원; Native core는 CLIProxy 코드나 프로세스에 의존하지 않음 |
+| 범용 모델 자동전환 | 부분 완료 | 기본 OFF, capability/mapping 기반 fallback과 복귀, Fable 5→Opus 4.8 live 전환 완료; 다중 fallback 후보와 실패 정리 보강 필요 |
+| Canonical conversation runtime | V1 부분 구현 | provider-neutral model/tool loop, SQLite/WAL, replay SSE, bounded cancel/recovery |
+| Persistent Goal runtime | V1 구현 | CAS/lease, 자동 후속 turn, pause/resume/edit/clear, turn/time/no-progress 한도 |
+| Canonical UI | Preview | draft-first 대화, provider/model/effort, Goal, folder/image, permission profile, fallback notice |
+| Host automation | Preview | `read_only`/`workspace`/`full_access`, direct-argv command, 이미지와 typed LDPlayer adapter |
+| Work-centric DAG runtime | 설계/기반 단계 | V4 명세와 execution 기반만 존재; WorkSet/WorkGraph scheduler와 acceptance runtime은 미구현 |
+| Built-in browser / Computer Use | 미구현 | canonical screenshot/action loop, approval, cancellation, replay 계약부터 필요 |
 
-현재 UI에는 account control plane과 canonical conversation preview가 함께 노출됩니다.
-Codex와 Claude adapter는 실행 가능하며 Gemini도 같은 정본 계약으로 구현되어 있습니다.
-단, proxy가 Gemini 모델을 제공하지 않는 현재 인증 상태에서는 Gemini를 선택할 수 없습니다.
-구현 경계와 정합성 판정은
-[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md)에 있습니다.
-대화에서 요청된 항목별 완료·미완료·검증 상태는
-[`docs/USER_REQUEST_STATUS.md`](docs/USER_REQUEST_STATUS.md)에서 추적합니다.
-로컬 호스트 자동화의 권한·이미지 컨텍스트·TODO 경계는
-[`docs/HOST_AUTOMATION.md`](docs/HOST_AUTOMATION.md)에 있습니다.
+상세한 구현 판정은 [구현 정합성 현황](docs/IMPLEMENTATION_STATUS.md), Native proxy와 모델
+fallback의 미해결 gate는 [Native Proxy TODO](docs/BATON_NATIVE_CLAUDE_PROXY_TODO.md)에서
+추적합니다.
 
-## Architecture
-
-목표 구조에서 Baton Core가 대화와 실행의 유일한 소유자입니다.
+## 아키텍처
 
 ```text
-                          Canonical conversation plane
-User / Baton UI ──▶ Baton Session Core ──▶ Context builder
-                         │                       │
-                         │ session/thread/      ├─▶ Codex adapter (Preview) ─▶ current turn
-                         │ turn/item/event       ├─▶ Claude adapter (Preview)
-                         │                       └─▶ Gemini adapter (Preview; auth blocked)
-                         │
-                         └─▶ delegation disabled ── child execution (planned)
+                         Canonical work plane
+User / Baton UI --> Session Core --> Context builder --> provider adapter
+                         |                                  |
+                         | session / thread / turn          +--> Codex
+                         | item / event / Goal               +--> Claude
+                         | execution provenance              +--> Gemini
+                         |
+                         +--> WorkSet / WorkGraph runtime (planned)
 
-                             Account control plane
-Baton BFF (:4400) ──▶ gateway management API (:3000) ──▶ account/quota/steering
-                                      │
-                                      └─▶ CLIProxy (:8317) ─▶ provider API
+                         Account control plane
+                         +--> Baton Native Claude Proxy --> Anthropic
+Baton BFF (:4400) -------+--> Baton Native Codex Proxy  --> OpenAI/ChatGPT
+                         +--> CLIProxy compatibility    --> provider APIs
 ```
 
-Provider adapter는 canonical history를 해당 provider 요청으로 변환하고, 응답 스트림을 다시
-Baton item/event로 정규화합니다. CLIProxy는 계정 선택·OAuth·token refresh·429 failover를
-담당하며 대화의 소유권을 갖지 않습니다.
+React SPA와 loopback-only Express BFF가 두 control plane을 제공합니다. Canonical SQLite와
+vault/state는 소스 트리 밖 `BATON_DATA_DIR`에 저장됩니다. Codex adapter는 매 turn ephemeral
+app-server thread에 portable history를 주입하고, Claude/Gemini adapter도 같은 canonical
+history에서 provider 요청을 재구성합니다.
 
-현재 구현은 React SPA와 Express BFF가 account control plane과 multi-provider canonical
-conversation preview를 함께 제공합니다. 정본 데이터는 소스 트리 밖의 SQLite에 저장됩니다.
-Codex app-server는 매 턴 ephemeral thread로 실행되고 Baton history를 주입받으며,
-Claude/Gemini adapter도 같은 portable history를 provider 요청으로 재구성합니다.
+## 구현된 주요 기능
 
-```text
-SPA (React + Vite + Tailwind + shadcn)
-  └─ BFF (Express :4400)
-       ├─ gateway session과 same-origin /api proxy
-       ├─ smart-rotation policy engine
-       └─ client proxy configuration manager
-            └─ gateway API (:3000) / CLIProxy (:8317)
-```
+- Claude/Codex 계정 추가, 상태, quota, pause/resume/delete와 우선순위 관리
+- Claude/Codex CLI와 Desktop별 프록시 적용/해제
+  - 대상 프로세스 종료와 file lock 확인
+  - 구조화된 설정 parser, Baton 소유 값 검증, 원자적 파일 교체
+  - Codex 기존 OpenAI session 가시성을 위한 `native-openai`와 격리된 custom-provider 모드
+- Baton Native Claude/Codex data plane, OAuth refresh, encrypted local vault와 account router
+- preferred model과 effective model을 분리한 opt-in 자동 fallback/복귀 및 대화 event
+- session/thread/turn/item/execution/provider binding의 SQLite/WAL 영속화
+- `/baton/v1` REST API, cursor replay SSE, idempotent retry, fork와 crash recovery
+- provider-neutral agent loop와 durable tool broker
+  - tool call 선기록, read 병렬화, mutation 직렬화, result 기록 후 provider 재개
+  - permission profile을 turn 시작 시 immutable snapshot으로 고정
+  - 정상 final까지 같은 turn 안에서 bounded model/tool round 반복
+- content-addressed 이미지 저장과 Codex/Claude/Gemini별 multimodal 변환
+- persistent Goal과 자동 continuation
+- native local task의 read-only preview와 승인 기반 fork-copy import
 
-## Implemented features
-
-- provider별 계정 카드, 5h/weekly quota, reset countdown, 제한 정보 없음 상태
-- 계정 pause/resume/delete, 수동 **이 계정만**, OAuth 계정 추가 wizard
-- reset-imminent-first 관측 순위, `fill-first` 선행 계약, 전체 유효 계정 failover 풀과 정책 로그
-- CLIProxy strategy, session affinity, proxy restart
-- Claude/Codex CLI·Desktop 개별 프록시 설정 적용/해제
-  - 대상 하나씩 독립 실행
-  - 앱이 확실히 종료된 경우에만 변경
-  - 파일 lock과 설정 충돌을 fail-closed로 처리
-  - 구조화된 parser, Baton 소유 값 확인, 원자적 교체
-  - Codex는 `model_provider=openai`를 유지하고 `openai_base_url`만 Baton loopback bridge로
-    설정하는 **기존 세션 유지 모드**와, 별도 `baton` provider 모드를 선택 가능
-- canonical session/thread/turn/item과 provider binding의 SQLite/WAL 영속화
-- 새 대화는 브라우저 draft로만 준비하고, 첫 메시지 전송 때 session/thread/turn/execution/items를 한 transaction으로 생성
-- 명시적 native 폴더 선택 후 검증된 `cwd`만 세션에 연결하며, 응답 불명 재시도는 같은 ID·본문을 사용
-- `/baton/v1` REST API, cursor replay SSE, fork, idempotent retry, cancel, crash recovery
-- provider-neutral agent loop와 Baton tool broker
-  - tool call 선기록, read 병렬화, mutation 직렬화, 결과 기록 후 provider 재개
-  - 검증된 `cwd`가 있는 세션에만 workspace read/list/search/write/replace 제공
-  - 정상 최종 응답까지 같은 canonical turn 안에서 model/tool round를 반복
-  - provider readiness 30초, turn 30분, tool/retry/output 한도로 무한 대기를 차단
-  - tool/retry/time/output 한도와 late completion보다 cancellation 우선; Codex app-server가
-    공개하지 않는 정확한 sampling/retry 합계는 30분 turn timeout과 host tool limit로 보완
-- 이미지와 LDPlayer 호스트 자동화
-  - Codex Desktop과 같은 숨은 이미지 picker·미리보기, content-addressed 로컬 저장과 정본 참조
-  - Codex `localImage`/dynamic-tool `inputImage`, Claude image block, Gemini `image_url`로 실제 모델 컨텍스트에 전달
-  - 대화별 정확한 LDPlayer 인스턴스만 연결·해제하고 start/tap/swipe/text/key/capture만 노출
-  - bounded UX-flow 템플릿으로 여러 조작·대기·캡처 지점을 한 작업으로 실행
-  - raw ADB·임의 shell은 미노출; Computer Use와 built-in browser는 후속 TODO
-- persistent Goal runtime
-  - `/goal`, `/goal edit|pause|resume|clear`, Goal panel과 세션 상태
-  - SQLite CAS/event, scheduler lease, 자동 continuation, token/turn/time/no-progress 한도
-- Codex app-server adapter
-  - portable history를 ephemeral native thread에 주입하는 stateless continuation
-  - approval, shell, MCP, plugin, multi-agent 실행면을 비활성화하고 시작 시 검증
-  - text, plan, reasoning summary, usage, error를 정본 item/event로 정규화
-- Claude/Gemini stateless HTTP adapter
-  - Baton portable text history만 전송하고 provider-native tool/subagent 실행은 허용하지 않음
-  - 요청 model과 실제 응답 model을 함께 기록해 Fable 5 등의 fallback을 명시적으로 표시
-- canonical conversation preview UI
-  - 홈·대화·설정에 동일한 앱 셸과 내비게이션 적용
-  - provider/model/effort 선택, 실행 불가능한 provider 비활성화, 턴 실행·취소
-
-## 활성 계정 확인
-
-Baton이 선택하는 **CLIProxy 업스트림 계정**과 네이티브 클라이언트에
-로그인된 **로컬 계정**은 서로 다른 상태입니다.
-
-- Codex의 `/status`와 `Heads up, you have less than ... of your weekly limit left` 같은
-  한도 경고는 **provider가 OpenAI 인증을 쓸 때만**(`requires_openai_auth` — 예: `model_provider = "openai"`,
-  또는 예전 `openai` 세션을 그냥 `resume`해서 provider가 `openai`로 복원됐을 때) `~/.codex/auth.json`의
-  **로컬 Codex 로그인 계정**을 기준으로 표시됩니다. 이 값은 Baton/CLIProxy가 실제 요청에 쓰는
-  업스트림 계정과 다를 수 있으므로, 이 표시만으로 실제 Baton 계정의 429 임박을 판단하면 안 됩니다.
-- `model_provider = "baton"`으로 **새로 시작한 세션**에서는 Codex가
-  `should_prefetch_rate_limits`(= `requires_openai_auth && has_chatgpt_account`)로 게이트하여
-  **로컬 계정 한도를 조회·표시하지 않습니다.** 따라서 예전에 본 `/status`·경고는 대개 `resume`로
-  provider가 `openai`로 복원된 세션의 정상 표시입니다([Codex 세션 재개 시 provider 복원 주의](#codex-세션-재개-시-provider-복원-주의) 참고).
-- 실제 사용 계정은 요청을 한 번 전송한 뒤 계정의 **최근 실제 사용 시각** 또는 quota 변화를
-  확인합니다. **정책 1순위**와 정책 로그는 계산상 순위이며 실제 전송 계정의 증거가 아닙니다.
-- `paused`인 계정은 기본 계정이어도 라우팅 대상이 아닙니다. `round-robin`에서는
-  활성 계정이 여러 개면 요청이 순환되므로, 특정 계정을 고정하려면 **이 계정만**을
-  선택하거나 나머지 계정을 일시정지합니다.
-- 계정 활성·일시정지·라우팅 변경은 보통 다음 요청부터 반영되어 Codex CLI를
-  재시작할 필요가 없습니다. 단, session affinity가 켜져 있으면 TTL 동안 기존
-  계정이 유지될 수 있습니다. 클라이언트의 프록시 URL·인증 설정을 적용하거나
-  해제한 경우에는 해당 클라이언트를 재시작합니다.
-
-> Claude CLI 프록시 설정은 `ANTHROPIC_AUTH_TOKEN`을 사용하므로 claude.ai 조직
-> connectors가 비활성화된다는 경고는 정상입니다. connectors가 필요하면 해당
-> 클라이언트의 Baton 프록시 설정을 해제하고 재시작하세요.
-
-### 네이티브 클라이언트의 세션 목록
-
-- **Codex Desktop(ChatGPT 로그인 포함)과 CLI:** 기존 OpenAI thread 목록을 유지하려면 설정 UI에서
-  **기존 세션 유지**를 선택합니다. 두 클라이언트 모두 `~/.codex/config.toml`의 현재
-  `model_provider`를 기준으로 목록을 필터링하므로, 별도 `baton` provider 모드는 기존
-  `openai` 목록과 분리됩니다.
-- **Claude CLI:** gateway 설정은 `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`만 바꾸며,
-  `--continue`/`--resume`이 사용하는 로컬 프로젝트 세션은 그대로 유지됩니다.
-- **Claude Desktop:** 지원되는 gateway 설정은 `inferenceProvider=gateway`라는 별도
-  provider로 전환합니다. Claude 계정에 저장된 기존 Chat/Cowork 목록을 그대로 유지하면서
-  base URL만 바꾸는 공식 설정은 없으므로, Baton은 세션 목록 보존을 약속하지 않습니다.
-
-## Run
+## 실행
 
 ```bash
-# 1. configure
-cp .env.example .env   # GATEWAY_URL / GATEWAY_USER / GATEWAY_PASS
-
-# 2. development (Vite :5173 + BFF :4400)
-npm run dev
-
-# 3. production
+cp .env.example .env
+npm ci
 npm run build
-npm start              # http://localhost:4400
+npm start
 ```
 
-`.env`는 gitignore되며 BFF가 gateway dashboard에 로그인할 자격 증명을 보관합니다.
-정본 SQLite는 `BATON_DATA_DIR`에 저장되며, 기본값은 Windows에서
-`%LOCALAPPDATA%\Baton`, 그 외 환경에서는 사용자 홈의 `Baton` 디렉터리입니다.
+대시보드는 기본적으로 <http://127.0.0.1:4400>에서 열립니다. `.env`에는 gateway 관리
+자격 증명이 필요하며, 정본 데이터의 기본 위치는 Windows `%LOCALAPPDATA%\Baton`, 그 외
+환경에서는 사용자 홈의 `Baton` 디렉터리입니다. 자세한 설치와 검증 순서는
+[설치 가이드](docs/installation.md)에 있습니다.
 
-## Codex 세션 재개 시 provider 복원 주의
+## Codex 세션 재개 시 provider 복원
 
-**증상.** config를 Baton으로 바꾼 뒤에도 예전 Codex 세션을 재개(`codex resume`)하면
-Baton/CLIProxy를 우회해 원래 provider(예: `openai`)로 직접 나갑니다. 그 결과 소진되거나
-엉뚱한 계정으로 `You've hit your usage limit` 같은 오류가 날 수 있습니다. 새로 시작한
-세션과 Codex Desktop은 정상입니다.
-
-**원인(버그 아님).** Codex CLI는 각 세션이 *생성 당시의 model/provider를 소유*하고,
-재개 시 그 값을 복원합니다. `~/.codex/config.toml`의 `model_provider`는 *새 세션의
-기본값*일 뿐입니다. 대화 도중 provider/model이 조용히 바뀌면 비용·기능·reasoning-state
-호환성이 달라지므로, 명시적 override가 없으면 스레드에 저장된 설정을 복원하도록 의도적으로
-설계된 동작입니다(OpenAI, `openai/codex#32746`). 따라서 Baton으로 전환한 *이후*에 만든
-세션은 재개해도 Baton으로 복원되어 문제가 없고, 전환 *이전*에 만든 세션만 해당합니다.
-
-**해결.** 재개할 때 provider를 명시적으로 덮어쓰세요. `-c`는 세션 플래그 레이어를 만들어
-현재 config의 provider가 복원값을 이깁니다.
+Codex는 session 생성 당시의 model/provider를 보존합니다. 설정 파일을 Baton으로 바꾼 뒤에도
+기존 `openai` session을 단순히 `codex resume`하면 원래 provider로 복원될 수 있습니다.
+custom-provider 모드로 명시적으로 재개하려면 다음처럼 override합니다.
 
 ```bash
 codex resume <session-id> -c model_provider=baton
 ```
 
-- `baton` provider는 `env_key = BATON_PROXY_TOKEN`을 요구합니다.
-  `Missing environment variable: BATON_PROXY_TOKEN`이 뜨면 그 셸에 토큰이 없는 것입니다.
-  토큰(= CLIProxy API 키)을 설정한 뒤 연 **새 터미널 탭/창**에서 실행하거나 셸에 직접
-  주입하세요. 이미 열려 있던 셸은 나중에 설정한 값을 물려받지 못할 수 있습니다.
-  토큰 값을 로그·명령 기록에 남기지 않도록 주의하세요.
+`baton` provider는 `BATON_PROXY_TOKEN`이 필요합니다. 기존 OpenAI thread 목록을 유지하려면
+Baton 설정 UI에서 Codex의 `native-openai` 모드를 사용하세요. 프록시 설정 변경 뒤에는 대상
+CLI/Desktop을 완전히 종료했다가 다시 시작해야 합니다.
 
-## Layout
+## 알려진 한계와 핵심 TODO
 
-- `server/` — BFF, gateway client/session, rotation policy, client integration
-- `server/session/` — canonical domain, SQLite store, orchestrator, REST/SSE, Codex adapter
-- `src/api/` — typed API client와 계약
-- `src/features/conversations/` — canonical conversation preview UI와 event stream client
-- `src/hooks/` — visibility-aware polling
-- `src/components/` — account, rotation, settings UI와 shadcn primitives
-- `scripts/codex-adapter-smoke.ts` — 실제 Codex app-server handshake·hardening smoke test
-- `tools/native-session-handoff/` — Codex Desktop-visible interactive task와 Claude Desktop local Code/Cowork task의 일회성 inventory·승계 proposal·승인 기반 CLI context-ingest 패키지(원격 Claude 채팅 제외, `local-all` 호환 범위 제공)
-- `docs/DESIGN.md` — 현재 account control plane 설계와 정책
-- `docs/COMMON_SESSION_DESIGN.md` — canonical conversation runtime 설계
-- `docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md` — native task fork-copy import, 중복 방지와 대화 목록 그룹화 계약
-- `docs/BUILD_DAG.md` — 빌드 구조
+- Native proxy는 구현됐지만 실제 2계정 failover, Codex free→pro entitlement refresh,
+  CLI/Desktop rollback과 24시간 canary는 외부 계정/시간 조건 때문에 아직 완료되지 않았습니다.
+- 모델 fallback은 첫 후보 실패 후 다음 후보를 순회하고 실패한 override를 정리하는 보강이
+  필요합니다. 현재 compatibility seed는 Fable 5→Opus 4.8이며 범용 schema 자체는 모델명과
+  분리돼 있습니다.
+- Work-centric DAG는 가설과 V4 설계 단계입니다. Native subagent/team은 canonical history
+  밖에 실행을 만들 수 있어 관리 turn에서 비활성화하며, Baton-managed child scheduler가
+  구현되기 전에는 대체 실행 경로가 없습니다.
+- **Built-in browser**는 아직 없습니다. 외부 개발 환경의 browser tool은 Baton conversation
+  tool이 아니며, durable navigation/action/result와 credential/permission 경계를 먼저 설계해야
+  합니다.
+- **Computer Use**는 아직 없습니다. Screenshot→action loop, 사용자 승인, effect 기록,
+  cancellation, timeout과 unknown-outcome recovery를 canonical runtime 아래 두기 전에는 노출하지
+  않습니다.
+- `full_access`는 사용자의 권한으로 임의 로컬 프로그램을 실행할 수 있습니다. 별도 approval
+  workflow는 아직 없으므로 명시적으로 선택한 대화에서만 사용해야 합니다.
+- Smart rotation의 계산상 우선순위는 CLIProxy credential order를 바꾸지 못합니다. Native
+  router와 달리 CLIProxy 호환 경로의 실제 요청 순서를 보장하는 값이 아닙니다.
+- Gemini adapter는 구현됐지만 현재 인증/model catalog 문제로 live 검증이 차단돼 있습니다.
+- Provider별 private reasoning/tool state는 완전히 이동할 수 없습니다. Baton은 portable
+  history를 보존하고 이동 불가능한 상태를 명시적으로 제한합니다.
 
-## Known limitations
+## 저장소 구조
 
-- Canonical conversation runtime은 V1 부분 구현입니다. Claude/Gemini는 stateless adapter이고 provider 고유
-  streaming/content part 확장은 아직 제한됩니다. Native session import는 독립 `fork_copy`만 지원하며 native
-  원본의 authority 승계·동기화·`/goal` 변경은 아직 구현되지 않았습니다.
-- Smart rotation의 `정책 1순위`는 계산상 관측값일 뿐 실제 요청 우선권을 보장하지 않습니다.
-  정책 ON은 CLIProxy `fill-first`와 전체 비수동-pause 계정 풀을 유지하지만, 설치된 관리 API로는
-  계산 순서를 credential order에 적용할 수 없어 엄밀한 reset-imminent-first는 아직 완성되지 않았습니다.
-- quota 응답에는 freshness 시각이 있지만 현재 카드 UI에는 설계된 “n초 전 기준” 표시가
-  연결되지 않았습니다.
-- 현재 canonical Codex 턴은 text 중심이며 native tool calling, shell, MCP, plugin, multi-agent를
-  의도적으로 비활성화합니다. 대신 provider-neutral Baton workspace/Goal tools를 사용합니다.
-- `run_command`는 현재 Windows sandbox가 작업공간 밖 읽기까지 차단할 수 있다고 검증되지 않아
-  기본 도구 목록에서 fail-closed로 제외됩니다. 파일 read/write 도구는 realpath 경계를 별도로 강제합니다.
-- Goal이 없는 일반 요청도 도구 호출이 끝나고 provider가 정상 final을 낼 때까지 한 턴 안에서 계속됩니다.
-  여러 canonical turn에 걸친 장기 목표는 사용자가 명시적으로 `/goal`을 만든 경우에만 자동 계속됩니다.
-- fork는 API와 저장소에서 지원하지만 현재 preview UI에는 fork 조작 화면이 없습니다.
-- 수정하지 않은 native Desktop UI는 외부 session protocol을 보장하지 않으므로 transparent한
-  공유를 약속하지 않습니다. 명시적 Baton UI/API 또는 지원되는 bridge가 정본 경로입니다.
-- Codex usage API의 첫 quota 조회는 수 초 지연될 수 있습니다.
-- Provider마다 역할·tool·reasoning 의미가 달라 완전한 내부 상태 이동은 불가능합니다. Baton은
-  표시 가능한 대화와 완료된 실행 결과를 보존하고, 이동 불가능한 상태는 명시적으로 차단합니다.
+- `server/` — BFF, Native proxies, account/fallback runtime, gateway integration
+- `server/session/` — canonical domain, SQLite store, orchestrator, adapters와 tools
+- `src/` — React UI, typed API client, conversation/account/settings 화면
+- `scripts/baton-cli.mjs` — `baton status` CLI
+- `docs/COMMON_SESSION_DESIGN.md` — canonical conversation 계약
+- `docs/WORK_CENTRIC_ORCHESTRATION_DESIGN_V4.md` — work-centric runtime 최신 목표 설계
+- `docs/HOST_AUTOMATION.md` — 권한 profile, host command, 이미지와 자동화 경계
+- `docs/BATON_NATIVE_CLAUDE_PROXY_TODO.md` — Native proxy/fallback 검증 및 미해결 작업
 
-## Design references
+## 설계 문서
 
-- [Account control plane and rotation](docs/DESIGN.md)
-- [Canonical session and provider-adapter contract](docs/COMMON_SESSION_DESIGN.md)
-- [Native session import and conversation grouping](docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md)
-- [Implementation conformance and known gaps](docs/IMPLEMENTATION_STATUS.md)
+- [Account control plane](docs/DESIGN.md)
+- [Canonical session and provider adapters](docs/COMMON_SESSION_DESIGN.md)
+- [Work-Centric Orchestration V4](docs/WORK_CENTRIC_ORCHESTRATION_DESIGN_V4.md)
+- [Host access and automation](docs/HOST_AUTOMATION.md)
+- [Native session import and grouping](docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md)
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md)

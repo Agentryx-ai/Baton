@@ -118,9 +118,10 @@ Provider switching is forbidden while a tool result, server continuation, or pro
 is pending. It is permitted only after a terminal turn boundary.
 
 For the app-server adapter, provider-internal request and stream retries are forced to zero. Baton is
-the only retry authority. After the configured number of completed model rounds is observed, a new
-dynamic tool-call ID is rejected before execution; exact replay of an already recorded call ID remains
-idempotent.
+the only retry authority. The default runtime does not add a provider-independent model-round cap:
+Codex runs until a terminal response, while Claude Agent SDK's `maxTurns` default is undefined.
+Tests and explicitly bounded internal operations may still supply a finite round cap. Exact replay of
+an already recorded call ID remains idempotent.
 
 Output truncation is not automatically retried as if it were a tool continuation. Context exhaustion
 may compact only portable history under a versioned compaction policy; provider-private pending
@@ -168,20 +169,22 @@ returned subject to the cap.
 
 ## 6. Deterministic limits
 
-The host enforces separate counters so similarly named provider limits cannot be confused. Version 1
-defaults are `32` model round trips, `128` total tool calls, `3` identical invocations, `120 seconds`
-per tool, `256 KiB` tool output, `30 minutes` per turn, and `3` transient provider retries:
+The common runtime follows the native agent-loop termination contract instead of inventing a Baton
+ceiling. Codex continues until its core loop receives a terminal response, and Claude Agent SDK leaves
+`maxTurns` and total budget unset by default. Therefore the default policy sets model rounds, total
+tool calls, identical tool calls, and whole-turn wall-clock limits to `null` (unset). A Goal or bounded
+internal operation may explicitly install a finite value in its immutable execution snapshot:
 
-- maximum model round trips per turn;
-- maximum total tool calls per turn;
-- maximum identical tool invocations per turn;
+- optional maximum model round trips for explicitly bounded internal operations and tests;
+- optional maximum total tool calls per turn;
+- optional maximum identical tool invocations per turn;
 - per-tool timeout and output-byte cap;
-- turn wall-clock limit;
+- optional turn wall-clock limit;
 - bounded transient provider retries;
 - optional turn token/cost budget;
 - user cancellation at every wait boundary.
 
-Limit exhaustion is a typed failure or limited state. Tool total/repetition limits are latched by the
+Finite-limit exhaustion is a typed failure or limited state. Explicit tool total/repetition limits are latched by the
 host and cannot be converted to a successful final
 assistant message. Default limits are versioned server policy and are copied into each execution's
 immutable policy/budget snapshot.
@@ -190,11 +193,17 @@ Precedence is: user cancellation; unknown mutating-tool outcome; approval/user-i
 usage limit; token/cost/wall-clock/tool/model limit; non-retryable provider error; valid completion.
 A higher-precedence result cannot be overwritten by a late lower-precedence event.
 
-Within the limit class Baton gives Goal token/time boundaries and the first latched host tool limit
-priority over a provider final response. Exact Codex sampling-round and combined internal retry
-counts are not exposed by the current app-server protocol; the 30-minute host turn timeout and tool
-limits remain authoritative, while exact `maxModelRoundTrips` and combined retry enforcement are a
-documented Codex protocol gap. Claude and Gemini expose their round boundaries to Baton directly.
+Within the limit class Baton gives explicit Goal token/time boundaries and the first latched explicit
+host tool limit priority over a provider final response. Exact Codex sampling-round and combined
+internal retry counts are not exposed by the current app-server protocol. Claude and Gemini expose
+their round boundaries to Baton directly, but the common runtime does not impose a provider-independent
+round, tool-count, repetition, or whole-turn wall-clock ceiling.
+
+Per-operation stall protection and context shaping remain separate from agent-loop termination. Baton
+still bounds one tool wait, one persisted tool result, and transient HTTP retries; Codex likewise bounds
+model-visible tool output and individual background-terminal polls without treating either as a whole-turn
+deadline. Long-running command parity requires a durable background process handle and polling contract,
+not a larger whole-turn timer.
 
 | Exhausted condition | Turn result | Owning Goal result | Reason code |
 | --- | --- | --- | --- |
@@ -203,7 +212,7 @@ documented Codex protocol gap. Claude and Gemini expose their round boundaries t
 | per-tool timeout | failed tool result; turn may recover | unchanged unless turn ultimately fails | `tool_timeout` |
 | turn wall clock | `failed` or provider `cancelled` with typed error | `budget_limited` | `turn_time_limit` |
 | turn token/cost budget | `cancelled` after safe wrap-up/interrupt | `budget_limited` | `turn_budget_limit` |
-| provider retry budget | `failed` | `blocked` | `provider_retry_exhausted` |
+| provider retry budget | `failed` | automatic Goal retries within its turn/time/no-progress budgets; otherwise `blocked` | `provider_retry_exhausted` |
 | hard account usage limit | `failed` | `usage_limited` | `provider_usage_limit` |
 
 ## 7. Status projection
