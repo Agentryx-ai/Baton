@@ -378,7 +378,8 @@ test('commit reports stale after source changes and safely replaces an untouched
   const reader = new MutableReader(candidate(['one']))
   const service = new NativeSessionImportService(store, [reader], { secret: Buffer.alloc(32, 9) })
   let preview = await service.preview()
-  await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const imported = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const importedSessionId = imported.results[0]!.sessionId!
   const importedThreadId = store.listSessions()[0]!.activeThreadId
   store.createGoal({
     threadId: importedThreadId,
@@ -398,8 +399,11 @@ test('commit reports stale after source changes and safely replaces an untouched
   preview = await service.preview()
   const rewritten = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
   assert.equal(rewritten.results[0]?.status, 'updated', rewritten.results[0]?.error)
+  assert.equal(rewritten.results[0]?.sessionId, importedSessionId)
   assert.equal(store.listSessions().length, 1)
   const replacedSession = store.listSessions()[0]!
+  assert.equal(replacedSession.id, importedSessionId)
+  assert.equal(replacedSession.activeThreadId, importedThreadId)
   assert.deepEqual(
     store.getSnapshot(replacedSession.activeThreadId)?.items.map((item) => item.payload.text),
     ['rewritten', 'two'],
