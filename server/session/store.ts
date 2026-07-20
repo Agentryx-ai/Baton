@@ -29,6 +29,8 @@ import type {
   UpsertProviderBindingInput,
   ProviderBinding,
   LdPlayerGrant,
+  GlobalPermissionSettings,
+  PermissionProfile,
 } from './domain.ts'
 import type { NativeImportStore } from './native-import/contracts.ts'
 
@@ -236,6 +238,11 @@ export interface UpdateWorkspaceInput {
   cwd: string | null
 }
 
+export interface UpdateSessionPermissionProfileInput {
+  sessionId: SessionId
+  profile: PermissionProfile | null
+}
+
 export interface UpdateLdPlayerGrantInput {
   sessionId: SessionId
   expectedThreadRevision: number
@@ -244,6 +251,9 @@ export interface UpdateLdPlayerGrantInput {
 }
 
 export interface SessionStore extends NativeImportStore {
+  getPermissionSettings(): GlobalPermissionSettings
+  updateDefaultPermissionProfile(profile: PermissionProfile): GlobalPermissionSettings
+  updateSessionPermissionProfile(input: UpdateSessionPermissionProfileInput): CanonicalSession
   createSession(input: CreateSessionInput): CanonicalSession
   getInitialSessionResult(input: InitialSessionRequestIdentity): BeginSessionResult | null
   beginSession(input: BeginSessionInput): BeginSessionResult

@@ -99,17 +99,36 @@ test('thread refresh replaces only the matching sidebar session projection', asy
 })
 
 test('session lists retain only an explicit valid selection and never auto-open the first row', async () => {
-  const { retainExplicitSessionSelection } = await import(workspaceModulePath) as {
+  const {
+    retainExplicitSessionSelection,
+    isConversationSelectionPending,
+    shouldApplyThreadSnapshot,
+  } = await import(workspaceModulePath) as {
     retainExplicitSessionSelection: (
       selectedSessionId: string | null,
       sessions: Array<{ id: string }>,
     ) => string | null
+    isConversationSelectionPending: (
+      selectedSessionId: string | null,
+      snapshotSessionId: string | null,
+    ) => boolean
+    shouldApplyThreadSnapshot: (
+      selectedSessionId: string | null,
+      snapshotSessionId: string,
+    ) => boolean
   }
   const sessions = [{ id: 'newest' }, { id: 'explicit' }]
 
   assert.equal(retainExplicitSessionSelection(null, sessions), null)
   assert.equal(retainExplicitSessionSelection('explicit', sessions), 'explicit')
   assert.equal(retainExplicitSessionSelection('missing', sessions), null)
+  assert.equal(isConversationSelectionPending(null, null), false)
+  assert.equal(isConversationSelectionPending('explicit', null), true)
+  assert.equal(isConversationSelectionPending('explicit', 'previous'), true)
+  assert.equal(isConversationSelectionPending('explicit', 'explicit'), false)
+  assert.equal(shouldApplyThreadSnapshot('explicit', 'explicit'), true)
+  assert.equal(shouldApplyThreadSnapshot('other', 'explicit'), false)
+  assert.equal(shouldApplyThreadSnapshot(null, 'explicit'), false)
 })
 
 test('background session projection polling runs only while visible and cleans up listeners', async () => {

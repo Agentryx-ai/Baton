@@ -20,6 +20,7 @@ import {
   getClientIntegrationStatus,
   removeClientIntegration,
 } from './client-integration.ts'
+import { getCachedBatonRuntimeStatus } from './baton-status.ts'
 
 export const batonRouter: Router = Router()
 
@@ -87,10 +88,14 @@ batonRouter.get('/baton/client-integration', async (_req: Request, res: Response
   res.json(await getClientIntegrationStatus())
 })
 
+batonRouter.get('/baton/status', async (_req: Request, res: Response) => {
+  res.json(await getCachedBatonRuntimeStatus())
+})
+
 batonRouter.post('/baton/client-integration/apply', async (req: Request, res: Response) => {
   try {
     const body = parseBody(req.body)
-    res.json(await applyClientIntegration(body.targets, body.codexMode))
+    res.json(await applyClientIntegration(body.targets, body.codexMode, body.claudeProxyMode))
   } catch (error) {
     const status = error instanceof ClientIntegrationError ? error.status : 500
     const message = error instanceof Error ? error.message : String(error)

@@ -10,9 +10,12 @@ import {
   inspectClaudeDesktopConfig,
   inspectCodexConfig,
   inspectCodexNativeConfig,
+  patchClaudeCliConfig,
+  patchClaudeDesktopConfig,
   patchCodexConfig,
   patchCodexNativeConfig,
   parseCodexIntegrationMode,
+  parseClaudeProxyMode,
   parseIntegrationTargets,
   removeClaudeCliConfig,
   removeClaudeDesktopConfig,
@@ -175,6 +178,50 @@ test('JSON removers preserve unrelated user settings', () => {
   assert.deepEqual(JSON.parse(removeClaudeDesktopConfig(desktop, baseUrl, token)), { keep: true })
 })
 
+test('Claude CLI Native and CLIProxy settings apply, inspect, and remove without touching user values', () => {
+  const original = JSON.stringify({ env: { KEEP: 'yes', ANTHROPIC_AUTH_TOKEN: 'stale' }, user: 1 })
+  const nativeBaseUrl = 'http://127.0.0.1:4400/baton/inference/anthropic'
+  const cliProxyBaseUrl = 'http://127.0.0.1:8317'
+
+  const native = patchClaudeCliConfig(original, nativeBaseUrl, null)
+  assert.equal(inspectClaudeCliConfig(native, nativeBaseUrl, null).configuration, 'applied')
+  assert.deepEqual(JSON.parse(native), {
+    env: { KEEP: 'yes', ANTHROPIC_BASE_URL: nativeBaseUrl },
+    user: 1,
+  })
+  assert.deepEqual(JSON.parse(removeClaudeCliConfig(native, nativeBaseUrl, null)), {
+    env: { KEEP: 'yes' },
+    user: 1,
+  })
+
+  const cliProxy = patchClaudeCliConfig(original, cliProxyBaseUrl, 'proxy-token')
+  assert.equal(inspectClaudeCliConfig(cliProxy, cliProxyBaseUrl, 'proxy-token').configuration, 'applied')
+  assert.deepEqual(JSON.parse(removeClaudeCliConfig(cliProxy, cliProxyBaseUrl, 'proxy-token')), {
+    env: { KEEP: 'yes' },
+    user: 1,
+  })
+})
+
+test('Claude Desktop uses a static gateway token in both proxy modes and round-trips user values', () => {
+  const original = JSON.stringify({ keep: true, inferenceProvider: 'firstParty' })
+  const models = [{
+    name: 'claude-fable-5',
+    anthropicFamilyTier: 'fable',
+    labelOverride: 'Fable 5',
+    isFamilyDefault: true as const,
+  }]
+  for (const [baseUrl, token] of [
+    ['http://127.0.0.1:4400/baton/inference/anthropic', 'native-token'],
+    ['http://127.0.0.1:8317', 'cliproxy-token'],
+  ] as const) {
+    const applied = patchClaudeDesktopConfig(original, baseUrl, token, models)
+    assert.equal(inspectClaudeDesktopConfig(applied, baseUrl, token).configuration, 'applied')
+    assert.deepEqual(JSON.parse(removeClaudeDesktopConfig(applied, baseUrl, token)), {
+      keep: true,
+    })
+  }
+})
+
 test('selectClaudeModels is input-order independent and selects newest families', () => {
   const models = [
     'claude-opus-4-6',
@@ -237,6 +284,13 @@ test('parseCodexIntegrationMode accepts only declared modes', () => {
   assert.equal(parseCodexIntegrationMode(undefined), 'custom-provider')
   assert.equal(parseCodexIntegrationMode('native-openai'), 'native-openai')
   assert.throws(() => parseCodexIntegrationMode('openai'), /올바르지 않은/)
+})
+
+test('parseClaudeProxyMode defaults to Baton Native and accepts CLIProxy only explicitly', () => {
+  assert.equal(parseClaudeProxyMode(undefined), 'native')
+  assert.equal(parseClaudeProxyMode('native'), 'native')
+  assert.equal(parseClaudeProxyMode('cliproxy'), 'cliproxy')
+  assert.throws(() => parseClaudeProxyMode('gateway'), /올바르지 않은/)
 })
 
 test('blockedProcessesForTargets ignores running unselected clients', () => {

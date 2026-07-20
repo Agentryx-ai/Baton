@@ -273,13 +273,13 @@ export class ToolCoordinator {
     const fingerprint = repetitionFingerprint(invocation)
     const identical = (this.#identicalCounts.get(fingerprint) ?? 0) + 1
     this.#identicalCounts.set(fingerprint, identical)
-    if (this.#toolCalls > this.#limits.maxToolCalls) {
+    if (this.#limits.maxToolCalls !== null && this.#toolCalls > this.#limits.maxToolCalls) {
       return this.#latchTerminalFailure(
         'tool_call_limit',
         `Turn exceeded ${this.#limits.maxToolCalls} tool calls`,
       )
     }
-    if (identical > this.#limits.maxIdenticalToolCalls) {
+    if (this.#limits.maxIdenticalToolCalls !== null && identical > this.#limits.maxIdenticalToolCalls) {
       return this.#latchTerminalFailure(
         'tool_repetition_limit',
         `Turn exceeded ${this.#limits.maxIdenticalToolCalls} identical tool calls`,
@@ -614,6 +614,7 @@ function definition(
 
 function validateLimits(limits: AgentLoopLimits): AgentLoopLimits {
   for (const [name, value] of Object.entries(limits)) {
+    if (value === null) continue
     if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`)
   }
   return Object.freeze({ ...limits })

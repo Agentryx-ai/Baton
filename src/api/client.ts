@@ -7,6 +7,7 @@
  * See docs/BUILD_DAG.md §2.2 for the frozen signatures.
  */
 import type {
+  BatonRuntimeStatus,
   Account,
   AccountQuota,
   AddStatus,
@@ -14,8 +15,10 @@ import type {
   ClientIntegrationRemoveResult,
   ClientIntegrationStatus,
   ClientIntegrationTarget,
+  ClaudeProxyMode,
   CodexIntegrationMode,
   PolicyState,
+  ModelFallbackStatus,
   Provider,
   ProxyStatus,
   RoutingStrategy,
@@ -32,6 +35,23 @@ export class ApiError extends Error {
     this.name = 'ApiError'
     this.status = status
   }
+}
+
+type GatewayAddStatus = {
+  status?: 'wait' | 'success' | 'error' | 'ok'
+  success?: boolean
+  error?: string
+}
+
+/** Normalize the gateway's legacy and current OAuth completion shapes. */
+export function normalizeAddStatus(result: GatewayAddStatus): AddStatus {
+  if (result.success === true || result.status === 'success' || result.status === 'ok') {
+    return { status: 'success' }
+  }
+  if (result.success === false || result.status === 'error') {
+    return { status: 'error', error: result.error }
+  }
+  return { status: 'wait' }
 }
 
 /** Attempt to pull a human-readable message out of an error response body. */
@@ -81,19 +101,50 @@ async function request<T>(
   return parsed as T
 }
 
+const nativeAccountBackends = new Map<Provider, boolean>()
+
+function nativeBackendFromStatus(provider: Provider, status: ClientIntegrationStatus): boolean {
+  if (provider === 'claude') {
+    const applied = status.targets.find((target) => (
+      target.target !== 'codex' && target.configuration === 'applied'
+    ))
+    return applied?.claudeProxyMode !== 'cliproxy'
+  }
+  if (provider === 'codex') {
+    const applied = status.targets.find((target) => target.target === 'codex')
+    return applied?.codexMode !== 'custom-provider'
+  }
+  return false
+}
+
+async function usesNativeAccountBackend(provider: Provider): Promise<boolean> {
+  const cached = nativeAccountBackends.get(provider)
+  if (cached !== undefined) return cached
+  const status = await request<ClientIntegrationStatus>('/baton/client-integration')
+  const native = nativeBackendFromStatus(provider, status)
+  nativeAccountBackends.set(provider, native)
+  return native
+}
+
+function nativeProviderBase(provider: Provider): string {
+  return provider === 'claude' ? '/baton/claude-native' : '/baton/codex-native'
+}
+
 export const client = {
   // ---- 조회 (reads) -------------------------------------------------------
 
-  /**
-   * Fan out over {@link UI_PROVIDERS}, calling `/api/cliproxy/auth/accounts/:provider`
-   * for each, and return a per-provider map. The gateway wraps the list in `{accounts}`.
-   */
+  /** Claude accounts come from Baton's native vault; other providers retain the CLIProxy contract. */
   getAccounts: async (): Promise<Record<Provider, Account[]>> => {
     const result = {} as Record<Provider, Account[]>
+    const status = await request<ClientIntegrationStatus>('/baton/client-integration')
     await Promise.all(
       UI_PROVIDERS.map(async (provider) => {
+        const native = nativeBackendFromStatus(provider, status)
+        nativeAccountBackends.set(provider, native)
         const body = await request<{ provider?: string; accounts?: Account[] }>(
-          `/api/cliproxy/auth/accounts/${provider}`,
+          native
+            ? `${nativeProviderBase(provider)}/accounts`
+            : `/api/cliproxy/auth/accounts/${provider}`,
         )
         result[provider] = body.accounts ?? []
       }),
@@ -101,13 +152,20 @@ export const client = {
     return result
   },
 
-  getQuota: (provider: Provider, accountId: string): Promise<AccountQuota> =>
-    request<AccountQuota>(
-      `/api/cliproxy/quota/${provider}/${encodeURIComponent(accountId)}`,
-    ),
+  getQuota: async (provider: Provider, accountId: string): Promise<AccountQuota> => {
+    const native = await usesNativeAccountBackend(provider)
+    return await request<AccountQuota>(
+      native
+        ? `${nativeProviderBase(provider)}/quota/${encodeURIComponent(accountId)}`
+        : `/api/cliproxy/quota/${provider}/${encodeURIComponent(accountId)}`,
+    )
+  },
 
   getProxyStatus: (): Promise<ProxyStatus> =>
     request<ProxyStatus>('/api/cliproxy/proxy-status'),
+
+  getBatonStatus: (): Promise<BatonRuntimeStatus> =>
+    request<BatonRuntimeStatus>('/baton/status'),
 
   getRoutingStrategy: (): Promise<RoutingStrategy> =>
     request<RoutingStrategy>('/api/cliproxy/routing/strategy'),
@@ -118,6 +176,18 @@ export const client = {
   /** Policy state lives on the BFF, not the gateway — hits `/baton/policy`. */
   getPolicy: (): Promise<PolicyState> => request<PolicyState>('/baton/policy'),
 
+  getModelFallback: (): Promise<ModelFallbackStatus> =>
+    request<ModelFallbackStatus>('/baton/model-fallback'),
+
+  setModelFallback: (settings: {
+    enabled?: boolean
+    promptDismissed?: boolean
+    userMappings?: Record<string, string[]>
+  }): Promise<ModelFallbackStatus> => request<ModelFallbackStatus>('/baton/model-fallback', {
+    method: 'POST',
+    json: settings,
+  }),
+
   getClientIntegrationStatus: (): Promise<ClientIntegrationStatus> =>
     request<ClientIntegrationStatus>('/baton/client-integration'),
 
@@ -127,24 +197,50 @@ export const client = {
   // Account steering is done purely via pause/resume.
 
   pauseAccount: async (provider: Provider, accountId: string): Promise<void> => {
+    const native = await usesNativeAccountBackend(provider)
     await request(
-      `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}/pause`,
+      native
+        ? `${nativeProviderBase(provider)}/accounts/${encodeURIComponent(accountId)}/pause`
+        : `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}/pause`,
       { method: 'POST' },
     )
   },
 
   resumeAccount: async (provider: Provider, accountId: string): Promise<void> => {
+    const native = await usesNativeAccountBackend(provider)
     await request(
-      `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}/resume`,
+      native
+        ? `${nativeProviderBase(provider)}/accounts/${encodeURIComponent(accountId)}/resume`
+        : `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}/resume`,
       { method: 'POST' },
     )
   },
 
   removeAccount: async (provider: Provider, accountId: string): Promise<void> => {
+    const native = await usesNativeAccountBackend(provider)
     await request(
-      `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}`,
+      native
+        ? `${nativeProviderBase(provider)}/accounts/${encodeURIComponent(accountId)}`
+        : `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}`,
       { method: 'DELETE' },
     )
+  },
+
+  preferAccount: async (provider: Provider, accountId: string): Promise<void> => {
+    const native = await usesNativeAccountBackend(provider)
+    if (!native || provider !== 'claude') {
+      throw new ApiError(409, '우선계정 지정은 Baton Native Claude에서만 지원됩니다.')
+    }
+    await request(
+      `${nativeProviderBase(provider)}/accounts/${encodeURIComponent(accountId)}/prefer`,
+      { method: 'POST' },
+    )
+  },
+
+  refreshCodexEntitlements: async (accountId: string): Promise<void> => {
+    await request(`/baton/codex-native/accounts/${encodeURIComponent(accountId)}/refresh-entitlements`, {
+      method: 'POST',
+    })
   },
 
   setRoutingStrategy: async (strategy: RoutingStrategyName): Promise<void> => {
@@ -168,22 +264,35 @@ export const client = {
     await request('/api/cliproxy/restart', { method: 'POST' })
   },
 
-  applyClientIntegration: (
+  applyClientIntegration: async (
     targets: ClientIntegrationTarget[],
     codexMode?: CodexIntegrationMode,
-  ): Promise<ClientIntegrationApplyResult> =>
-    request<ClientIntegrationApplyResult>('/baton/client-integration/apply', {
+    claudeProxyMode?: ClaudeProxyMode,
+  ): Promise<ClientIntegrationApplyResult> => {
+    const result = await request<ClientIntegrationApplyResult>('/baton/client-integration/apply', {
       method: 'POST',
-      json: { targets, ...(codexMode ? { codexMode } : {}) },
-    }),
+      json: {
+        targets,
+        ...(codexMode ? { codexMode } : {}),
+        ...(claudeProxyMode ? { claudeProxyMode } : {}),
+      },
+    })
+    if (targets.some((target) => target !== 'codex')) nativeAccountBackends.delete('claude')
+    if (targets.includes('codex')) nativeAccountBackends.delete('codex')
+    return result
+  },
 
-  removeClientIntegration: (
+  removeClientIntegration: async (
     targets: ClientIntegrationTarget[],
-  ): Promise<ClientIntegrationRemoveResult> =>
-    request<ClientIntegrationRemoveResult>('/baton/client-integration/remove', {
+  ): Promise<ClientIntegrationRemoveResult> => {
+    const result = await request<ClientIntegrationRemoveResult>('/baton/client-integration/remove', {
       method: 'POST',
       json: { targets },
-    }),
+    })
+    if (targets.some((target) => target !== 'codex')) nativeAccountBackends.delete('claude')
+    if (targets.includes('codex')) nativeAccountBackends.delete('codex')
+    return result
+  },
 
   /** Toggle / configure the policy engine on the BFF, returning fresh state. */
   setPolicy: (enabled: boolean, policy?: string): Promise<PolicyState> =>
@@ -202,12 +311,15 @@ export const client = {
     provider: Provider,
     nickname?: string,
   ): Promise<{ url: string; state: string }> => {
+    const native = await usesNativeAccountBackend(provider)
     const body = await request<{
       url?: string
       auth_url?: string
       authUrl?: string
       state?: string
-    }>(`/api/cliproxy/auth/${provider}/start-url`, {
+    }>(native
+      ? `${nativeProviderBase(provider)}/auth/start-url`
+      : `/api/cliproxy/auth/${provider}/start-url`, {
       method: 'POST',
       json: { nickname },
     })
@@ -224,22 +336,33 @@ export const client = {
     return { url, state }
   },
 
-  getAddStatus: (provider: Provider, state: string): Promise<AddStatus> =>
-    request<AddStatus>(
-      `/api/cliproxy/auth/${provider}/status?state=${encodeURIComponent(state)}`,
-    ),
+  getAddStatus: async (provider: Provider, state: string): Promise<AddStatus> => {
+    const native = await usesNativeAccountBackend(provider)
+    return normalizeAddStatus(await request<GatewayAddStatus>(
+      native
+        ? `${nativeProviderBase(provider)}/auth/status?state=${encodeURIComponent(state)}`
+        : `/api/cliproxy/auth/${provider}/status?state=${encodeURIComponent(state)}`,
+    ))
+  },
 
-  submitCallback: (
+  submitCallback: async (
     provider: Provider,
     redirectUrl: string,
-  ): Promise<AddStatus> =>
-    request<AddStatus>(`/api/cliproxy/auth/${provider}/submit-callback`, {
+  ): Promise<AddStatus> => {
+    const native = await usesNativeAccountBackend(provider)
+    return request<GatewayAddStatus>(native
+      ? `${nativeProviderBase(provider)}/auth/submit-callback`
+      : `/api/cliproxy/auth/${provider}/submit-callback`, {
       method: 'POST',
       json: { redirectUrl },
-    }),
+    }).then(normalizeAddStatus)
+  },
 
   cancelAddAccount: async (provider: Provider): Promise<void> => {
-    await request(`/api/cliproxy/auth/${provider}/cancel`, { method: 'POST' })
+    const native = await usesNativeAccountBackend(provider)
+    await request(native
+      ? `${nativeProviderBase(provider)}/auth/cancel`
+      : `/api/cliproxy/auth/${provider}/cancel`, { method: 'POST' })
   },
 }
 

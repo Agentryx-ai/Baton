@@ -1,6 +1,8 @@
 import { randomBytes } from 'node:crypto'
 
 export type CanonicalProvider = 'claude' | 'codex' | 'gemini'
+export type PermissionProfile = 'read_only' | 'workspace' | 'full_access'
+export type PermissionProfileSource = 'global' | 'session_override'
 export type SessionId = string
 export type ThreadId = string
 export type TurnId = string
@@ -106,22 +108,25 @@ export type VisibleWorkStatus =
   | 'idle'
 
 export interface AgentLoopLimits {
-  maxModelRoundTrips: number
-  maxToolCalls: number
-  maxIdenticalToolCalls: number
+  maxModelRoundTrips: number | null
+  maxToolCalls: number | null
+  maxIdenticalToolCalls: number | null
   toolTimeoutMs: number
   toolOutputBytes: number
-  turnTimeoutMs: number
+  turnTimeoutMs: number | null
   maxProviderRetries: number
 }
 
 export const DEFAULT_AGENT_LOOP_LIMITS: Readonly<AgentLoopLimits> = Object.freeze({
-  maxModelRoundTrips: 32,
-  maxToolCalls: 128,
-  maxIdenticalToolCalls: 3,
+  // Codex runs until it reaches a terminal response, and Claude Agent SDK's
+  // maxTurns default is undefined. Provider-independent loop ceilings are
+  // therefore opt-in rather than Baton-only defaults.
+  maxModelRoundTrips: null,
+  maxToolCalls: null,
+  maxIdenticalToolCalls: null,
   toolTimeoutMs: 120_000,
   toolOutputBytes: 256 * 1_024,
-  turnTimeoutMs: 30 * 60_000,
+  turnTimeoutMs: null,
   maxProviderRetries: 3,
 })
 
@@ -179,6 +184,7 @@ export interface CanonicalSession {
   activeThreadId: ThreadId
   projectKey: string | null
   cwd: string | null
+  permissions: SessionPermissionState
   /** Exact local emulator capability explicitly connected by the user; null grants no ADB access. */
   ldPlayer?: LdPlayerGrant | null
   schemaVersion: number
@@ -196,6 +202,18 @@ export interface CanonicalSession {
     /** Native metadata only. It is never an authorized tool root until the user connects it. */
     cwd: string | null
   } | null
+}
+
+export interface GlobalPermissionSettings {
+  defaultProfile: PermissionProfile
+  updatedAt: string
+}
+
+export interface SessionPermissionState {
+  defaultProfile: PermissionProfile
+  override: PermissionProfile | null
+  effectiveProfile: PermissionProfile
+  source: PermissionProfileSource
 }
 
 export interface LdPlayerGrant {
@@ -464,6 +482,8 @@ export interface ExecutionPolicySnapshot {
   cwd: string | null
   maxDepth: number
   capabilityGrant: string | null
+  permissionProfile?: PermissionProfile
+  permissionProfileSource?: PermissionProfileSource
 }
 
 export interface ProviderBinding {

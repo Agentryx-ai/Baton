@@ -20,16 +20,18 @@ import { contextSummaryPromptText } from './context-summary-contract.js'
 import { estimateUtf8Tokens } from './context-materializer.js'
 
 const SUMMARY_GENERATOR_ID = 'baton-provider-context-summary'
-const SUMMARY_GENERATOR_VERSION = '5'
+const SUMMARY_GENERATOR_VERSION = '6'
 const SUMMARY_PROMPT_ATTEMPTS = 2
 const DEFAULT_SUMMARY_INPUT_BUDGET_TOKENS = 104_000
 const SUMMARY_PROMPT_BUDGET_RATIO = 0.7
+const SUMMARY_TARGET_RATIO = 0.75
+const SUMMARY_TRUNCATION_MARKER = '\n\n[...middle omitted to enforce Baton summary limit...]\n\n'
 const SUMMARY_TURN_LIMITS: AgentLoopLimits = Object.freeze({
   ...DEFAULT_AGENT_LOOP_LIMITS,
   maxModelRoundTrips: 2,
   maxProviderRetries: 1,
   maxToolCalls: 0,
-  turnTimeoutMs: Math.min(DEFAULT_AGENT_LOOP_LIMITS.turnTimeoutMs, 300_000),
+  turnTimeoutMs: 300_000,
 })
 
 export interface ProviderContextSummaryGeneratorOptions {
@@ -87,7 +89,7 @@ export class ProviderContextSummaryGenerator implements ContextSummaryGenerator 
     const exactPrompt = contextSummaryPromptText(input)
     if (estimateUtf8Tokens(exactPrompt) <= promptBudget) {
       return {
-        summary: await this.#generatePrompt(exactPrompt),
+        summary: await this.#generatePrompt(exactPrompt, input.maximumSummaryTokens),
         generator: this.metadata(),
       }
     }
@@ -118,17 +120,22 @@ export class ProviderContextSummaryGenerator implements ContextSummaryGenerator 
         previousSummary: rollingSummary,
         turns: segment.turns,
         items: segment.items,
-      }))
+      }), input.maximumSummaryTokens)
     }
     if (!rollingSummary) throw new Error('Context summary chunking produced no summary')
     return { summary: rollingSummary, generator: this.metadata() }
   }
 
-  async #generatePrompt(prompt: string): Promise<string> {
+  async #generatePrompt(prompt: string, maximumSummaryTokens: number): Promise<string> {
     let latestError: unknown = null
     for (let attempt = 1; attempt <= SUMMARY_PROMPT_ATTEMPTS; attempt += 1) {
       try {
-        return await this.#generatePromptAttempt(prompt)
+        const target = Math.max(1, Math.floor(maximumSummaryTokens * SUMMARY_TARGET_RATIO))
+        const generated = await this.#generatePromptAttempt([
+          `Aim for at most ${target} approximate tokens and never exceed ${maximumSummaryTokens} tokens.`,
+          prompt,
+        ].join('\n'))
+        return boundSummary(generated, maximumSummaryTokens)
       } catch (error) {
         latestError = error
         if (attempt === SUMMARY_PROMPT_ATTEMPTS || !isRetryableSummaryFailure(error)) throw error
@@ -174,6 +181,29 @@ export class ProviderContextSummaryGenerator implements ContextSummaryGenerator 
     if (!summary) throw new Error('Context summary provider returned no assistant text')
     return summary
   }
+}
+
+function boundSummary(summary: string, maximumSummaryTokens: number): string {
+  const normalized = summary.trim()
+  if (estimateUtf8Tokens(normalized) <= maximumSummaryTokens) return normalized
+
+  const codePoints = Array.from(normalized)
+  let low = 0
+  let high = codePoints.length
+  let best = SUMMARY_TRUNCATION_MARKER.trim()
+  while (low <= high) {
+    const keep = Math.floor((low + high) / 2)
+    const head = Math.floor(keep * 0.4)
+    const tail = keep - head
+    const candidate = `${codePoints.slice(0, head).join('').trimEnd()}${SUMMARY_TRUNCATION_MARKER}${codePoints.slice(codePoints.length - tail).join('').trimStart()}`
+    if (estimateUtf8Tokens(candidate) <= maximumSummaryTokens) {
+      best = candidate
+      low = keep + 1
+    } else {
+      high = keep - 1
+    }
+  }
+  return best
 }
 
 function isRetryableSummaryFailure(error: unknown): boolean {

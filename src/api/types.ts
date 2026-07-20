@@ -15,8 +15,10 @@ export interface Account {
   isDefault: boolean
   email: string
   nickname: string
-  /** Paused = excluded from CLIProxy rotation (manual or by policy engine). */
+  /** Paused = excluded from the provider's account rotation. */
   paused?: boolean
+  /** Lower values are attempted first by Baton Native account routing. */
+  priority?: number
   createdAt?: string
   lastUsedAt?: string
 }
@@ -55,6 +57,39 @@ export interface ProxyStatus {
   target?: string
 }
 
+export interface BatonRuntimeStatus {
+  checkedAt: string
+  proxy: {
+    running: boolean | null
+    port: number | null
+    version: string | null
+    strategy: string | null
+    sessionAffinity: boolean | null
+  }
+  codex: {
+    integrationMode: CodexIntegrationMode | null
+    configuration: string
+    modelProvider: 'baton' | 'openai' | 'unknown'
+    providerAuth: 'available' | 'missing-or-conflicting' | 'unknown'
+    openAiLogin: {
+      kind: 'chatgpt' | 'api-key' | 'access-token' | 'personal-access-token' | 'none' | 'unknown'
+      label: string
+    }
+    remotePluginCatalog: {
+      state: 'eligible' | 'unavailable' | 'unknown'
+      reason: string
+    }
+    configuredHome: string
+    notice: string
+  }
+  inferenceAccount: {
+    label: string
+    observedAt: string | null
+    basis: 'most-recent-last-used' | 'unavailable'
+  } | null
+  warnings: string[]
+}
+
 export type RoutingStrategyName = 'round-robin' | 'fill-first'
 
 export interface RoutingStrategy {
@@ -80,6 +115,7 @@ export type ClientKind =
 
 export type ClientIntegrationTarget = 'claude-cli' | 'claude-desktop' | 'codex'
 export type CodexIntegrationMode = 'custom-provider' | 'native-openai'
+export type ClaudeProxyMode = 'native' | 'cliproxy'
 
 export interface ClientProcess {
   pid: number
@@ -105,6 +141,7 @@ export interface ClientIntegrationTargetStatus {
   configuration: ClientIntegrationConfigurationState
   configurationDetail?: string
   codexMode?: CodexIntegrationMode
+  claudeProxyMode?: ClaudeProxyMode
 }
 
 export type ClientIntegrationConfigurationState =
@@ -134,6 +171,36 @@ export interface AddStatus {
 export interface AddStart {
   url: string
   state: string
+}
+
+export interface ActiveModelFallback {
+  preferredModel: string
+  effectiveModel: string
+  reason: 'quota' | 'safety_refusal'
+  activatedAt: number
+  resetHint: number | null
+  lastProbeAt: number | null
+  accountAlias?: string
+}
+
+export interface ModelFallbackEvent {
+  id: number
+  at: number
+  type: 'available' | 'activated' | 'recovered' | 'disabled' | 'failed' | 'server_event'
+  preferredModel: string
+  effectiveModel: string
+  reason: 'quota' | 'safety_refusal'
+  direction?: 'retry' | 'revert' | 'sticky'
+  category?: string
+  accountId?: string
+}
+
+export interface ModelFallbackStatus {
+  enabled: boolean
+  promptDismissed: boolean
+  userMappings: Record<string, string[]>
+  active: ActiveModelFallback[]
+  events: ModelFallbackEvent[]
 }
 
 // ---- Policy engine (BFF /baton/*) ----

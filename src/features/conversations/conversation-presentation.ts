@@ -77,7 +77,13 @@ export function usageSummary(payload: JsonObject): string {
 }
 
 export function transcriptItems(items: CanonicalItemDto[]): CanonicalItemDto[] {
-  return items.filter((item) => item.kind !== 'usage')
+  return items.filter((item) => item.kind !== 'usage' && !isInternalGoalContinuation(item))
+}
+
+function isInternalGoalContinuation(item: CanonicalItemDto): boolean {
+  return item.kind === 'user_message'
+    && item.visibility === 'baton_private'
+    && item.payload.goalContinuation === true
 }
 
 export interface ConversationDisplayEntry {

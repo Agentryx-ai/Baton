@@ -6,6 +6,8 @@ import test, { type TestContext } from 'node:test'
 import type { AgentToolInvocation } from '../domain.ts'
 import {
   CodexSandboxCommandRunner,
+  FullAccessCommandRunner,
+  HostCommandToolRuntime,
   LocalWorkspaceToolRuntime,
   type SandboxCommandRequest,
   type SandboxCommandRunner,
@@ -254,6 +256,64 @@ test('run_command is not advertised or executable before strict sandbox verifica
   const result = await runtime.execute(invocation('run_command', { argv: ['cmd.exe', '/c', 'echo unsafe'] }))
   assert.equal(result.success, false)
   assert.equal(result.error?.code, 'tool_unavailable')
+})
+
+test('read-only workspace advertises and executes no mutation or command tools', async (t) => {
+  const cwd = await workspace(t)
+  await writeFile(path.join(cwd, 'value.txt'), 'safe')
+  const runtime = new LocalWorkspaceToolRuntime({ cwd, access: 'read_only', enableCommands: true })
+  assert.deepEqual(runtime.definitions.map((definition) => definition.name), [
+    'read_file', 'list_files', 'search_text',
+  ])
+  const write = await runtime.execute(invocation('write_file', {
+    path: 'value.txt', content: 'changed', expectedSha256: '0'.repeat(64),
+  }))
+  assert.equal(write.success, false)
+  assert.equal(write.error?.code, 'tool_unavailable')
+  const command = await runtime.execute(invocation('run_command', { argv: ['unused'] }))
+  assert.equal(command.success, false)
+  assert.equal(command.error?.code, 'tool_unavailable')
+})
+
+test('host command runtime exposes only run_command without a connected workspace', async (t) => {
+  const cwd = await workspace(t)
+  const runner = new FakeRunner(async (request) => {
+    assert.equal(request.cwd, cwd)
+    request.onStdout(Buffer.from('host-ok'))
+    return 0
+  })
+  const runtime = new HostCommandToolRuntime({ cwd, commandRunner: runner })
+  assert.deepEqual(runtime.definitions.map((definition) => definition.name), ['run_command'])
+  const result = await runtime.execute(invocation('run_command', { argv: ['adb', 'devices', '-l'] }))
+  assert.equal(result.success, true)
+  assert.equal(result.content?.stdout, 'host-ok')
+})
+
+test('full-access runner uses direct argv and strips Baton-owned secrets', async (t) => {
+  const cwd = await workspace(t)
+  const previousSecret = process.env.BATON_PROXY_TOKEN
+  const previousMarker = process.env.BATON_FULL_ACCESS_TEST
+  process.env.BATON_PROXY_TOKEN = 'must-not-leak'
+  process.env.BATON_FULL_ACCESS_TEST = 'also-stripped'
+  process.env.FULL_ACCESS_PUBLIC_MARKER = 'visible'
+  t.after(() => {
+    if (previousSecret === undefined) delete process.env.BATON_PROXY_TOKEN
+    else process.env.BATON_PROXY_TOKEN = previousSecret
+    if (previousMarker === undefined) delete process.env.BATON_FULL_ACCESS_TEST
+    else process.env.BATON_FULL_ACCESS_TEST = previousMarker
+    delete process.env.FULL_ACCESS_PUBLIC_MARKER
+  })
+  const stdout: Buffer[] = []
+  const runner = new FullAccessCommandRunner()
+  const result = await runner.run({
+    argv: [process.execPath, '-e', "process.stdout.write(String(Boolean(process.env.BATON_PROXY_TOKEN))+','+String(Boolean(process.env.BATON_FULL_ACCESS_TEST))+','+process.env.FULL_ACCESS_PUBLIC_MARKER)"],
+    cwd,
+    signal: new AbortController().signal,
+    onStdout: (chunk) => stdout.push(Buffer.from(chunk)),
+    onStderr: () => undefined,
+  })
+  assert.equal(result.exitCode, 0)
+  assert.equal(Buffer.concat(stdout).toString('utf8'), 'false,false,visible')
 })
 
 test('list_files and search_text return deterministic workspace-relative results', async (t) => {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Check, Copy, Info, RefreshCw, RotateCw, ShieldCheck, ShieldOff } from 'lucide-react'
+import { Check, Copy, Info, RefreshCw, RotateCw, ShieldCheck, ShieldOff, TriangleAlert } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type {
@@ -7,12 +7,17 @@ import type {
   ClientIntegrationRemoveResult,
   ClientIntegrationStatus,
   ClientIntegrationTarget,
+  ClaudeProxyMode,
   CodexIntegrationMode,
+  ModelFallbackStatus,
   ProxyStatus,
   RoutingStrategy,
   SessionAffinity,
 } from '@/api/types'
+import { client } from '@/api/client'
+import { pendingModelFallbackOffers } from '@/api/model-fallback'
 import { Button } from '@/components/ui/button'
+import { BatonStatusCard } from '@/components/BatonStatusCard'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
@@ -20,6 +25,8 @@ import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import type { AssistantLabelMode, SessionViewPreferences } from '@/features/conversations/session-view-preferences'
+import { conversationApi } from '@/features/conversations/api'
+import type { PermissionProfile, PermissionSettingsDto } from '@/features/conversations/types'
 
 interface SettingsSectionProps {
   routing: RoutingStrategy | null
@@ -37,6 +44,7 @@ interface SettingsSectionProps {
   onApplyClientIntegration: (
     targets: ClientIntegrationTarget[],
     codexMode?: CodexIntegrationMode,
+    claudeProxyMode?: ClaudeProxyMode,
   ) => Promise<ClientIntegrationApplyResult>
   onRemoveClientIntegration: (
     targets: ClientIntegrationTarget[],
@@ -117,16 +125,90 @@ export function SettingsSection({
 
   const [copied, setCopied] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const [permissionSettings, setPermissionSettings] = useState<PermissionSettingsDto | null>(null)
+  const [permissionError, setPermissionError] = useState<string | null>(null)
+  const [permissionBusy, setPermissionBusy] = useState(false)
   const [changingIntegrationTarget, setChangingIntegrationTarget] = useState<
     ClientIntegrationTarget | null
   >(null)
   const [codexMode, setCodexMode] = useState<CodexIntegrationMode>('native-openai')
+  const [claudeProxyMode, setClaudeProxyMode] = useState<ClaudeProxyMode>('native')
+  const [modelFallback, setModelFallback] = useState<ModelFallbackStatus | null>(null)
+  const [modelFallbackError, setModelFallbackError] = useState<string | null>(null)
+  const [modelFallbackBusy, setModelFallbackBusy] = useState(false)
   useEffect(() => {
     const appliedMode = clientIntegration?.targets.find(
       (target) => target.target === 'codex',
     )?.codexMode
     if (appliedMode) setCodexMode(appliedMode)
   }, [clientIntegration])
+  useEffect(() => {
+    const appliedMode = clientIntegration?.targets.find(
+      (target) => target.target !== 'codex' && target.configuration === 'applied',
+    )?.claudeProxyMode
+    if (appliedMode) setClaudeProxyMode(appliedMode)
+  }, [clientIntegration])
+
+  useEffect(() => {
+    let cancelled = false
+    conversationApi.getPermissionSettings().then((result) => {
+      if (!cancelled) setPermissionSettings(result)
+    }).catch((error: unknown) => {
+      if (!cancelled) setPermissionError(error instanceof Error ? error.message : String(error))
+    })
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    const refresh = () => client.getModelFallback().then((status) => {
+      if (!cancelled) {
+        setModelFallback(status)
+        setModelFallbackError(null)
+      }
+    }).catch((error: unknown) => {
+      if (!cancelled) setModelFallbackError(error instanceof Error ? error.message : String(error))
+    })
+    void refresh()
+    const interval = window.setInterval(refresh, 10_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [])
+
+  const updateModelFallback = async (settings: {
+    enabled?: boolean
+    promptDismissed?: boolean
+  }) => {
+    if (modelFallbackBusy) return
+    setModelFallbackBusy(true)
+    try {
+      setModelFallback(await client.setModelFallback(settings))
+      setModelFallbackError(null)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setModelFallbackError(message)
+      toast.error(message)
+    } finally {
+      setModelFallbackBusy(false)
+    }
+  }
+
+  const setDefaultPermissionProfile = async (profile: PermissionProfile) => {
+    if (permissionBusy || permissionSettings?.defaultProfile === profile) return
+    setPermissionBusy(true)
+    setPermissionError(null)
+    try {
+      const updated = await conversationApi.updatePermissionSettings(profile)
+      setPermissionSettings(updated)
+      toast.success('새 권한 기본값을 저장했습니다. 다음 턴부터 적용됩니다.')
+    } catch (error) {
+      setPermissionError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setPermissionBusy(false)
+    }
+  }
 
   const commitTtl = () => {
     if (!affinity) return
@@ -158,6 +240,7 @@ export function SettingsSection({
       const result = await onApplyClientIntegration(
         [target],
         target === 'codex' ? codexMode : undefined,
+        target !== 'codex' ? claudeProxyMode : undefined,
       )
       toast.success(`${result.updated.join(', ')} 설정을 적용했습니다. 이제 앱을 다시 실행하세요.`)
     } catch (error) {
@@ -213,6 +296,44 @@ export function SettingsSection({
               ? '정책 ON 동안 fill-first가 필수입니다. 전략을 바꾸려면 정책을 먼저 끄세요.'
               : 'round-robin은 균등 분산, fill-first는 계정별 순차 소진에 적합합니다.'}
           </p>
+        </Row>
+
+        <Separator />
+
+        <Row label="대화 권한">
+          <RadioGroup
+            value={permissionSettings?.defaultProfile}
+            onValueChange={(value) => void setDefaultPermissionProfile(value as PermissionProfile)}
+            disabled={!permissionSettings || permissionBusy}
+            className="gap-2"
+          >
+            <div className="flex items-start gap-2">
+              <RadioGroupItem value="read_only" id="permission-read-only" className="mt-0.5" />
+              <Label htmlFor="permission-read-only" className="font-normal">
+                <span className="block font-medium">읽기 전용</span>
+                <span className="block text-xs text-muted-foreground">연결한 프로젝트의 읽기·검색만 허용합니다.</span>
+              </Label>
+            </div>
+            <div className="flex items-start gap-2">
+              <RadioGroupItem value="workspace" id="permission-workspace" className="mt-0.5" />
+              <Label htmlFor="permission-workspace" className="font-normal">
+                <span className="block font-medium">작업공간</span>
+                <span className="block text-xs text-muted-foreground">연결한 프로젝트 안에서 파일 변경과 샌드박스 명령을 허용합니다.</span>
+              </Label>
+            </div>
+            <div className="flex items-start gap-2">
+              <RadioGroupItem value="full_access" id="permission-full-access" className="mt-0.5" />
+              <Label htmlFor="permission-full-access" className="font-normal">
+                <span className="block font-medium">전체 액세스</span>
+                <span className="block text-xs text-muted-foreground">OS 샌드박스 없이 로컬 명령과 네트워크를 사용합니다.</span>
+              </Label>
+            </div>
+          </RadioGroup>
+          <p className="mt-2 text-xs leading-5 text-muted-foreground">
+            전체 액세스에서는 별도 연결 없이 adb, LDPlayer 명령, Git, PowerShell 등 설치된 도구를 사용할 수 있습니다.
+            대화별로 재정의할 수 있으며 실행 중인 턴의 권한은 바뀌지 않습니다.
+          </p>
+          {permissionError ? <p className="mt-2 text-xs text-destructive">{permissionError}</p> : null}
         </Row>
 
         <Separator />
@@ -313,6 +434,42 @@ export function SettingsSection({
 
         <Row label="클라이언트 자동 설정">
           <div className="space-y-3">
+            <div className="rounded-md border bg-background/70 p-3">
+              <span className="block text-sm font-medium">Claude 프록시 코어</span>
+              <RadioGroup
+                value={claudeProxyMode}
+                onValueChange={(value) => setClaudeProxyMode(value as ClaudeProxyMode)}
+                className="mt-2 gap-2"
+              >
+                <div className="flex items-start gap-2">
+                  <RadioGroupItem value="native" id="claude-proxy-native" className="mt-0.5" />
+                  <Label htmlFor="claude-proxy-native" className="space-y-0.5 font-normal">
+                    <span className="block text-xs font-medium">Baton Native (권장)</span>
+                    <span className="block text-[11px] leading-4 text-muted-foreground">
+                      Baton이 Anthropic에 직접 연결합니다. OAuth 갱신과 모델별 한도 판별을 보존하며 Fable 5 소진을 구체적으로 표시합니다.
+                    </span>
+                  </Label>
+                </div>
+                <div className="flex items-start gap-2">
+                  <RadioGroupItem value="cliproxy" id="claude-proxy-cliproxy" className="mt-0.5" />
+                  <Label htmlFor="claude-proxy-cliproxy" className="space-y-0.5 font-normal">
+                    <span className="block text-xs font-medium">CLIProxy (호환/rollback)</span>
+                    <span className="block text-[11px] leading-4 text-muted-foreground">
+                      기존 gateway 경로를 유지합니다. Native 전환에 문제가 있을 때만 사용하세요.
+                    </span>
+                  </Label>
+                </div>
+              </RadioGroup>
+              {claudeProxyMode === 'cliproxy' ? (
+                <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-amber-800 dark:text-amber-200">
+                  <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+                  <p className="text-xs leading-5">
+                    확인된 제한: Fable 같은 모델별 한도와 계정 전체 429를 구분하지 못하고 일반 429로 표시하거나 장시간 재시도할 수 있습니다.
+                    Baton의 모델별 quota preflight와 향후 자동 모델전환도 적용되지 않습니다.
+                  </p>
+                </div>
+              ) : null}
+            </div>
             <div className="grid gap-2 sm:grid-cols-3">
               {INTEGRATION_TARGETS.map((option) => {
                 const status = clientIntegration?.targets.find(
@@ -380,8 +537,8 @@ export function SettingsSection({
                         isApplied ? (
                           <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
                             {status?.codexMode === 'native-openai'
-                              ? '기존 OpenAI 세션 유지 모드'
-                              : 'Baton 전용 Provider · 기존 OpenAI 대화와 분리'}
+                              ? 'Baton Native Proxy · 기존 OpenAI 세션 유지'
+                              : 'CLIProxy 호환 Provider · 기존 OpenAI 대화와 분리'}
                           </span>
                         ) : (
                           <RadioGroup
@@ -392,23 +549,36 @@ export function SettingsSection({
                             <div className="flex items-start gap-2">
                               <RadioGroupItem value="native-openai" id="codex-native-openai" className="mt-0.5" />
                               <Label htmlFor="codex-native-openai" className="space-y-0.5 font-normal">
-                                <span className="block text-xs font-medium">기존 세션 유지 (권장 · Desktop)</span>
+                                <span className="block text-xs font-medium">Baton Native Proxy · 기존 세션 유지 (권장)</span>
                                 <span className="block text-[11px] leading-4 text-muted-foreground">
-                                  model_provider=openai를 유지하고 전송 주소만 Baton으로 바꿉니다. Desktop과 CLI의 기존 OpenAI 목록을 유지합니다.
+                                  Baton이 Codex OAuth refresh, live 모델 카탈로그, 모델-aware 계정 failover를 직접 수행합니다. Desktop과 CLI의 기존 OpenAI 목록을 유지합니다.
                                 </span>
                               </Label>
                             </div>
                             <div className="flex items-start gap-2">
                               <RadioGroupItem value="custom-provider" id="codex-custom-provider" className="mt-0.5" />
                               <Label htmlFor="codex-custom-provider" className="space-y-0.5 font-normal">
-                                <span className="block text-xs font-medium">Baton 전용 Provider (고급)</span>
-                                <span className="block text-[11px] leading-4 text-muted-foreground">
-                                  model_provider=baton으로 새 대화를 별도 목록에 저장합니다. 기존 OpenAI 대화와 이어지지 않으므로 Provider 격리가 필요할 때만 사용하세요.
+                                <span className="block text-xs font-medium">CLIProxy 호환 Provider (rollback)</span>
+                                <span className="block text-[11px] leading-4 text-amber-700 dark:text-amber-300">
+                                  실제 usage-limit 뒤 same-request failover가 되지 않거나, stale plan 때문에 상위 모델이 사라질 수 있습니다. 플랜 변경 반영에 재로그인이 필요할 수 있습니다.
                                 </span>
                               </Label>
                             </div>
                           </RadioGroup>
                         )
+                      ) : isApplied ? (
+                        <>
+                          <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                            {status?.claudeProxyMode === 'native'
+                              ? 'Baton Native Proxy 적용됨'
+                              : 'CLIProxy 호환 경로 적용됨'}
+                          </span>
+                          {status?.claudeProxyMode === 'cliproxy' ? (
+                            <span className="block text-xs leading-5 text-amber-700 dark:text-amber-300">
+                              모델별 429 식별과 자동전환을 사용할 수 없습니다.
+                            </span>
+                          ) : null}
+                        </>
                       ) : null}
                     </div>
                     <Button
@@ -465,7 +635,89 @@ export function SettingsSection({
 
         <Separator />
 
+        <Row label="모델 자동전환">
+          <div className="space-y-3">
+            {modelFallback?.active.map((active) => (
+              <div
+                key={active.preferredModel}
+                className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm"
+                role="status"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium">
+                    {active.preferredModel} → {active.effectiveModel} 자동 전환됨
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={modelFallbackBusy}
+                    onClick={() => void updateModelFallback({ enabled: false })}
+                  >
+                    자동전환 끄기
+                  </Button>
+                </div>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  선호 모델은 변경되지 않았습니다. 60초 간격의 제한된 probe에서 한도가 회복되면 자동 복귀합니다.
+                  {active.accountAlias ? ` 현재 계정: ${active.accountAlias}.` : ''}
+                </p>
+              </div>
+            ))}
+
+            {!modelFallback?.enabled
+              && !modelFallback?.promptDismissed
+              && pendingModelFallbackOffers(modelFallback?.events ?? []).length > 0 ? (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+                  <p className="text-sm font-medium">원 모델의 모든 계정 한도가 소진되었습니다.</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    서버 capability 또는 호환 mapping으로 허용된 모델에만 자동 전환할 수 있습니다. 더 비싼 모델 사용량이 발생할 수 있습니다.
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button
+                      size="sm"
+                      disabled={modelFallbackBusy}
+                      onClick={() => void updateModelFallback({ enabled: true })}
+                    >
+                      자동전환 켜기
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={modelFallbackBusy}
+                      onClick={() => void updateModelFallback({ promptDismissed: true })}
+                    >
+                      다시 보지 않기
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+
+            <div className="flex items-start justify-between gap-4 rounded-md border bg-background/70 p-3">
+              <div>
+                <Label htmlFor="model-auto-fallback">허용된 모델로 자동전환</Label>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  기본값은 꺼짐입니다. 같은 모델의 모든 계정을 먼저 시도하며, 선호 모델 설정을 덮어쓰지 않습니다.
+                </p>
+              </div>
+              <Switch
+                id="model-auto-fallback"
+                checked={modelFallback?.enabled ?? false}
+                disabled={!modelFallback || modelFallbackBusy}
+                onCheckedChange={(enabled) => void updateModelFallback({ enabled })}
+              />
+            </div>
+            {modelFallbackError ? <p className="text-xs text-destructive">{modelFallbackError}</p> : null}
+          </div>
+        </Row>
+
+        <Separator />
+
         {/* (d) Proxy restart */}
+        <Row label="진단">
+          <BatonStatusCard />
+        </Row>
+
+        <Separator />
+
         <Row label="프록시">
           <div className="flex items-center gap-3">
             <Button

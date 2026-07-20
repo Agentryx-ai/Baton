@@ -184,8 +184,8 @@ class LiveSteerQueue {
     })
   }
 
-  claim(round: number, limit: number, sealIfEmpty = false): ClaimedSteer[] {
-    if (!this.accepting || round >= limit) {
+  claim(round: number, limit: number | null, sealIfEmpty = false): ClaimedSteer[] {
+    if (!this.accepting || (limit !== null && round >= limit)) {
       this.close()
       return []
     }
@@ -325,7 +325,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     }
     if (context.signal.aborted) abort()
     else context.signal.addEventListener('abort', abort, { once: true })
-    const timeout = setTimeout(() => {
+    const timeout = context.limits.turnTimeoutMs === null ? null : setTimeout(() => {
       turnTimedOut = true
       controller.abort(new Error(
         `${this.provider} turn exceeded time limit (${context.limits.turnTimeoutMs}ms)`,
@@ -403,7 +403,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
               },
             })
     }).finally(() => {
-      clearTimeout(timeout)
+      if (timeout !== null) clearTimeout(timeout)
       context.signal.removeEventListener('abort', abort)
       this.active.delete(controller)
     })
@@ -588,7 +588,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     let outputContinuations = 0
     let requestMaxTokens = CLAUDE_INITIAL_MAX_TOKENS
 
-    for (let round = 1; round <= context.limits.maxModelRoundTrips; round += 1) {
+    for (let round = 1; context.limits.maxModelRoundTrips === null
+      || round <= context.limits.maxModelRoundTrips; round += 1) {
       const response = await fetchWithRetry(this.fetchImpl, `${this.connection!.baseUrl}/v1/messages`, {
         method: 'POST',
         headers: {
@@ -725,7 +726,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         }
         outputContinuations += 1
         const canContinue = outputContinuations <= CLAUDE_OUTPUT_CONTINUATION_LIMIT
-          && round < context.limits.maxModelRoundTrips
+          && (context.limits.maxModelRoundTrips === null || round < context.limits.maxModelRoundTrips)
         const followUp = canContinue
           ? { role: 'user', content: 'Please continue from where you left off.' }
           : undefined
@@ -765,7 +766,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
         await recordRound()
         throw new ProviderLoopError('provider_invalid_terminal', 'Claude returned tool_use without a tool_use block')
       }
-      if (round >= context.limits.maxModelRoundTrips) {
+      if (context.limits.maxModelRoundTrips !== null && round >= context.limits.maxModelRoundTrips) {
         await recordRound({
           assistant: { role: 'assistant', content },
           toolResults: [],
@@ -826,7 +827,8 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     const seenProviderCallIds = new Set<string>()
     const retryBudget = createRetryBudget(context.limits.maxProviderRetries)
 
-    for (let round = 1; round <= context.limits.maxModelRoundTrips; round += 1) {
+    for (let round = 1; context.limits.maxModelRoundTrips === null
+      || round <= context.limits.maxModelRoundTrips; round += 1) {
       const response = await fetchWithRetry(this.fetchImpl, `${this.connection!.baseUrl}/v1/chat/completions`, {
         method: 'POST',
         headers: {
@@ -1217,8 +1219,8 @@ function unavailableToolResult(reason: unknown): AgentToolResult {
   }
 }
 
-function assertAnotherModelRound(round: number, limit: number, reason: string): void {
-  if (round >= limit) {
+function assertAnotherModelRound(round: number, limit: number | null, reason: string): void {
+  if (limit !== null && round >= limit) {
     throw new ProviderLoopError(
       'model_round_limit',
       `${reason} requires another model round but reached model round-trip limit (${limit})`,

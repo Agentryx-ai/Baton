@@ -200,6 +200,15 @@ test('enforces total, repetition, and output limits before returning canonical r
   assert.equal(output.terminalFailure, null)
 })
 
+test('default policy does not impose Baton-only total or identical tool-call ceilings', async () => {
+  const coordinator = makeCoordinator(new FakeStore(), new FakeRuntime([READ]))
+  for (let index = 0; index < 129; index += 1) {
+    const result = await coordinator.execute(call(`default-${index}`, 'read_file', { path: 'same' }))
+    assert.equal(result.success, true)
+  }
+  assert.equal(coordinator.terminalFailure, null)
+})
+
 test('mutation timeout waits for execution settlement before recording the failure', async () => {
   const store = new FakeStore()
   const gate = deferred<AgentToolResult>()

@@ -179,6 +179,37 @@ test('large target windows still cap each summary prompt below the summary turn 
     estimateUtf8Tokens(String(request.input[0]?.payload.text)) <= 75_000), true)
 })
 
+test('provider summary deterministically bounds oversized output while retaining its beginning and end', async () => {
+  const oversized = `BEGIN-${'middle '.repeat(2_000)}-END`
+  const adapter = new SummaryAdapter(0, oversized)
+  const snapshot = fixtureSnapshot()
+  const generator = new ProviderContextSummaryGenerator({
+    adapter,
+    adapterVersion: 'test/1',
+    provider: 'claude',
+    model: 'claude-test',
+    effort: 'high',
+    snapshot,
+  })
+
+  const result = await generator.generate({
+    threadId: snapshot.thread.id,
+    sourceItemIds: ['portable'],
+    sourceHash: 'a'.repeat(64),
+    throughSequence: 1,
+    previousSummary: null,
+    turns: [],
+    items: [snapshot.items[0]!],
+    maximumSummaryTokens: 128,
+  })
+
+  assert.ok(estimateUtf8Tokens(result.summary) <= 128)
+  assert.match(result.summary, /^BEGIN-/)
+  assert.match(result.summary, /-END$/)
+  assert.match(result.summary, /middle omitted to enforce Baton summary limit/)
+  assert.match(String(adapter.requestSeen?.input[0]?.payload.text), /never exceed 128 tokens/)
+})
+
 class SummaryAdapter implements SessionProviderAdapter {
   readonly provider = 'claude' as const
   requestSeen: CanonicalTurnRequest | null = null
@@ -186,9 +217,11 @@ class SummaryAdapter implements SessionProviderAdapter {
   snapshotSeen: ThreadSnapshot | null = null
   contextSeen: ProviderExecutionContext | null = null
   failuresRemaining: number
+  readonly responseText: string
 
-  constructor(failuresRemaining = 0) {
+  constructor(failuresRemaining = 0, responseText = 'portable compact state') {
     this.failuresRemaining = failuresRemaining
+    this.responseText = responseText
   }
 
   async initialize(): Promise<AdapterHandshake> {
@@ -232,10 +265,11 @@ class SummaryAdapter implements SessionProviderAdapter {
         dispose: async () => undefined,
       }
     }
+    const responseText = this.responseText
     const events = (async function* (): AsyncIterable<NativeProviderEvent> {
       yield {
         eventId: 'summary', type: 'assistant', durability: 'durable',
-        payload: { text: 'portable compact state' },
+        payload: { text: responseText },
       }
     })()
     return {
@@ -260,7 +294,8 @@ function fixtureSnapshot(): ThreadSnapshot {
   return {
     session: {
       id: 'session', title: null, preview: null, activeThreadId: 'thread', projectKey: null,
-      cwd: null, schemaVersion: 1, createdAt: '2026-07-19T00:00:00.000Z',
+      cwd: null, permissions: { defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global' },
+      schemaVersion: 1, createdAt: '2026-07-19T00:00:00.000Z',
       updatedAt: '2026-07-19T00:00:00.000Z', archivedAt: null, workStatus: 'idle', source: null,
     },
     thread: {

@@ -65,6 +65,9 @@ const session: CanonicalSession = {
   activeThreadId: thread.id,
   projectKey: null,
   cwd: null,
+  permissions: {
+    defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global',
+  },
   schemaVersion: 1,
   createdAt: now,
   updatedAt: now,
@@ -170,6 +173,8 @@ class TestConversationService implements ConversationService {
   reconciledInput: ReconcileToolInput | null = null
   listedScope: SessionListScope | null = null
   workspaceInput: { sessionId: string; expectedRevision: number; cwd: string | null } | null = null
+  permissionInput: { sessionId: string; profile: 'read_only' | 'workspace' | 'full_access' | null } | null = null
+  permissionDefault: 'read_only' | 'workspace' | 'full_access' = 'workspace'
   goal: CanonicalGoal | null = null
   followUpInput: SubmitFollowUpInput | null = null
 
@@ -191,6 +196,33 @@ class TestConversationService implements ConversationService {
 
   getSession(sessionId: string): CanonicalSession | null {
     return this.sessions.find((candidate) => candidate.id === sessionId) ?? null
+  }
+
+  getPermissionSettings() {
+    return { defaultProfile: this.permissionDefault, updatedAt: now }
+  }
+
+  updateDefaultPermissionProfile(profile: 'read_only' | 'workspace' | 'full_access') {
+    this.permissionDefault = profile
+    return this.getPermissionSettings()
+  }
+
+  updateSessionPermissionProfile(
+    sessionId: string,
+    profile: 'read_only' | 'workspace' | 'full_access' | null,
+  ): CanonicalSession {
+    this.permissionInput = { sessionId, profile }
+    const found = this.getSession(sessionId)
+    if (!found) throw new SessionStoreError('not_found', 'session not found')
+    return {
+      ...found,
+      permissions: {
+        defaultProfile: this.permissionDefault,
+        override: profile,
+        effectiveProfile: profile ?? this.permissionDefault,
+        source: profile === null ? 'global' : 'session_override',
+      },
+    }
   }
 
   archiveSession(sessionId: string): CanonicalSession {
@@ -619,6 +651,16 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
     assert.equal(snapshot.status, 200)
     assert.equal(((await json(snapshot)).thread as Record<string, unknown>).revision, 0)
 
+    service.items = [
+      { ...item, id: 'item-1', sequence: 1 },
+      { ...item, id: 'item-2', sequence: 2 },
+    ]
+    const boundedSnapshot = await fetch(`${baseUrl}/threads/${thread.id}?itemLimit=1`)
+    assert.equal(boundedSnapshot.status, 200)
+    assert.deepEqual((await json(boundedSnapshot)).items, [service.items[1]])
+    const invalidSnapshotLimit = await fetch(`${baseUrl}/threads/${thread.id}?itemLimit=1001`)
+    assert.equal(invalidSnapshotLimit.status, 400)
+
     const missingThread = await fetch(`${baseUrl}/threads/missing`)
     assert.equal(missingThread.status, 404)
     assert.deepEqual(await json(missingThread), { code: 'not_found', error: 'thread not found' })
@@ -641,6 +683,38 @@ test('session routes parse JSON, list sessions, and return deterministic errors'
       code: 'invalid_json',
       error: 'request body is not valid JSON',
     })
+  })
+})
+
+test('permission routes validate global defaults and nullable session overrides', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl) => {
+    const initial = await fetch(`${baseUrl}/permissions`)
+    assert.deepEqual(await initial.json(), { defaultProfile: 'workspace', updatedAt: now })
+    const global = await fetch(`${baseUrl}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ defaultProfile: 'full_access' }),
+    })
+    assert.equal(global.status, 200)
+    assert.equal((await json(global)).defaultProfile, 'full_access')
+    const override = await fetch(`${baseUrl}/sessions/${session.id}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ profile: 'read_only' }),
+    })
+    assert.equal(override.status, 200)
+    assert.deepEqual(service.permissionInput, { sessionId: session.id, profile: 'read_only' })
+    const inherit = await fetch(`${baseUrl}/sessions/${session.id}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ profile: null }),
+    })
+    assert.equal(inherit.status, 200)
+    assert.deepEqual(service.permissionInput, { sessionId: session.id, profile: null })
+    const invalid = await fetch(`${baseUrl}/permissions`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ defaultProfile: 'unsafe' }),
+    })
+    assert.equal(invalid.status, 400)
+    assert.equal((await json(invalid)).code, 'invalid_request')
   })
 })
 

@@ -152,7 +152,8 @@ export function AddAccountWizard({
   useEffect(() => {
     if (step !== "wait" || !oauthState) return
     let active = true
-    const id = window.setInterval(async () => {
+    let timeoutId: number | undefined
+    const poll = async () => {
       try {
         const res = await client.getAddStatus(provider, oauthState)
         if (!active) return
@@ -162,10 +163,14 @@ export function AddAccountWizard({
       } catch {
         // Transient poll failure — keep waiting.
       }
-    }, 2000)
+      if (active && !completedRef.current) {
+        timeoutId = window.setTimeout(poll, 2000)
+      }
+    }
+    timeoutId = window.setTimeout(poll, 2000)
     return () => {
       active = false
-      window.clearInterval(id)
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
     }
   }, [step, oauthState, provider, markComplete])
 

@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Target, Shield, Moon, Pause, Play, Crosshair, Trash2 } from 'lucide-react'
+import { Target, Shield, Moon, Pause, Play, Crosshair, RefreshCw, Star, Trash2 } from 'lucide-react'
 
 import type { Account, AccountQuota } from '@/api/types'
 import { cn } from '@/lib/utils'
@@ -21,9 +21,8 @@ import { QuotaBar } from '@/components/QuotaBar'
 
 /**
  * Honest account state — every value maps to a real backend fact, never an
- * inert "default" flag (CLIProxy round-robins all non-paused credentials; there
- * is no per-request default lever). See docs/DESIGN.md §5 and the default-concept
- * removal note.
+ * inert "default" flag. CLIProxy round-robins non-paused credentials, while a
+ * Baton Native backend may expose a real lowest-priority preferred account.
  *
  * - target        : engine's calculated first-ranked account (engine ON only;
  *                   CLIProxy request order is still determined by its strategy)
@@ -46,6 +45,8 @@ export interface AccountCardProps {
   onPause: () => void
   onResume: () => void
   onSolo: () => void
+  onRefreshEntitlements?: () => void
+  onPrefer?: () => void
   onRemove: () => void
 }
 
@@ -101,6 +102,8 @@ export function AccountCard({
   onPause,
   onResume,
   onSolo,
+  onRefreshEntitlements,
+  onPrefer,
   onRemove,
 }: AccountCardProps) {
   const [confirmOpen, setConfirmOpen] = React.useState(false)
@@ -141,6 +144,12 @@ export function AccountCard({
               {badge.label}
             </Badge>
           )}
+          {account.isDefault && onPrefer ? (
+            <Badge variant="outline" className="gap-1 text-ok">
+              <Star className="size-3" aria-hidden />
+              Native 우선계정
+            </Badge>
+          ) : null}
         </div>
 
         {/* Quota */}
@@ -158,8 +167,7 @@ export function AccountCard({
 
         <Separator />
 
-        {/* Actions — every control maps to a real backend op (pause/resume =
-            CLIProxy rotation membership). No "default" (inert for routing). */}
+        {/* Actions — every control maps to a real backend operation. */}
         <div className="flex flex-wrap items-center gap-2">
           {status === 'user-paused' ? (
             <Button variant="outline" size="sm" onClick={onResume}>
@@ -182,6 +190,18 @@ export function AccountCard({
               이 계정만
             </Button>
           )}
+          {onRefreshEntitlements ? (
+            <Button variant="outline" size="sm" onClick={onRefreshEntitlements}>
+              <RefreshCw className="size-3" aria-hidden />
+              엔트리먼트 새로고침
+            </Button>
+          ) : null}
+          {onPrefer && !account.isDefault && status === 'active' ? (
+            <Button variant="outline" size="sm" onClick={onPrefer}>
+              <Star className="size-3" aria-hidden />
+              우선계정으로
+            </Button>
+          ) : null}
           <Button
             variant="ghost"
             size="icon-sm"

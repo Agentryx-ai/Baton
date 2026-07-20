@@ -4,6 +4,7 @@ import type {
   AccountQuota,
   ClientIntegrationApplyResult,
   ClientIntegrationTarget,
+  ClaudeProxyMode,
   CodexIntegrationMode,
   PolicyProviderState,
   Provider,
@@ -17,6 +18,7 @@ import { usePolicy } from '@/hooks/usePolicy'
 import { useProxyStatus } from '@/hooks/useProxyStatus'
 import { usePolling } from '@/hooks/usePolling'
 import { Header } from '@/components/Header'
+import { ModelFallbackNotice } from '@/components/ModelFallbackNotice'
 import { AppNavigation, type AppView } from '@/components/AppNavigation'
 import { DashboardOverview } from '@/components/DashboardOverview'
 import { RotationPanel } from '@/components/RotationPanel'
@@ -41,8 +43,8 @@ function viewFromHash(): AppView {
 function App() {
   const [activeView, setActiveView] = useState<AppView>(viewFromHash)
   const { accounts, refresh: refreshAccounts } = useAccounts()
-  const { state: policy, setEnabled } = usePolicy()
-  const { status: proxy } = useProxyStatus()
+  const { state: policy, setEnabled, refresh: refreshPolicy } = usePolicy()
+  const { status: proxy, refresh: refreshProxyStatus } = useProxyStatus()
   const [wizardOpen, setWizardOpen] = useState(false)
   const [apiKey, setApiKey] = useState<string | null>(null)
   const [conversationPreferences, setConversationPreferences] = useState<SessionViewPreferences>(loadSessionViewPreferences)
@@ -130,12 +132,16 @@ function App() {
   const refreshAll = useCallback(() => {
     refreshAccounts()
     refreshQuotas()
+    refreshPolicy()
+    refreshProxyStatus()
     refreshRouting()
     refreshAffinity()
     refreshClientIntegration()
   }, [
     refreshAccounts,
     refreshQuotas,
+    refreshPolicy,
+    refreshProxyStatus,
     refreshRouting,
     refreshAffinity,
     refreshClientIntegration,
@@ -176,8 +182,9 @@ function App() {
   const onApplyClientIntegration = async (
     targets: ClientIntegrationTarget[],
     codexMode?: CodexIntegrationMode,
+    claudeProxyMode?: ClaudeProxyMode,
   ): Promise<ClientIntegrationApplyResult> => {
-    const result = await client.applyClientIntegration(targets, codexMode)
+    const result = await client.applyClientIntegration(targets, codexMode, claudeProxyMode)
     refreshClientIntegration()
     return result
   }
@@ -198,10 +205,34 @@ function App() {
       && codexIntegration
       && codexIntegration.configuration !== 'applied',
   )
+  const codexNativeApplied = codexIntegration?.configuration === 'applied'
+    && codexIntegration.codexMode === 'native-openai'
+  const claudeNativeApplied = clientIntegration?.targets.some((target) => (
+    target.target !== 'codex'
+    && target.configuration === 'applied'
+    && target.claudeProxyMode === 'native'
+  )) ?? false
+  const onPreferClaudeAccount = (accountId: string) => {
+    void client.preferAccount('claude', accountId).then(() => {
+      toast.success('Claude Native 우선계정을 변경했습니다.')
+      refreshAccounts()
+    }).catch((error) => {
+      toast.error(error instanceof Error ? error.message : String(error))
+    })
+  }
+  const onRefreshCodexEntitlements = (accountId: string) => {
+    void client.refreshCodexEntitlements(accountId).then(() => {
+      toast.success('Codex OAuth와 모델 엔트리먼트를 새로고침했습니다.')
+      refreshAll()
+    }).catch((error) => {
+      toast.error(error instanceof Error ? error.message : String(error))
+    })
+  }
 
   return (
     <div className="min-h-screen bg-background text-foreground">
       <Header proxy={proxy} onRefresh={refreshAll} />
+      <ModelFallbackNotice />
 
       {activeView !== 'conversations' && (
         <AppNavigation active={activeView} onNavigate={navigate} variant="mobile" />
@@ -252,6 +283,12 @@ function App() {
                 onPause={onPause}
                 onResume={onResume}
                 onSolo={onSolo}
+                onRefreshEntitlements={prov === 'codex' && codexNativeApplied
+                  ? onRefreshCodexEntitlements
+                  : undefined}
+                onPrefer={prov === 'claude' && claudeNativeApplied
+                  ? onPreferClaudeAccount
+                  : undefined}
                 onRemove={onRemove}
                 onAddAccount={onAddAccount}
               />

@@ -74,6 +74,26 @@ test('usage stays canonical but is summarized once outside the transcript', () =
   assert.equal(latestUsageSummary([turn]), '합계 12 · 입력 10 · 출력 2')
 })
 
+test('internal Goal continuation stays canonical without appearing as a user chat message', () => {
+  const internal = {
+    ...item({
+      goalContinuation: true,
+      text: 'Continue working toward the active conversation Goal.',
+    }),
+    id: 'goal-continuation',
+    kind: 'user_message' as const,
+    visibility: 'baton_private' as const,
+  }
+  const user = {
+    ...item({ text: '계속 진행해 주세요.' }),
+    id: 'user-message',
+    kind: 'user_message' as const,
+  }
+
+  assert.deepEqual(transcriptItems([internal, user]), [user])
+  assert.deepEqual(conversationEntries([internal, user]).map((entry) => entry.item), [user])
+})
+
 test('tool calls and results become one compact transcript entry', () => {
   const call = {
     ...item({ callId: 'tool-1', name: 'read_file', arguments: { path: 'src/App.tsx' } }),

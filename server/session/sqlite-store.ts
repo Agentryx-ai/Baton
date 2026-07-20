@@ -29,11 +29,13 @@ import type {
   ExecutionPolicySnapshot,
   FailContextCompactionJobInput,
   FinishTurnInput,
+  GlobalPermissionSettings,
   GoalSchedulerLease,
   GoalId,
   GoalStatus,
   GoalStatusReason,
   NewCanonicalItem,
+  PermissionProfile,
   LdPlayerGrant,
   ProviderBinding,
   ProviderCapabilities,
@@ -75,6 +77,7 @@ import type {
   SessionListScope,
   SessionStore,
   UpdateWorkspaceInput,
+  UpdateSessionPermissionProfileInput,
   UpdateLdPlayerGrantInput,
   UpdateGoalStatusInput,
 } from './store.ts'
@@ -92,7 +95,8 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 16
+const SCHEMA_VERSION = 17
+const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace'
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
 const DEFAULT_GOAL_LEASE_MS = 30_000
@@ -1241,6 +1245,25 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 16')
         appliedVersion = 16
       }
+      if (appliedVersion < 17) {
+        const now = this.#now()
+        this.#db.exec(`
+          ALTER TABLE sessions ADD COLUMN permission_profile_override TEXT
+            CHECK(permission_profile_override IS NULL OR permission_profile_override IN ('read_only','workspace','full_access'));
+          CREATE TABLE permission_settings (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            default_profile TEXT NOT NULL CHECK(default_profile IN ('read_only','workspace','full_access')),
+            updated_at TEXT NOT NULL
+          ) STRICT;
+        `)
+        this.#db.prepare(`
+          INSERT INTO permission_settings(singleton,default_profile,updated_at) VALUES(1,?,?)
+        `).run(DEFAULT_PERMISSION_PROFILE, now)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(17, 'generic-permission-profiles', now)
+        this.#db.exec('PRAGMA user_version = 17')
+        appliedVersion = 17
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
@@ -1371,6 +1394,7 @@ export class SqliteSessionStore implements SessionStore {
     return this.#transaction('IMMEDIATE', () => {
       const replay = this.getInitialSessionResult(input)
       if (replay) return replay
+      this.#assertPermissionSnapshotCurrent(input.policySnapshot, null)
 
       const threadId = this.#idFactory()
       const turnId = this.#idFactory()
@@ -1549,6 +1573,50 @@ export class SqliteSessionStore implements SessionStore {
         connected: input.cwd !== null,
         previousConnected: session.cwd !== null,
         revision: thread.revision + 1,
+      }, now)
+      return this.getSession(session.id) as CanonicalSession
+    })
+  }
+
+  getPermissionSettings(): GlobalPermissionSettings {
+    const row = this.#one(this.#db.prepare(`
+      SELECT default_profile,updated_at FROM permission_settings WHERE singleton=1
+    `))
+    return {
+      defaultProfile: parsePermissionProfile(text(row, 'default_profile')),
+      updatedAt: text(row, 'updated_at'),
+    }
+  }
+
+  updateDefaultPermissionProfile(profile: PermissionProfile): GlobalPermissionSettings {
+    const validated = parsePermissionProfile(profile)
+    const now = this.#now()
+    this.#db.prepare(`
+      UPDATE permission_settings SET default_profile=?,updated_at=? WHERE singleton=1
+    `).run(validated, now)
+    return this.getPermissionSettings()
+  }
+
+  updateSessionPermissionProfile(input: UpdateSessionPermissionProfileInput): CanonicalSession {
+    return this.#transaction('IMMEDIATE', () => {
+      const session = this.getSession(input.sessionId)
+      if (!session) throw new SessionStoreError('not_found', `Session not found: ${input.sessionId}`)
+      if (session.archivedAt) throw new SessionStoreError('session_archived', 'Cannot change permissions for an archived session')
+      const thread = this.getThread(session.activeThreadId)
+      if (!thread) throw new Error('Corrupt database: active thread is missing')
+      if (thread.status !== 'idle') {
+        throw new SessionStoreError('session_busy', 'Permissions can only change while the current turn is idle')
+      }
+      const profile = input.profile === null ? null : parsePermissionProfile(input.profile)
+      if (session.permissions.override === profile) return session
+      const now = this.#now()
+      this.#db.prepare(`
+        UPDATE sessions SET permission_profile_override=?,updated_at=? WHERE id=?
+      `).run(profile, now, session.id)
+      this.#appendStreamEvent(session.id, thread.id, null, 'host_capability_changed', {
+        capability: 'permission_profile',
+        override: profile,
+        effectiveProfile: profile ?? this.getPermissionSettings().defaultProfile,
       }, now)
       return this.getSession(session.id) as CanonicalSession
     })
@@ -1786,13 +1854,16 @@ export class SqliteSessionStore implements SessionStore {
 
       const thread = this.getThread(input.threadId)
       if (!thread) throw new SessionStoreError('not_found', `Thread not found: ${input.threadId}`)
-      if (this.getSession(thread.sessionId)?.archivedAt) {
+      const session = this.getSession(thread.sessionId)
+      if (session?.archivedAt) {
         throw new SessionStoreError('session_archived', '휴지통의 대화에는 메시지를 보낼 수 없습니다.')
       }
       if (thread.revision !== input.expectedRevision) {
         throw new SessionStoreError('revision_conflict', `Expected revision ${input.expectedRevision}, got ${thread.revision}`)
       }
       if (thread.status !== 'idle') throw new SessionStoreError('turn_not_running', 'Thread already has an active turn')
+      if (!session) throw new Error('Corrupt database: turn session is missing')
+      this.#assertPermissionSnapshotCurrent(input.policySnapshot, session)
 
       const now = this.#now()
       const goalContext = input.goalContext ?? null
@@ -1902,6 +1973,7 @@ export class SqliteSessionStore implements SessionStore {
       const session = this.getSession(thread.sessionId)
       if (!session || session.archivedAt) throw new SessionStoreError('session_archived', 'Follow-up session is archived')
       if (thread.status !== 'idle') throw new SessionStoreError('turn_not_running', 'Thread already has an active turn')
+      this.#assertPermissionSnapshotCurrent(input.policySnapshot, session)
       const turnSequence = integer(this.#one(this.#db.prepare(
         'SELECT COALESCE(MAX(sequence),0)+1 AS next_sequence FROM turns WHERE thread_id=?',
       ), thread.id), 'next_sequence')
@@ -4677,6 +4749,22 @@ export class SqliteSessionStore implements SessionStore {
       }, now)
   }
 
+  #assertPermissionSnapshotCurrent(
+    policySnapshot: ExecutionPolicySnapshot,
+    session: CanonicalSession | null,
+  ): void {
+    if (policySnapshot.permissionProfile === undefined) return
+    const expectedProfile = session?.permissions.effectiveProfile ?? this.getPermissionSettings().defaultProfile
+    const expectedSource = session?.permissions.source ?? 'global'
+    if (policySnapshot.permissionProfile !== expectedProfile
+      || policySnapshot.permissionProfileSource !== expectedSource) {
+      throw new SessionStoreError(
+        'revision_conflict',
+        'Permission settings changed while the turn was starting; refresh and retry',
+      )
+    }
+  }
+
   #appendStreamEvent(
     sessionId: string,
     threadId: string,
@@ -4692,6 +4780,8 @@ export class SqliteSessionStore implements SessionStore {
 
   #session(row: SqlRow): CanonicalSession {
     const sourceProvider = nullableText(row, 'source_provider')
+    const defaultProfile = parsePermissionProfile(text(row, 'default_permission_profile'))
+    const permissionOverride = parseNullablePermissionProfile(row.permission_profile_override)
     return {
       id: text(row, 'id'),
       title: nullableText(row, 'title'),
@@ -4699,6 +4789,12 @@ export class SqliteSessionStore implements SessionStore {
       activeThreadId: text(row, 'active_thread_id'),
       projectKey: nullableText(row, 'project_key'),
       cwd: nullableText(row, 'cwd'),
+      permissions: {
+        defaultProfile,
+        override: permissionOverride,
+        effectiveProfile: permissionOverride ?? defaultProfile,
+        source: permissionOverride === null ? 'global' : 'session_override',
+      },
       ldPlayer: parseLdPlayerGrant(row.ldplayer_grant_json),
       schemaVersion: integer(row, 'schema_version'),
       createdAt: text(row, 'created_at'),
@@ -5076,6 +5172,7 @@ function sessionSelect(): string {
     SELECT s.*,
       (SELECT t.status FROM turns t WHERE t.thread_id=s.active_thread_id ORDER BY t.sequence DESC LIMIT 1) AS latest_turn_status,
       (SELECT g.status FROM goals g WHERE g.thread_id=s.active_thread_id) AS current_goal_status,
+      (SELECT ps.default_profile FROM permission_settings ps WHERE ps.singleton=1) AS default_permission_profile,
       (SELECT ns.provider FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_provider,
       (SELECT ns.source_client FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_client,
       (SELECT ns.source_alias FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_alias,
@@ -5084,6 +5181,17 @@ function sessionSelect(): string {
       (SELECT ns.cwd FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_cwd
     FROM sessions s
   `
+}
+
+function parsePermissionProfile(value: string): PermissionProfile {
+  if (value === 'read_only' || value === 'workspace' || value === 'full_access') return value
+  throw new Error(`Unsupported permission profile: ${value}`)
+}
+
+function parseNullablePermissionProfile(value: SqlRow[string]): PermissionProfile | null {
+  if (value === null || value === undefined) return null
+  if (typeof value !== 'string') throw new Error('Permission profile override must be text')
+  return parsePermissionProfile(value)
 }
 
 function visibleWorkStatus(row: SqlRow, imported: boolean): CanonicalSession['workStatus'] {

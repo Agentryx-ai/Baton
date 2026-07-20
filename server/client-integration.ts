@@ -10,6 +10,10 @@ import {
   writeFile,
 } from 'node:fs/promises'
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml'
+import {
+  loadNativeClaudeProxyConnection,
+  type NativeClaudeProxyConnection,
+} from './claude-native-runtime.ts'
 
 export type ClientKind =
   | 'claude-cli'
@@ -21,6 +25,7 @@ export type ClientKind =
 
 export type ClientIntegrationTarget = 'claude-cli' | 'claude-desktop' | 'codex'
 export type CodexIntegrationMode = 'custom-provider' | 'native-openai'
+export type ClaudeProxyMode = 'native' | 'cliproxy'
 
 export interface ClientProcess {
   pid: number
@@ -46,6 +51,7 @@ export interface ClientIntegrationTargetStatus {
   configuration: ClientIntegrationConfigurationState
   configurationDetail?: string
   codexMode?: CodexIntegrationMode
+  claudeProxyMode?: ClaudeProxyMode
 }
 
 export type ClientIntegrationConfigurationState =
@@ -105,6 +111,7 @@ export class ClientIntegrationError extends Error {
 const FAMILY_ORDER = ['opus', 'sonnet', 'haiku', 'fable'] as const
 const POWERSHELL = 'powershell.exe'
 const DEFAULT_CODEX_MODE: CodexIntegrationMode = 'custom-provider'
+const DEFAULT_CLAUDE_PROXY_MODE: ClaudeProxyMode = 'native'
 export const CODEX_NATIVE_PROXY_PATH = '/baton/inference/openai/v1'
 const TARGET_DEFINITIONS: ReadonlyArray<{
   target: ClientIntegrationTarget
@@ -124,6 +131,16 @@ export function codexNativeProxyBaseUrl(
   port: number = Number(process.env.BATON_PORT ?? 4400),
 ): string {
   return `http://127.0.0.1:${port}${CODEX_NATIVE_PROXY_PATH}`
+}
+
+interface ProxyConnection {
+  baseUrl: string
+  token: string
+  models: string[]
+}
+
+function asProxyConnection(connection: NativeClaudeProxyConnection): ProxyConnection {
+  return connection
 }
 
 function executableName(record: ProcessRecord): string {
@@ -201,9 +218,35 @@ export async function getClientIntegrationStatus(): Promise<ClientIntegrationSta
   }
 
   let targets = buildTargetStatuses(running, processError === undefined)
+  const [nativeResult, cliProxyResult] = await Promise.allSettled([
+    loadNativeClaudeProxyConnection(false),
+    loadProxyConnection(false),
+  ])
   try {
-    const proxy = await loadProxyConnection(false)
-    const configurations = await inspectTargetConfigurations(proxy.baseUrl, proxy.token)
+    let configurations: Map<ClientIntegrationTarget, ConfigurationInspection>
+    if (nativeResult.status === 'fulfilled') {
+      configurations = await inspectAllIntegrationConfigurations(
+        asProxyConnection(nativeResult.value),
+        cliProxyResult.status === 'fulfilled' ? cliProxyResult.value : null,
+      )
+    } else if (cliProxyResult.status === 'fulfilled') {
+      configurations = await inspectTargetConfigurations(
+        cliProxyResult.value,
+        cliProxyResult.value,
+        undefined,
+        'cliproxy',
+      )
+      for (const target of ['claude-cli', 'claude-desktop'] as const) {
+        const inspection = configurations.get(target)
+        if (inspection?.configuration === 'applied') {
+          configurations.set(target, { ...inspection, claudeProxyMode: 'cliproxy' })
+        }
+      }
+    } else {
+      throw new Error(
+        `Native: ${errorMessage(nativeResult.reason)} · CLIProxy: ${errorMessage(cliProxyResult.reason)}`,
+      )
+    }
     targets = targets.map((target) => ({ ...target, ...configurations.get(target.target) }))
   } catch (error) {
     const detail = `실제 설정 상태를 확인하지 못했습니다: ${errorMessage(error)}`
@@ -255,21 +298,46 @@ function compactProcessError(error: unknown): string {
 export async function applyClientIntegration(
   inputTargets?: unknown,
   inputCodexMode?: unknown,
+  inputClaudeProxyMode?: unknown,
 ): Promise<ClientIntegrationApplyResult> {
   const targets = parseIntegrationTargets(inputTargets)
   const codexMode = parseCodexIntegrationMode(inputCodexMode)
+  const claudeProxyMode = parseClaudeProxyMode(inputClaudeProxyMode)
   await requireTargetsStopped(targets)
 
+  const hasClaudeTarget = targets.includes('claude-cli') || targets.includes('claude-desktop')
   const needsClaudeModels = targets.includes('claude-desktop')
   const needsCodexEnvironment = targets.includes('codex') && codexMode === 'custom-provider'
-  const proxy = await loadProxyConnection(needsClaudeModels)
-  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'applyable', codexMode)
-  const models = needsClaudeModels ? selectClaudeModels(proxy.models) : []
+  const needsCliProxy = needsCodexEnvironment || (hasClaudeTarget && claudeProxyMode === 'cliproxy')
+  const cliProxy = needsCliProxy
+    ? await loadProxyConnection(needsClaudeModels && claudeProxyMode === 'cliproxy')
+    : null
+  const claudeConnection = hasClaudeTarget
+    ? claudeProxyMode === 'native'
+      ? asProxyConnection(await loadNativeClaudeProxyConnection(needsClaudeModels))
+      : cliProxy
+    : null
+  await requireConfigurationState(
+    targets,
+    claudeConnection,
+    cliProxy,
+    'applyable',
+    codexMode,
+    claudeProxyMode,
+  )
+  const models = needsClaudeModels ? selectClaudeModels(claudeConnection?.models ?? []) : []
   if (needsClaudeModels && models.length === 0) {
     throw new ClientIntegrationError(502, '프록시 모델 목록에서 Claude 모델을 찾지 못했습니다.')
   }
 
-  const files = await prepareFiles(targets, proxy.baseUrl, proxy.token, models, codexMode)
+  const files = await prepareFiles(
+    targets,
+    claudeConnection,
+    cliProxy,
+    models,
+    codexMode,
+    claudeProxyMode,
+  )
   await assertFilesUnlocked(files)
 
   // Close the race window as much as possible: process state is checked again
@@ -287,7 +355,8 @@ export async function applyClientIntegration(
       committed.push(file)
     }
     if (needsCodexEnvironment) {
-      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', proxy.token)
+      if (!cliProxy) throw new ClientIntegrationError(502, 'Codex용 CLIProxy 연결이 없습니다.')
+      await setUserEnvironmentVariable('BATON_PROXY_TOKEN', cliProxy.token)
     }
   } catch (error) {
     const rollbackErrors = await rollbackFiles(committed)
@@ -319,13 +388,39 @@ export async function removeClientIntegration(
   const targets = parseIntegrationTargets(inputTargets)
   await requireTargetsStopped(targets)
 
-  const proxy = await loadProxyConnection(false)
-  const current = await inspectTargetConfigurations(proxy.baseUrl, proxy.token)
+  const nativeConnection = asProxyConnection(await loadNativeClaudeProxyConnection(false))
+  const cliProxyResult = await loadProxyConnection(false).then(
+    (connection): ProxyConnection | null => connection,
+    (): ProxyConnection | null => null,
+  )
+  const current = await inspectAllIntegrationConfigurations(nativeConnection, cliProxyResult)
   const codexMode = targets.includes('codex')
     ? current.get('codex')?.codexMode ?? DEFAULT_CODEX_MODE
     : DEFAULT_CODEX_MODE
-  await requireConfigurationState(targets, proxy.baseUrl, proxy.token, 'applied', codexMode)
-  const files = await prepareRemovalFiles(targets, proxy.baseUrl, proxy.token, codexMode)
+  const selectedClaudeModes = new Set(targets
+    .filter((target): target is 'claude-cli' | 'claude-desktop' => target !== 'codex')
+    .map((target) => current.get(target)?.claudeProxyMode)
+    .filter((mode): mode is ClaudeProxyMode => mode !== undefined))
+  if (selectedClaudeModes.size > 1) {
+    throw new ClientIntegrationError(409, '선택한 Claude 클라이언트가 서로 다른 프록시 모드를 사용합니다. 하나씩 해제하세요.')
+  }
+  const selectedClaudeMode = selectedClaudeModes.values().next().value as ClaudeProxyMode | undefined
+  const claudeConnection = selectedClaudeMode === 'cliproxy' ? cliProxyResult : nativeConnection
+  await requireConfigurationState(
+    targets,
+    claudeConnection,
+    cliProxyResult,
+    'applied',
+    codexMode,
+    selectedClaudeMode,
+  )
+  const files = await prepareRemovalFiles(
+    targets,
+    claudeConnection,
+    cliProxyResult,
+    codexMode,
+    selectedClaudeMode,
+  )
   await assertFilesUnlocked(files)
   await requireTargetsStopped(targets)
 
@@ -389,6 +484,12 @@ export function parseCodexIntegrationMode(input: unknown): CodexIntegrationMode 
   if (input === undefined) return DEFAULT_CODEX_MODE
   if (input === 'custom-provider' || input === 'native-openai') return input
   throw new ClientIntegrationError(400, `올바르지 않은 Codex 통합 모드입니다: ${String(input)}`)
+}
+
+export function parseClaudeProxyMode(input: unknown): ClaudeProxyMode {
+  if (input === undefined) return DEFAULT_CLAUDE_PROXY_MODE
+  if (input === 'native' || input === 'cliproxy') return input
+  throw new ClientIntegrationError(400, `올바르지 않은 Claude 프록시 모드입니다: ${String(input)}`)
 }
 
 export function blockedProcessesForTargets(
@@ -501,7 +602,7 @@ function nestedString(object: Record<string, unknown>, keys: string[]): string |
 
 type ConfigurationInspection = Pick<
   ClientIntegrationTargetStatus,
-  'configuration' | 'configurationDetail' | 'codexMode'
+  'configuration' | 'configurationDetail' | 'codexMode' | 'claudeProxyMode'
 >
 
 /** Applying is a deterministic repair for partial/stale Baton-owned fields. */
@@ -513,12 +614,18 @@ export function canApplyConfiguration(
 
 async function requireConfigurationState(
   targets: ClientIntegrationTarget[],
-  baseUrl: string,
-  token: string,
+  claudeConnection: ProxyConnection | null,
+  codexConnection: ProxyConnection | null,
   expected: 'applied' | 'applyable',
   codexMode?: CodexIntegrationMode,
+  claudeProxyMode?: ClaudeProxyMode,
 ): Promise<void> {
-  const inspections = await inspectTargetConfigurations(baseUrl, token, codexMode)
+  const inspections = await inspectTargetConfigurations(
+    claudeConnection,
+    codexConnection,
+    codexMode,
+    claudeProxyMode,
+  )
   const invalid = targets
     .map((target) => ({ target, inspection: inspections.get(target)! }))
     .filter(({ target, inspection }) => expected === 'applied'
@@ -540,9 +647,10 @@ async function requireConfigurationState(
 }
 
 async function inspectTargetConfigurations(
-  baseUrl: string,
-  token: string,
+  claudeConnection: ProxyConnection | null,
+  codexConnection: ProxyConnection | null,
   codexMode?: CodexIntegrationMode,
+  claudeProxyMode?: ClaudeProxyMode,
 ): Promise<Map<ClientIntegrationTarget, ConfigurationInspection>> {
   const home = homedir()
   const claudeCli = path.join(home, '.claude', 'settings.json')
@@ -565,19 +673,32 @@ async function inspectTargetConfigurations(
 
   await Promise.all([
     inspect('claude-cli', async () => {
+      if (!claudeConnection) {
+        return { configuration: 'unknown', configurationDetail: 'Claude 프록시 연결을 확인하지 못했습니다.' }
+      }
       const source = await readOptional(claudeCli)
       return source.existed
-        ? inspectClaudeCliConfig(source.content, baseUrl, token)
+        ? inspectClaudeCliConfig(
+          source.content,
+          claudeConnection.baseUrl,
+          claudeProxyMode === 'native' ? null : claudeConnection.token,
+        )
         : { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
     }),
     inspect('claude-desktop', async () => {
+      if (!claudeConnection) {
+        return { configuration: 'unknown', configurationDetail: 'Claude 프록시 연결을 확인하지 못했습니다.' }
+      }
       const file = await findClaudeDesktopConfig()
       const source = await readOptional(file)
       return source.existed
-        ? inspectClaudeDesktopConfig(source.content, baseUrl, token)
+        ? inspectClaudeDesktopConfig(source.content, claudeConnection.baseUrl, claudeConnection.token)
         : { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
     }),
     inspect('codex', async () => {
+      if (!codexConnection) {
+        return { configuration: 'unknown', configurationDetail: 'CLIProxy 연결을 확인하지 못했습니다.' }
+      }
       const source = await readOptional(codex)
       if (!source.existed) {
         return { configuration: 'not-applied', configurationDetail: '설정 파일 없음' }
@@ -585,8 +706,8 @@ async function inspectTargetConfigurations(
       const environmentToken = await getUserEnvironmentVariable('BATON_PROXY_TOKEN')
       return inspectCodexIntegration(
         source.content,
-        `${baseUrl}/v1`,
-        token,
+        `${codexConnection.baseUrl}/v1`,
+        codexConnection.token,
         environmentToken,
         codexNativeProxyBaseUrl(),
         codexMode,
@@ -594,6 +715,46 @@ async function inspectTargetConfigurations(
     }),
   ])
 
+  return result
+}
+
+function chooseClaudeInspection(
+  native: ConfigurationInspection,
+  cliproxy: ConfigurationInspection,
+): ConfigurationInspection {
+  if (native.configuration === 'applied') return { ...native, claudeProxyMode: 'native' }
+  if (cliproxy.configuration === 'applied') return { ...cliproxy, claudeProxyMode: 'cliproxy' }
+  if (native.configuration === 'unknown' || cliproxy.configuration === 'unknown') {
+    return {
+      configuration: 'unknown',
+      configurationDetail: [native.configurationDetail, cliproxy.configurationDetail]
+        .filter(Boolean)
+        .join(' · '),
+    }
+  }
+  if (native.configuration === 'conflict' || cliproxy.configuration === 'conflict') {
+    return native.configuration === 'conflict' ? native : cliproxy
+  }
+  return { configuration: 'not-applied' }
+}
+
+async function inspectAllIntegrationConfigurations(
+  nativeConnection: ProxyConnection,
+  cliProxyConnection: ProxyConnection | null,
+  codexMode?: CodexIntegrationMode,
+): Promise<Map<ClientIntegrationTarget, ConfigurationInspection>> {
+  const [nativeInspections, cliProxyInspections] = await Promise.all([
+    inspectTargetConfigurations(nativeConnection, cliProxyConnection, codexMode, 'native'),
+    inspectTargetConfigurations(cliProxyConnection, cliProxyConnection, codexMode, 'cliproxy'),
+  ])
+  const result = new Map<ClientIntegrationTarget, ConfigurationInspection>()
+  for (const target of ['claude-cli', 'claude-desktop'] as const) {
+    result.set(target, chooseClaudeInspection(
+      nativeInspections.get(target)!,
+      cliProxyInspections.get(target)!,
+    ))
+  }
+  result.set('codex', cliProxyInspections.get('codex')!)
   return result
 }
 
@@ -667,7 +828,7 @@ function inspection(
 export function inspectClaudeCliConfig(
   content: string,
   baseUrl: string,
-  token: string,
+  token: string | null,
 ): ConfigurationInspection {
   const config = parseJsonObject(content, 'Claude CLI 설정')
   const env = config.env
@@ -678,7 +839,10 @@ export function inspectClaudeCliConfig(
   const present = 'ANTHROPIC_BASE_URL' in values || 'ANTHROPIC_AUTH_TOKEN' in values
   return inspection(
     present,
-    values.ANTHROPIC_BASE_URL === baseUrl && values.ANTHROPIC_AUTH_TOKEN === token,
+    values.ANTHROPIC_BASE_URL === baseUrl
+      && (token === null
+        ? !('ANTHROPIC_AUTH_TOKEN' in values)
+        : values.ANTHROPIC_AUTH_TOKEN === token),
     'Baton 소유 항목이 부분 적용되었거나 현재 프록시와 다릅니다.',
   )
 }
@@ -703,6 +867,41 @@ export function inspectClaudeDesktopConfig(
       && Array.isArray(config.inferenceModels),
     'Baton 소유 항목이 부분 적용되었거나 현재 프록시와 다릅니다.',
   )
+}
+
+export function patchClaudeCliConfig(content: string, baseUrl: string, token: string | null): string {
+  const config = parseJsonObject(content || '{}', 'Claude CLI 설정')
+  const existingEnv = config.env
+  if (existingEnv !== undefined && (!existingEnv || typeof existingEnv !== 'object' || Array.isArray(existingEnv))) {
+    throw new ClientIntegrationError(422, 'Claude CLI 설정의 env 값이 객체가 아니어서 안전하게 병합할 수 없습니다.')
+  }
+  const nextEnv: Record<string, unknown> = {
+    ...(existingEnv as Record<string, unknown> | undefined),
+    ANTHROPIC_BASE_URL: baseUrl,
+  }
+  if (token === null) delete nextEnv.ANTHROPIC_AUTH_TOKEN
+  else nextEnv.ANTHROPIC_AUTH_TOKEN = token
+  config.env = nextEnv
+  const result = `${JSON.stringify(config, null, 2)}\n`
+  parseJsonObject(result, '변경된 Claude CLI 설정')
+  return result
+}
+
+export function patchClaudeDesktopConfig(
+  content: string,
+  baseUrl: string,
+  token: string,
+  models: ClaudeDesktopModel[],
+): string {
+  const config = parseJsonObject(content, 'Claude Desktop 설정')
+  config.inferenceProvider = 'gateway'
+  config.inferenceCredentialKind = 'static'
+  config.inferenceGatewayBaseUrl = baseUrl
+  config.inferenceGatewayApiKey = token
+  config.inferenceModels = models
+  const result = `${JSON.stringify(config, null, 2)}\n`
+  parseJsonObject(result, '변경된 Claude Desktop 설정')
+  return result
 }
 
 export function inspectCodexConfig(
@@ -804,10 +1003,11 @@ function compareModelVersion(a: string, b: string): number {
 
 async function prepareFiles(
   targets: ClientIntegrationTarget[],
-  baseUrl: string,
-  token: string,
+  claudeConnection: ProxyConnection | null,
+  codexConnection: ProxyConnection | null,
   models: ClaudeDesktopModel[],
   codexMode: CodexIntegrationMode,
+  claudeProxyMode: ClaudeProxyMode,
 ): Promise<PreparedFile[]> {
   const home = homedir()
   const claudeCli = path.join(home, '.claude', 'settings.json')
@@ -815,19 +1015,13 @@ async function prepareFiles(
   const files: PreparedFile[] = []
 
   if (targets.includes('claude-cli')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const claudeSource = await readOptional(claudeCli)
-    const claudeConfig = parseJsonObject(claudeSource.content || '{}', 'Claude CLI 설정')
-    const existingEnv = claudeConfig.env
-    if (existingEnv !== undefined && (!existingEnv || typeof existingEnv !== 'object' || Array.isArray(existingEnv))) {
-      throw new ClientIntegrationError(422, 'Claude CLI 설정의 env 값이 객체가 아니어서 안전하게 병합할 수 없습니다.')
-    }
-    claudeConfig.env = {
-      ...(existingEnv as Record<string, unknown> | undefined),
-      ANTHROPIC_BASE_URL: baseUrl,
-      ANTHROPIC_AUTH_TOKEN: token,
-    }
-    const content = `${JSON.stringify(claudeConfig, null, 2)}\n`
-    parseJsonObject(content, '변경된 Claude CLI 설정')
+    const content = patchClaudeCliConfig(
+      claudeSource.content,
+      claudeConnection.baseUrl,
+      claudeProxyMode === 'native' ? null : claudeConnection.token,
+    )
     files.push({
       label: 'Claude CLI',
       target: claudeCli,
@@ -837,19 +1031,18 @@ async function prepareFiles(
   }
 
   if (targets.includes('claude-desktop')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const claudeDesktop = await findClaudeDesktopConfig()
     const desktopSource = await readOptional(claudeDesktop)
     if (!desktopSource.existed) {
       throw new ClientIntegrationError(422, 'Claude Desktop의 적용 대상 설정 파일이 사라졌습니다.')
     }
-    const desktopConfig = parseJsonObject(desktopSource.content, 'Claude Desktop 설정')
-    desktopConfig.inferenceProvider = 'gateway'
-    desktopConfig.inferenceCredentialKind = 'static'
-    desktopConfig.inferenceGatewayBaseUrl = baseUrl
-    desktopConfig.inferenceGatewayApiKey = token
-    desktopConfig.inferenceModels = models
-    const content = `${JSON.stringify(desktopConfig, null, 2)}\n`
-    parseJsonObject(content, '변경된 Claude Desktop 설정')
+    const content = patchClaudeDesktopConfig(
+      desktopSource.content,
+      claudeConnection.baseUrl,
+      claudeConnection.token,
+      models,
+    )
     files.push({
       label: 'Claude Desktop',
       target: claudeDesktop,
@@ -859,10 +1052,13 @@ async function prepareFiles(
   }
 
   if (targets.includes('codex')) {
+    if (codexMode === 'custom-provider' && !codexConnection) {
+      throw new ClientIntegrationError(502, 'Codex용 CLIProxy 연결이 없습니다.')
+    }
     const codexSource = await readOptional(codex)
     const content = codexMode === 'native-openai'
       ? patchCodexNativeConfig(codexSource.content, codexNativeProxyBaseUrl())
-      : patchCodexConfig(codexSource.content, `${baseUrl}/v1`)
+      : patchCodexConfig(codexSource.content, `${codexConnection!.baseUrl}/v1`)
     parseToml(content)
     files.push({
       label: 'Codex CLI/Desktop',
@@ -877,9 +1073,10 @@ async function prepareFiles(
 
 async function prepareRemovalFiles(
   targets: ClientIntegrationTarget[],
-  baseUrl: string,
-  token: string,
+  claudeConnection: ProxyConnection | null,
+  codexConnection: ProxyConnection | null,
   codexMode: CodexIntegrationMode,
+  claudeProxyMode?: ClaudeProxyMode,
 ): Promise<PreparedFile[]> {
   const home = homedir()
   const claudeCli = path.join(home, '.claude', 'settings.json')
@@ -887,29 +1084,36 @@ async function prepareRemovalFiles(
   const files: PreparedFile[] = []
 
   if (targets.includes('claude-cli')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const source = await readOptional(claudeCli)
     if (!source.existed) throw new ClientIntegrationError(409, 'Claude CLI 설정이 이미 없습니다.')
     files.push({
       label: 'Claude CLI',
       target: claudeCli,
-      content: removeClaudeCliConfig(source.content, baseUrl, token),
+      content: removeClaudeCliConfig(
+        source.content,
+        claudeConnection.baseUrl,
+        claudeProxyMode === 'native' ? null : claudeConnection.token,
+      ),
       existed: true,
     })
   }
 
   if (targets.includes('claude-desktop')) {
+    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
     const file = await findClaudeDesktopConfig()
     const source = await readOptional(file)
     if (!source.existed) throw new ClientIntegrationError(409, 'Claude Desktop 설정이 이미 없습니다.')
     files.push({
       label: 'Claude Desktop',
       target: file,
-      content: removeClaudeDesktopConfig(source.content, baseUrl, token),
+      content: removeClaudeDesktopConfig(source.content, claudeConnection.baseUrl, claudeConnection.token),
       existed: true,
     })
   }
 
   if (targets.includes('codex')) {
+    if (!codexConnection) throw new ClientIntegrationError(502, 'Codex용 CLIProxy 연결이 없습니다.')
     const source = await readOptional(codex)
     if (!source.existed) throw new ClientIntegrationError(409, 'Codex 설정이 이미 없습니다.')
     files.push({
@@ -917,7 +1121,7 @@ async function prepareRemovalFiles(
       target: codex,
       content: codexMode === 'native-openai'
         ? unpatchCodexNativeConfig(source.content, codexNativeProxyBaseUrl())
-        : unpatchCodexConfig(source.content, `${baseUrl}/v1`),
+        : unpatchCodexConfig(source.content, `${codexConnection.baseUrl}/v1`),
       existed: true,
     })
   }
@@ -925,7 +1129,7 @@ async function prepareRemovalFiles(
   return files
 }
 
-export function removeClaudeCliConfig(content: string, baseUrl: string, token: string): string {
+export function removeClaudeCliConfig(content: string, baseUrl: string, token: string | null): string {
   const config = parseJsonObject(content, 'Claude CLI 설정')
   const current = inspectClaudeCliConfig(content, baseUrl, token)
   if (current.configuration !== 'applied') {

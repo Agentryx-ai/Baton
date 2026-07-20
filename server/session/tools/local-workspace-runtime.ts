@@ -131,20 +131,62 @@ export class CodexSandboxCommandRunner implements SandboxCommandRunner {
   }
 }
 
+/** Executes argv directly on the local host. Selection of this runner is the full-access boundary. */
+export class FullAccessCommandRunner implements SandboxCommandRunner {
+  async run(request: SandboxCommandRequest): Promise<{ exitCode: number | null }> {
+    return await new Promise((resolve, reject) => {
+      const child = spawn(request.argv[0]!, [...request.argv.slice(1)], {
+        cwd: request.cwd,
+        env: fullAccessCommandEnvironment(),
+        windowsHide: true,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let settled = false
+      const finish = (callback: () => void): void => {
+        if (settled) return
+        settled = true
+        request.signal.removeEventListener('abort', abort)
+        callback()
+      }
+      const abort = (): void => {
+        if (child.exitCode !== null) return
+        if (process.platform === 'win32' && child.pid) {
+          const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+            windowsHide: true, shell: false, stdio: 'ignore',
+          })
+          killer.once('error', () => child.kill())
+        } else {
+          child.kill('SIGKILL')
+        }
+      }
+      child.stdout?.on('data', (chunk: Buffer) => request.onStdout(chunk))
+      child.stderr?.on('data', (chunk: Buffer) => request.onStderr(chunk))
+      child.once('error', (error) => finish(() => reject(error)))
+      child.once('close', (code) => finish(() => resolve({ exitCode: code })))
+      request.signal.addEventListener('abort', abort, { once: true })
+      if (request.signal.aborted) abort()
+    })
+  }
+}
+
 export interface LocalWorkspaceToolRuntimeOptions {
   cwd: string
   commandRunner?: SandboxCommandRunner
+  access?: 'read_only' | 'workspace'
   /** Commands stay unavailable unless a strict external-read sandbox has been verified by the host. */
   enableCommands?: boolean
   maxOutputBytes?: number
 }
 
 export class LocalWorkspaceToolRuntime {
+  readonly abortWaitsForTermination = true
   readonly definitions: readonly AgentToolDefinition[]
   readonly #cwd: string
   readonly #commandRunner: SandboxCommandRunner
   readonly #maxOutputBytes: number
   readonly #enableCommands: boolean
+  readonly #access: 'read_only' | 'workspace'
 
   constructor(options: LocalWorkspaceToolRuntimeOptions) {
     if (!path.isAbsolute(options.cwd)) throw new Error('LocalWorkspaceToolRuntime cwd must be absolute')
@@ -155,9 +197,15 @@ export class LocalWorkspaceToolRuntime {
     this.#cwd = path.resolve(options.cwd)
     this.#commandRunner = options.commandRunner ?? new CodexSandboxCommandRunner()
     this.#enableCommands = options.enableCommands === true
-    this.definitions = this.#enableCommands
-      ? LOCAL_WORKSPACE_TOOL_DEFINITIONS
-      : LOCAL_WORKSPACE_TOOL_DEFINITIONS.filter((definition) => definition.name !== 'run_command')
+    this.#access = options.access ?? 'workspace'
+    this.definitions = LOCAL_WORKSPACE_TOOL_DEFINITIONS.filter((definition) => {
+      if (!this.#enableCommands && definition.name === 'run_command') return false
+      if (this.#access === 'read_only'
+        && (definition.name === 'write_file' || definition.name === 'replace_text' || definition.name === 'run_command')) {
+        return false
+      }
+      return true
+    })
     this.#maxOutputBytes = options.maxOutputBytes ?? DEFAULT_OUTPUT_BYTES
   }
 
@@ -168,10 +216,16 @@ export class LocalWorkspaceToolRuntime {
         case 'read_file': return ok(await this.#readFile(validateReadFile(invocation.input), signal))
         case 'list_files': return ok(await this.#listFiles(validateListFiles(invocation.input), signal))
         case 'search_text': return ok(await this.#searchText(validateSearchText(invocation.input), signal))
-        case 'write_file': return ok(await this.#writeFile(validateWriteFile(invocation.input), signal))
-        case 'replace_text': return ok(await this.#replaceText(validateReplaceText(invocation.input), signal))
+        case 'write_file': {
+          if (this.#access === 'read_only') throw new ToolRuntimeError('tool_unavailable', 'write_file is unavailable in read-only mode', false)
+          return ok(await this.#writeFile(validateWriteFile(invocation.input), signal))
+        }
+        case 'replace_text': {
+          if (this.#access === 'read_only') throw new ToolRuntimeError('tool_unavailable', 'replace_text is unavailable in read-only mode', false)
+          return ok(await this.#replaceText(validateReplaceText(invocation.input), signal))
+        }
         case 'run_command': {
-          if (!this.#enableCommands) {
+          if (!this.#enableCommands || this.#access === 'read_only') {
             throw new ToolRuntimeError(
               'tool_unavailable',
               'run_command is disabled until the host verifies strict workspace-only read isolation',
@@ -334,68 +388,7 @@ export class LocalWorkspaceToolRuntime {
 
   async #runCommand(input: RunCommandInput, signal: AbortSignal): Promise<JsonObject> {
     const root = await this.#resolvePath('.', false)
-    const controller = new AbortController()
-    let timedOut = false
-    const forwardAbort = (): void => controller.abort(signal.reason)
-    signal.addEventListener('abort', forwardAbort, { once: true })
-    const timer = setTimeout(() => {
-      timedOut = true
-      controller.abort(new Error('tool timeout'))
-    }, input.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS)
-    let remaining = this.#maxOutputBytes
-    let truncated = false
-    const stdout: Buffer[] = []
-    const stderr: Buffer[] = []
-    const collect = (target: Buffer[], value: Uint8Array): void => {
-      const chunk = Buffer.from(value)
-      if (chunk.length > remaining) truncated = true
-      if (remaining > 0) {
-        const accepted = chunk.subarray(0, remaining)
-        if (accepted.length > 0) target.push(accepted)
-        remaining -= accepted.length
-      }
-    }
-    try {
-      let exitCode: number | null
-      try {
-        const result = await this.#commandRunner.run({
-          argv: input.argv,
-          cwd: root.absolute,
-          signal: controller.signal,
-          onStdout: (chunk) => collect(stdout, chunk),
-          onStderr: (chunk) => collect(stderr, chunk),
-        })
-        exitCode = result.exitCode
-      } catch (error) {
-        if (!timedOut) {
-          if (signal.aborted) throw new ToolRuntimeError('tool_aborted', 'Tool execution was cancelled', false)
-          throw error
-        }
-        exitCode = null
-      }
-      if (signal.aborted && !timedOut) {
-        throw new ToolRuntimeError('tool_aborted', 'Tool execution was cancelled', false)
-      }
-      const output = {
-        exitCode: timedOut ? null : exitCode,
-        stdout: safeOutputText(Buffer.concat(stdout)),
-        stderr: safeOutputText(Buffer.concat(stderr)),
-        timedOut,
-        truncated,
-      }
-      if (timedOut) {
-        throw new ToolRuntimeError(
-          'tool_timeout',
-          'Command exceeded its timeout and its process tree was terminated',
-          false,
-          output,
-        )
-      }
-      return output
-    } finally {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', forwardAbort)
-    }
+    return executeCommand(this.#commandRunner, root.absolute, input, signal, this.#maxOutputBytes)
   }
 
   async #atomicWrite(
@@ -504,6 +497,40 @@ export class LocalWorkspaceToolRuntime {
   }
 }
 
+/** Full-access command surface for conversations without a connected workspace. */
+export class HostCommandToolRuntime {
+  readonly abortWaitsForTermination = true
+  readonly definitions = Object.freeze([
+    LOCAL_WORKSPACE_TOOL_DEFINITIONS.find((definition) => definition.name === 'run_command')!,
+  ])
+  readonly #cwd: string
+  readonly #runner: SandboxCommandRunner
+  readonly #maxOutputBytes: number
+
+  constructor(options: { cwd?: string; commandRunner?: SandboxCommandRunner; maxOutputBytes?: number } = {}) {
+    this.#cwd = path.resolve(options.cwd ?? process.cwd())
+    this.#runner = options.commandRunner ?? new FullAccessCommandRunner()
+    this.#maxOutputBytes = options.maxOutputBytes ?? DEFAULT_OUTPUT_BYTES
+  }
+
+  async execute(invocation: AgentToolInvocation, signal: AbortSignal = NEVER_ABORTED_SIGNAL): Promise<AgentToolResult> {
+    try {
+      if (invocation.name !== 'run_command') {
+        throw new ToolRuntimeError('tool_not_found', `Unregistered tool: ${invocation.name}`, false)
+      }
+      return ok(await executeCommand(
+        this.#runner,
+        this.#cwd,
+        validateRunCommand(invocation.input),
+        signal,
+        this.#maxOutputBytes,
+      ))
+    } catch (error) {
+      return failure(normalizeError(error))
+    }
+  }
+}
+
 interface ResolvedWorkspacePath { absolute: string, relative: string }
 interface ReadFileInput { path: string, offset?: number, limit?: number }
 interface ListFilesInput { path?: string, maxEntries?: number }
@@ -599,6 +626,77 @@ function validateReplaceText(input: JsonObject): ReplaceTextInput {
     ...(input.expectedOccurrences === undefined ? {} : {
       expectedOccurrences: integer(input.expectedOccurrences, 'expectedOccurrences', 1, 1_000),
     }),
+  }
+}
+
+async function executeCommand(
+  runner: SandboxCommandRunner,
+  cwd: string,
+  input: RunCommandInput,
+  signal: AbortSignal,
+  maxOutputBytes: number,
+): Promise<JsonObject> {
+  const controller = new AbortController()
+  let timedOut = false
+  const forwardAbort = (): void => controller.abort(signal.reason)
+  signal.addEventListener('abort', forwardAbort, { once: true })
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort(new Error('tool timeout'))
+  }, input.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS)
+  let remaining = maxOutputBytes
+  let truncated = false
+  const stdout: Buffer[] = []
+  const stderr: Buffer[] = []
+  const collect = (target: Buffer[], value: Uint8Array): void => {
+    const chunk = Buffer.from(value)
+    if (chunk.length > remaining) truncated = true
+    if (remaining > 0) {
+      const accepted = chunk.subarray(0, remaining)
+      if (accepted.length > 0) target.push(accepted)
+      remaining -= accepted.length
+    }
+  }
+  try {
+    let exitCode: number | null
+    try {
+      const result = await runner.run({
+        argv: input.argv,
+        cwd,
+        signal: controller.signal,
+        onStdout: (chunk) => collect(stdout, chunk),
+        onStderr: (chunk) => collect(stderr, chunk),
+      })
+      exitCode = result.exitCode
+    } catch (error) {
+      if (!timedOut) {
+        if (signal.aborted) throw new ToolRuntimeError('tool_aborted', 'Tool execution was cancelled', false)
+        throw error
+      }
+      exitCode = null
+    }
+    if (signal.aborted && !timedOut) {
+      throw new ToolRuntimeError('tool_aborted', 'Tool execution was cancelled', false)
+    }
+    const output = {
+      exitCode: timedOut ? null : exitCode,
+      stdout: safeOutputText(Buffer.concat(stdout)),
+      stderr: safeOutputText(Buffer.concat(stderr)),
+      timedOut,
+      truncated,
+    }
+    if (timedOut) {
+      throw new ToolRuntimeError(
+        'tool_timeout',
+        'Command exceeded its timeout and its process tree was terminated',
+        false,
+        output,
+      )
+    }
+    return output
+  } finally {
+    clearTimeout(timer)
+    signal.removeEventListener('abort', forwardAbort)
   }
 }
 
@@ -775,6 +873,14 @@ function commandEnvironment(sandboxHome: string, commandTemp: string): NodeJS.Pr
   environment.USERPROFILE = sandboxHome
   environment.TEMP = commandTemp
   environment.TMP = commandTemp
+  return environment
+}
+
+function fullAccessCommandEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { ...process.env }
+  for (const key of Object.keys(environment)) {
+    if (/^(?:BATON_|GATEWAY_)/iu.test(key)) delete environment[key]
+  }
   return environment
 }
 

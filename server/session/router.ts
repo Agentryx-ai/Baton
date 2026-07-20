@@ -9,6 +9,7 @@ import type {
   CreateSessionInput,
   GoalObservation,
   NewCanonicalItem,
+  PermissionProfile,
 } from './domain.ts'
 import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
 import { WorkspaceRootError } from './workspace-root.ts'
@@ -40,7 +41,9 @@ const ITEM_KINDS = new Set<CanonicalItemKind>([
   'provider_event',
 ])
 const SSE_HEARTBEAT_MS = 15_000
+const MAX_SNAPSHOT_ITEM_LIMIT = 1_000
 const VISIBILITIES = new Set(['portable', 'provider_private', 'baton_private'])
+const PERMISSION_PROFILES = new Set<PermissionProfile>(['read_only', 'workspace', 'full_access'])
 
 export interface ConversationRouter extends Router {
   closeStreams(): void
@@ -176,6 +179,14 @@ function requiredProvider(body: Record<string, unknown>, key = 'provider'): Cano
     throw new RequestValidationError(`${key} must be claude, codex, or gemini`)
   }
   return value as CanonicalProvider
+}
+
+function permissionProfile(value: unknown, nullable = false): PermissionProfile | null {
+  if (nullable && value === null) return null
+  if (typeof value !== 'string' || !PERMISSION_PROFILES.has(value as PermissionProfile)) {
+    throw new RequestValidationError('profile must be read_only, workspace, full_access, or null')
+  }
+  return value as PermissionProfile
 }
 
 function parseGoalObservation(value: unknown): GoalObservation {
@@ -550,6 +561,16 @@ export function createConversationRouter(
   }))
   router.use(express.json({ limit: '2mb' }))
 
+  router.get('/permissions', route((_req, res) => {
+    res.json(service.getPermissionSettings())
+  }))
+
+  router.put('/permissions', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['defaultProfile'])
+    res.json(service.updateDefaultPermissionProfile(permissionProfile(body.defaultProfile) as PermissionProfile))
+  }))
+
   router.post(
     '/sessions',
     route((req, res) => {
@@ -582,6 +603,15 @@ export function createConversationRouter(
 
   router.post('/sessions/:sessionId/restore', route((req, res) => {
     res.json(service.restoreSession(pathParam(req, 'sessionId')))
+  }))
+
+  router.put('/sessions/:sessionId/permissions', route((req, res) => {
+    const body = bodyRecord(req.body)
+    requireOnlyKeys(body, ['profile'])
+    res.json(service.updateSessionPermissionProfile(
+      pathParam(req, 'sessionId'),
+      permissionProfile(body.profile, true),
+    ))
   }))
 
   router.put('/sessions/:sessionId/workspace', route((req, res) => {
@@ -763,14 +793,24 @@ export function createConversationRouter(
     res.json(session)
   })
 
-  router.get('/threads/:threadId', (req, res) => {
+  router.get('/threads/:threadId', route((req, res) => {
     const snapshot = service.getSnapshot(pathParam(req, 'threadId'))
     if (!snapshot) {
       res.status(404).json({ code: 'not_found', error: 'thread not found' })
       return
     }
-    res.json(snapshot)
-  })
+    const itemLimit = req.query.itemLimit === undefined
+      ? undefined
+      : parseRequiredQueryInteger(req.query.itemLimit, 'itemLimit')
+    if (itemLimit !== undefined && itemLimit > MAX_SNAPSHOT_ITEM_LIMIT) {
+      throw new RequestValidationError(`itemLimit must not exceed ${MAX_SNAPSHOT_ITEM_LIMIT}`)
+    }
+    res.json(itemLimit === undefined ? snapshot : {
+      ...snapshot,
+      items: snapshot.items.slice(-itemLimit),
+      itemsTruncated: snapshot.items.length > itemLimit,
+    })
+  }))
 
   router.get('/threads/:threadId/goal', (req, res) => {
     const threadId = pathParam(req, 'threadId')

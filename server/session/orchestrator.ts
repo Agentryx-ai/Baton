@@ -21,6 +21,8 @@ import type {
   CanonicalTurn,
   CreateSessionInput,
   FinishTurnInput,
+  GlobalPermissionSettings,
+  PermissionProfile,
   SessionId,
   ThreadId,
   ThreadSnapshot,
@@ -53,7 +55,11 @@ import {
   type GoalTerminalIntent,
   type ToolRuntime,
 } from './tool-coordinator.ts'
-import { LocalWorkspaceToolRuntime } from './tools/local-workspace-runtime.ts'
+import {
+  FullAccessCommandRunner,
+  HostCommandToolRuntime,
+  LocalWorkspaceToolRuntime,
+} from './tools/local-workspace-runtime.ts'
 import { CompositeToolRuntime } from './tools/composite-runtime.ts'
 import { LdPlayerHost, LdPlayerToolRuntime } from './tools/ldplayer-runtime.ts'
 import type { LocalImageArtifactStore } from './image-artifacts.ts'
@@ -146,7 +152,8 @@ export class TurnOrchestrator implements ConversationService {
     } catch (error) {
       throw new ProviderReadinessError(normalized.provider, { cause: error })
     }
-    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, null)
+    const permissionProfile = this.store.getPermissionSettings().defaultProfile
+    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, null, permissionProfile)
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
       ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
@@ -177,6 +184,8 @@ export class TurnOrchestrator implements ConversationService {
         cwd: workspaceCwd,
         maxDepth: 0,
         capabilityGrant: null,
+        permissionProfile,
+        permissionProfileSource: 'global',
       },
       budget: {
         ...(normalized.effort ? { effort: normalized.effort } : {}),
@@ -203,6 +212,15 @@ export class TurnOrchestrator implements ConversationService {
 
   listSessions(scope: SessionListScope = 'active'): CanonicalSession[] { return this.store.listSessions(scope) }
   getSession(sessionId: SessionId): CanonicalSession | null { return this.store.getSession(sessionId) }
+  getPermissionSettings(): GlobalPermissionSettings { return this.store.getPermissionSettings() }
+  updateDefaultPermissionProfile(profile: PermissionProfile): GlobalPermissionSettings {
+    return this.store.updateDefaultPermissionProfile(profile)
+  }
+  updateSessionPermissionProfile(sessionId: SessionId, profile: PermissionProfile | null): CanonicalSession {
+    const session = this.store.updateSessionPermissionProfile({ sessionId, profile })
+    this.events.publish(session.activeThreadId)
+    return session
+  }
   archiveSession(sessionId: SessionId): CanonicalSession { return this.store.archiveSession(sessionId) }
   restoreSession(sessionId: SessionId): CanonicalSession { return this.store.restoreSession(sessionId) }
   connectWorkspace(input: WorkspaceMutationInput): CanonicalSession {
@@ -470,7 +488,11 @@ export class TurnOrchestrator implements ConversationService {
         return false
       }
       const workspaceCwd = snapshot.session.cwd ? assertWorkspaceRoot(snapshot.session.cwd) : null
-      const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, snapshot.session.ldPlayer ?? null)
+      const workspaceRuntime = this.sessionToolRuntime(
+        workspaceCwd,
+        snapshot.session.ldPlayer ?? null,
+        snapshot.session.permissions.effectiveProfile,
+      )
       const toolDefinitions = [
         ...workspaceRuntime.definitions,
         ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
@@ -489,6 +511,8 @@ export class TurnOrchestrator implements ConversationService {
           capabilityGrant: snapshot.session.ldPlayer
             ? `ldplayer:${snapshot.session.ldPlayer.instanceIndex}`
             : null,
+          permissionProfile: snapshot.session.permissions.effectiveProfile,
+          permissionProfileSource: snapshot.session.permissions.source,
         },
         budget: { ...(prior.effort ? { effort: prior.effort } : {}), agentLoopLimits: DEFAULT_AGENT_LOOP_LIMITS, goalAutomatic: false },
       } as BeginTurnFromFollowUpInput)
@@ -553,7 +577,14 @@ export class TurnOrchestrator implements ConversationService {
     const workspaceCwd = beforeTurn?.session.cwd
       ? assertWorkspaceRoot(beforeTurn.session.cwd)
       : null
-    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, beforeTurn?.session.ldPlayer ?? null)
+    const permissionProfile = beforeTurn?.session.permissions.effectiveProfile
+      ?? this.store.getPermissionSettings().defaultProfile
+    const permissionProfileSource = beforeTurn?.session.permissions.source ?? 'global'
+    const workspaceRuntime = this.sessionToolRuntime(
+      workspaceCwd,
+      beforeTurn?.session.ldPlayer ?? null,
+      permissionProfile,
+    )
     const goalToolDefinitions = GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal')
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
@@ -590,6 +621,8 @@ export class TurnOrchestrator implements ConversationService {
         capabilityGrant: beforeTurn?.session.ldPlayer
           ? `ldplayer:${beforeTurn.session.ldPlayer.instanceIndex}`
           : null,
+        permissionProfile,
+        permissionProfileSource,
       },
       budget: {
         ...(input.effort ? { effort: input.effort } : {}),
@@ -641,6 +674,7 @@ export class TurnOrchestrator implements ConversationService {
       model: input.model,
       effort: input.effort ?? null,
       workspaceRuntime,
+      allowWorkspaceCommands: result.execution.policySnapshot.allowedTools.includes('run_command'),
       limits: DEFAULT_AGENT_LOOP_LIMITS,
       initialGoalObservation: result.turn.goalId === null || result.turn.goalRevision === null
         ? { kind: 'none' }
@@ -970,10 +1004,23 @@ export class TurnOrchestrator implements ConversationService {
     }
   }
 
-  private sessionToolRuntime(cwd: string | null, ldPlayer: LdPlayerGrant | null): ToolRuntime {
+  private sessionToolRuntime(
+    cwd: string | null,
+    ldPlayer: LdPlayerGrant | null,
+    profile: PermissionProfile,
+  ): ToolRuntime {
     const runtimes: ToolRuntime[] = []
-    if (cwd) runtimes.push(new LocalWorkspaceToolRuntime({ cwd }))
-    if (ldPlayer && this.hostRuntime) {
+    if (cwd) {
+      runtimes.push(new LocalWorkspaceToolRuntime({
+        cwd,
+        access: profile === 'read_only' ? 'read_only' : 'workspace',
+        enableCommands: profile !== 'read_only',
+        ...(profile === 'full_access' ? { commandRunner: new FullAccessCommandRunner() } : {}),
+      }))
+    } else if (profile === 'full_access') {
+      runtimes.push(new HostCommandToolRuntime())
+    }
+    if (profile !== 'read_only' && ldPlayer && this.hostRuntime) {
       runtimes.push(new LdPlayerToolRuntime(ldPlayer, this.hostRuntime.ldPlayer, this.hostRuntime.artifacts))
     }
     if (runtimes.length === 0) return NO_WORKSPACE_RUNTIME
@@ -1033,6 +1080,12 @@ export class TurnOrchestrator implements ConversationService {
       const stoppingError = terminal.status === 'cancelled' || terminal.status === 'interrupted'
         ? { ...(terminal.error ?? {}), code: terminal.error?.code ?? 'runtime_interrupted' }
         : terminal.error
+      if (automatic && stoppingError?.code === 'provider_retry_exhausted') {
+        await delay(transientGoalRetryDelay(accounted.goal.automaticTurnsUsed))
+        await this.goalRuntime.notifyThreadIdle(turn.threadId)
+        this.events.publish(turn.threadId)
+        return
+      }
       this.stopGoalForTerminal(accounted.goal, stoppingError)
       this.events.publish(turn.threadId)
       return
@@ -1434,6 +1487,14 @@ function budgetLimitReason(code: string): string | null {
   if (code === 'goal_token_limit') return 'goal_token_limit'
   if (code === 'goal_time_limit') return 'goal_time_limit'
   return null
+}
+
+function transientGoalRetryDelay(automaticTurnsUsed: number): number {
+  return Math.min(5_000, 250 * (2 ** Math.min(automaticTurnsUsed, 4)))
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 class GoalExecutionLimitError extends Error {

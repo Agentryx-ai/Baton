@@ -15,6 +15,8 @@ import type {
   ThreadSnapshot,
   TurnId,
   LdPlayerGrant,
+  GlobalPermissionSettings,
+  PermissionProfile,
 } from './domain.ts'
 import type {
   ClearGoalInput,
@@ -93,6 +95,9 @@ export interface ConversationService {
   startSession(input: StartSessionInput): Promise<BeginSessionResult>
   listSessions(scope?: SessionListScope): CanonicalSession[]
   getSession(sessionId: SessionId): CanonicalSession | null
+  getPermissionSettings(): GlobalPermissionSettings
+  updateDefaultPermissionProfile(profile: PermissionProfile): GlobalPermissionSettings
+  updateSessionPermissionProfile(sessionId: SessionId, profile: PermissionProfile | null): CanonicalSession
   archiveSession(sessionId: SessionId): CanonicalSession
   restoreSession(sessionId: SessionId): CanonicalSession
   connectWorkspace(input: WorkspaceMutationInput): CanonicalSession

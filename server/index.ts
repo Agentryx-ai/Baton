@@ -17,14 +17,37 @@ import { fetchGateway, sessionStatus } from './gateway-session.ts'
 import { batonRouter } from './baton-routes.ts'
 import { createHostRouter } from './host-routes.ts'
 import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
-import { createOpenAiInferenceBridge } from './openai-inference-bridge.ts'
+import { createCodexNativeProxy } from './codex-native-proxy.ts'
+import { codexNativeRuntime } from './codex-native-runtime.ts'
+import { CodexNativeOAuthManager } from './codex-native-oauth.ts'
+import { createCodexNativeAccountRouter } from './codex-native-account-routes.ts'
 import { createClaudeQuotaEnricher } from './claude-quota-enrichment.ts'
+import { CLAUDE_NATIVE_PROXY_PATH, createClaudeNativeProxy } from './claude-native-proxy.ts'
+import { createClaudeNativeAccountRouter } from './claude-native-account-routes.ts'
+import {
+  claudeNativeAccountVault,
+  claudeNativeOAuthManager,
+  ensureNativeClaudeAccounts,
+  claudeQuotaPreflight,
+  loadNativeClaudeAccountCredential,
+  loadNativeClaudeCredentialCandidates,
+  loadNativeClaudeProxyConnection,
+} from './claude-native-runtime.ts'
 import { policyEngine } from './policy-engine.ts'
 import { createConversationRuntime } from './session/runtime.ts'
+import { ModelFallbackRuntime, modelFallbackStatePath } from './model-fallback-runtime.ts'
+import { createModelFallbackRouter } from './model-fallback-routes.ts'
+import { NativeProxyHealthTracker } from './native-proxy-health.ts'
 
 const app = express()
 const conversationRuntime = createConversationRuntime({ dataDir: config.dataDir })
 const enrichClaudeQuota = createClaudeQuotaEnricher({ fetchGateway })
+const codexNativeOAuthManager = new CodexNativeOAuthManager({ vault: codexNativeRuntime.vault })
+const modelFallbackRuntime = new ModelFallbackRuntime({
+  filePath: modelFallbackStatePath(config.dataDir),
+})
+const claudeNativeHealth = new NativeProxyHealthTracker({ provider: 'claude' })
+const codexNativeHealth = new NativeProxyHealthTracker({ provider: 'codex' })
 
 // Canonical JSON routes must consume their body before the raw gateway proxy middleware.
 app.use('/baton/v1', conversationRuntime.router)
@@ -33,12 +56,46 @@ app.use('/baton/v1', conversationRuntime.router)
 app.use(express.raw({ type: () => true, limit: '10mb' }))
 
 app.get('/baton/health', (_req, res) => {
-  res.json({ ok: true, gateway: config.gatewayUrl, session: sessionStatus() })
+  res.json({
+    ok: true,
+    gateway: config.gatewayUrl,
+    session: sessionStatus(),
+    nativeProxy: {
+      claude: claudeNativeHealth.snapshot(),
+      codex: codexNativeHealth.snapshot(),
+    },
+  })
 })
 
-// Preserve Codex's built-in `openai` provider identity while routing inference
-// through Baton's loopback-only CLIProxy connection.
-app.use(CODEX_NATIVE_PROXY_PATH, createOpenAiInferenceBridge())
+// Baton-owned Codex data plane. The legacy custom-provider mode still routes
+// directly to CLIProxy; only the explicit native-openai mode uses this path.
+app.use(CODEX_NATIVE_PROXY_PATH, createCodexNativeProxy({
+  loadAccounts: () => codexNativeRuntime.loadProxyAccounts(),
+  health: codexNativeHealth,
+}))
+app.use('/baton/codex-native', createCodexNativeAccountRouter({
+  runtime: codexNativeRuntime,
+  oauth: codexNativeOAuthManager,
+}))
+
+// Baton-owned Claude data plane. It is always available on the loopback-only
+// BFF, but Claude clients use it only after explicit integration selection.
+app.use(CLAUDE_NATIVE_PROXY_PATH, createClaudeNativeProxy({
+  loadCredentialCandidates: () => loadNativeClaudeCredentialCandidates(),
+  loadClientToken: async () => (await loadNativeClaudeProxyConnection(false)).token,
+  checkModelQuota: (model, credential) => claudeQuotaPreflight.check(model, credential),
+  modelFallback: modelFallbackRuntime,
+  health: claudeNativeHealth,
+}))
+app.use('/baton/claude-native', createClaudeNativeAccountRouter({
+  vault: claudeNativeAccountVault,
+  oauth: claudeNativeOAuthManager,
+  ensureAccounts: ensureNativeClaudeAccounts,
+  getQuota: async (accountId) => claudeQuotaPreflight.accountQuota(
+    await loadNativeClaudeAccountCredential(accountId),
+  ),
+}))
+app.use('/baton/model-fallback', createModelFallbackRouter(modelFallbackRuntime))
 
 // Policy engine control plane (/baton/policy ...).
 app.use(batonRouter)

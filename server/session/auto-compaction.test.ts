@@ -476,7 +476,8 @@ function makeSnapshot(turns: CanonicalTurn[], items: CanonicalItem[]): ThreadSna
   return {
     session: {
       id: 'session-1', title: null, preview: null, activeThreadId: 'thread-1', projectKey: null,
-      cwd: null, schemaVersion: 1, createdAt: '2026-07-19T00:00:00Z',
+      cwd: null, permissions: { defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global' },
+      schemaVersion: 1, createdAt: '2026-07-19T00:00:00Z',
       updatedAt: '2026-07-19T00:00:00Z', archivedAt: null, workStatus: 'idle',
     },
     thread: {

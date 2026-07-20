@@ -86,6 +86,8 @@ function downgradeEmptyDerivedSchemaToV13(path: string): void {
     )
     BEGIN SELECT RAISE(ABORT, 'invalid compaction job transition'); END;
     DELETE FROM schema_migrations WHERE version>=14;
+    DROP TABLE permission_settings;
+    ALTER TABLE sessions DROP COLUMN permission_profile_override;
     ALTER TABLE sessions DROP COLUMN ldplayer_grant_json;
     PRAGMA user_version=13;
   `)
@@ -127,7 +129,7 @@ function beginSessionInput(
   }
 }
 
-test('initial session materialization is atomic, idempotent, and keeps schema v16', (t) => {
+test('initial session materialization is atomic, idempotent, and keeps schema v17', (t) => {
   const path = databasePath(t)
   const store = new SqliteSessionStore(path, deterministicOptions())
   const input = beginSessionInput()
@@ -175,7 +177,7 @@ test('initial session materialization is atomic, idempotent, and keeps schema v1
     const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
     assert.equal(row.count, expected, table)
   }
-  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17)
   store.close()
 
   const reopened = new SqliteSessionStore(path, deterministicOptions())
@@ -273,7 +275,7 @@ function nativeCandidate(contents: string[], cwd: string, contentDigest: string)
   }
 }
 
-test('schema v1 migrates through v16 with host capability storage', (t) => {
+test('schema v1 migrates through v17 with host capability storage', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -314,10 +316,10 @@ test('schema v1 migrates through v16 with host capability storage', (t) => {
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -344,7 +346,7 @@ test('schema v1 migrates through v16 with host capability storage', (t) => {
   }).follow_up_window, 'closed')
 })
 
-test('schema v6 migrates to v16 in place and reopens without replaying migrations', (t) => {
+test('schema v6 migrates to v17 in place and reopens without replaying migrations', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -397,11 +399,11 @@ test('schema v6 migrates to v16 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -413,7 +415,7 @@ test('schema v6 migrates to v16 in place and reopens without replaying migration
     .get() as { count: number }).count, 1)
 })
 
-test('schema v10 rebuilds follow-up constraints through v16 with foreign keys and reopens once', (t) => {
+test('schema v10 rebuilds follow-up constraints through v17 with foreign keys and reopens once', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -446,7 +448,7 @@ test('schema v10 rebuilds follow-up constraints through v16 with foreign keys an
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17)
   assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
   assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
 })
@@ -467,6 +469,8 @@ test('schema v12 migrates once to immutable derived context tables and preserves
     DROP TABLE context_compactions;
     DROP TABLE context_compaction_jobs;
     DELETE FROM schema_migrations WHERE version>=13;
+    DROP TABLE permission_settings;
+    ALTER TABLE sessions DROP COLUMN permission_profile_override;
     ALTER TABLE sessions DROP COLUMN ldplayer_grant_json;
     PRAGMA user_version=12;
   `)
@@ -480,11 +484,11 @@ test('schema v12 migrates once to immutable derived context tables and preserves
 
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations WHERE version>=13 ORDER BY version')
       .all() as Array<{ version: number }>).map((row) => row.version),
-    [13, 14, 15, 16],
+    [13, 14, 15, 16, 17],
   )
   const tables = (inspected.prepare(`
     SELECT name FROM sqlite_schema WHERE type='table'
@@ -502,7 +506,7 @@ test('schema v12 migrates once to immutable derived context tables and preserves
   ])
 })
 
-test('schema v16 reopen fails closed when a derived-context protection trigger is missing', (t) => {
+test('schema v17 reopen fails closed when a derived-context protection trigger is missing', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   initial.close()
@@ -517,7 +521,7 @@ test('schema v16 reopen fails closed when a derived-context protection trigger i
   )
 })
 
-test('an empty released v13 database migrates through v16 and gains the authoritative frontier schema', (t) => {
+test('an empty released v13 database migrates through v17 and gains the authoritative frontier schema', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   const session = initial.createSession({ title: 'old-v13 sentinel' })
@@ -529,7 +533,7 @@ test('an empty released v13 database migrates through v16 and gains the authorit
   migrated.close()
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17)
   assert.ok((inspected.prepare(`
     SELECT 1 FROM pragma_table_info('context_compaction_jobs')
     WHERE name='expected_previous_artifact_id'
@@ -1398,6 +1402,76 @@ test('archiving an active session is rejected and does not interrupt its turn', 
   )
   assert.equal(store.getTurn(started.turn.id)?.status, 'running')
   assert.equal(store.getSession(session.id)?.archivedAt, null)
+})
+
+test('permission profiles inherit the global default, support session overrides, and persist', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  const inherited = store.createSession({ title: 'inherited' })
+  const overridden = store.createSession({ title: 'overridden' })
+  assert.equal(store.getPermissionSettings().defaultProfile, 'workspace')
+  assert.deepEqual(store.getSession(inherited.id)?.permissions, {
+    defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global',
+  })
+
+  store.updateDefaultPermissionProfile('full_access')
+  assert.equal(store.getSession(inherited.id)?.permissions.effectiveProfile, 'full_access')
+  const readOnly = store.updateSessionPermissionProfile({ sessionId: overridden.id, profile: 'read_only' })
+  assert.deepEqual(readOnly.permissions, {
+    defaultProfile: 'full_access', override: 'read_only', effectiveProfile: 'read_only', source: 'session_override',
+  })
+  store.updateDefaultPermissionProfile('workspace')
+  assert.equal(store.getSession(overridden.id)?.permissions.effectiveProfile, 'read_only')
+  assert.equal(store.updateSessionPermissionProfile({ sessionId: overridden.id, profile: null })
+    .permissions.effectiveProfile, 'workspace')
+  assert.throws(() => store.updateDefaultPermissionProfile('unsafe' as never), /unsupported permission profile/i)
+  store.updateSessionPermissionProfile({ sessionId: overridden.id, profile: 'full_access' })
+  store.close()
+
+  const reopened = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => reopened.close())
+  assert.equal(reopened.getPermissionSettings().defaultProfile, 'workspace')
+  assert.deepEqual(reopened.getSession(overridden.id)?.permissions, {
+    defaultProfile: 'workspace', override: 'full_access', effectiveProfile: 'full_access', source: 'session_override',
+  })
+})
+
+test('session permission override fails closed while a turn is active', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  assert.throws(
+    () => store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'full_access' }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'session_busy',
+  )
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  assert.equal(store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'full_access' })
+    .permissions.effectiveProfile, 'full_access')
+})
+
+test('turn creation rejects a permission snapshot made stale by a concurrent settings change', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const staleGlobal: ExecutionPolicySnapshot = {
+    ...policy, permissionProfile: 'workspace', permissionProfileSource: 'global',
+  }
+  store.updateDefaultPermissionProfile('full_access')
+  assert.throws(
+    () => store.beginTurn({ ...beginInput(session.activeThreadId), policySnapshot: staleGlobal }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict',
+  )
+
+  store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'read_only' })
+  const staleOverride: ExecutionPolicySnapshot = {
+    ...policy, permissionProfile: 'read_only', permissionProfileSource: 'session_override',
+  }
+  store.updateSessionPermissionProfile({ sessionId: session.id, profile: 'workspace' })
+  assert.throws(
+    () => store.beginTurn({ ...beginInput(session.activeThreadId, 'request-2', 'hash-2'), policySnapshot: staleOverride }),
+    (error: unknown) => error instanceof SessionStoreError && error.code === 'revision_conflict',
+  )
 })
 
 test('workspace mutation uses thread CAS, invalidates bindings, and blocks active Goals', (t) => {

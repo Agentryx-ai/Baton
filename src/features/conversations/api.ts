@@ -22,6 +22,8 @@ import type {
   ReconcileUnknownMutationResultDto,
   ImageArtifactRefDto,
   LdPlayerInstanceDto,
+  PermissionProfile,
+  PermissionSettingsDto,
 } from './types.ts'
 
 const BASE_PATH = '/baton/v1'
@@ -126,6 +128,19 @@ async function nativeImportPost<T>(path: string, body: unknown, retried = false)
 }
 
 export const conversationApi = {
+  getPermissionSettings: (): Promise<PermissionSettingsDto> => request('/permissions'),
+
+  updatePermissionSettings: (defaultProfile: PermissionProfile): Promise<PermissionSettingsDto> =>
+    request('/permissions', jsonRequest('PUT', { defaultProfile })),
+
+  updateSessionPermission: (
+    sessionId: string,
+    profile: PermissionProfile | null,
+  ): Promise<CanonicalSessionDto> => request(
+    `/sessions/${encodeURIComponent(sessionId)}/permissions`,
+    jsonRequest('PUT', { profile }),
+  ),
+
   listModels: (provider: string): Promise<{
     provider: string
     models: ProviderModelDescriptorDto[]
@@ -195,8 +210,8 @@ export const conversationApi = {
   disconnectWorkspace: (sessionId: string, expectedRevision: number): Promise<CanonicalSessionDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}/workspace`, jsonRequest('DELETE', { expectedRevision })),
 
-  getThread: (threadId: string): Promise<ThreadSnapshotDto> =>
-    request(`/threads/${encodeURIComponent(threadId)}`),
+  getThread: (threadId: string, itemLimit?: number): Promise<ThreadSnapshotDto> =>
+    request(`/threads/${encodeURIComponent(threadId)}${itemLimit === undefined ? '' : `?itemLimit=${itemLimit}`}`),
 
   getGoal: async (threadId: string): Promise<CanonicalGoalDto | null> => {
     const result = await request<{ goal: CanonicalGoalDto | null }>(`/threads/${encodeURIComponent(threadId)}/goal`)

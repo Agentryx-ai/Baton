@@ -5,6 +5,7 @@ export interface JsonObject {
 }
 
 export type CanonicalProvider = 'claude' | 'codex' | 'gemini'
+export type PermissionProfile = 'read_only' | 'workspace' | 'full_access'
 export type ThreadStatus = 'idle' | 'running' | 'blocked' | 'failed' | 'archived'
 export type TurnStatus =
   | 'queued'
@@ -57,6 +58,7 @@ export interface CanonicalSessionDto {
   activeThreadId: string
   projectKey: string | null
   cwd: string | null
+  permissions: SessionPermissionStateDto
   ldPlayer?: LdPlayerGrantDto | null
   schemaVersion: number
   createdAt: string
@@ -64,6 +66,18 @@ export interface CanonicalSessionDto {
   archivedAt: string | null
   workStatus: VisibleWorkStatus
   source?: NativeSessionSourceSummaryDto | null
+}
+
+export interface PermissionSettingsDto {
+  defaultProfile: PermissionProfile
+  updatedAt: string
+}
+
+export interface SessionPermissionStateDto {
+  defaultProfile: PermissionProfile
+  override: PermissionProfile | null
+  effectiveProfile: PermissionProfile
+  source: 'global' | 'session_override'
 }
 
 export interface LdPlayerGrantDto {
@@ -223,6 +237,7 @@ export interface ThreadSnapshotDto {
   thread: CanonicalThreadDto
   turns: CanonicalTurnDto[]
   items: CanonicalItemDto[]
+  itemsTruncated?: boolean
   bindings: JsonValue[]
   followUps?: CanonicalFollowUpDto[]
   goal?: CanonicalGoalDto | null

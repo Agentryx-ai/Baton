@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import type {
@@ -25,7 +25,6 @@ import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 import { hasPortableUserContent, imageAttachments, type ImageArtifactResolver } from './image-artifacts.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
-  'agents.enabled': false,
   web_search: 'disabled',
   project_doc_max_bytes: 0,
   'features.multi_agent': false,
@@ -247,8 +246,10 @@ export class CodexJsonlRpcClient {
       }
       buffer += decoder.decode()
       if (buffer.trim().length > 0) this.accept(JSON.parse(buffer) as RpcMessage)
-      this.failPending(new Error('Codex app-server stdout closed'))
-      this.messages.end()
+      const result = await this.process.exited
+      const error = new Error(`Codex app-server exited (${exitLabel(result)})`)
+      this.failPending(error)
+      this.messages.fail(error)
     } catch (error) {
       this.failPending(error)
       this.messages.fail(error)
@@ -282,9 +283,12 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   private readonly proxyConnectionProvider: (() => Promise<CodexProxyConnection>) | undefined
   private readonly isolatedCodexHome: string
   private readonly ownsIsolatedCodexHome: boolean
+  private readonly installsHardenedModelCatalog: boolean
   private readonly cacheIdentitySecret: Buffer | null
   private readonly imageArtifacts: ImageArtifactResolver | null
   private proxyConnection: CodexProxyConnection | null = null
+  private modelCatalogPath: string | null = null
+  private modelCatalogModelCount = 0
   private initializePromise: Promise<AdapterHandshake> | null = null
   private mcpDisableOverrides: Record<string, false> = {}
   private readonly active = new Set<ProviderTurnExecution>()
@@ -303,6 +307,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       throw new TypeError('Codex canonical cache identity secret must contain at least 32 bytes')
     }
     this.ownsIsolatedCodexHome = options.isolatedCodexHome === undefined && options.processFactory === undefined
+    this.installsHardenedModelCatalog = options.processFactory === undefined
     this.isolatedCodexHome = options.isolatedCodexHome
       ?? (options.processFactory
         ? path.join(tmpdir(), 'baton-codex-test-home')
@@ -407,7 +412,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         : this.proxyConnection
       process = this.processFactory(
         this.executable,
-        launchArgs(this.mcpDisableOverrides, executionConnection),
+        launchArgs(this.mcpDisableOverrides, executionConnection, this.modelCatalogPath),
         proxyEnvironment(executionConnection, this.isolatedCodexHome),
       )
     } catch (error) {
@@ -508,8 +513,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       disposed = true
       acceptingSteers = false
       await Promise.race([closeSteers(), delay(this.shutdownTimeoutMs)])
-      await process.closeInput().catch(() => undefined)
-      const exited = await Promise.race([
+      const inputClosed = await Promise.race([
+        process.closeInput().then(() => true, () => true),
+        delay(this.shutdownTimeoutMs).then(() => false),
+      ])
+      const exited = inputClosed && await Promise.race([
         process.exited.then(() => true, () => true),
         delay(this.shutdownTimeoutMs).then(() => false),
       ])
@@ -587,9 +595,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       void cancel('user_cancelled', 'Codex turn was cancelled by the caller').catch(() => undefined)
     }
     context.signal.addEventListener('abort', abortListener, { once: true })
-    turnTimer = setTimeout(() => {
-      void cancel('turn_time_limit', 'Codex turn exceeded the wall-clock limit').catch(() => undefined)
-    }, context.limits.turnTimeoutMs)
+    if (context.limits.turnTimeoutMs !== null) {
+      turnTimer = setTimeout(() => {
+        void cancel('turn_time_limit', 'Codex turn exceeded the wall-clock limit').catch(() => undefined)
+      }, context.limits.turnTimeoutMs)
+    }
     if (context.signal.aborted) {
       abortListener()
       return execution
@@ -698,7 +708,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 if (existing && existing.signature !== signature) {
                   throw capabilityViolation(`dynamic tool call id ${toolCall.callId} was reused with different input`)
                 }
-                if (!existing && modelRoundTrips + 1 >= context.limits.maxModelRoundTrips) {
+                if (!existing && context.limits.maxModelRoundTrips !== null
+                  && modelRoundTrips + 1 >= context.limits.maxModelRoundTrips) {
                   failLimit(
                     'model_round_limit',
                     'Codex requested a tool after the host model round-trip limit',
@@ -748,7 +759,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               if (!seenUsageTotals.has(roundIdentity)) {
                 seenUsageTotals.add(roundIdentity)
                 modelRoundTrips += 1
-                if (modelRoundTrips > context.limits.maxModelRoundTrips) {
+                if (context.limits.maxModelRoundTrips !== null
+                  && modelRoundTrips > context.limits.maxModelRoundTrips) {
                   failLimit('model_round_limit', 'Codex exceeded the observable model round-trip limit')
                   return
                 }
@@ -906,6 +918,16 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   }
 
   private async preflight(): Promise<AdapterHandshake> {
+    if (this.installsHardenedModelCatalog && this.modelCatalogPath === null) {
+      mkdirSync(this.isolatedCodexHome, { recursive: true })
+      const hardenedCatalog = installHardenedModelCatalog(
+        this.executable,
+        this.isolatedCodexHome,
+        this.shutdownTimeoutMs,
+      )
+      this.modelCatalogPath = hardenedCatalog.path
+      this.modelCatalogModelCount = hardenedCatalog.modelCount
+    }
     this.proxyConnection = this.proxyConnectionProvider
       ? await this.proxyConnectionProvider()
       : null
@@ -936,6 +958,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         mcpServersDisabled: Object.keys(this.mcpDisableOverrides).length,
         toolTransport: 'client-owned-dynamic-functions',
         providerLocalMetadataTools: ['update_plan'],
+        modelSelectedMultiAgent: this.modelCatalogPath === null
+          ? 'test-process-factory'
+          : `disabled-for-${this.modelCatalogModelCount}-models`,
         canonicalCacheIdentity: this.cacheIdentitySecret
           ? 'hmac-sha256-loopback-responses-bridge-v1'
           : 'disabled-no-installation-secret',
@@ -948,7 +973,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   ): Promise<{ initialized: JsonObject; configRead: JsonObject }> {
     const process = this.processFactory(
       this.executable,
-      launchArgs(overrides, this.proxyConnection),
+      launchArgs(overrides, this.proxyConnection, this.modelCatalogPath),
       proxyEnvironment(this.proxyConnection, this.isolatedCodexHome),
     )
     const client = new CodexJsonlRpcClient(process)
@@ -967,19 +992,78 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       )
       return { initialized, configRead }
     } finally {
-      await process.closeInput().catch(() => undefined)
-      const exited = await Promise.race([
-        process.exited.then(() => true, () => true),
+      const inputClosed = await Promise.race([
+        process.closeInput().then(() => true, () => true),
         delay(this.shutdownTimeoutMs).then(() => false),
       ])
-      if (!exited) await process.kill().catch(() => undefined)
+      if (!inputClosed) {
+        await process.kill().catch(() => undefined)
+      } else {
+        const exited = await Promise.race([
+          process.exited.then(() => true, () => true),
+          delay(this.shutdownTimeoutMs).then(() => false),
+        ])
+        if (!exited) await process.kill().catch(() => undefined)
+      }
     }
   }
+}
+
+export function hardenCodexModelCatalog(raw: string): { json: string; modelCount: number } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new Error('Codex model catalog was not valid JSON')
+  }
+  const catalog = asObject(parsed, 'Codex model catalog')
+  if (!Array.isArray(catalog.models) || catalog.models.length === 0) {
+    throw new Error('Codex model catalog did not contain any models')
+  }
+  const models = catalog.models.map((value, index) => {
+    const model = asObject(value, `Codex model catalog entry ${String(index)}`)
+    if (typeof model.slug !== 'string' || model.slug.trim().length === 0) {
+      throw new Error(`Codex model catalog entry ${String(index)} omitted its slug`)
+    }
+    return { ...model, multi_agent_version: 'disabled' }
+  })
+  return { json: JSON.stringify({ ...catalog, models }), modelCount: models.length }
+}
+
+function installHardenedModelCatalog(
+  executable: string,
+  isolatedCodexHome: string,
+  timeoutMs: number,
+): { path: string; modelCount: number } {
+  let raw: string | null = null
+  // The installed CLI's bundled catalog is deterministic and does not depend on
+  // the user's provider, credentials, gateway, or network availability.
+  for (const args of [['debug', 'models', '--bundled'], ['debug', 'models']] as const) {
+    try {
+      const invocation = resolveCodexInvocation(executable, args)
+      raw = execFileSync(invocation.executable, invocation.args, {
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: timeoutMs,
+      })
+      break
+    } catch {
+      // The online view is only a bounded compatibility fallback if this CLI
+      // version does not expose its bundled catalog.
+    }
+  }
+  if (raw === null) throw new Error('Codex model catalog could not be read for canonical hardening')
+  const hardened = hardenCodexModelCatalog(raw)
+  const target = path.join(isolatedCodexHome, 'baton-model-catalog.json')
+  writeFileSync(target, hardened.json, { encoding: 'utf8', mode: 0o600 })
+  return { path: target, modelCount: hardened.modelCount }
 }
 
 function launchArgs(
   additional: Record<string, false> = {},
   connection: CodexProxyConnection | null = null,
+  modelCatalogPath: string | null = null,
 ): string[] {
   const providerOverrides = connection ? {
     model_provider: 'baton',
@@ -994,6 +1078,7 @@ function launchArgs(
   } : {}
   const overrides = Object.entries({
     ...HARDENING_OVERRIDES,
+    ...(modelCatalogPath ? { model_catalog_json: modelCatalogPath } : {}),
     ...providerOverrides,
     ...additional,
   }).flatMap(([key, value]) => [
@@ -1231,8 +1316,15 @@ function isApprovalRequest(method: string): boolean {
 
 function normalizeTurnError(value: unknown): JsonObject | null {
   const error = asOptionalObject(value)
-  if (error?.codexErrorInfo !== 'usageLimitExceeded') return error
-  return { ...error, code: 'provider_usage_limit' }
+  if (error?.codexErrorInfo === 'usageLimitExceeded') {
+    return { ...error, code: 'provider_usage_limit' }
+  }
+  const message = typeof error?.message === 'string' ? error.message : ''
+  if (/unexpected status (?:408|409|5\d\d)\b/i.test(message)
+    || /(?:connection (?:termination|reset)|stream disconnected before completion)/i.test(message)) {
+    return { ...error, code: 'provider_retry_exhausted' }
+  }
+  return error
 }
 
 function terminalStatus(value: unknown): ProviderTerminalResult['status'] {

@@ -47,6 +47,8 @@ export interface ProviderSectionProps {
   onPause: (provider: Provider, accountId: string) => void
   onResume: (provider: Provider, accountId: string) => void
   onSolo: (provider: Provider, accountId: string) => void
+  onRefreshEntitlements?: (accountId: string) => void
+  onPrefer?: (accountId: string) => void
   onRemove: (provider: Provider, accountId: string) => void
   onAddAccount: (provider: Provider) => void
 }
@@ -60,6 +62,8 @@ export function ProviderSection({
   onPause,
   onResume,
   onSolo,
+  onRefreshEntitlements,
+  onPrefer,
   onRemove,
   onAddAccount,
 }: ProviderSectionProps) {
@@ -103,6 +107,12 @@ export function ProviderSection({
                 onPause={() => onPause(provider, account.id)}
                 onResume={() => onResume(provider, account.id)}
                 onSolo={() => onSolo(provider, account.id)}
+                onRefreshEntitlements={provider === 'codex' && onRefreshEntitlements
+                  ? () => onRefreshEntitlements(account.id)
+                  : undefined}
+                onPrefer={provider === 'claude' && onPrefer
+                  ? () => onPrefer(account.id)
+                  : undefined}
                 onRemove={() => onRemove(provider, account.id)}
               />
             )

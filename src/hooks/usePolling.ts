@@ -24,22 +24,27 @@ export function usePolling<T>(
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<Error | null>(null)
   const [loading, setLoading] = useState(false)
+  const requestSequence = useRef(0)
 
   // Keep the latest fn without retriggering the polling effect.
   const fnRef = useRef(fn)
   fnRef.current = fn
 
   const refresh = useCallback(() => {
+    const sequence = ++requestSequence.current
     setLoading(true)
     fnRef.current()
       .then((result) => {
+        if (sequence !== requestSequence.current) return
         setData(result)
         setError(null)
       })
       .catch((err: unknown) => {
+        if (sequence !== requestSequence.current) return
         setError(err instanceof Error ? err : new Error(String(err)))
       })
       .finally(() => {
+        if (sequence !== requestSequence.current) return
         setLoading(false)
       })
   }, [])
@@ -73,6 +78,7 @@ export function usePolling<T>(
 
     return () => {
       stop()
+      requestSequence.current += 1
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
   }, [intervalMs, refresh])

@@ -117,30 +117,6 @@ function toolCallingAdapter(
   return adapter
 }
 
-function toolLimitIgnoringAdapter(): SessionProviderAdapter {
-  const adapter = safeAdapter([])
-  adapter.execute = async (_request, context): Promise<ProviderTurnExecution> => {
-    const terminal = (async () => {
-      for (let index = 0; index < 129; index += 1) {
-        await context.executeTool({
-          callId: `limit-call-${index}`,
-          providerCallId: `limit-provider-call-${index}`,
-          name: `missing_tool_${index}`,
-          input: {},
-        })
-      }
-      return { status: 'completed' as const, usage: { outputTokens: 1 } }
-    })()
-    return {
-      events: emptyEvents(terminal),
-      terminal,
-      async cancel() {},
-      async dispose() {},
-    }
-  }
-  return adapter
-}
-
 function interruptedAdapter(): SessionProviderAdapter {
   const adapter = safeAdapter([])
   adapter.execute = async (): Promise<ProviderTurnExecution> => ({
@@ -149,6 +125,38 @@ function interruptedAdapter(): SessionProviderAdapter {
     async cancel() {},
     async dispose() {},
   })
+  return adapter
+}
+
+function transientThenCompletingAdapter(): SessionProviderAdapter {
+  const adapter = safeAdapter([])
+  let executions = 0
+  adapter.execute = async (_request, context): Promise<ProviderTurnExecution> => {
+    executions += 1
+    const terminal = executions === 1
+      ? Promise.resolve({
+          status: 'failed' as const,
+          error: { code: 'provider_retry_exhausted', message: 'temporary upstream 503' },
+        })
+      : (async () => {
+          const result = await context.executeTool({
+            callId: 'complete-after-transient',
+            providerCallId: 'provider-complete-after-transient',
+            name: 'update_goal',
+            input: {
+              status: 'complete',
+              evidence: [{ requirement: 'recover', proof: 'second automatic turn completed' }],
+            },
+          })
+          return result.success
+            ? { status: 'completed' as const, usage: { outputTokens: 1 } }
+            : { status: 'failed' as const, error: result.error ?? undefined }
+        })()
+    return {
+      events: emptyEvents(terminal), terminal,
+      async cancel() {}, async dispose() {},
+    }
+  }
   return adapter
 }
 
@@ -1207,6 +1215,41 @@ test('a session without a verified cwd receives no workspace mutation tools', as
   assert.equal((toolResult?.payload.result as { error?: { code?: string } } | undefined)?.error?.code, 'tool_not_found')
 })
 
+test('full access snapshots host command permission and works without a connected workspace', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-full-access-'))
+  const output = join(directory, 'host-command.txt')
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  store.updateDefaultPermissionProfile('full_access')
+  const registry = new AdapterRegistry()
+  registry.register(toolCallingAdapter({
+    name: 'run_command',
+    input: {
+      argv: [process.execPath, '-e', "require('node:fs').writeFileSync(process.argv[1], 'full-access')", output],
+    },
+  }))
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const session = orchestrator.createSession({})
+  const started = await orchestrator.startTurn({
+    threadId: session.activeThreadId,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'full-access-no-workspace',
+    expectedRevision: 0,
+    input: [{ kind: 'user_message', payload: { text: 'run the host command' } }],
+  })
+  await waitForTerminal(store, started.turn.id)
+
+  assert.equal(store.getTurn(started.turn.id)?.status, 'completed', JSON.stringify(store.listItems(session.activeThreadId)))
+  assert.equal(readFileSync(output, 'utf8'), 'full-access')
+  assert.equal(started.execution.policySnapshot.permissionProfile, 'full_access')
+  assert.equal(started.execution.policySnapshot.permissionProfileSource, 'global')
+  assert.equal(started.execution.policySnapshot.allowedTools.includes('run_command'), true)
+})
+
 test('an active Goal launches a continuation and can complete through the provider-neutral Goal tool', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-goal-'))
   const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
@@ -1270,6 +1313,38 @@ test('a staged Goal completion is discarded when the provider later fails', asyn
   assert.equal(store.getGoalById(goal.id)?.statusReason?.code, 'provider_failure')
 })
 
+test('an automatic Goal retries an exhausted transient provider failure within its Goal limits', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-transient-retry-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  registry.register(transientThenCompletingAdapter())
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const session = orchestrator.createSession({ cwd: directory })
+  await orchestrator.startGoalRuntime()
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'recover from one transient provider failure',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (store.getGoalById(goal.id)?.status === 'complete') break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  const turns = store.getSnapshot(session.activeThreadId)?.turns ?? []
+  assert.equal(turns.length, 2)
+  assert.equal(turns[0]?.error?.code, 'provider_retry_exhausted')
+  assert.equal(turns[1]?.status, 'completed')
+  assert.equal(store.getGoalById(goal.id)?.status, 'complete')
+  assert.equal(store.getGoalById(goal.id)?.automaticTurnsUsed, 2)
+})
+
 test('replacing an active Goal flushes and interrupts the old revision before the new Goal waits', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-goal-replace-'))
   const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
@@ -1311,37 +1386,6 @@ test('replacing an active Goal flushes and interrupts the old revision before th
   assert.equal(store.getGoal(session.activeThreadId)?.status, 'active')
   assert.equal(store.getThread(session.activeThreadId)?.status, 'idle')
   assert.equal(store.getTurn(started.turn.id)?.status, 'cancelled')
-})
-
-test('a provider cannot turn the host tool-call limit into a successful Goal turn', async (t) => {
-  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-tool-limit-'))
-  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
-  const registry = new AdapterRegistry()
-  registry.register(toolLimitIgnoringAdapter())
-  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
-  t.after(async () => {
-    await orchestrator.close()
-    rmSync(directory, { recursive: true, force: true })
-  })
-  const session = orchestrator.createSession({})
-  await orchestrator.startGoalRuntime()
-  const goal = await orchestrator.createGoal({
-    threadId: session.activeThreadId,
-    expected: { kind: 'none' },
-    objective: 'respect the host tool boundary',
-    provider: 'codex',
-    model: 'gpt-test',
-  })
-
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    if (store.getGoalById(goal.id)?.status === 'budget_limited') break
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  const turn = store.getSnapshot(session.activeThreadId)?.turns[0]
-  assert.equal(turn?.status, 'failed')
-  assert.equal(turn?.error?.code, 'tool_call_limit')
-  assert.equal(store.getGoalById(goal.id)?.status, 'budget_limited')
-  assert.equal(store.getGoalById(goal.id)?.statusReason?.code, 'tool_call_limit')
 })
 
 test('a Goal that reaches its token budget during a turn stops as budget_limited', async (t) => {

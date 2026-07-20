@@ -12,6 +12,7 @@ import {
   Paperclip,
   RefreshCw,
   Send,
+  ShieldCheck,
   Smartphone,
   Square,
   Trash2,
@@ -79,6 +80,7 @@ import type {
   ThreadSnapshotDto,
   ImageArtifactRefDto,
   LdPlayerInstanceDto,
+  PermissionProfile,
 } from './types'
 import { useConversationEvents } from './useConversationEvents'
 
@@ -124,6 +126,11 @@ function latestActiveTurn(turns: CanonicalTurnDto[]): CanonicalTurnDto | null {
 }
 
 const PROVIDERS: CanonicalProvider[] = ['codex', 'claude', 'gemini']
+const PERMISSION_LABEL: Record<PermissionProfile, string> = {
+  read_only: '읽기 전용',
+  workspace: '작업공간',
+  full_access: '전체 액세스',
+}
 const PROVIDER_NAME: Record<CanonicalProvider, string> = {
   codex: 'Codex',
   claude: 'Claude',
@@ -260,6 +267,20 @@ export function retainExplicitSessionSelection(
   return selectedSessionId !== null && sessions.some((session) => session.id === selectedSessionId)
     ? selectedSessionId
     : null
+}
+
+export function isConversationSelectionPending(
+  selectedSessionId: string | null,
+  snapshotSessionId: string | null,
+): boolean {
+  return selectedSessionId !== null && snapshotSessionId !== selectedSessionId
+}
+
+export function shouldApplyThreadSnapshot(
+  selectedSessionId: string | null,
+  snapshotSessionId: string,
+): boolean {
+  return selectedSessionId === snapshotSessionId
 }
 
 export interface UnknownMutationCall {
@@ -648,6 +669,10 @@ export function ConversationWorkspace({
   const [workspaceCwd, setWorkspaceCwd] = useState('')
   const [workspaceBusy, setWorkspaceBusy] = useState(false)
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
+  const [permissionDialogOpen, setPermissionDialogOpen] = useState(false)
+  const [permissionSelection, setPermissionSelection] = useState<PermissionProfile | 'global'>('global')
+  const [permissionBusy, setPermissionBusy] = useState(false)
+  const [permissionError, setPermissionError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [cancellingFollowUpId, setCancellingFollowUpId] = useState<string | null>(null)
@@ -680,6 +705,8 @@ export function ConversationWorkspace({
   const threadRequest = useRef(0)
   const sessionListRequest = useRef(0)
   const sessionListBusy = useRef(false)
+  const fullHistoryThreadId = useRef<string | null>(null)
+  const selectedSessionIdRef = useRef<string | null>(selectedSessionId)
   const draftSessionIdRef = useRef<string | null>(draft?.sessionId ?? null)
   const draftRef = useRef<ConversationDraft | null>(draft)
   const draftOpenRef = useRef(draftOpen)
@@ -692,6 +719,8 @@ export function ConversationWorkspace({
     () => sessions?.find((session) => session.id === selectedSessionId) ?? null,
     [selectedSessionId, sessions],
   )
+  selectedSessionIdRef.current = selectedSessionId
+  const selectionPending = isConversationSelectionPending(selectedSessionId, snapshot?.session.id ?? null)
   const isDraft = sessionScope === 'active' && draftOpen && draft !== null && selectedSessionId === null
   const draftSessionId = draft?.sessionId ?? null
   draftSessionIdRef.current = draftSessionId
@@ -791,7 +820,7 @@ export function ConversationWorkspace({
     }
   }, [currentCatalog, draft, draftOpen, model, provider])
 
-  const refreshThread = useCallback(async (): Promise<boolean> => {
+  const refreshThread = useCallback(async (fullHistory = false): Promise<boolean> => {
     const requestId = ++threadRequest.current
     if (!threadId) {
       setSnapshot(null)
@@ -800,8 +829,12 @@ export function ConversationWorkspace({
     }
     setLoadingThread(true)
     try {
-      const result = await conversationApi.getThread(threadId)
-      if (requestId === threadRequest.current) {
+      if (fullHistory) fullHistoryThreadId.current = threadId
+      const itemLimit = fullHistory || fullHistoryThreadId.current === threadId
+        ? undefined
+        : TRANSCRIPT_PAGE_SIZE
+      const result = await conversationApi.getThread(threadId, itemLimit)
+      if (shouldApplyThreadSnapshot(selectedSessionIdRef.current, result.session.id)) {
         setSnapshot(result)
         setSessions((current) => replaceSessionProjection(current, result.session))
         setError(null)
@@ -1021,6 +1054,31 @@ export function ConversationWorkspace({
       setWorkspaceError(errorMessage(cause))
     } finally {
       setWorkspaceBusy(false)
+    }
+  }
+
+  const openPermissionDialog = () => {
+    if (!snapshot) return
+    setPermissionSelection(snapshot.session.permissions.override ?? 'global')
+    setPermissionError(null)
+    setPermissionDialogOpen(true)
+  }
+
+  const updateSessionPermission = async () => {
+    if (!snapshot) return
+    setPermissionBusy(true)
+    setPermissionError(null)
+    try {
+      await conversationApi.updateSessionPermission(
+        snapshot.session.id,
+        permissionSelection === 'global' ? null : permissionSelection,
+      )
+      setPermissionDialogOpen(false)
+      await Promise.all([refreshThread(), refreshSessions(true)])
+    } catch (cause) {
+      setPermissionError(errorMessage(cause))
+    } finally {
+      setPermissionBusy(false)
     }
   }
 
@@ -1409,7 +1467,9 @@ export function ConversationWorkspace({
 
   const selectSession = (sessionId: string) => {
     setDraftOpen(false)
+    if (sessionId !== selectedSessionId) fullHistoryThreadId.current = null
     setSelectedSessionId(sessionId)
+    setSnapshot(null)
     setPrompt('')
     setAttachments([])
     setGoalPanelVersion(0)
@@ -1590,11 +1650,46 @@ export function ConversationWorkspace({
         onImported={refreshSessions}
       />
 
+      <Dialog open={permissionDialogOpen} onOpenChange={(open) => { if (!permissionBusy) setPermissionDialogOpen(open) }}>
+        <DialogContent className="max-w-md">
+          <DialogTitle>대화 권한</DialogTitle>
+          <DialogDescription>
+            이 대화의 다음 턴부터 적용합니다. 실행 중인 턴은 시작할 때 고정된 권한을 유지합니다.
+          </DialogDescription>
+          <div className="space-y-2">
+            <label className="flex items-start gap-2 rounded-xl border p-3 text-sm">
+              <input type="radio" name="session-permission" value="global" checked={permissionSelection === 'global'} onChange={() => setPermissionSelection('global')} />
+              <span><span className="block font-medium">전역 설정 따름</span><span className="text-xs text-muted-foreground">현재 {snapshot ? PERMISSION_LABEL[snapshot.session.permissions.defaultProfile] : ''}</span></span>
+            </label>
+            {(['read_only', 'workspace', 'full_access'] as const).map((profile) => (
+              <label key={profile} className="flex items-start gap-2 rounded-xl border p-3 text-sm">
+                <input type="radio" name="session-permission" value={profile} checked={permissionSelection === profile} onChange={() => setPermissionSelection(profile)} />
+                <span>
+                  <span className="block font-medium">{PERMISSION_LABEL[profile]}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {profile === 'read_only' ? '프로젝트 읽기·검색만 허용'
+                      : profile === 'workspace' ? '프로젝트 파일 변경과 샌드박스 명령 허용'
+                        : 'OS 샌드박스 없이 adb를 포함한 로컬 명령·네트워크 허용'}
+                  </span>
+                </span>
+              </label>
+            ))}
+          </div>
+          {permissionError ? <p role="alert" className="text-sm text-destructive">{permissionError}</p> : null}
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="ghost" disabled={permissionBusy} onClick={() => setPermissionDialogOpen(false)}>취소</Button>
+            <Button type="button" disabled={permissionBusy || snapshot?.thread.status !== 'idle'} onClick={() => void updateSessionPermission()}>
+              {permissionBusy ? '적용 중…' : snapshot?.thread.status !== 'idle' ? '현재 턴 종료 후 변경' : '적용'}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={ldPlayerDialogOpen} onOpenChange={(open) => { if (!ldPlayerBusy) setLdPlayerDialogOpen(open) }}>
         <DialogContent className="max-w-md">
           <DialogTitle>LDPlayer 연결</DialogTitle>
           <DialogDescription>
-            이 대화에 선택한 인스턴스의 시작, 화면 조작, 캡처 권한만 부여합니다. 임의 ADB 또는 셸 명령은 허용하지 않습니다.
+            제한 모드에서 화면 조작과 캡처를 구조화된 도구로 제공하는 선택 기능입니다. 전체 액세스에서는 이 연결 없이 adb와 LDPlayer 명령을 사용할 수 있습니다.
           </DialogDescription>
           {ldPlayerError ? <p role="alert" className="text-sm text-destructive">{ldPlayerError}</p> : null}
           <label className="space-y-1.5 text-sm">
@@ -1827,7 +1922,7 @@ export function ConversationWorkspace({
           </Button>
           <div className="min-w-0 flex-1">
             <h1 className="truncate text-sm font-semibold">
-              {selectedSession?.title || selectedSession?.preview || (sessionScope === 'trash' ? '휴지통' : '새 대화')}
+              {selectedSession?.title || selectedSession?.preview || (selectionPending ? '대화를 불러오는 중…' : sessionScope === 'trash' ? '휴지통' : '새 대화')}
             </h1>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -1836,6 +1931,12 @@ export function ConversationWorkspace({
               : isDraft ? <span>저장 전</span>
                 : snapshot ? <SessionStatus status={snapshot.session.workStatus} /> : <span>준비됨</span>}
             {sessionScope === 'active' ? <Badge variant="secondary" className="hidden sm:inline-flex">{PROVIDER_NAME[provider]}</Badge> : null}
+            {snapshot && sessionScope === 'active' ? (
+              <Button type="button" variant="ghost" size="xs" onClick={openPermissionDialog}>
+                <ShieldCheck aria-hidden />
+                {PERMISSION_LABEL[snapshot.session.permissions.effectiveProfile]}
+              </Button>
+            ) : null}
             {snapshot && sessionScope === 'active' ? (
               <Button type="button" variant="ghost" size="xs" onClick={openWorkspaceDialog}>
                 <FolderOpen aria-hidden />
@@ -1924,8 +2025,15 @@ export function ConversationWorkspace({
               </section>
             ) : null}
 
-            {loadingThread && !snapshot ? (
-              <p className="m-auto text-sm text-muted-foreground">대화를 불러오는 중…</p>
+            {selectionPending || (loadingThread && !snapshot) ? (
+              <div className="m-auto space-y-3 text-center">
+                <p className="text-sm text-muted-foreground">대화를 불러오는 중…</p>
+                {error && threadId ? (
+                  <Button type="button" size="sm" variant="outline" onClick={() => void refreshThread()}>
+                    다시 시도
+                  </Button>
+                ) : null}
+              </div>
             ) : !snapshot ? (
               <div className="m-auto max-w-md py-16 text-center">
                 <h2 className="text-2xl font-semibold tracking-tight">{sessionScope === 'trash' ? '휴지통이 비어 있습니다' : '무엇을 도와드릴까요?'}</h2>
@@ -1946,21 +2054,32 @@ export function ConversationWorkspace({
               </div>
             ) : (
               <div>
-                {transcriptEntries.hiddenCount > 0 ? (
+                {snapshot.itemsTruncated || transcriptEntries.hiddenCount > 0 ? (
                   <div className="mb-6 flex flex-col items-center gap-2 text-center">
                     <Button
                       type="button"
                       size="sm"
                       variant="outline"
-                      onClick={() => setTranscriptWindow({
-                        threadId,
-                        limit: transcriptLimit + TRANSCRIPT_PAGE_SIZE,
-                      })}
+                      disabled={loadingThread}
+                      onClick={() => {
+                        if (snapshot.itemsTruncated) {
+                          void refreshThread(true)
+                          return
+                        }
+                        setTranscriptWindow({
+                          threadId,
+                          limit: transcriptLimit + TRANSCRIPT_PAGE_SIZE,
+                        })
+                      }}
                     >
-                      이전 기록 {Math.min(TRANSCRIPT_PAGE_SIZE, transcriptEntries.hiddenCount)}개 더 보기
+                      {snapshot.itemsTruncated
+                        ? '이전 기록 불러오기'
+                        : `이전 기록 ${Math.min(TRANSCRIPT_PAGE_SIZE, transcriptEntries.hiddenCount)}개 더 보기`}
                     </Button>
                     <p className="text-xs text-muted-foreground">
-                      빠른 표시를 위해 이전 기록 {transcriptEntries.hiddenCount}개를 접었습니다.
+                      {snapshot.itemsTruncated
+                        ? '빠른 표시를 위해 최근 기록부터 불러왔습니다.'
+                        : `빠른 표시를 위해 이전 기록 ${transcriptEntries.hiddenCount}개를 접었습니다.`}
                     </p>
                   </div>
                 ) : null}

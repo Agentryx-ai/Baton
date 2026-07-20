@@ -91,7 +91,9 @@ function snapshotWithPriorTurn(items: NewCanonicalItem[]): ThreadSnapshot {
 const snapshot: ThreadSnapshot = {
   session: {
     id: 'session-1', title: null, preview: null, activeThreadId: 'thread-1',
-    projectKey: null, cwd: null, schemaVersion: 1,
+    projectKey: null, cwd: null,
+    permissions: { defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global' },
+    schemaVersion: 1,
     createdAt: '2026-07-18T00:00:00.000Z', updatedAt: '2026-07-18T00:00:00.000Z', archivedAt: null,
     workStatus: 'running',
   },

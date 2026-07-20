@@ -6,6 +6,7 @@ import type { NativeProviderEvent, ProviderExecutionContext } from './adapter.ts
 import {
   CodexCanonicalAdapter,
   CodexJsonlRpcClient,
+  hardenCodexModelCatalog,
   type CodexAppServerProcess,
   type CodexProcessFactory,
 } from './codex-adapter.ts'
@@ -13,7 +14,7 @@ import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
 import type { AgentToolDefinition, AgentToolInvocation, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 import type { ImageArtifactRef } from './image-artifacts.ts'
 
-type ExitResult = { code: number | null; signal: NodeJS.Signals | null }
+type ExitResult = { code: number | null; signal: NodeJS.Signals | null; stderr?: string }
 type Scenario =
   | 'normal'
   | 'compaction'
@@ -39,6 +40,7 @@ type Scenario =
   | 'steerUnsupported'
   | 'steerManual'
   | 'usageLimit'
+  | 'transientFailure'
   | 'exit'
 
 class TestStream<T> implements AsyncIterable<T> {
@@ -76,6 +78,7 @@ class FakeProcess implements CodexAppServerProcess {
   readonly exited: Promise<ExitResult>
   private exitResolve!: (result: ExitResult) => void
   private hasExited = false
+  hangOnCloseInput = false
   private readonly onWrite: ((message: Record<string, unknown>, self: FakeProcess) => void) | undefined
 
   constructor(onWrite?: (message: Record<string, unknown>, self: FakeProcess) => void) {
@@ -92,6 +95,7 @@ class FakeProcess implements CodexAppServerProcess {
   }
 
   async closeInput(): Promise<void> {
+    if (this.hangOnCloseInput) await new Promise<void>(() => undefined)
     this.exit({ code: 0, signal: null })
   }
 
@@ -126,7 +130,6 @@ function idOf(message: Record<string, unknown>): string | number {
 function configResult(): Record<string, unknown> {
   return {
     config: {
-      agents: { enabled: false },
       web_search: 'disabled',
       project_doc_max_bytes: 0,
       features: {
@@ -318,7 +321,7 @@ function emitToolCall(process: FakeProcess, options: {
 
 function emitScenario(process: FakeProcess, scenario: Scenario): void {
   if (scenario === 'exit') {
-    process.exit({ code: 7, signal: null })
+    process.exit({ code: 7, signal: null, stderr: 'invalid test configuration' })
     return
   }
   if (scenario === 'collab') {
@@ -344,6 +347,24 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
             message: 'quota exhausted',
             codexErrorInfo: 'usageLimitExceeded',
             additionalDetails: 'preserved',
+          },
+        },
+      },
+    })
+    return
+  }
+  if (scenario === 'transientFailure') {
+    process.emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'native-thread',
+        turn: {
+          id: 'native-turn',
+          status: 'failed',
+          error: {
+            message: 'unexpected status 503 Service Unavailable: upstream connect error',
+            codexErrorInfo: 'other',
+            additionalDetails: null,
           },
         },
       },
@@ -472,7 +493,8 @@ function snapshot(): ThreadSnapshot {
   return {
     session: {
       id: 'session', title: null, preview: null, activeThreadId: 'thread', projectKey: null,
-      cwd: 'C:/workspace', schemaVersion: 1, createdAt: now, updatedAt: now, archivedAt: null,
+      cwd: 'C:/workspace', permissions: { defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global' },
+      schemaVersion: 1, createdAt: now, updatedAt: now, archivedAt: null,
       workStatus: 'idle',
     },
     thread: {
@@ -571,6 +593,33 @@ test('JSONL client parses fragmented frames and correlates out-of-order response
   await process.closeInput()
 })
 
+test('Codex model catalog hardening disables model-selected native agents without changing models', () => {
+  const hardened = hardenCodexModelCatalog(JSON.stringify({
+    models: [
+      { slug: 'gpt-5.6-sol', display_name: 'Sol', multi_agent_version: 'v2' },
+      { slug: 'gpt-5.6-luna', display_name: 'Luna', multi_agent_version: 'v1' },
+    ],
+    etag: 'keep-me',
+  }))
+  assert.equal(hardened.modelCount, 2)
+  assert.deepEqual(JSON.parse(hardened.json), {
+    models: [
+      { slug: 'gpt-5.6-sol', display_name: 'Sol', multi_agent_version: 'disabled' },
+      { slug: 'gpt-5.6-luna', display_name: 'Luna', multi_agent_version: 'disabled' },
+    ],
+    etag: 'keep-me',
+  })
+})
+
+test('Codex model catalog hardening fails closed on malformed or unidentified models', () => {
+  assert.throws(() => hardenCodexModelCatalog('{'), /valid JSON/)
+  assert.throws(() => hardenCodexModelCatalog('{"models":[]}'), /contain any models/)
+  assert.throws(
+    () => hardenCodexModelCatalog('{"models":[{"display_name":"missing slug"}]}'),
+    /omitted its slug/,
+  )
+})
+
 test('Codex preflight bounds a hung initialize request and terminates its process', async () => {
   const created: FakeProcess[] = []
   const adapter = new CodexCanonicalAdapter({
@@ -585,6 +634,25 @@ test('Codex preflight bounds a hung initialize request and terminates its proces
   await assert.rejects(adapter.initialize(), /initialize request timed out after 5ms/)
   assert.equal(created.length, 1)
   assert.deepEqual(await created[0]?.exited, { code: 0, signal: null })
+})
+
+test('Codex preflight bounds a hung stdin close and kills the process tree', async () => {
+  const process = new FakeProcess((message, self) => {
+    if (message.method === 'initialize') {
+      self.emit({ id: idOf(message), result: { userAgent: 'codex-test/1' } })
+    } else if (message.method === 'config/read') {
+      self.emit({ id: idOf(message), result: configResult() })
+    }
+  })
+  process.hangOnCloseInput = true
+  const adapter = new CodexCanonicalAdapter({
+    shutdownTimeoutMs: 5,
+    processFactory: () => process,
+  })
+
+  const handshake = await adapter.initialize()
+  assert.equal(handshake.adapterVersion, 'codex-test/1')
+  assert.deepEqual(await process.exited, { code: null, signal: 'SIGTERM' })
 })
 
 test('preflight discovers inherited MCP servers and relaunches with each one disabled', async () => {
@@ -654,7 +722,6 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     },
   })
   for (const args of argsSeen) {
-    assert.ok(args.includes('agents.enabled=false'))
     assert.ok(args.includes('web_search="disabled"'))
     assert.ok(args.includes('project_doc_max_bytes=0'))
     assert.ok(args.includes('features.multi_agent=false'))
@@ -696,7 +763,6 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.match(String(params.developerInstructions), /Verify before finishing\.$/)
   assert.deepEqual(params.dynamicTools, [])
   assert.deepEqual(params.config, {
-    'agents.enabled': false,
     web_search: 'disabled',
     project_doc_max_bytes: 0,
     'features.multi_agent': false,
@@ -1299,7 +1365,7 @@ test('process exit before turn completion produces a failed terminal result', as
   const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
   const terminal = await execution.terminal
   assert.equal(terminal.status, 'failed')
-  assert.match(String(terminal.error?.message), /exited|closed/)
+  assert.match(String(terminal.error?.message), /code 7: invalid test configuration/)
 })
 
 test('Codex usage-limit TurnError is normalized without discarding official fields', async () => {
@@ -1315,5 +1381,21 @@ test('Codex usage-limit TurnError is normalized without discarding official fiel
     codexErrorInfo: 'usageLimitExceeded',
     additionalDetails: 'preserved',
     code: 'provider_usage_limit',
+  })
+})
+
+test('Codex exhausted transient upstream errors retain fields and receive a retryable category', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('transientFailure', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.deepEqual(terminal.error, {
+    message: 'unexpected status 503 Service Unavailable: upstream connect error',
+    codexErrorInfo: 'other',
+    additionalDetails: null,
+    code: 'provider_retry_exhausted',
   })
 })
