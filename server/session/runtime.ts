@@ -19,6 +19,7 @@ import { CodexLocalSourceReader } from './native-import/codex-source.ts'
 import { ClaudeLocalSourceReader } from './native-import/claude-source.ts'
 import { NativeSessionImportService } from './native-import/service.ts'
 import { LocalImageArtifactStore } from './image-artifacts.ts'
+import { discoverSkillResources } from './tools/skill-resource-runtime.ts'
 
 export interface ConversationRuntimeOptions {
   dataDir: string
@@ -56,6 +57,10 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
     provider: 'claude',
     proxyConnection: statelessProxyConnection,
     imageArtifacts,
+    skillResources: discoverSkillResources([
+      path.join(homedir(), '.claude', 'skills'),
+      path.join(homedir(), '.agents', 'skills'),
+    ]),
   }))
   adapters.register(new StatelessHttpCanonicalAdapter({
     provider: 'gemini',

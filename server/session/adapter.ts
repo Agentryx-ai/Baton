@@ -79,6 +79,13 @@ export interface ProviderBindingPatch {
   modelFamily?: string
 }
 
+export interface ProviderSkillResource {
+  /** Stable provider-local identifier exposed to the model (for example, openai-docs). */
+  id: string
+  /** Immutable root that the Baton read-only skill resource tool may access. */
+  root: string
+}
+
 export interface SessionProviderAdapter {
   readonly provider: CanonicalProvider
 
@@ -91,6 +98,8 @@ export interface SessionProviderAdapter {
   ): Promise<ProviderTurnExecution>
   normalize(event: NativeProviderEvent): NewCanonicalItem[]
   extractBinding(event: NativeProviderEvent): ProviderBindingPatch | null
+  /** Provider-selected skill resources. These never grant execution or general filesystem access. */
+  skillResources?(): readonly ProviderSkillResource[]
   shutdown(): Promise<void>
 }
 

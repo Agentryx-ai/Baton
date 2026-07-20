@@ -58,6 +58,7 @@ import {
   HostCommandToolRuntime,
   LocalWorkspaceToolRuntime,
 } from './tools/local-workspace-runtime.ts'
+import { CompositeToolRuntime, SkillResourceToolRuntime } from './tools/skill-resource-runtime.ts'
 import type { LocalImageArtifactStore } from './image-artifacts.ts'
 import { hasPortableUserContent, imageAttachments } from './image-artifacts.ts'
 import { assertWorkspaceRoot, resolveWorkspaceRoot } from './workspace-root.ts'
@@ -149,7 +150,7 @@ export class TurnOrchestrator implements ConversationService {
       throw new ProviderReadinessError(normalized.provider, { cause: error })
     }
     const permissionProfile = this.store.getPermissionSettings().defaultProfile
-    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, permissionProfile)
+    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, permissionProfile, ready.adapter)
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
       ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
@@ -443,6 +444,7 @@ export class TurnOrchestrator implements ConversationService {
       const workspaceRuntime = this.sessionToolRuntime(
         workspaceCwd,
         snapshot.session.permissions.effectiveProfile,
+        ready.adapter,
       )
       const toolDefinitions = [
         ...workspaceRuntime.definitions,
@@ -532,6 +534,7 @@ export class TurnOrchestrator implements ConversationService {
     const workspaceRuntime = this.sessionToolRuntime(
       workspaceCwd,
       permissionProfile,
+      ready.adapter,
     )
     const goalToolDefinitions = GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal')
     const toolDefinitions: readonly AgentToolDefinition[] = [
@@ -953,16 +956,20 @@ export class TurnOrchestrator implements ConversationService {
   private sessionToolRuntime(
     cwd: string | null,
     profile: PermissionProfile,
+    adapter: import('./adapter.ts').SessionProviderAdapter,
   ): ToolRuntime {
-    if (cwd) {
-      return new LocalWorkspaceToolRuntime({
+    const workspace: ToolRuntime = cwd
+      ? new LocalWorkspaceToolRuntime({
         cwd,
         access: profile === 'read_only' ? 'read_only' : 'workspace',
         enableCommands: profile !== 'read_only',
         ...(profile === 'full_access' ? { commandRunner: new FullAccessCommandRunner() } : {}),
       })
-    }
-    return profile === 'full_access' ? new HostCommandToolRuntime() : NO_WORKSPACE_RUNTIME
+      : profile === 'full_access' ? new HostCommandToolRuntime() : NO_WORKSPACE_RUNTIME
+    const skills = adapter.skillResources?.() ?? []
+    return skills.length > 0
+      ? new CompositeToolRuntime([workspace, new SkillResourceToolRuntime(skills)])
+      : workspace
   }
 
   private validateImageInputs(items: readonly NewCanonicalItem[]): void {

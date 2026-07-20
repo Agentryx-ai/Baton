@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import path from 'node:path'
 import test from 'node:test'
 
 import { StatelessHttpCanonicalAdapter } from './stateless-http-adapter.ts'
@@ -110,6 +111,23 @@ const snapshot: ThreadSnapshot = {
   }],
   bindings: [],
 }
+
+test('Claude adapter advertises only configured provider-global skills through the canonical read contract', () => {
+  const resource = { id: 'source-command-plan', root: path.resolve('fixture-skill') }
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+    skillResources: [resource],
+  })
+  const request = adapter.materialize({
+    turnId: 'skill-turn', model: 'claude-fable-5',
+    input: [{ kind: 'user_message', payload: { text: 'plan this' } }],
+  }, snapshot)
+  const body = request.body as Record<string, unknown>
+  assert.match(String(body.developerInstructions), /source-command-plan/)
+  assert.match(String(body.developerInstructions), /read_skill_resource/)
+  assert.deepEqual(adapter.skillResources(), [resource])
+})
 
 test('Claude adapter sends stateless history and records a provider-reported model fallback', async () => {
   const sentBodies: Record<string, unknown>[] = []

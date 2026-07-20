@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
 import type {
   AdapterHandshake,
@@ -13,6 +13,7 @@ import type {
   ProviderSteerResult,
   ProviderTerminalResult,
   ProviderTurnExecution,
+  ProviderSkillResource,
   SessionProviderAdapter,
 } from './adapter.ts'
 import type { AgentToolResult, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
@@ -58,7 +59,10 @@ const CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS = `Baton is the canonical execution o
 Use only the dynamic tools exposed by Baton in this turn. Do not invoke Codex-native collaboration,
 subagent, shell, web search, MCP, app, plugin, approval, or task-execution tools. If requested work
 requires an unavailable capability, continue safely with available Baton tools or report the exact
-limitation; never create execution outside Baton's canonical ledger.`
+limitation; never create execution outside Baton's canonical ledger.
+When a selected skill provides a filesystem location, read its files with read_skill_resource using
+the skill name and a skill-relative path (normally SKILL.md). Never pass an absolute skill path to
+read_file.`
 
 const ALLOWED_ITEM_TYPES = new Set([
   'userMessage',
@@ -911,6 +915,10 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   // completion. Persisting its native id would create a false resumable binding.
   extractBinding(_event: NativeProviderEvent) { return null }
 
+  skillResources(): readonly ProviderSkillResource[] {
+    return discoverCodexSkillResources(this.isolatedCodexHome)
+  }
+
   async shutdown(): Promise<void> {
     this.shuttingDown = true
     await Promise.allSettled([...this.active].map((execution) => execution.dispose()))
@@ -918,6 +926,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
   }
 
   private async preflight(): Promise<AdapterHandshake> {
+    if (this.ownsIsolatedCodexHome) seedUserCodexSkills(this.isolatedCodexHome)
     if (this.installsHardenedModelCatalog && this.modelCatalogPath === null) {
       mkdirSync(this.isolatedCodexHome, { recursive: true })
       const hardenedCatalog = installHardenedModelCatalog(
@@ -1007,6 +1016,39 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       }
     }
   }
+}
+
+function seedUserCodexSkills(isolatedCodexHome: string): void {
+  const target = path.join(isolatedCodexHome, 'skills')
+  mkdirSync(target, { recursive: true })
+  for (const source of [path.join(homedir(), '.codex', 'skills'), path.join(homedir(), '.agents', 'skills')]) {
+    if (!existsSync(source)) continue
+    for (const entry of readdirSync(source, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === '.system' || existsSync(path.join(target, entry.name))) continue
+      cpSync(path.join(source, entry.name), path.join(target, entry.name), {
+        recursive: true,
+        dereference: false,
+        errorOnExist: false,
+        force: false,
+      })
+    }
+  }
+}
+
+function discoverCodexSkillResources(isolatedCodexHome: string): readonly ProviderSkillResource[] {
+  const roots = [path.join(isolatedCodexHome, 'skills'), path.join(isolatedCodexHome, 'skills', '.system')]
+  const resources = new Map<string, string>()
+  for (const root of roots) {
+    if (!existsSync(root)) continue
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name === '.system') continue
+      const skillRoot = path.join(root, entry.name)
+      if (existsSync(path.join(skillRoot, 'SKILL.md')) && !resources.has(entry.name)) {
+        resources.set(entry.name, skillRoot)
+      }
+    }
+  }
+  return Object.freeze([...resources].map(([id, root]) => Object.freeze({ id, root })))
 }
 
 export function hardenCodexModelCatalog(raw: string): { json: string; modelCount: number } {

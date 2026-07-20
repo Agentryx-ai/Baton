@@ -8,6 +8,7 @@ import type {
   ProviderSteerResult,
   ProviderTerminalResult,
   ProviderTurnExecution,
+  ProviderSkillResource,
   SessionProviderAdapter,
 } from './adapter.ts'
 import type {
@@ -44,6 +45,7 @@ export interface StatelessHttpAdapterOptions {
   proxyConnection: () => Promise<StatelessProxyConnection>
   fetchImpl?: typeof fetch
   imageArtifacts?: ImageArtifactResolver
+  skillResources?: readonly ProviderSkillResource[]
 }
 
 type ProviderMessage = Record<string, unknown>
@@ -235,6 +237,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
   private readonly proxyConnectionProvider: () => Promise<StatelessProxyConnection>
   private readonly fetchImpl: typeof fetch
   private readonly imageArtifacts: ImageArtifactResolver | null
+  private readonly providerSkillResources: readonly ProviderSkillResource[]
   private connection: StatelessProxyConnection | null = null
   private initializePromise: Promise<AdapterHandshake> | null = null
   private shuttingDown = false
@@ -245,6 +248,7 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
     this.proxyConnectionProvider = options.proxyConnection
     this.fetchImpl = options.fetchImpl ?? fetch
     this.imageArtifacts = options.imageArtifacts ?? null
+    this.providerSkillResources = Object.freeze([...(options.skillResources ?? [])])
   }
 
   initialize(): Promise<AdapterHandshake> {
@@ -301,10 +305,17 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       provider: this.provider,
       model: request.model,
       effort: request.effort ?? null,
-      developerInstructions: canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+      developerInstructions: withSkillInstructions(
+        canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
+        this.providerSkillResources,
+      ),
       messages,
     }
     return { body }
+  }
+
+  skillResources(): readonly ProviderSkillResource[] {
+    return this.providerSkillResources
   }
 
   async execute(
@@ -960,6 +971,19 @@ export class StatelessHttpCanonicalAdapter implements SessionProviderAdapter {
       `Gemini exceeded model round-trip limit (${context.limits.maxModelRoundTrips})`,
     )
   }
+}
+
+function withSkillInstructions(
+  existing: string | null,
+  resources: readonly ProviderSkillResource[],
+): string | null {
+  if (resources.length === 0) return existing
+  const skillNames = resources.map(({ id }) => id).join(', ')
+  const instructions = `Provider-global skills available in this Baton turn: ${skillNames}.
+When the user names one or the request clearly matches one, first call read_skill_resource with the
+skill name and path SKILL.md, read it completely, and follow it. Read referenced files through the
+same tool. Skill instructions do not grant native shell, web, MCP, app, plugin, or connector tools.`
+  return existing ? `${existing}\n\n${instructions}` : instructions
 }
 
 function rejectOnAbort(signal: AbortSignal): Promise<never> {
