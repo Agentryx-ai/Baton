@@ -143,10 +143,12 @@ export class NativeRecordAccumulator {
   readonly #records: NativePortableRecord[] = []
   #prefixDigest = sha256('')
   #count = 0
+  #portableCount = 0
 
   constructor(includeRecords: boolean) { this.#includeRecords = includeRecords }
 
   get count(): number { return this.#count }
+  get portableCount(): number { return this.#portableCount }
   get contentDigest(): string { return this.#prefixDigest }
   get records(): NativePortableRecord[] { return this.#records }
 
@@ -154,6 +156,7 @@ export class NativeRecordAccumulator {
     if (this.#count >= MAX_NATIVE_PORTABLE_RECORDS) throw new Error('native_source_portable_record_limit')
     this.#prefixDigest = sha256(`${this.#prefixDigest}\0${record.digest}`)
     this.#count += 1
+    if (record.item.visibility === 'portable') this.#portableCount += 1
     if (this.#includeRecords) this.#records.push({ ...record, prefixDigest: this.#prefixDigest })
   }
 }

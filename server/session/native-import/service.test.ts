@@ -343,12 +343,20 @@ test('additive parser metadata preserves a v1 prefix and permits an append updat
   store.close()
 })
 
-test('commit reports stale after source changes and rejects a rewritten prefix', async () => {
+test('commit reports stale after source changes and safely replaces an untouched rewritten import', async () => {
   const store = await newStore()
   const reader = new MutableReader(candidate(['one']))
   const service = new NativeSessionImportService(store, [reader], { secret: Buffer.alloc(32, 9) })
   let preview = await service.preview()
   await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  const importedThreadId = store.listSessions()[0]!.activeThreadId
+  store.createGoal({
+    threadId: importedThreadId,
+    expected: { kind: 'none' },
+    objective: 'user resumed the imported Goal without sending chat',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
 
   reader.candidate = candidate(['one', 'two'])
   preview = await service.preview()
@@ -359,8 +367,14 @@ test('commit reports stale after source changes and rejects a rewritten prefix',
   reader.candidate = candidate(['rewritten', 'two'])
   preview = await service.preview()
   const rewritten = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
-  assert.equal(rewritten.results[0]?.status, 'failed')
-  assert.match(rewritten.results[0]?.error ?? '', /source_rewritten/)
+  assert.equal(rewritten.results[0]?.status, 'updated', rewritten.results[0]?.error)
+  assert.equal(store.listSessions().length, 1)
+  const replacedSession = store.listSessions()[0]!
+  assert.deepEqual(
+    store.getSnapshot(replacedSession.activeThreadId)?.items.map((item) => item.payload.text),
+    ['rewritten', 'two'],
+  )
+  assert.equal(store.getGoal(replacedSession.activeThreadId), null)
   store.close()
 })
 
@@ -480,6 +494,12 @@ test('native delta is rejected after a fork even when the fork added no items', 
   const receipt = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
   assert.equal(receipt.results[0]?.status, 'failed')
   assert.match(receipt.results[0]?.error ?? '', /update_conflict_after_fork/)
+
+  reader.candidate = candidate(['rewritten', 'two'])
+  preview = await service.preview()
+  const rewritten = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+  assert.equal(rewritten.results[0]?.status, 'failed')
+  assert.match(rewritten.results[0]?.error ?? '', /source_rewritten_conflict/)
   store.close()
 })
 

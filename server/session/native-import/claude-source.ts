@@ -16,6 +16,7 @@ import {
   applyGoalCommand, NativeGoalReconstructor, parseClaudeGoalCommand,
   parseClaudeGoalConfirmation, parseExplicitGoalCommand,
 } from './goal-reconstruction.ts'
+import { nativeContextCheckpointPayload } from '../native-context-checkpoint.ts'
 
 interface ClaudeDesktopMetadata {
   sessionId?: unknown
@@ -53,7 +54,7 @@ const CLAUDE_BLOCK_TYPES = new Set([
   'text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'fallback', 'image', 'document',
   'server_tool_use', 'web_search_tool_result',
 ])
-const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-goal-v2`
+const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v3`
 
 export interface ClaudeSourceReaderOptions {
   desktopRoot?: string
@@ -365,6 +366,7 @@ function parseClaudeRecords(
   let createdAt: string | null = null
   let updatedAt: string | null = null
   let skipped = 0
+  let pendingCompactMetadata: Record<string, unknown> | null = null
   let customTitle: NativeTitle | null = null
   let aiTitle: NativeTitle | null = null
   let agentName: NativeTitle | null = null
@@ -421,6 +423,10 @@ function parseClaudeRecords(
       continue
     }
     if (eventType === 'system') {
+      if (string(event.subtype) === 'compact_boundary') {
+        pendingCompactMetadata = object(event.compactMetadata)
+        continue
+      }
       const content = string(event.content) ?? ''
       const command = parseClaudeGoalCommand(content)
       const confirmation = parseClaudeGoalConfirmation(content)
@@ -433,6 +439,20 @@ function parseClaudeRecords(
     const message = object(event.message)
     if (!message || !('content' in message)) throw new Error('claude_message_framing_invalid')
     const content = message.content
+    if (eventType === 'user' && event.isCompactSummary === true) {
+      const summary = messageText(content)
+      if (!summary?.trim()) throw new Error('claude_compact_summary_framing_invalid')
+      const baseId = string(event.uuid) ?? `${sessionId}:${lineIndex + 1}`
+      addClaudeRecord(records, `${baseId}:compact`, 'provider_event', nativeContextCheckpointPayload({
+        version: 1,
+        provider: 'claude',
+        format: 'claude_compact_summary',
+        summary,
+        metadata: pendingCompactMetadata,
+      }), timestamp, sourceClient, 'provider_private')
+      pendingCompactMetadata = null
+      continue
+    }
     currentModel = string(message.model) ?? currentModel
     currentEffort = string(message.effort) ?? currentEffort
     const fullText = messageText(content) ?? ''
@@ -496,7 +516,7 @@ function parseClaudeRecords(
   return {
     records: records.records,
     contentDigest: records.contentDigest,
-    portableItemCount: records.count,
+    portableItemCount: records.portableCount,
     cwd, createdAt, updatedAt, skipped,
     title: customTitle ?? aiTitle ?? agentName,
     warnings: skipped ? [`${skipped} known non-portable or hidden Claude records/blocks were not imported`] : [],
@@ -508,11 +528,12 @@ function addClaudeRecord(
   records: NativeRecordAccumulator, key: string,
   kind: NativePortableRecord['item']['kind'], payload: Record<string, unknown>, createdAt: string | null,
   sourceClient: NativeSourceClient,
+  visibility: NativePortableRecord['item']['visibility'] = 'portable',
 ): void {
   const sourcePayload = { ...payload, nativeSourceClient: sourceClient, nativeTimestamp: createdAt }
   records.add({
     key, ordinal: records.count + 1, digest: sha256(stableJson({ kind, payload: sourcePayload, key })), createdAt,
-    item: { kind, visibility: 'portable', provider: 'claude', nativeId: key, payload: sourcePayload },
+    item: { kind, visibility, provider: 'claude', nativeId: key, payload: sourcePayload },
   })
 }
 

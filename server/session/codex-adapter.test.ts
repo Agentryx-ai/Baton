@@ -711,6 +711,35 @@ test('materializes canonical image references as Codex localImage input and data
   }])
 })
 
+test('injects exact Codex native replacement history and only the uncovered suffix', () => {
+  const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
+  const base = snapshot()
+  const nativeHistory = [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'native summary' }] },
+    { type: 'compaction', encrypted_content: 'opaque-checkpoint' },
+  ]
+  const projected = adapter.materialize(request(), {
+    ...base,
+    items: [
+      base.items[0]!,
+      {
+        ...base.items[0]!, id: 'checkpoint', sequence: 2, kind: 'provider_event',
+        visibility: 'provider_private', provider: 'codex',
+        payload: { nativeContextCheckpoint: {
+          version: 1, provider: 'codex', format: 'codex_replacement_history',
+          history: nativeHistory, sourceModel: 'gpt-test',
+        } },
+      },
+      { ...base.items[0]!, id: 'suffix', sequence: 3, payload: { text: 'suffix answer' } },
+    ],
+  }).body as Record<string, unknown>
+
+  assert.deepEqual(projected.history, [
+    ...nativeHistory,
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'suffix answer' }] },
+  ])
+})
+
 function readFileTool(): AgentToolDefinition {
   return {
     name: 'read_file',

@@ -65,6 +65,9 @@ export interface UserGoalStatusInput {
   goalId: string
   expectedRevision: number
   status: 'active' | 'paused'
+  provider?: CanonicalProvider
+  model?: string
+  effort?: string | null
   resetLimitCounters?: boolean
 }
 

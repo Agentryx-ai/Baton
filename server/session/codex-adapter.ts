@@ -24,6 +24,7 @@ import {
 } from './canonical-cache-identity.ts'
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 import { hasPortableUserContent, imageAttachments, type ImageArtifactResolver } from './image-artifacts.ts'
+import { latestNativeContextCheckpoint } from './native-context-checkpoint.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
@@ -344,7 +345,14 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
 
   materialize(request: CanonicalTurnRequest, snapshot: ThreadSnapshot): NativeTurnRequest {
     this.validate(request, snapshot)
-    const history = snapshot.items.flatMap((item): JsonObject[] => {
+    const nativeCheckpoint = latestNativeContextCheckpoint(snapshot.items, 'codex')
+    const replayItems = nativeCheckpoint === null
+      ? snapshot.items
+      : snapshot.items.filter((item) => item.sequence > nativeCheckpoint.item.sequence)
+    const checkpointHistory = nativeCheckpoint?.checkpoint.provider === 'codex'
+      ? nativeCheckpoint.checkpoint.history
+      : []
+    const history = [...checkpointHistory, ...replayItems.flatMap((item): JsonObject[] => {
       if (item.visibility !== 'portable') return []
       const text = portableHistoryText(item.kind, item.payload)
       const attachments = item.kind === 'user_message' ? imageAttachments(item.payload) : []
@@ -369,7 +377,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           ],
         },
       ]
-    })
+    })]
     const body: MaterializedCodexTurn = {
       turnId: request.turnId,
       canonicalThreadId: snapshot.thread.id,

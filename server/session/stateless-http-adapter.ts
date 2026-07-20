@@ -21,6 +21,7 @@ import type {
 } from './domain.ts'
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 import { hasPortableUserContent, imageAttachments, parseImageArtifactRef, type ImageArtifactResolver } from './image-artifacts.ts'
+import { latestNativeContextCheckpoint } from './native-context-checkpoint.ts'
 
 type SupportedProvider = Extract<CanonicalProvider, 'claude' | 'gemini'>
 type JsonObject = Record<string, unknown>
@@ -1394,8 +1395,13 @@ function materializeProviderHistory(
   snapshot: ThreadSnapshot,
   provider: SupportedProvider,
 ): ProviderMessage[] {
-  const messages: ProviderMessage[] = []
-  const ordered = [...snapshot.items].sort((left, right) => left.sequence - right.sequence)
+  const nativeCheckpoint = latestNativeContextCheckpoint(snapshot.items, provider)
+  const messages: ProviderMessage[] = nativeCheckpoint?.checkpoint.provider === 'claude'
+    ? [{ role: 'user', content: nativeCheckpoint.checkpoint.summary }]
+    : []
+  const ordered = snapshot.items
+    .filter((item) => nativeCheckpoint === null || item.sequence > nativeCheckpoint.item.sequence)
+    .sort((left, right) => left.sequence - right.sequence)
   for (let index = 0; index < ordered.length;) {
     const first = ordered[index]!
     const turnKey = first.turnId ?? `item:${first.id}`

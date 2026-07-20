@@ -15,6 +15,7 @@ import {
   contextSummaryInputHash,
   contextSummaryTurnReceipt,
 } from './context-summary-contract.js'
+import { latestNativeContextCheckpoint } from './native-context-checkpoint.js'
 
 /**
  * An immutable, derived view over a precise canonical-item coverage frontier.
@@ -65,6 +66,8 @@ export interface MaterializedContext {
 export interface StableContextPrefix {
   turns: readonly CanonicalTurn[]
   throughSequence: number
+  /** Native imports predate Baton turns and therefore have null turn ids. */
+  includesLeadingTurnlessItems?: true
 }
 
 const SAFE_TERMINAL_TURN_STATUSES = new Set<CanonicalTurn['status']>([
@@ -138,6 +141,12 @@ export function sourceHashForItems(items: readonly CanonicalItem[]): string {
  */
 export function stableContextPrefixes(snapshot: ThreadSnapshot): readonly StableContextPrefix[] {
   const items = orderedThreadItems(snapshot)
+  const leadingTurnless: CanonicalItem[] = []
+  for (const item of items) {
+    if (item.turnId !== null) break
+    leadingTurnless.push(item)
+  }
+  if (leadingTurnless.length > 0 && !hasSafeContextToolState(leadingTurnless)) return []
   const itemsByTurn = new Map<TurnId, CanonicalItem[]>()
   for (const item of items) {
     if (item.turnId === null) continue
@@ -151,7 +160,11 @@ export function stableContextPrefixes(snapshot: ThreadSnapshot): readonly Stable
         - (itemsByTurn.get(right.id)?.[0]?.sequence ?? Number.MAX_SAFE_INTEGER)
       || left.id.localeCompare(right.id))
   const terminal: CanonicalTurn[] = []
-  const prefixes: StableContextPrefix[] = []
+  const prefixes: StableContextPrefix[] = leadingTurnless.length === 0 ? [] : [{
+    turns: [],
+    throughSequence: leadingTurnless.at(-1)!.sequence,
+    includesLeadingTurnlessItems: true,
+  }]
 
   for (const turn of turns) {
     if (!SAFE_TERMINAL_TURN_STATUSES.has(turn.status)) break
@@ -161,6 +174,7 @@ export function stableContextPrefixes(snapshot: ThreadSnapshot): readonly Stable
     prefixes.push({
       turns: [...terminal],
       throughSequence: turnItems.at(-1)!.sequence,
+      ...(leadingTurnless.length === 0 ? {} : { includesLeadingTurnlessItems: true as const }),
     })
   }
   return prefixes
@@ -174,8 +188,9 @@ export function coverageItems(
   const includedTurns = new Set<TurnId>(prefix.turns.map((turn) => turn.id))
   return orderedThreadItems(snapshot).filter((item) =>
     item.sequence <= prefix.throughSequence
-      && item.turnId !== null
-      && includedTurns.has(item.turnId),
+      && (item.turnId === null
+        ? prefix.includesLeadingTurnlessItems === true
+        : includedTurns.has(item.turnId)),
   )
 }
 
@@ -187,8 +202,9 @@ export function summarySourceItems(
   const includedTurns = new Set<TurnId>(prefix.turns.map((turn) => turn.id))
   return orderedThreadItems(snapshot).filter((item) =>
     item.sequence <= prefix.throughSequence
-      && item.turnId !== null
-      && includedTurns.has(item.turnId)
+      && (item.turnId === null
+        ? prefix.includesLeadingTurnlessItems === true
+        : includedTurns.has(item.turnId))
       && item.visibility === 'portable'
       && SUMMARY_INPUT_KINDS.has(item.kind),
   )
@@ -225,8 +241,16 @@ export function materializeContext(
   }
 
   const items = orderedThreadItems(snapshot)
+  const nativeCheckpoint = provider === undefined ? null : latestNativeContextCheckpoint(items, provider)
+  const useNativeCheckpoint = nativeCheckpoint !== null
+    && (selected === null || nativeCheckpoint.item.sequence > selected.throughSequence)
+  if (useNativeCheckpoint) selected = null
   const coveredIds = new Set(selected?.sourceItemIds ?? [])
-  const entries: MaterializedContextEntry[] = selected
+  const entries: MaterializedContextEntry[] = useNativeCheckpoint
+    ? items
+        .filter((item) => item.sequence >= nativeCheckpoint.item.sequence)
+        .map((item): MaterializedContextEntry => ({ type: 'canonical_item', item }))
+    : selected
     ? [{ type: 'derived_summary', artifact: selected }, ...items
         .filter((item) => !coveredIds.has(item.id))
         .map((item): MaterializedContextEntry => ({ type: 'canonical_item', item }))]

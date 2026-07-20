@@ -20,6 +20,7 @@ test('Claude catalog follows the web product family order with friendly labels a
     'Haiku 4.5',
   ])
   assert.deepEqual(catalog.models[0]?.effortLevels, ['low', 'medium', 'high', 'max'])
+  assert.equal(catalog.models[0]?.contextWindowTokens, 1_000_000)
   assert.equal(catalog.models.at(-1)?.defaultEffort, null)
 })
 
@@ -48,6 +49,11 @@ test('Codex catalog is deterministic and preserves a configured default', () => 
     '균형 잡힌 기본 모델',
   ])
   assert.equal(catalog.defaultModel, 'gpt-5.6-terra')
+  assert.deepEqual(catalog.models[0] && {
+    contextWindowTokens: catalog.models[0].contextWindowTokens,
+    usableInputTokens: catalog.models[0].usableInputTokens,
+    autoCompactTokens: catalog.models[0].autoCompactTokens,
+  }, { contextWindowTokens: 272_000, usableInputTokens: 258_400, autoCompactTokens: 244_800 })
 })
 
 test('Gemini remains supported but unavailable when authentication exposes no models', () => {

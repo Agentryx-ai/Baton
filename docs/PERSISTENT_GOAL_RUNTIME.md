@@ -83,7 +83,9 @@ revision observed by that tool context.
 - Pause is committed before interruption so a late terminal event cannot restart work. Cancelling or
   interrupting a Goal-owned turn MUST first compare-and-swap `active -> paused` for the captured
   revision, revoke its scheduler lease, and then interrupt the provider. It MUST NOT auto-resume.
-- Resume starts a fresh blocked/no-progress audit and schedules continuation if the thread is idle.
+- Resume atomically writes the provider, model, and effort currently selected in the composer together
+  with the status CAS. It then starts a fresh blocked/no-progress audit and schedules continuation if the
+  thread is idle. The scheduler never resumes with a stale executor captured when the Goal was created.
 - Clear prevents any pending scheduler lease from starting another turn.
 
 User cancellation follows the pause rule above. Runtime/process loss is different: recovery flushes

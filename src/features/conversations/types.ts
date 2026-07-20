@@ -422,6 +422,9 @@ export interface ProviderModelDescriptorDto {
   description: string
   effortLevels: string[]
   defaultEffort: string | null
+  contextWindowTokens: number
+  usableInputTokens: number | null
+  autoCompactTokens: number | null
 }
 
 export interface BeginTurnResultDto {

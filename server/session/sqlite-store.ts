@@ -3161,6 +3161,9 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   updateGoalStatus(input: UpdateGoalStatusInput): GoalCasResult {
+    if (input.model !== undefined && !input.model) {
+      throw new GoalStoreError('invalid_goal_input', 'Goal model must not be empty')
+    }
     return this.#transaction('IMMEDIATE', () => {
       const row = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), input.goalId)
       if (!row) return { status: 'stale', goal: null }
@@ -3189,13 +3192,16 @@ export class SqliteSessionStore implements SessionStore {
       const reason = input.status === 'active' || !input.reason ? null : { ...input.reason, at: now }
       const stoppedForTimeLimit = input.status === 'budget_limited' && reason?.code === 'goal_time_limit'
       this.#db.prepare(`
-        UPDATE goals SET status=?,status_reason_json=?,revision=?,time_used_seconds=?,automatic_turns_used=?,
-          no_progress_count=?,last_progress_digest=?,updated_at=?,completed_at=?
+        UPDATE goals SET status=?,status_reason_json=?,revision=?,provider=?,model=?,effort=?,
+          time_used_seconds=?,automatic_turns_used=?,no_progress_count=?,last_progress_digest=?,updated_at=?,completed_at=?
         WHERE id=? AND revision=?
       `).run(
         input.status,
         reason === null ? null : canonicalJson(reason),
         revision,
+        input.provider ?? current.provider,
+        input.model ?? current.model,
+        Object.prototype.hasOwnProperty.call(input, 'effort') ? (input.effort ?? null) : current.effort,
         resetCounters ? 0 : stoppedForTimeLimit
           ? Math.max(current.timeUsedSeconds, current.maxActiveSeconds)
           : current.timeUsedSeconds,
@@ -3738,22 +3744,36 @@ export class SqliteSessionStore implements SessionStore {
     const current = this.#nativeImportState(existing)
     if (!input.previewedState || input.previewedState.sourceId !== current.sourceId
       || input.previewedState.contentDigest !== current.contentDigest) throw new Error('native import state changed after preview')
-    const boundary = candidate.records[current.lastRecordOrdinal - 1]
-    if (current.lastRecordOrdinal > candidate.records.length || (current.lastRecordOrdinal > 0 && (!boundary
-      || boundary.prefixDigest !== current.prefixDigest || boundary.digest !== current.lastRecordDigest))) {
-      throw new Error('source_rewritten: only append-only native deltas can be imported')
-    }
     const sessionRow = this.#one(this.#db.prepare(`
       SELECT s.next_item_sequence,s.active_thread_id,t.id AS root_thread_id,t.revision,
         (SELECT COUNT(*) FROM threads child WHERE child.session_id=s.id AND child.id<>t.id) AS fork_count,
         (SELECT COUNT(*) FROM turns turn_row WHERE turn_row.thread_id=t.id) AS turn_count,
-        (SELECT COUNT(*) FROM items item_row WHERE item_row.session_id=s.id) AS item_count
+        (SELECT COUNT(*) FROM items item_row WHERE item_row.session_id=s.id) AS item_count,
+        (SELECT COUNT(*) FROM follow_ups follow_up WHERE follow_up.session_id=s.id) AS follow_up_count,
+        (SELECT COUNT(*) FROM provider_bindings binding WHERE binding.thread_id=t.id) AS binding_count,
+        (SELECT COUNT(*) FROM goals goal WHERE goal.thread_id=t.id
+          AND (goal.revision>1 OR goal.status<>'paused')) AS changed_goal_count
       FROM sessions s JOIN threads t ON t.session_id=s.id AND t.parent_thread_id IS NULL WHERE s.id=?
     `), current.sessionId)
-    if (text(sessionRow, 'active_thread_id') !== text(sessionRow, 'root_thread_id')
-      || integer(sessionRow, 'fork_count') !== 0
-      || integer(sessionRow, 'turn_count') !== 0 || integer(sessionRow, 'item_count') !== current.importedItemSequence
-      || integer(sessionRow, 'next_item_sequence') !== current.importedItemSequence + 1) {
+    const untouchedRoot = text(sessionRow, 'active_thread_id') === text(sessionRow, 'root_thread_id')
+      && integer(sessionRow, 'fork_count') === 0
+      && integer(sessionRow, 'turn_count') === 0
+      && integer(sessionRow, 'item_count') === current.importedItemSequence
+      && integer(sessionRow, 'next_item_sequence') === current.importedItemSequence + 1
+      && integer(sessionRow, 'follow_up_count') === 0
+    const boundary = candidate.records[current.lastRecordOrdinal - 1]
+    const sourceRewritten = current.lastRecordOrdinal > candidate.records.length
+      || (current.lastRecordOrdinal > 0 && (!boundary
+        || boundary.prefixDigest !== current.prefixDigest || boundary.digest !== current.lastRecordDigest))
+    if (sourceRewritten) {
+      if (!untouchedRoot) {
+        throw new Error('source_rewritten_conflict: imported session has Baton turns, items, or forks')
+      }
+      this.#deleteUntouchedNativeImport(current.sourceId, current.sessionId)
+      const replacement = this.#createNativeImport({ ...input, previewedState: null })
+      return { ...replacement, status: 'updated' }
+    }
+    if (!untouchedRoot) {
       throw new Error('update_conflict_after_fork: imported session is no longer an untouched root thread')
     }
     const delta = candidate.records.slice(current.lastRecordOrdinal)
@@ -3777,6 +3797,35 @@ export class SqliteSessionStore implements SessionStore {
     if (imported.length) this.#appendStreamEvent(current.sessionId, threadId, null, 'items_appended', { itemIds: imported.map((item) => item.id), nativeDelta: true }, now)
     this.#reconcileNativeGoal(existing, candidate, true)
     return { candidateId: candidate.candidateId, status: 'updated', sessionId: current.sessionId, importedItemCount: imported.length }
+  }
+
+  #deleteUntouchedNativeImport(sourceId: string, sessionId: string): void {
+    this.#db.exec('PRAGMA defer_foreign_keys = ON')
+    const contextCount = integer(this.#one(this.#db.prepare(
+      'SELECT COUNT(*) AS count FROM session_purge_context',
+    )), 'count')
+    if (contextCount !== 0) throw new Error('Session purge context is unexpectedly occupied')
+    this.#db.prepare('INSERT INTO session_purge_context(session_id) VALUES (?)').run(sessionId)
+    this.#db.prepare('DELETE FROM native_imported_records WHERE source_id=?').run(sourceId)
+    this.#db.prepare('DELETE FROM native_session_revisions WHERE source_id=?').run(sourceId)
+    this.#db.prepare('DELETE FROM native_session_identity_keys WHERE source_id=?').run(sourceId)
+    this.#db.prepare('DELETE FROM native_session_source_provenance WHERE source_id=?').run(sourceId)
+    this.#db.prepare('DELETE FROM native_session_sources WHERE id=?').run(sourceId)
+    this.#db.prepare('DELETE FROM goal_events WHERE session_id=?').run(sessionId)
+    this.#db.prepare(`DELETE FROM goals WHERE thread_id IN (
+      SELECT id FROM threads WHERE session_id=?
+    )`).run(sessionId)
+    this.#db.prepare(`DELETE FROM provider_bindings WHERE thread_id IN (
+      SELECT id FROM threads WHERE session_id=?
+    )`).run(sessionId)
+    this.#db.prepare('DELETE FROM stream_events WHERE session_id=?').run(sessionId)
+    this.#db.prepare('DELETE FROM items WHERE session_id=?').run(sessionId)
+    this.#db.prepare('DELETE FROM threads WHERE session_id=?').run(sessionId)
+    const deleted = this.#db.prepare('DELETE FROM sessions WHERE id=?').run(sessionId)
+    this.#db.prepare('DELETE FROM session_purge_context WHERE session_id=?').run(sessionId)
+    if (deleted.changes !== 1 || this.#all(this.#db.prepare('PRAGMA foreign_key_check')).length > 0) {
+      throw new Error('native import replacement failed integrity validation')
+    }
   }
 
   reconcileNativeGoal(candidate: NativeSessionCandidate, apply = true): NativeGoalReconcileResult {

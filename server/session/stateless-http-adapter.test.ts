@@ -129,6 +129,47 @@ test('Claude adapter advertises only configured provider-global skills through t
   assert.deepEqual(adapter.skillResources(), [resource])
 })
 
+test('Claude uses its native compact summary plus suffix and never consumes a Codex checkpoint', () => {
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+  })
+  const checkpoint = {
+    ...snapshot.items[0]!, id: 'claude-checkpoint', sequence: 2, kind: 'provider_event' as const,
+    visibility: 'provider_private' as const, provider: 'claude' as const,
+    payload: { nativeContextCheckpoint: {
+      version: 1, provider: 'claude', format: 'claude_compact_summary',
+      summary: 'native summary', metadata: { preTokens: 100 },
+    } },
+  }
+  const suffix = { ...snapshot.items[0]!, id: 'suffix', sequence: 3, payload: { text: 'suffix' } }
+  const body = adapter.materialize({
+    turnId: 'compact-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  }, { ...snapshot, items: [snapshot.items[0]!, checkpoint, suffix] }).body as Record<string, unknown>
+  assert.deepEqual(body.messages, [
+    { role: 'user', content: 'native summary' },
+    { role: 'assistant', content: 'suffix' },
+    { role: 'user', content: 'continue' },
+  ])
+
+  const codexCheckpoint = {
+    ...checkpoint, id: 'codex-checkpoint', provider: 'codex' as const,
+    payload: { nativeContextCheckpoint: {
+      version: 1, provider: 'codex', format: 'codex_replacement_history',
+      history: [{ type: 'compaction', encrypted_content: 'opaque' }], sourceModel: 'gpt-test',
+    } },
+  }
+  const crossProviderBody = adapter.materialize({
+    turnId: 'cross-provider-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  }, { ...snapshot, items: [snapshot.items[0]!, codexCheckpoint, suffix] }).body as Record<string, unknown>
+  assert.deepEqual(crossProviderBody.messages, [
+    { role: 'assistant', content: 'history\n\nsuffix' },
+    { role: 'user', content: 'continue' },
+  ])
+})
+
 test('Claude adapter sends stateless history and records a provider-reported model fallback', async () => {
   const sentBodies: Record<string, unknown>[] = []
   const adapter = new StatelessHttpCanonicalAdapter({
