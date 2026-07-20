@@ -30,3 +30,14 @@
 - [ ] 범용 모델 fallback 다중 후보 순회와 실패 override 정리
 - [ ] Native priority-failover 외 선택적 부하분산 정책 설계
 - [ ] Codex Responses WebSocket transport를 구현해 HTTP fallback 시작 지연 제거
+
+## 마이그레이션 회귀 후속 (2026-07-21 발견)
+
+- [ ] 마이그레이션된 Claude credential이 quota 500으로 실패하는 원인 확증
+      (refresh `invalid_grant` 추정) 및 quota 라우트에서 refresh 실패를 표면화
+      → issues/migrated-claude-accounts-fail-quota-and-canary-placeholder-duplicate.md
+- [ ] 같은 Anthropic 계정의 Native vault 중복 정리 + 마이그레이션 매칭을 불변 account id로 수행
+- [ ] Claude 계정 email 미기입 시 placeholder(`Claude Code`) 대신 재로그인 유도/식별 라벨 표시
+- [ ] b813d7c 이전에 마이그레이션된 `~/.codex/config.toml`에 baton compat alias가 없는 경우
+      자동 복구(detect-and-heal) 또는 repair 명령 제공
+      → issues/already-migrated-codex-config-missing-baton-compat-alias.md
