@@ -35,6 +35,7 @@ type Scenario =
   | 'collabChildTool'
   | 'foreignCollabSender'
   | 'childStartsBeforeCollab'
+  | 'subAgentActivity'
   | 'foreignNotification'
   | 'nonSpawnUnknownReceiver'
   | 'forbiddenExecution'
@@ -413,6 +414,16 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
         threadId: 'unrelated-native-root',
         turnId: 'unrelated-native-turn',
         item: { id: 'foreign-message-1', type: 'agentMessage', text: 'unrelated output' },
+      },
+    })
+  }
+  if (scenario === 'subAgentActivity') {
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'native-thread',
+        turnId: 'native-turn',
+        item: { id: 'subagent-activity-1', type: 'subAgentActivity', kind: 'started' },
       },
     })
   }
@@ -1210,6 +1221,21 @@ test('adapter ignores notifications from an unrelated native root thread', async
   assert.equal((await execution.terminal).status, 'completed')
   assert.ok(!events.some((event) => (event.payload as Record<string, unknown> | null)?.threadId
     === 'unrelated-native-root'))
+})
+
+test('adapter accepts native subagent activity without adding portable history', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('subAgentActivity', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const events = await collect(execution.events)
+  assert.equal((await execution.terminal).status, 'completed')
+  assert.ok(events.some((event) => event.type === 'item/completed'
+    && ((event.payload as Record<string, unknown> | null)?.item as Record<string, unknown> | undefined)?.id
+      === 'subagent-activity-1'))
+  assert.ok(!events.flatMap((event) => adapter.normalize(event)).some((item) =>
+    item.nativeId === 'subagent-activity-1'))
 })
 
 test('adapter does not grant ownership from non-spawn collaboration receivers', async () => {
