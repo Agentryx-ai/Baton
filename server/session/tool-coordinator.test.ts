@@ -263,10 +263,12 @@ test('workspace commands are absent by default and require termination-safe opt-
 })
 
 test('Goal tools have exact schemas, refresh observation, and use revision CAS', async () => {
-  assert.deepEqual(GOAL_TOOL_DEFINITIONS.map((tool) => tool.name), ['get_goal', 'create_goal', 'update_goal'])
+  assert.deepEqual(GOAL_TOOL_DEFINITIONS.map((tool) => tool.name), [
+    'get_goal', 'create_goal', 'propose_goal_completion', 'update_goal',
+  ])
   assert.equal(GOAL_TOOL_DEFINITIONS.every((tool) => tool.inputSchema.additionalProperties === false), true)
   const updateGoalSchema = GOAL_TOOL_DEFINITIONS.find((tool) => tool.name === 'update_goal')?.inputSchema
-  assert.deepEqual(updateGoalSchema?.required, ['status', 'evidence'])
+  assert.deepEqual(updateGoalSchema?.required, ['status'])
   assert.equal('allOf' in (updateGoalSchema ?? {}), false)
   const store = new FakeStore()
   const current = goal({ revision: 3, tokenBudget: 100, tokensUsed: 40, noProgressCount: 2 })
@@ -284,8 +286,6 @@ test('Goal tools have exact schemas, refresh observation, and use revision CAS',
   assert.equal(stale.error?.code, 'stale_goal_revision')
   const read = await coordinator.execute(call('read-goal', 'get_goal', {}))
   assert.deepEqual(read.success && read.content.remainingTokens, 60)
-  const missingAudit = await coordinator.execute(call('missing-audit', 'update_goal', { status: 'complete' }))
-  assert.equal(missingAudit.error?.code, 'invalid_tool_input')
   const complete = await coordinator.execute(call('complete', 'update_goal', {
     status: 'complete',
     evidence: [{ requirement: 'ship it', proof: 'tests passed' }],
@@ -293,17 +293,45 @@ test('Goal tools have exact schemas, refresh observation, and use revision CAS',
   assert.equal(complete.success, true)
   assert.equal(complete.success && complete.content.finalTokensUsed, 47)
   assert.equal(store.lastStatusUpdate, null)
-  assert.deepEqual(coordinator.goalTerminalIntent, {
+  assert.deepEqual(coordinator.goalCompletionProposalIntent, {
     goalId: current.id,
     expectedRevision: 3,
-    status: 'complete',
-    completionEvidence: [{ requirement: 'ship it', proof: 'tests passed' }],
+    summary: 'Legacy update_goal completion proposal',
+    requirements: [{
+      id: 'requirement-1',
+      requirement: 'ship it',
+      evidence: [{ kind: 'current_turn', reference: null, claim: 'tests passed' }],
+    }],
+    compatibilityAlias: true,
   })
   const conflict = await coordinator.execute(call('conflict', 'update_goal', {
     status: 'complete', evidence: [{ requirement: 'ship it', proof: 'different proof' }],
   }))
-  assert.equal(conflict.error?.code, 'goal_terminal_intent_conflict')
+  assert.equal(conflict.error?.code, 'goal_completion_proposal_conflict')
   assert.equal(flushed, 3)
+
+  const compatibilityStore = new FakeStore()
+  compatibilityStore.goal = current
+  const compatibilityCoordinator = makeCoordinator(compatibilityStore, new FakeRuntime([READ]), {}, {
+    initialGoalObservation: { kind: 'goal', goalId: current.id, revision: current.revision },
+  })
+  await compatibilityCoordinator.execute(call('proof-read', 'read_file', { path: 'result.txt' }))
+  const statusOnly = await compatibilityCoordinator.execute(call('status-only', 'update_goal', { status: 'complete' }))
+  assert.equal(statusOnly.success, true)
+  assert.deepEqual(compatibilityCoordinator.goalCompletionProposalIntent?.requirements, [{
+    id: 'requirement-1',
+    requirement: current.objective,
+    evidence: [
+      {
+        kind: 'tool_result', reference: 'proof-read',
+        claim: 'Successful read_file result from the terminal turn',
+      },
+      {
+        kind: 'current_turn', reference: null,
+        claim: 'The terminal turn contains the claimed completed deliverable',
+      },
+    ],
+  }])
 })
 
 test('create_goal uses captured no_goal observation and rejects unknown input fields', async () => {
@@ -442,6 +470,7 @@ function goal(overrides: Partial<CanonicalGoal> = {}): CanonicalGoal {
     maxActiveSeconds: 7_200, noProgressCount: 0, lastProgressDigest: null,
     createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString(),
     startedAt: new Date(0).toISOString(), completedAt: null,
+    verificationProposalId: null, latestCompletionReceiptId: null, latestStopReceiptId: null,
     ...overrides,
   }
 }

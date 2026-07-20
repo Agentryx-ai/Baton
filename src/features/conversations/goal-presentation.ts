@@ -1,5 +1,6 @@
 export type GoalViewStatus =
   | 'active'
+  | 'verifying'
   | 'paused'
   | 'blocked'
   | 'usage_limited'
@@ -25,6 +26,8 @@ export interface GoalView {
   maxAutomaticTurns: number
   tokensUsed: number
   tokenBudget: number | null
+  verificationProposalId?: string | null
+  latestCompletionReceiptId?: string | null
 }
 
 export interface GoalStatusPresentation {
@@ -36,6 +39,7 @@ export type GoalWorkStatus = 'awaiting_goal_turn' | 'queued' | 'running' | 'wait
 
 const STATUS_PRESENTATION: Record<GoalViewStatus, GoalStatusPresentation> = {
   active: { label: '진행 중', tone: 'active' },
+  verifying: { label: '완료 검증 중', tone: 'active' },
   paused: { label: '일시 정지', tone: 'muted' },
   blocked: { label: '확인 필요', tone: 'warning' },
   usage_limited: { label: '사용량 제한', tone: 'warning' },
@@ -54,6 +58,10 @@ const REASON_LABELS: Readonly<Record<string, string>> = {
   runtime_interrupted: '실행이 중단되어 확인이 필요합니다.',
   unknown_mutation_outcome: '변경 작업의 결과를 확인해야 합니다.',
   user_paused: '사용자가 일시 정지했습니다.',
+  verification_incomplete: '완료 근거가 부족해 작업을 계속합니다.',
+  verification_indeterminate: '완료 검증을 확정하지 못해 작업을 계속합니다.',
+  verification_host_rejected: '완료 검증이 호스트 검사에서 거부되었습니다.',
+  confirmed_impossible: '독립 검증에서 현재 범위의 달성 불가능성이 확인되었습니다.',
 }
 
 const integerFormatter = new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 0 })

@@ -193,6 +193,7 @@ export function requireAppliedGoalStatus(result: GoalStatusMutationResult): void
 
 export function goalEditDescription(status: CanonicalGoalDto['status']): string {
   if (status === 'active') return 'Goal 내용을 저장합니다. 현재 진행 상태와 누적 사용량은 유지됩니다.'
+  if (status === 'verifying') return '진행 중인 완료 검증을 무효화하고 수정된 Goal로 작업을 다시 시작합니다.'
   if (status === 'complete') return 'Goal 내용을 저장하고 같은 Goal을 다시 시작합니다. 누적 사용량은 유지됩니다.'
   if (status === 'budget_limited') {
     return '예산 제한 상태를 유지하려면 내용을 저장할 수 없습니다. 먼저 Goal을 다시 시작한 뒤 수정해 주세요.'
@@ -589,6 +590,7 @@ export const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: 
   running: { label: '진행 중', dot: 'bg-ok' },
   queued: { label: '대기 중', dot: 'bg-info' },
   awaiting_goal_turn: { label: '다음 작업 준비 중', dot: 'bg-info' },
+  verifying: { label: '목표 검증 중', dot: 'bg-info' },
   usage_limited: { label: '사용량 제한', dot: 'bg-warning' },
   budget_limited: { label: '실행 제한', dot: 'bg-warning' },
   blocked: { label: '차단됨', dot: 'bg-destructive' },
@@ -612,7 +614,7 @@ function SessionStatus({ status }: { status: CanonicalSessionDto['workStatus'] |
   const presentation = sessionStatusPresentation(status)
   return (
     <span className="inline-flex shrink-0 items-center gap-1 text-[0.625rem] font-normal text-muted-foreground">
-      <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'awaiting_goal_turn' || status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
+      <span className={cn('size-1.5 rounded-full', presentation.dot, (status === 'awaiting_goal_turn' || status === 'verifying' || status === 'running' || status === 'waiting_tool') && 'animate-pulse')} aria-hidden />
       {presentation.label}
     </span>
   )

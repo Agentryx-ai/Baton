@@ -8,6 +8,15 @@ import type {
   CanonicalFollowUp,
   CanonicalExecution,
   CanonicalGoal,
+  GoalCompletionProposal,
+  GoalCompletionReceipt,
+  GoalEvidenceBundle,
+  GoalRequirementClaim,
+  GoalVerificationAttempt,
+  GoalVerificationDecision,
+  GoalVerificationHistory,
+  GoalStopReceipt,
+  GoalVerifierLease,
   CanonicalItem,
   CanonicalItemKind,
   CanonicalProvider,
@@ -48,10 +57,13 @@ import type {
 import { uuidV7 } from './domain.ts'
 import { hasSafeContextToolState } from './context-materializer.js'
 import { LEGACY_CONTEXT_VIEW_KEY } from './context-view-contract.js'
+import { goalEvidenceHash } from './goal-evidence.ts'
 import type {
   ClaimGoalLeaseInput,
+  ClaimGoalVerifierLeaseInput,
   ClaimFollowUpInput,
   BeginSessionInput,
+  BeginGoalVerificationInput,
   BeginTurnFromFollowUpInput,
   CloseFollowUpWindowResult,
   CheckpointGoalTurnInput,
@@ -63,16 +75,20 @@ import type {
   EnqueueFollowUpInput,
   EnqueueFollowUpResult,
   ForkThreadInput,
+  FinishGoalVerificationInput,
+  FinishGoalVerificationResult,
   GoalCasResult,
   GoalAwareBeginTurnInput,
   GoalEvent,
   HeartbeatGoalLeaseInput,
+  HeartbeatGoalVerifierLeaseInput,
   InitialSessionRequestIdentity,
   RecordGoalTurnInput,
   ReconcileToolInput,
   ReconcileToolResult,
   RequeueFollowUpInput,
   ReleaseGoalLeaseInput,
+  ReleaseGoalVerifierLeaseInput,
   SessionListScope,
   SessionStore,
   UpdateWorkspaceInput,
@@ -93,11 +109,12 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 18
+const SCHEMA_VERSION = 19
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace'
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
 const DEFAULT_GOAL_LEASE_MS = 30_000
+const DEFAULT_GOAL_VERIFIER_LEASE_MS = 45_000
 const DEFAULT_FOLLOW_UP_LEASE_MS = 30_000
 const ACTIVE_TURN_STATUSES = new Set(['queued', 'running', 'waiting_tool'])
 const TERMINAL_TURN_STATUSES = new Set(['completed', 'cancelled', 'failed', 'interrupted'])
@@ -1253,6 +1270,134 @@ export class SqliteSessionStore implements SessionStore {
         this.#db.exec('PRAGMA user_version = 18')
         appliedVersion = 18
       }
+      if (appliedVersion < 19) {
+        this.#db.exec(`
+          ALTER TABLE goals ADD COLUMN verification_proposal_id TEXT;
+          ALTER TABLE goals ADD COLUMN latest_completion_receipt_id TEXT;
+          ALTER TABLE goals ADD COLUMN latest_stop_receipt_id TEXT;
+
+          CREATE TABLE goal_completion_proposals (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            goal_id TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL CHECK(goal_revision>=1),
+            turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE RESTRICT,
+            summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 2000),
+            requirements_json TEXT NOT NULL CHECK(json_valid(requirements_json) AND json_type(requirements_json)='array'),
+            evidence_bundle_json TEXT NOT NULL CHECK(json_valid(evidence_bundle_json) AND json_type(evidence_bundle_json)='object'),
+            evidence_bundle_hash TEXT NOT NULL CHECK(length(evidence_bundle_hash)=64),
+            status TEXT NOT NULL CHECK(status IN ('verifying','accepted','rejected','ineligible')),
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            UNIQUE(goal_id,goal_revision,turn_id)
+          ) STRICT;
+          CREATE INDEX goal_completion_proposals_goal ON goal_completion_proposals(goal_id,goal_revision,created_at);
+          CREATE TRIGGER goal_completion_proposals_immutable BEFORE UPDATE ON goal_completion_proposals
+          WHEN NEW.id<>OLD.id OR NEW.session_id<>OLD.session_id OR NEW.thread_id<>OLD.thread_id
+            OR NEW.goal_id<>OLD.goal_id OR NEW.goal_revision<>OLD.goal_revision OR NEW.turn_id<>OLD.turn_id
+            OR NEW.summary<>OLD.summary OR NEW.requirements_json<>OLD.requirements_json
+            OR NEW.evidence_bundle_json<>OLD.evidence_bundle_json
+            OR NEW.evidence_bundle_hash<>OLD.evidence_bundle_hash OR NEW.created_at<>OLD.created_at BEGIN
+            SELECT RAISE(ABORT, 'Goal completion proposal evidence is immutable');
+          END;
+          CREATE TRIGGER goal_completion_proposals_transition BEFORE UPDATE ON goal_completion_proposals
+          WHEN NOT (
+            OLD.status='verifying' AND NEW.status IN ('accepted','rejected','ineligible')
+            AND OLD.resolved_at IS NULL AND NEW.resolved_at IS NOT NULL
+          ) BEGIN
+            SELECT RAISE(ABORT, 'Invalid Goal completion proposal transition');
+          END;
+          CREATE TRIGGER goal_completion_proposals_no_delete BEFORE DELETE ON goal_completion_proposals
+          WHEN NOT EXISTS (SELECT 1 FROM session_purge_context WHERE session_id=OLD.session_id) BEGIN
+            SELECT RAISE(ABORT, 'Goal completion proposals are retained');
+          END;
+
+          CREATE TABLE goal_verifier_leases (
+            proposal_id TEXT PRIMARY KEY REFERENCES goal_completion_proposals(id) ON DELETE CASCADE,
+            lease_id TEXT NOT NULL UNIQUE,
+            goal_id TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL CHECK(goal_revision>=1),
+            owner_id TEXT NOT NULL CHECK(length(owner_id)>=1),
+            acquired_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+          ) STRICT;
+
+          CREATE TABLE goal_verification_attempts (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            proposal_id TEXT NOT NULL REFERENCES goal_completion_proposals(id) ON DELETE RESTRICT,
+            goal_id TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL CHECK(goal_revision>=1),
+            evaluator_provider TEXT NOT NULL CHECK(evaluator_provider IN ('claude','codex','gemini')),
+            evaluator_model TEXT NOT NULL CHECK(length(evaluator_model)>=1),
+            evidence_bundle_hash TEXT NOT NULL CHECK(length(evidence_bundle_hash)=64),
+            outcome TEXT NOT NULL CHECK(outcome IN ('complete','incomplete','impossible','indeterminate')),
+            decision_json TEXT NOT NULL CHECK(json_valid(decision_json) AND json_type(decision_json)='object'),
+            usage_json TEXT CHECK(usage_json IS NULL OR (json_valid(usage_json) AND json_type(usage_json)='object')),
+            started_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX goal_verification_attempts_goal ON goal_verification_attempts(goal_id,goal_revision,completed_at);
+          CREATE TRIGGER goal_verification_attempts_no_update BEFORE UPDATE ON goal_verification_attempts BEGIN
+            SELECT RAISE(ABORT, 'Goal verification attempts are append-only');
+          END;
+          CREATE TRIGGER goal_verification_attempts_no_delete BEFORE DELETE ON goal_verification_attempts
+          WHEN NOT EXISTS (SELECT 1 FROM session_purge_context WHERE session_id=OLD.session_id) BEGIN
+            SELECT RAISE(ABORT, 'Goal verification attempts are append-only');
+          END;
+
+          CREATE TABLE goal_completion_receipts (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            goal_id TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL CHECK(goal_revision>=1),
+            proposal_id TEXT NOT NULL REFERENCES goal_completion_proposals(id) ON DELETE RESTRICT,
+            verification_attempt_id TEXT NOT NULL UNIQUE REFERENCES goal_verification_attempts(id) ON DELETE RESTRICT,
+            evidence_bundle_hash TEXT NOT NULL CHECK(length(evidence_bundle_hash)=64),
+            host_checks_json TEXT NOT NULL CHECK(json_valid(host_checks_json) AND json_type(host_checks_json)='array'),
+            acceptance_policy_version TEXT NOT NULL,
+            accepted_at TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX goal_completion_receipts_goal ON goal_completion_receipts(goal_id,goal_revision,accepted_at);
+          CREATE TRIGGER goal_completion_receipts_no_update BEFORE UPDATE ON goal_completion_receipts BEGIN
+            SELECT RAISE(ABORT, 'Goal completion receipts are append-only');
+          END;
+          CREATE TRIGGER goal_completion_receipts_no_delete BEFORE DELETE ON goal_completion_receipts
+          WHEN NOT EXISTS (SELECT 1 FROM session_purge_context WHERE session_id=OLD.session_id) BEGIN
+            SELECT RAISE(ABORT, 'Goal completion receipts are append-only');
+          END;
+
+          CREATE TABLE goal_stop_receipts (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+            thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+            goal_id TEXT NOT NULL,
+            goal_revision INTEGER NOT NULL CHECK(goal_revision>=1),
+            verification_attempt_id TEXT NOT NULL UNIQUE REFERENCES goal_verification_attempts(id) ON DELETE RESTRICT,
+            kind TEXT NOT NULL CHECK(kind='confirmed_impossible'),
+            reason TEXT NOT NULL,
+            evidence_bundle_hash TEXT NOT NULL CHECK(length(evidence_bundle_hash)=64),
+            decided_at TEXT NOT NULL,
+            resumable INTEGER NOT NULL CHECK(resumable IN (0,1))
+          ) STRICT;
+          CREATE INDEX goal_stop_receipts_goal ON goal_stop_receipts(goal_id,goal_revision,decided_at);
+          CREATE TRIGGER goal_stop_receipts_no_update BEFORE UPDATE ON goal_stop_receipts BEGIN
+            SELECT RAISE(ABORT, 'Goal stop receipts are append-only');
+          END;
+          CREATE TRIGGER goal_stop_receipts_no_delete BEFORE DELETE ON goal_stop_receipts
+          WHEN NOT EXISTS (SELECT 1 FROM session_purge_context WHERE session_id=OLD.session_id) BEGIN
+            SELECT RAISE(ABORT, 'Goal stop receipts are append-only');
+          END;
+        `)
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(19, 'independent-goal-verification', this.#now())
+        this.#db.exec('PRAGMA user_version = 19')
+        appliedVersion = 19
+      }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
         throw new Error(`Session schema metadata mismatch: user_version=${userVersion}`)
@@ -1290,6 +1435,24 @@ export class SqliteSessionStore implements SessionStore {
       ['trigger', 'execution_context_manifests_no_delete'],
       ['trigger', 'execution_context_entries_no_update'],
       ['trigger', 'execution_context_entries_no_delete'],
+      ['table', 'goal_completion_proposals'],
+      ['table', 'goal_verifier_leases'],
+      ['table', 'goal_verification_attempts'],
+      ['table', 'goal_completion_receipts'],
+      ['table', 'goal_stop_receipts'],
+      ['index', 'goal_completion_proposals_goal'],
+      ['index', 'goal_verification_attempts_goal'],
+      ['index', 'goal_completion_receipts_goal'],
+      ['index', 'goal_stop_receipts_goal'],
+      ['trigger', 'goal_completion_proposals_immutable'],
+      ['trigger', 'goal_completion_proposals_transition'],
+      ['trigger', 'goal_completion_proposals_no_delete'],
+      ['trigger', 'goal_verification_attempts_no_update'],
+      ['trigger', 'goal_verification_attempts_no_delete'],
+      ['trigger', 'goal_completion_receipts_no_update'],
+      ['trigger', 'goal_completion_receipts_no_delete'],
+      ['trigger', 'goal_stop_receipts_no_update'],
+      ['trigger', 'goal_stop_receipts_no_delete'],
     ]
     const actual = new Set(this.#all(this.#db.prepare(`
       SELECT type,name FROM sqlite_schema WHERE type IN ('table','index','trigger')
@@ -1300,7 +1463,7 @@ export class SqliteSessionStore implements SessionStore {
     if (missing.length > 0) {
       throw new ContextPersistenceError(
         'integrity_violation',
-        `Session schema is missing required derived-context protections: ${missing.join(', ')}`,
+        `Session schema is missing required persistence protections: ${missing.join(', ')}`,
       )
     }
   }
@@ -1639,6 +1802,14 @@ export class SqliteSessionStore implements SessionStore {
         DELETE FROM native_session_identity_keys WHERE source_id IN (${sourceIds});
         DELETE FROM native_session_source_provenance WHERE source_id IN (${sourceIds});
         DELETE FROM native_session_sources
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM goal_stop_receipts
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM goal_completion_receipts
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM goal_verification_attempts
+          WHERE session_id IN (SELECT session_id FROM session_purge_context);
+        DELETE FROM goal_completion_proposals
           WHERE session_id IN (SELECT session_id FROM session_purge_context);
         DELETE FROM provider_events WHERE turn_id IN (
           SELECT t.id FROM turns t
@@ -3016,7 +3187,7 @@ export class SqliteSessionStore implements SessionStore {
       SELECT g.* FROM goals g
       JOIN threads t ON t.id=g.thread_id
       JOIN sessions s ON s.id=t.session_id
-      WHERE g.status='active' AND s.archived_at IS NULL
+      WHERE g.status='active' AND g.verification_proposal_id IS NULL AND s.archived_at IS NULL
       ORDER BY g.updated_at,g.id
     `))
       .map((row) => this.#goal(row))
@@ -3027,6 +3198,267 @@ export class SqliteSessionStore implements SessionStore {
     return this.#all(this.#db.prepare(
       'SELECT * FROM goal_events WHERE thread_id=? AND sequence>? ORDER BY sequence',
     ), threadId, afterSequence).map((row) => this.#goalEvent(row))
+  }
+
+  listPendingGoalCompletionProposals(): GoalCompletionProposal[] {
+    return this.#all(this.#db.prepare(`
+      SELECT p.* FROM goal_completion_proposals p
+      JOIN goals g ON g.id=p.goal_id
+      JOIN sessions s ON s.id=p.session_id
+      WHERE p.status='verifying' AND g.verification_proposal_id=p.id
+        AND g.revision=p.goal_revision AND s.archived_at IS NULL
+      ORDER BY p.created_at,p.id
+    `)).map((row) => this.#goalCompletionProposal(row))
+  }
+
+  getGoalVerificationHistory(goalId: GoalId): GoalVerificationHistory {
+    return {
+      proposals: this.#all(this.#db.prepare(`
+        SELECT * FROM goal_completion_proposals WHERE goal_id=? ORDER BY created_at,id
+      `), goalId).map((row) => this.#goalCompletionProposal(row)),
+      attempts: this.#all(this.#db.prepare(`
+        SELECT * FROM goal_verification_attempts WHERE goal_id=? ORDER BY completed_at,id
+      `), goalId).map((row) => this.#goalVerificationAttempt(row)),
+      receipts: this.#all(this.#db.prepare(`
+        SELECT * FROM goal_completion_receipts WHERE goal_id=? ORDER BY accepted_at,id
+      `), goalId).map((row) => this.#goalCompletionReceipt(row)),
+      stopReceipts: this.#all(this.#db.prepare(`
+        SELECT * FROM goal_stop_receipts WHERE goal_id=? ORDER BY decided_at,id
+      `), goalId).map((row) => this.#goalStopReceipt(row)),
+    }
+  }
+
+  beginGoalVerification(input: BeginGoalVerificationInput): GoalCompletionProposal | null {
+    return this.#transaction('IMMEDIATE', () => {
+      const goalRow = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), input.goalId)
+      if (!goalRow) return null
+      const goal = this.#goal(goalRow)
+      if (goal.revision !== input.goalRevision || goal.status !== 'active') return null
+      const turn = this.#optional(this.#db.prepare('SELECT * FROM turns WHERE id=?'), input.turnId)
+      if (!turn || text(turn, 'status') !== 'completed'
+        || nullableText(turn, 'goal_id') !== goal.id
+        || integer(turn, 'goal_revision') !== goal.revision) return null
+      const terminalAccounting = this.#optional(this.#db.prepare(`
+        SELECT terminal FROM goal_turn_accounting WHERE turn_id=? AND goal_id=? AND goal_revision=?
+      `), input.turnId, goal.id, goal.revision)
+      if (!terminalAccounting || integer(terminalAccounting, 'terminal') !== 1) return null
+      validateGoalEvidenceBundle(input.evidenceBundle, goal, input.turnId)
+      if (input.summary !== input.evidenceBundle.proposalSummary
+        || canonicalJson(input.requirements) !== canonicalJson(input.evidenceBundle.requirements)) {
+        throw new GoalStoreError('invalid_goal_input', 'Completion proposal does not match its frozen evidence bundle')
+      }
+      if (input.summary.trim().length < 1 || [...input.summary].length > 2_000) {
+        throw new GoalStoreError('invalid_goal_input', 'Completion proposal summary must contain 1..2000 characters')
+      }
+      validateGoalRequirementClaims(input.requirements)
+      const thread = this.getThread(goal.threadId)
+      if (!thread) throw new Error('Corrupt database: Goal thread is missing')
+      const now = this.#now()
+      const proposalId = this.#idFactory()
+      this.#db.prepare(`
+        INSERT INTO goal_completion_proposals(
+          id,session_id,thread_id,goal_id,goal_revision,turn_id,summary,requirements_json,
+          evidence_bundle_json,evidence_bundle_hash,status,created_at,resolved_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?, 'verifying',?,NULL)
+      `).run(
+        proposalId, thread.sessionId, goal.threadId, goal.id, goal.revision, input.turnId,
+        input.summary, canonicalJson(input.requirements), canonicalJson(input.evidenceBundle),
+        input.evidenceBundle.hash, now,
+      )
+      this.#db.prepare(`
+        UPDATE goals SET verification_proposal_id=?,status_reason_json=NULL,updated_at=?
+        WHERE id=? AND revision=? AND status='active' AND verification_proposal_id IS NULL
+      `).run(proposalId, now, goal.id, goal.revision)
+      const verifying = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), goal.id))
+      if (verifying.verificationProposalId !== proposalId) throw new Error('Goal verification CAS failed')
+      this.#appendGoalEvent(verifying, thread.sessionId, 'goal_verification_started', {
+        proposalId,
+        turnId: input.turnId,
+        evidenceBundleHash: input.evidenceBundle.hash,
+      }, now)
+      this.#appendGoalChanged(verifying, thread.sessionId, input.turnId, now)
+      return this.#goalCompletionProposal(this.#one(this.#db.prepare(
+        'SELECT * FROM goal_completion_proposals WHERE id=?',
+      ), proposalId))
+    })
+  }
+
+  claimGoalVerifierLease(input: ClaimGoalVerifierLeaseInput): GoalVerifierLease | null {
+    const duration = validateLeaseDuration(input.leaseDurationMs ?? DEFAULT_GOAL_VERIFIER_LEASE_MS)
+    if (!input.ownerId) throw new GoalStoreError('invalid_goal_input', 'Goal verifier lease owner must not be empty')
+    return this.#transaction('IMMEDIATE', () => {
+      const proposal = this.#optional(this.#db.prepare(`
+        SELECT p.id FROM goal_completion_proposals p
+        JOIN goals g ON g.id=p.goal_id
+        WHERE p.id=? AND p.goal_id=? AND p.goal_revision=? AND p.status='verifying'
+          AND g.revision=p.goal_revision AND g.verification_proposal_id=p.id
+      `), input.proposalId, input.goalId, input.goalRevision)
+      if (!proposal) return null
+      const now = this.#now()
+      const existing = this.#optional(this.#db.prepare(
+        'SELECT * FROM goal_verifier_leases WHERE proposal_id=?',
+      ), input.proposalId)
+      if (existing && text(existing, 'expires_at') > now) return null
+      if (existing) this.#db.prepare('DELETE FROM goal_verifier_leases WHERE proposal_id=?').run(input.proposalId)
+      const leaseId = this.#idFactory()
+      const expiresAt = addMilliseconds(now, duration)
+      this.#db.prepare(`
+        INSERT INTO goal_verifier_leases(
+          proposal_id,lease_id,goal_id,goal_revision,owner_id,acquired_at,heartbeat_at,expires_at
+        ) VALUES (?,?,?,?,?,?,?,?)
+      `).run(
+        input.proposalId, leaseId, input.goalId, input.goalRevision, input.ownerId, now, now, expiresAt,
+      )
+      return this.#goalVerifierLease(this.#one(this.#db.prepare(
+        'SELECT * FROM goal_verifier_leases WHERE proposal_id=?',
+      ), input.proposalId))
+    })
+  }
+
+  heartbeatGoalVerifierLease(input: HeartbeatGoalVerifierLeaseInput): GoalVerifierLease | null {
+    const duration = validateLeaseDuration(input.leaseDurationMs ?? DEFAULT_GOAL_VERIFIER_LEASE_MS)
+    return this.#transaction('IMMEDIATE', () => {
+      const now = this.#now()
+      const row = this.#optional(this.#db.prepare(`
+        SELECT l.* FROM goal_verifier_leases l
+        JOIN goal_completion_proposals p ON p.id=l.proposal_id
+        JOIN goals g ON g.id=p.goal_id
+        WHERE l.proposal_id=? AND l.lease_id=? AND l.goal_id=? AND l.goal_revision=? AND l.owner_id=?
+          AND l.expires_at>? AND p.status='verifying' AND g.verification_proposal_id=p.id
+      `), input.proposalId, input.leaseId, input.goalId, input.goalRevision, input.ownerId, now)
+      if (!row) return null
+      const expiresAt = addMilliseconds(now, duration)
+      this.#db.prepare('UPDATE goal_verifier_leases SET heartbeat_at=?,expires_at=? WHERE proposal_id=?')
+        .run(now, expiresAt, input.proposalId)
+      return this.#goalVerifierLease(this.#one(this.#db.prepare(
+        'SELECT * FROM goal_verifier_leases WHERE proposal_id=?',
+      ), input.proposalId))
+    })
+  }
+
+  releaseGoalVerifierLease(input: ReleaseGoalVerifierLeaseInput): boolean {
+    return this.#transaction('IMMEDIATE', () => {
+      const result = this.#db.prepare(`
+        DELETE FROM goal_verifier_leases WHERE proposal_id=? AND lease_id=? AND owner_id=?
+      `).run(input.proposalId, input.leaseId, input.ownerId)
+      return result.changes === 1
+    })
+  }
+
+  finishGoalVerification(input: FinishGoalVerificationInput): FinishGoalVerificationResult {
+    return this.#transaction('IMMEDIATE', () => {
+      const proposalRow = this.#optional(this.#db.prepare(
+        'SELECT * FROM goal_completion_proposals WHERE id=?',
+      ), input.proposalId)
+      const goalRow = this.#optional(this.#db.prepare('SELECT * FROM goals WHERE id=?'), input.goalId)
+      if (!proposalRow || !goalRow) return {
+        status: 'stale', goal: goalRow ? this.#goal(goalRow) : null,
+        attempt: null, receipt: null, stopReceipt: null,
+      }
+      const proposal = this.#goalCompletionProposal(proposalRow)
+      const goal = this.#goal(goalRow)
+      const lease = this.#optional(this.#db.prepare(`
+        SELECT * FROM goal_verifier_leases
+        WHERE proposal_id=? AND lease_id=? AND owner_id=? AND expires_at>?
+      `), proposal.id, input.leaseId, input.leaseOwner, this.#now())
+      if (proposal.status !== 'verifying' || proposal.goalId !== goal.id
+        || proposal.goalRevision !== input.goalRevision || goal.revision !== input.goalRevision
+        || goal.verificationProposalId !== proposal.id || goal.status !== 'verifying' || !lease) {
+        return { status: 'stale', goal, attempt: null, receipt: null, stopReceipt: null }
+      }
+      validateGoalVerificationDecision(input.decision)
+      const now = this.#now()
+      const thread = this.getThread(goal.threadId)
+      if (!thread) throw new Error('Corrupt database: Goal thread is missing')
+      const attemptId = this.#idFactory()
+      this.#db.prepare(`
+        INSERT INTO goal_verification_attempts(
+          id,session_id,thread_id,proposal_id,goal_id,goal_revision,evaluator_provider,evaluator_model,
+          evidence_bundle_hash,outcome,decision_json,usage_json,started_at,completed_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        attemptId, thread.sessionId, goal.threadId, proposal.id, goal.id, goal.revision,
+        input.evaluatorProvider, input.evaluatorModel, proposal.evidenceBundle.hash,
+        input.decision.outcome, canonicalJson(input.decision),
+        input.usage == null ? null : canonicalJson(input.usage), now, now,
+      )
+      const hostChecks = completionHostChecks(proposal, input.decision)
+      const accepted = input.decision.outcome === 'complete' && hostChecks.failures.length === 0
+      const impossibleChecks = impossibleHostChecks(proposal, input.decision)
+      const impossible = input.decision.outcome === 'impossible' && impossibleChecks.failures.length === 0
+      const relevantFailures = input.decision.outcome === 'impossible'
+        ? impossibleChecks.failures
+        : hostChecks.failures
+      const receiptId = accepted ? this.#idFactory() : null
+      const stopReceiptId = impossible ? this.#idFactory() : null
+      if (receiptId) {
+        this.#db.prepare(`
+          INSERT INTO goal_completion_receipts(
+            id,session_id,thread_id,goal_id,goal_revision,proposal_id,verification_attempt_id,
+            evidence_bundle_hash,host_checks_json,acceptance_policy_version,accepted_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        `).run(
+          receiptId, thread.sessionId, goal.threadId, goal.id, goal.revision, proposal.id, attemptId,
+          proposal.evidenceBundle.hash, canonicalJson(hostChecks.passed), 'goal-v2.1', now,
+        )
+      }
+      if (stopReceiptId) {
+        this.#db.prepare(`
+          INSERT INTO goal_stop_receipts(
+            id,session_id,thread_id,goal_id,goal_revision,verification_attempt_id,kind,reason,
+            evidence_bundle_hash,decided_at,resumable
+          ) VALUES (?,?,?,?,?,?,'confirmed_impossible',?,?,?,1)
+        `).run(
+          stopReceiptId, thread.sessionId, goal.threadId, goal.id, goal.revision, attemptId,
+          input.decision.reason, proposal.evidenceBundle.hash, now,
+        )
+      }
+      const nextStatus = accepted ? 'complete' : impossible ? 'blocked' : 'active'
+      const reason: GoalStatusReason | null = accepted ? null : {
+        code: impossible ? 'confirmed_impossible'
+          : input.decision.outcome === 'indeterminate' ? 'verification_indeterminate'
+            : input.decision.outcome === 'complete' || input.decision.outcome === 'impossible'
+              ? 'verification_host_rejected' : 'verification_incomplete',
+        source: 'host',
+        message: relevantFailures.length > 0
+          ? `Verification was not accepted: ${relevantFailures.join('; ')}`
+          : input.decision.reason,
+        at: now,
+      }
+      this.#db.prepare(`
+        UPDATE goal_completion_proposals SET status=?,resolved_at=? WHERE id=? AND status='verifying'
+      `).run(accepted ? 'accepted' : 'rejected', now, proposal.id)
+      this.#db.prepare('DELETE FROM goal_verifier_leases WHERE proposal_id=?').run(proposal.id)
+      this.#db.prepare(`
+        UPDATE goals SET status=?,status_reason_json=?,verification_proposal_id=NULL,
+          latest_completion_receipt_id=?,latest_stop_receipt_id=?,updated_at=?,completed_at=?
+        WHERE id=? AND revision=? AND verification_proposal_id=?
+      `).run(
+        nextStatus, reason === null ? null : canonicalJson(reason), receiptId, stopReceiptId,
+        now, accepted ? now : null, goal.id, goal.revision, proposal.id,
+      )
+      const updated = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), goal.id))
+      const attempt = this.#goalVerificationAttempt(this.#one(this.#db.prepare(
+        'SELECT * FROM goal_verification_attempts WHERE id=?',
+      ), attemptId))
+      const receipt = receiptId ? this.#goalCompletionReceipt(this.#one(this.#db.prepare(
+        'SELECT * FROM goal_completion_receipts WHERE id=?',
+      ), receiptId)) : null
+      const stopReceipt = stopReceiptId ? this.#goalStopReceipt(this.#one(this.#db.prepare(
+        'SELECT * FROM goal_stop_receipts WHERE id=?',
+      ), stopReceiptId)) : null
+      this.#appendGoalEvent(updated, thread.sessionId, 'goal_verification_finished', {
+        proposalId: proposal.id,
+        attemptId,
+        outcome: input.decision.outcome,
+        accepted,
+        hostCheckFailures: relevantFailures,
+        receiptId,
+        stopReceiptId,
+      }, now)
+      this.#appendGoalChanged(updated, thread.sessionId, null, now)
+      return { status: 'applied', goal: updated, attempt, receipt, stopReceipt }
+    })
   }
 
   createGoal(input: CreateGoalInput): CanonicalGoal {
@@ -3051,6 +3483,11 @@ export class SqliteSessionStore implements SessionStore {
       const now = this.#now()
       if (currentRow) {
         const previous = this.#goal(currentRow)
+        if (previous.verificationProposalId) {
+          this.#db.prepare(`UPDATE goal_completion_proposals SET status='ineligible',resolved_at=? WHERE id=? AND status='verifying'`)
+            .run(now, previous.verificationProposalId)
+          this.#db.prepare('DELETE FROM goal_verifier_leases WHERE proposal_id=?').run(previous.verificationProposalId)
+        }
         this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(previous.id)
         this.#appendGoalEvent(previous, thread.sessionId, 'goal_replaced', { previous }, now)
         this.#db.prepare('DELETE FROM goals WHERE id=?').run(previous.id)
@@ -3111,7 +3548,7 @@ export class SqliteSessionStore implements SessionStore {
           : reasonCode === 'goal_time_limit'
             ? largerTimeLimit
             : largerTokenLimit || largerTurnLimit || largerTimeLimit
-      if (current.status === 'complete') nextStatus = 'active'
+      if (current.status === 'complete' || current.status === 'verifying') nextStatus = 'active'
       if (current.status === 'budget_limited') {
         const resetRelevantCounter = input.resetLimitCounters === true && reasonCode !== 'goal_token_limit'
         if (!largerRelevantLimit && !resetRelevantCounter) {
@@ -3129,7 +3566,8 @@ export class SqliteSessionStore implements SessionStore {
         UPDATE goals SET
           objective=?,status=?,status_reason_json=?,revision=?,provider=?,model=?,effort=?,token_budget=?,
           tokens_used=?,time_used_seconds=?,max_automatic_turns=?,automatic_turns_used=?,max_active_seconds=?,
-          no_progress_count=0,last_progress_digest=NULL,updated_at=?,completed_at=?
+          no_progress_count=0,last_progress_digest=NULL,verification_proposal_id=NULL,
+          latest_completion_receipt_id=NULL,latest_stop_receipt_id=NULL,updated_at=?,completed_at=?
         WHERE id=? AND revision=?
       `).run(
         input.objective ?? current.objective,
@@ -3150,6 +3588,11 @@ export class SqliteSessionStore implements SessionStore {
         current.id,
         current.revision,
       )
+      if (current.verificationProposalId) {
+        this.#db.prepare(`UPDATE goal_completion_proposals SET status='ineligible',resolved_at=? WHERE id=? AND status='verifying'`)
+          .run(now, current.verificationProposalId)
+        this.#db.prepare('DELETE FROM goal_verifier_leases WHERE proposal_id=?').run(current.verificationProposalId)
+      }
       this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(current.id)
       const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), current.id))
       const thread = this.getThread(goal.threadId)
@@ -3193,7 +3636,8 @@ export class SqliteSessionStore implements SessionStore {
       const stoppedForTimeLimit = input.status === 'budget_limited' && reason?.code === 'goal_time_limit'
       this.#db.prepare(`
         UPDATE goals SET status=?,status_reason_json=?,revision=?,provider=?,model=?,effort=?,
-          time_used_seconds=?,automatic_turns_used=?,no_progress_count=?,last_progress_digest=?,updated_at=?,completed_at=?
+          time_used_seconds=?,automatic_turns_used=?,no_progress_count=?,last_progress_digest=?,
+          verification_proposal_id=NULL,updated_at=?,completed_at=?
         WHERE id=? AND revision=?
       `).run(
         input.status,
@@ -3213,6 +3657,11 @@ export class SqliteSessionStore implements SessionStore {
         current.id,
         current.revision,
       )
+      if (current.verificationProposalId) {
+        this.#db.prepare(`UPDATE goal_completion_proposals SET status='ineligible',resolved_at=? WHERE id=? AND status='verifying'`)
+          .run(now, current.verificationProposalId)
+        this.#db.prepare('DELETE FROM goal_verifier_leases WHERE proposal_id=?').run(current.verificationProposalId)
+      }
       this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(current.id)
       const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), current.id))
       const thread = this.getThread(goal.threadId)
@@ -3234,6 +3683,11 @@ export class SqliteSessionStore implements SessionStore {
       const thread = this.getThread(current.threadId)
       if (!thread) throw new Error('Corrupt database: Goal thread is missing')
       const now = this.#now()
+      if (current.verificationProposalId) {
+        this.#db.prepare(`UPDATE goal_completion_proposals SET status='ineligible',resolved_at=? WHERE id=? AND status='verifying'`)
+          .run(now, current.verificationProposalId)
+        this.#db.prepare('DELETE FROM goal_verifier_leases WHERE proposal_id=?').run(current.verificationProposalId)
+      }
       this.#db.prepare('DELETE FROM goal_scheduler_leases WHERE goal_id=?').run(current.id)
       this.#db.prepare('DELETE FROM goals WHERE id=?').run(current.id)
       this.#appendGoalEvent(current, thread.sessionId, 'goal_cleared', { goal: current }, now)
@@ -4970,11 +5424,13 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   #goal(row: SqlRow): CanonicalGoal {
+    const verificationProposalId = nullableText(row, 'verification_proposal_id')
+    const storedStatus = text(row, 'status') as Exclude<GoalStatus, 'verifying'>
     return {
       id: text(row, 'id'),
       threadId: text(row, 'thread_id'),
       objective: text(row, 'objective'),
-      status: text(row, 'status') as GoalStatus,
+      status: storedStatus === 'active' && verificationProposalId !== null ? 'verifying' : storedStatus,
       statusReason: parseNullableObject(row.status_reason_json) as unknown as GoalStatusReason | null,
       revision: integer(row, 'revision'),
       provider: text(row, 'provider') as CanonicalGoal['provider'],
@@ -4992,6 +5448,81 @@ export class SqliteSessionStore implements SessionStore {
       updatedAt: text(row, 'updated_at'),
       startedAt: text(row, 'started_at'),
       completedAt: nullableText(row, 'completed_at'),
+      verificationProposalId,
+      latestCompletionReceiptId: nullableText(row, 'latest_completion_receipt_id'),
+      latestStopReceiptId: nullableText(row, 'latest_stop_receipt_id'),
+    }
+  }
+
+  #goalCompletionProposal(row: SqlRow): GoalCompletionProposal {
+    const requirements = parseArray(row.requirements_json) as unknown as GoalRequirementClaim[]
+    const evidenceBundle = parseObject(row.evidence_bundle_json) as unknown as GoalEvidenceBundle
+    const storedHash = text(row, 'evidence_bundle_hash')
+    const { hash, ...evidenceContent } = evidenceBundle
+    if (hash !== storedHash || goalEvidenceHash(evidenceContent) !== storedHash
+      || evidenceBundle.goalId !== text(row, 'goal_id')
+      || evidenceBundle.goalRevision !== integer(row, 'goal_revision')
+      || evidenceBundle.terminalTurn?.id !== text(row, 'turn_id')
+      || evidenceBundle.proposalSummary !== text(row, 'summary')
+      || canonicalJson(evidenceBundle.requirements) !== canonicalJson(requirements)) {
+      throw new ContextPersistenceError('integrity_violation', 'Stored Goal completion proposal evidence is inconsistent')
+    }
+    return {
+      id: text(row, 'id'),
+      goalId: text(row, 'goal_id'),
+      goalRevision: integer(row, 'goal_revision'),
+      turnId: text(row, 'turn_id'),
+      summary: text(row, 'summary'),
+      requirements,
+      evidenceBundle,
+      status: text(row, 'status') as GoalCompletionProposal['status'],
+      createdAt: text(row, 'created_at'),
+      resolvedAt: nullableText(row, 'resolved_at'),
+    }
+  }
+
+  #goalVerificationAttempt(row: SqlRow): GoalVerificationAttempt {
+    return {
+      id: text(row, 'id'),
+      proposalId: text(row, 'proposal_id'),
+      goalId: text(row, 'goal_id'),
+      goalRevision: integer(row, 'goal_revision'),
+      evaluatorProvider: text(row, 'evaluator_provider') as CanonicalProvider,
+      evaluatorModel: text(row, 'evaluator_model'),
+      evidenceBundleHash: text(row, 'evidence_bundle_hash'),
+      outcome: text(row, 'outcome') as GoalVerificationAttempt['outcome'],
+      decision: parseObject(row.decision_json) as unknown as GoalVerificationDecision,
+      usage: parseNullableObject(row.usage_json),
+      startedAt: text(row, 'started_at'),
+      completedAt: text(row, 'completed_at'),
+    }
+  }
+
+  #goalCompletionReceipt(row: SqlRow): GoalCompletionReceipt {
+    return {
+      id: text(row, 'id'),
+      goalId: text(row, 'goal_id'),
+      goalRevision: integer(row, 'goal_revision'),
+      proposalId: text(row, 'proposal_id'),
+      verificationAttemptId: text(row, 'verification_attempt_id'),
+      evidenceBundleHash: text(row, 'evidence_bundle_hash'),
+      hostChecks: parseArray(row.host_checks_json) as string[],
+      acceptedAt: text(row, 'accepted_at'),
+      acceptancePolicyVersion: text(row, 'acceptance_policy_version'),
+    }
+  }
+
+  #goalStopReceipt(row: SqlRow): GoalStopReceipt {
+    return {
+      id: text(row, 'id'),
+      goalId: text(row, 'goal_id'),
+      goalRevision: integer(row, 'goal_revision'),
+      verificationAttemptId: text(row, 'verification_attempt_id'),
+      kind: 'confirmed_impossible',
+      reason: text(row, 'reason'),
+      evidenceBundleHash: text(row, 'evidence_bundle_hash'),
+      decidedAt: text(row, 'decided_at'),
+      resumable: integer(row, 'resumable') === 1,
     }
   }
 
@@ -5003,6 +5534,19 @@ export class SqliteSessionStore implements SessionStore {
   #goalLease(row: SqlRow): GoalSchedulerLease {
     return {
       leaseId: text(row, 'lease_id'),
+      goalId: text(row, 'goal_id'),
+      goalRevision: integer(row, 'goal_revision'),
+      ownerId: text(row, 'owner_id'),
+      acquiredAt: text(row, 'acquired_at'),
+      heartbeatAt: text(row, 'heartbeat_at'),
+      expiresAt: text(row, 'expires_at'),
+    }
+  }
+
+  #goalVerifierLease(row: SqlRow): GoalVerifierLease {
+    return {
+      leaseId: text(row, 'lease_id'),
+      proposalId: text(row, 'proposal_id'),
       goalId: text(row, 'goal_id'),
       goalRevision: integer(row, 'goal_revision'),
       ownerId: text(row, 'owner_id'),
@@ -5183,18 +5727,155 @@ function goalObservationMatches(
 function isValidGoalTransition(current: GoalStatus, next: GoalStatus, resetLimitCounters: boolean): boolean {
   if (current === 'active') {
     return next === 'paused' || next === 'blocked' || next === 'usage_limited'
-      || next === 'budget_limited' || next === 'complete'
+      || next === 'budget_limited'
   }
+
+  if (current === 'verifying') return next === 'paused' || next === 'blocked'
   if (next !== 'active') return false
   if (current === 'paused' || current === 'blocked' || current === 'usage_limited') return true
   return current === 'budget_limited' && resetLimitCounters
+}
+
+function validateGoalEvidenceBundle(bundle: GoalEvidenceBundle, goal: CanonicalGoal, turnId: string): void {
+  if (bundle.goalId !== goal.id || bundle.goalRevision !== goal.revision
+    || bundle.objective !== goal.objective || bundle.terminalTurn.id !== turnId
+    || bundle.terminalTurn.status !== 'completed') {
+    throw new GoalStoreError('invalid_goal_input', 'Frozen Goal evidence does not match the Goal turn')
+  }
+  const { hash, ...content } = bundle
+  validateSha256(hash, 'Goal evidence bundle hash')
+  if (goalEvidenceHash(content) !== hash) {
+    throw new GoalStoreError('invalid_goal_input', 'Frozen Goal evidence bundle hash does not match its content')
+  }
+  const ids = bundle.evidence.map((entry) => entry.id)
+  if (new Set(ids).size !== ids.length) {
+    throw new GoalStoreError('invalid_goal_input', 'Frozen Goal evidence IDs must be unique')
+  }
+}
+
+function validateGoalRequirementClaims(requirements: readonly GoalRequirementClaim[]): void {
+  if (requirements.length < 1 || requirements.length > 64) {
+    throw new GoalStoreError('invalid_goal_input', 'Completion proposal requires 1..64 requirements')
+  }
+  const ids = new Set<string>()
+  for (const requirement of requirements) {
+    if (!requirement.id || ids.has(requirement.id) || !requirement.requirement.trim()
+      || requirement.evidence.length < 1 || requirement.evidence.length > 32) {
+      throw new GoalStoreError('invalid_goal_input', 'Completion proposal requirements are invalid')
+    }
+    ids.add(requirement.id)
+  }
+}
+
+function validateGoalVerificationDecision(decision: GoalVerificationDecision): void {
+  if (!['complete', 'incomplete', 'impossible', 'indeterminate'].includes(decision.outcome)
+    || !decision.reason.trim() || [...decision.reason].length > 4_000
+    || !Array.isArray(decision.requirements) || !Array.isArray(decision.missingEvidence)
+    || !Array.isArray(decision.impossibleEvidenceIds)) {
+    throw new GoalStoreError('invalid_goal_input', 'Goal verifier returned an invalid decision')
+  }
+  const ids = new Set<string>()
+  for (const result of decision.requirements) {
+    if (!result.requirementId || ids.has(result.requirementId)
+      || !['satisfied', 'unsatisfied', 'unproven', 'impossible'].includes(result.result)
+      || !Array.isArray(result.evidenceIds) || !result.reason.trim()) {
+      throw new GoalStoreError('invalid_goal_input', 'Goal verifier requirement results are invalid')
+    }
+    ids.add(result.requirementId)
+  }
+}
+
+function completionHostChecks(
+  proposal: GoalCompletionProposal,
+  decision: GoalVerificationDecision,
+): { passed: string[]; failures: string[] } {
+  const passed = [
+    'normal_provider_termination',
+    'terminal_goal_accounting',
+    'goal_revision_match',
+    'evidence_bundle_hash_match',
+  ]
+  const failures: string[] = []
+  const expected = new Set(proposal.requirements.map((requirement) => requirement.id))
+  const actual = new Set(decision.requirements.map((requirement) => requirement.requirementId))
+  if (expected.size !== actual.size || [...expected].some((id) => !actual.has(id))) {
+    failures.push('requirement coverage is incomplete')
+  } else {
+    passed.push('complete_requirement_coverage')
+  }
+  const evidence = new Map(proposal.evidenceBundle.evidence.map((entry) => [entry.id, entry]))
+  for (const result of decision.requirements) {
+    if (result.result !== 'satisfied') failures.push(`${result.requirementId} is ${result.result}`)
+    if (result.evidenceIds.length < 1) failures.push(`${result.requirementId} cites no evidence`)
+    for (const evidenceId of result.evidenceIds) {
+      const entry = evidence.get(evidenceId)
+      if (!entry) failures.push(`${result.requirementId} cites unknown evidence ${evidenceId}`)
+      else if (!entry.authoritative) failures.push(`${result.requirementId} cites non-authoritative evidence ${evidenceId}`)
+      else if (entry.payload.requirementId !== result.requirementId) {
+        failures.push(`${result.requirementId} cites evidence belonging to another requirement`)
+      }
+    }
+  }
+  if (decision.missingEvidence.length > 0) failures.push('verifier reported missing evidence')
+  if (decision.impossibleEvidenceIds.length > 0 && decision.outcome === 'complete') {
+    failures.push('complete decision also reported impossibility evidence')
+  }
+  if (failures.length === 0) passed.push('authoritative_evidence_references')
+  return { passed, failures: [...new Set(failures)] }
+}
+
+function impossibleHostChecks(
+  proposal: GoalCompletionProposal,
+  decision: GoalVerificationDecision,
+): { passed: string[]; failures: string[] } {
+  const passed: string[] = []
+  const failures: string[] = []
+  const expected = new Set(proposal.requirements.map((requirement) => requirement.id))
+  const actual = new Set(decision.requirements.map((requirement) => requirement.requirementId))
+  if (expected.size !== actual.size || [...expected].some((id) => !actual.has(id))) {
+    failures.push('requirement coverage is incomplete')
+  }
+  if (decision.impossibleEvidenceIds.length < 1) failures.push('impossible decision cites no affirmative evidence')
+  const evidence = new Map(proposal.evidenceBundle.evidence.map((entry) => [entry.id, entry]))
+  for (const evidenceId of decision.impossibleEvidenceIds) {
+    const entry = evidence.get(evidenceId)
+    if (!entry) failures.push(`impossible decision cites unknown evidence ${evidenceId}`)
+    else if (!entry.authoritative) failures.push(`impossible decision cites non-authoritative evidence ${evidenceId}`)
+    else if (entry.kind !== 'tool_result') failures.push(`impossible decision cites non-tool evidence ${evidenceId}`)
+  }
+  const impossibleRequirements = decision.requirements.filter((requirement) => requirement.result === 'impossible')
+  if (impossibleRequirements.length < 1) {
+    failures.push('no requirement was independently classified as impossible')
+  }
+  for (const requirement of impossibleRequirements) {
+    if (requirement.evidenceIds.length < 1) {
+      failures.push(`${requirement.requirementId} cites no impossibility evidence`)
+    }
+    for (const evidenceId of requirement.evidenceIds) {
+      const entry = evidence.get(evidenceId)
+      if (!entry) failures.push(`${requirement.requirementId} cites unknown evidence ${evidenceId}`)
+      else if (!entry.authoritative) {
+        failures.push(`${requirement.requirementId} cites non-authoritative evidence ${evidenceId}`)
+      } else if (entry.kind !== 'tool_result') {
+        failures.push(`${requirement.requirementId} cites non-tool evidence ${evidenceId}`)
+      } else if (entry.payload.requirementId !== requirement.requirementId) {
+        failures.push(`${requirement.requirementId} cites evidence belonging to another requirement`)
+      }
+      if (!decision.impossibleEvidenceIds.includes(evidenceId)) {
+        failures.push(`${requirement.requirementId} evidence ${evidenceId} is absent from impossibleEvidenceIds`)
+      }
+    }
+  }
+  if (failures.length === 0) passed.push('affirmative_authoritative_impossibility_evidence')
+  return { passed, failures: [...new Set(failures)] }
 }
 
 function sessionSelect(): string {
   return `
     SELECT s.*,
       (SELECT t.status FROM turns t WHERE t.thread_id=s.active_thread_id ORDER BY t.sequence DESC LIMIT 1) AS latest_turn_status,
-      (SELECT g.status FROM goals g WHERE g.thread_id=s.active_thread_id) AS current_goal_status,
+      (SELECT CASE WHEN g.status='active' AND g.verification_proposal_id IS NOT NULL
+        THEN 'verifying' ELSE g.status END FROM goals g WHERE g.thread_id=s.active_thread_id) AS current_goal_status,
       (SELECT ps.default_profile FROM permission_settings ps WHERE ps.singleton=1) AS default_permission_profile,
       (SELECT ns.provider FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_provider,
       (SELECT ns.source_client FROM native_session_sources ns WHERE ns.session_id=s.id ORDER BY ns.first_imported_at LIMIT 1) AS source_client,
@@ -5223,6 +5904,7 @@ function visibleWorkStatus(row: SqlRow, imported: boolean): CanonicalSession['wo
   if (turn === 'waiting_tool' || turn === 'running' || turn === 'queued') return turn
   const goal = nullableText(row, 'current_goal_status')
   if (goal === 'active') return 'awaiting_goal_turn'
+  if (goal === 'verifying') return 'verifying'
   if (goal === 'usage_limited' || goal === 'budget_limited' || goal === 'blocked' || goal === 'paused') return goal
   if (turn === 'failed' || turn === 'interrupted' || turn === 'cancelled') return turn
   if (goal === 'complete') return 'complete'

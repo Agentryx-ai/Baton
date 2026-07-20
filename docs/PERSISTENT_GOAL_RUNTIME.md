@@ -1,10 +1,10 @@
 # Persistent Goal runtime
 
-> Status: **V1 IMPLEMENTED (2026-07-19).** SQLite projection/events, revision CAS, leases,
-> automatic continuation, limits, recovery, Goal inspection/terminal tools, REST API, `/goal` commands, and UI controls
-> are active. Provider adapters and the Goal runtime have separate deterministic coverage; cross-layer
-> Goal lifecycle conformance through every real adapter remains incomplete, and Gemini live execution
-> remains unverified while its proxy authentication is unavailable.
+> Status: **V2 IMPLEMENTED (2026-07-21).** SQLite projection/events, revision CAS, scheduler and
+> verifier leases, automatic continuation, independent completion verification, immutable receipts,
+> limits, recovery, Goal tools, REST API, `/goal` commands, and UI controls are active. Deterministic
+> coverage includes Codex/Claude-compatible provider-neutral tools and adapters. Live provider
+> availability and authentication remain operational concerns rather than Goal correctness claims.
 
 ## 1. Purpose and separation
 
@@ -37,6 +37,7 @@ resume clears it. A duplicate idempotent event does not change it.
 Statuses are:
 
 - `active`: eligible for automatic continuation;
+- `verifying`: a completion proposal and frozen evidence bundle are under independent review;
 - `paused`: stopped by the user and resumable;
 - `blocked`: external change or user input is required;
 - `usage_limited`: provider/account availability prevents progress;
@@ -107,7 +108,12 @@ Invalid transitions return `invalid_goal_transition` without changing revision o
 | complete | edit | active | same ID; revision +1; counters retained; completion time cleared |
 | active | pause or user cancel | paused | revision +1; active time flushed; reason set |
 | paused/blocked/usage_limited/budget_limited | resume | active | revision +1; start segment now; no-progress zero; reason cleared |
-| active | model complete | complete | captured revision CAS; completion time now |
+| active | model completion proposal | verifying | captured revision CAS; evidence bundle frozen |
+| verifying | verifier accepts and host checks pass | complete | immutable attempt and completion receipt written |
+| verifying | verifier rejects or cannot decide | active | reason recorded; continuation may resume |
+| verifying | verifier proves impossibility with authoritative tool evidence | blocked | resumable stop receipt written |
+| verifying | user edit | active | proposal and verifier lease invalidated; revision +1 |
+| verifying | user pause | paused | proposal and verifier lease invalidated; revision +1 |
 | active | host three-turn no-progress audit | blocked | captured revision CAS; active time flushed |
 | active | host usage limit | usage_limited | captured revision CAS; active time flushed |
 | active | host budget/turn/time limit | budget_limited | captured revision CAS; active time flushed |
@@ -122,33 +128,75 @@ create while an unfinished Goal exists are invalid.
 The ordinary provider-neutral tool set includes:
 
 - `get_goal`: read current status, budgets, usage, and remaining budget;
-- `update_goal`: stage only `complete`; the host commits that intent only after a normal
-  provider terminal response and final Goal accounting.
+- `propose_goal_completion`: submit a bounded requirement list and evidence references for
+  independent verification;
+- `update_goal`: Codex-compatible completion alias. It accepts `{status:"complete"}` and may also
+  accept legacy evidence entries. With no evidence argument Baton collects successful tool results
+  and the terminal deliverable as candidates. It never completes the Goal directly.
 
 Goal creation is a user/API action (`/goal` or the Goal dialog). The reserved `create_goal` schema is
 not advertised on ordinary turns because Baton currently has no independent, validated host signal
 that a natural-language message explicitly authorized persistent Goal creation.
 
 The model cannot pause, resume, clear, block, or mark usage/budget limits. Those are user/host mutations.
-`complete` is valid only after a requirement-by-requirement evidence audit proves that no requested
-work remains. Blocked state is host-owned: three consecutive turns without canonical positive
-progress produce `blocked/no_progress`. Hard work, uncertainty, or partial progress is not a blocker.
+`complete` is valid only after a requirement-by-requirement evidence audit, an isolated verifier
+decision, and host checks prove that no requested work remains. Blocked state is host-owned: three
+consecutive turns without canonical positive progress produce `blocked/no_progress`. A verifier may
+also produce `blocked/confirmed_impossible`, but only with affirmative, successful, untruncated
+tool-result evidence. Hard work, uncertainty, a worker statement, or partial progress is not proof
+of impossibility.
 
 Exact schemas and results are:
 
 - `get_goal` input: `{}`. Result: `{ goal: ConversationGoal|null, remainingTokens: integer|null }`.
   It refreshes the calling context's observed `(goalId, revision)`.
-- `update_goal` input is
-  `{ status: "complete", evidence: [{requirement,proof}, ...] }`. Completion requires 1..64 bounded
-  evidence entries, compares the calling context's last observed `(goalId, revision)`, and stages a
-  terminal intent. Missing Goal returns
+- `propose_goal_completion` input is
+  `{summary, requirements:[{requirement,evidence:[{kind,reference?,claim}]}]}`. `kind` is
+  `tool_result` or `current_turn`; a tool result requires its call reference. The proposal requires
+  1..64 requirements with 1..32 evidence references each.
+- `update_goal` input is `{status:"complete"}` with optional legacy
+  `evidence:[{requirement,proof}]`. It compares the calling context's last observed
+  `(goalId, revision)` and stages the same terminal proposal. Missing Goal returns
   `goal_not_found`; stopped Goal returns `invalid_goal_transition`; changed ID/revision returns
   `stale_goal_revision` with the current Goal projection and performs no mutation.
 
 The tools reject unknown properties. Tool errors use the canonical `{code,message,retryable:false}`
-shape. Only `get_goal` may refresh a stale observation; `update_goal` never retries implicitly.
+shape. Only `get_goal` may refresh a stale observation. Completion calls never retry implicitly and
+their success result means `proposalStaged`, not Goal completion.
 
-## 6. Automatic continuation
+## 6. Independent completion verification
+
+A worker cannot write `complete`. After the provider ends normally and every accepted tool call is
+durably settled, Baton freezes the exact Goal revision, objective, terminal turn, requirements,
+bounded evidence payloads, omissions, and SHA-256 hash into a completion proposal. A failed,
+cancelled, or interrupted provider turn discards the staged intent.
+
+The verifier is a separate provider execution using the selected Goal provider and model. It gets an
+empty conversation, empty bindings, no Goal state, no tools, no approvals, no native tool calls, and
+only the frozen evidence prompt. It must return one strict JSON object with `complete`, `incomplete`,
+`impossible`, or `indeterminate`. Provider prose, markdown wrappers, unknown properties, duplicate
+requirement IDs, and malformed evidence are rejected.
+
+The host then independently checks exact requirement coverage, evidence ownership and authority,
+normal terminal accounting, revision identity, and the frozen hash. `current_turn` can prove the
+deliverable itself but is not proof of filesystem, test, network, or runtime state. `impossible`
+additionally requires successful, untruncated `tool_result` evidence assigned to every requirement
+classified as impossible.
+
+Accepted completion writes an append-only verification attempt and completion receipt, then projects
+the unchanged Goal revision as `complete`. Rejection writes the attempt, returns the Goal to `active`,
+and passes the reason into the next automatic turn. Confirmed impossibility writes an append-only,
+resumable stop receipt and projects `blocked/confirmed_impossible`. The UI displays `verifying` and
+the latest completion receipt ID. Full history is available at
+`GET /baton/v1/goals/:goalId/verifications`.
+
+A durable verifier lease permits one verifier per proposal. It is heartbeated during long checks,
+may be reclaimed only after expiry, and is required when committing a verdict. Edit, pause, replace,
+or clear invalidates the proposal and lease, so a late verdict is stale. Startup recovers pending
+proposals before scheduling active Goal work. Verifier failure records `indeterminate` and resumes
+the Goal rather than guessing success.
+
+## 7. Automatic continuation
 
 An `active` Goal on an idle thread acquires one scheduler lease and starts an internal continuation
 turn. The internal context:
@@ -182,7 +230,7 @@ compare-and-swaps the captured active Goal to `blocked` with
 `reason=unknown_mutation_outcome`. No continuation is scheduled until the user reconciles the side
 effect and explicitly resumes.
 
-## 7. Runaway prevention
+## 8. Runaway prevention
 
 Compatibility behavior is bounded by Baton-owned safeguards:
 
@@ -213,12 +261,16 @@ Goal limit mapping is deterministic: automatic-turn and active-time exhaustion p
 non-retryable provider failure produces `blocked/provider_failure`; unknown mutation recovery
 produces `blocked/unknown_mutation_outcome`.
 
-## 8. Accounting
+## 9. Accounting
 
 Goal tokens count uncached input plus output; cached input is not charged when the provider reports it
 separately. Active elapsed time is accumulated only while an active Goal turn or idle-continuation
 lease is running. Accounting is committed before an external Goal mutation and at every terminal turn
 boundary.
+
+Verifier usage is recorded on its immutable verification attempt for audit and cost attribution. It
+does not change the worker Goal token or automatic-turn counters because it cannot perform Goal work,
+call tools, or continue the conversation.
 
 Provider usage is flushed whenever a durable usage update is received, and elapsed/tool progress is
 flushed after every tool completion. Replayed duplicate events are idempotent. If a process dies
@@ -231,7 +283,7 @@ Token budget crossing does not pretend the current work succeeded. Baton marks `
 stops scheduling substantive continuation, and asks the current turn to summarize progress when a
 safe steering boundary remains.
 
-## 9. Provider neutrality and switching
+## 10. Provider neutrality and switching
 
 The Goal never belongs to a provider. The selected provider/model is an execution preference for the
 next safe turn. A user may change it between turns. Baton must not switch provider while an in-flight
@@ -240,10 +292,15 @@ tool call or provider-private continuation is pending.
 All Goal tools, statuses, accounting, revisions, and events have identical semantics regardless of
 which adapter executes the turn.
 
-## 10. Verification matrix
+## 11. Verification matrix
 
 Conformance requires tests for create/read/edit/replace, pause/resume/clear, completion and three-turn
 blocked audit, stale revision rejection, one lease per revision, pause-before-cancel, restart during
 idle scheduling, provider failure and usage limits, token/turn/time/no-progress limits, accounting
 idempotency, unknown mutation recovery, provider switching only at a safe boundary, and automatic
-continuation through every supported provider adapter.
+continuation through every supported provider adapter. V2 additionally requires proposal settlement
+after normal provider termination, frozen-evidence hash validation, isolated no-tool verification,
+strict result parsing, exact requirement coverage, host rejection of unknown/non-authoritative
+evidence, authoritative-tool-only impossibility, immutable completion and stop receipts, exclusive
+verifier leases with expiry recovery, stale verdict fencing after user mutation, and startup recovery
+of pending verification.

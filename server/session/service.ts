@@ -3,6 +3,7 @@ import type {
   BeginSessionResult,
   CanonicalItem,
   CanonicalGoal,
+  GoalVerificationHistory,
   CanonicalFollowUp,
   CanonicalProvider,
   CanonicalSession,
@@ -103,6 +104,7 @@ export interface ConversationService {
   listEvents(threadId: ThreadId, afterSequence?: number): CanonicalStreamEvent[]
 
   getGoal(threadId: ThreadId): CanonicalGoal | null
+  getGoalVerificationHistory(goalId: string): GoalVerificationHistory
   createGoal(input: CreateGoalInput): Promise<CanonicalGoal>
   editGoal(input: EditGoalInput): Promise<CanonicalGoal>
   updateGoalStatus(input: UserGoalStatusInput): Promise<GoalCasResult>

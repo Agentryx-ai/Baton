@@ -794,6 +794,10 @@ export function createConversationRouter(
     res.json(await service.editGoal(parseEditGoalInput(pathParam(req, 'goalId'), req.body)))
   }))
 
+  router.get('/goals/:goalId/verifications', (req, res) => {
+    res.json(service.getGoalVerificationHistory(pathParam(req, 'goalId')))
+  })
+
   router.post('/goals/:goalId/status', route(async (req, res) => {
     const body = bodyRecord(req.body)
     requireOnlyKeys(body, [

@@ -6,6 +6,15 @@ import type {
   CanonicalItem,
   CanonicalFollowUp,
   CanonicalGoal,
+  GoalCompletionProposal,
+  GoalCompletionReceipt,
+  GoalEvidenceBundle,
+  GoalRequirementClaim,
+  GoalVerificationDecision,
+  GoalVerificationHistory,
+  GoalVerificationAttempt,
+  GoalStopReceipt,
+  GoalVerifierLease,
   CanonicalProvider,
   CanonicalSession,
   CanonicalStreamEvent,
@@ -156,6 +165,53 @@ export interface GoalTurnContext {
   leaseId: string
 }
 
+export interface BeginGoalVerificationInput {
+  goalId: GoalId
+  goalRevision: number
+  turnId: TurnId
+  summary: string
+  requirements: GoalRequirementClaim[]
+  evidenceBundle: GoalEvidenceBundle
+}
+
+export interface FinishGoalVerificationInput {
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  evaluatorProvider: CanonicalProvider
+  evaluatorModel: string
+  decision: GoalVerificationDecision
+  usage?: Record<string, unknown> | null
+  leaseId: string
+  leaseOwner: string
+}
+
+export interface ClaimGoalVerifierLeaseInput {
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  ownerId: string
+  leaseDurationMs?: number
+}
+
+export interface HeartbeatGoalVerifierLeaseInput extends ClaimGoalVerifierLeaseInput {
+  leaseId: string
+}
+
+export interface ReleaseGoalVerifierLeaseInput {
+  proposalId: string
+  leaseId: string
+  ownerId: string
+}
+
+export interface FinishGoalVerificationResult {
+  status: 'applied' | 'stale'
+  goal: CanonicalGoal | null
+  attempt: GoalVerificationAttempt | null
+  receipt: GoalCompletionReceipt | null
+  stopReceipt: GoalStopReceipt | null
+}
+
 export interface EnqueueFollowUpInput {
   threadId: ThreadId
   clientRequestId: string
@@ -290,6 +346,8 @@ export interface SessionStore extends NativeImportStore {
   getGoalById(goalId: GoalId): CanonicalGoal | null
   listActiveGoals(): CanonicalGoal[]
   listGoalEvents(threadId: ThreadId, afterSequence?: number): GoalEvent[]
+  listPendingGoalCompletionProposals(): GoalCompletionProposal[]
+  getGoalVerificationHistory(goalId: GoalId): GoalVerificationHistory
   createGoal(input: CreateGoalInput): CanonicalGoal
   editGoal(input: EditGoalInput): CanonicalGoal
   updateGoalStatus(input: UpdateGoalStatusInput): GoalCasResult
@@ -299,6 +357,11 @@ export interface SessionStore extends NativeImportStore {
   releaseGoalLease(input: ReleaseGoalLeaseInput): boolean
   checkpointGoalTurn(input: CheckpointGoalTurnInput): GoalCasResult
   recordGoalTurn(input: RecordGoalTurnInput): GoalCasResult
+  beginGoalVerification(input: BeginGoalVerificationInput): GoalCompletionProposal | null
+  claimGoalVerifierLease(input: ClaimGoalVerifierLeaseInput): GoalVerifierLease | null
+  heartbeatGoalVerifierLease(input: HeartbeatGoalVerifierLeaseInput): GoalVerifierLease | null
+  releaseGoalVerifierLease(input: ReleaseGoalVerifierLeaseInput): boolean
+  finishGoalVerification(input: FinishGoalVerificationInput): FinishGoalVerificationResult
 
   close(): void
 }

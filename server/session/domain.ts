@@ -34,6 +34,7 @@ export type ExecutionStatus =
 
 export type GoalStatus =
   | 'active'
+  | 'verifying'
   | 'paused'
   | 'blocked'
   | 'usage_limited'
@@ -71,6 +72,126 @@ export interface CanonicalGoal {
   updatedAt: string
   startedAt: string
   completedAt: string | null
+  verificationProposalId: string | null
+  latestCompletionReceiptId: string | null
+  latestStopReceiptId: string | null
+}
+
+export type GoalEvidenceKind = 'tool_result' | 'current_turn'
+
+export interface GoalEvidenceReference {
+  kind: GoalEvidenceKind
+  reference: string | null
+  claim: string
+}
+
+export interface GoalRequirementClaim {
+  id: string
+  requirement: string
+  evidence: GoalEvidenceReference[]
+}
+
+export interface GoalFrozenEvidence {
+  id: string
+  kind: GoalEvidenceKind
+  reference: string
+  claim: string
+  authoritative: boolean
+  payload: Record<string, unknown>
+}
+
+export interface GoalEvidenceBundle {
+  goalId: GoalId
+  goalRevision: number
+  objective: string
+  proposalSummary: string
+  requirements: GoalRequirementClaim[]
+  evidence: GoalFrozenEvidence[]
+  terminalTurn: {
+    id: TurnId
+    status: 'completed'
+    provider: CanonicalProvider
+    model: string
+  }
+  omissions: string[]
+  hash: string
+}
+
+export type GoalVerificationOutcome = 'complete' | 'incomplete' | 'impossible' | 'indeterminate'
+export type GoalRequirementVerificationResult = 'satisfied' | 'unsatisfied' | 'unproven' | 'impossible'
+
+export interface GoalVerificationRequirement {
+  requirementId: string
+  result: GoalRequirementVerificationResult
+  evidenceIds: string[]
+  reason: string
+}
+
+export interface GoalVerificationDecision {
+  outcome: GoalVerificationOutcome
+  reason: string
+  requirements: GoalVerificationRequirement[]
+  missingEvidence: string[]
+  impossibleEvidenceIds: string[]
+}
+
+export interface GoalCompletionProposal {
+  id: string
+  goalId: GoalId
+  goalRevision: number
+  turnId: TurnId
+  summary: string
+  requirements: GoalRequirementClaim[]
+  evidenceBundle: GoalEvidenceBundle
+  status: 'verifying' | 'accepted' | 'rejected' | 'ineligible'
+  createdAt: string
+  resolvedAt: string | null
+}
+
+export interface GoalVerificationAttempt {
+  id: string
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  evaluatorProvider: CanonicalProvider
+  evaluatorModel: string
+  evidenceBundleHash: string
+  outcome: GoalVerificationOutcome
+  decision: GoalVerificationDecision
+  usage: Record<string, unknown> | null
+  startedAt: string
+  completedAt: string
+}
+
+export interface GoalCompletionReceipt {
+  id: string
+  goalId: GoalId
+  goalRevision: number
+  proposalId: string
+  verificationAttemptId: string
+  evidenceBundleHash: string
+  hostChecks: string[]
+  acceptedAt: string
+  acceptancePolicyVersion: string
+}
+
+export interface GoalStopReceipt {
+  id: string
+  goalId: GoalId
+  goalRevision: number
+  verificationAttemptId: string
+  kind: 'confirmed_impossible'
+  reason: string
+  evidenceBundleHash: string
+  decidedAt: string
+  resumable: boolean
+}
+
+export interface GoalVerificationHistory {
+  proposals: GoalCompletionProposal[]
+  attempts: GoalVerificationAttempt[]
+  receipts: GoalCompletionReceipt[]
+  stopReceipts: GoalStopReceipt[]
 }
 
 export type GoalObservation =
@@ -87,6 +208,17 @@ export interface GoalSchedulerLease {
   expiresAt: string
 }
 
+export interface GoalVerifierLease {
+  leaseId: string
+  proposalId: string
+  goalId: GoalId
+  goalRevision: number
+  ownerId: string
+  acquiredAt: string
+  heartbeatAt: string
+  expiresAt: string
+}
+
 export type VisibleWorkStatus =
   | 'archived'
   | 'waiting_user'
@@ -95,6 +227,7 @@ export type VisibleWorkStatus =
   | 'running'
   | 'queued'
   | 'awaiting_goal_turn'
+  | 'verifying'
   | 'usage_limited'
   | 'budget_limited'
   | 'blocked'

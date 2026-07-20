@@ -24,6 +24,7 @@ export type VisibleWorkStatus =
   | 'running'
   | 'queued'
   | 'awaiting_goal_turn'
+  | 'verifying'
   | 'usage_limited'
   | 'budget_limited'
   | 'blocked'
@@ -270,7 +271,7 @@ export interface CanonicalGoalDto {
   id: string
   threadId: string
   objective: string
-  status: 'active' | 'paused' | 'blocked' | 'usage_limited' | 'budget_limited' | 'complete'
+  status: 'active' | 'verifying' | 'paused' | 'blocked' | 'usage_limited' | 'budget_limited' | 'complete'
   statusReason: {
     code: string
     source: 'user' | 'host' | 'provider' | 'model'
@@ -293,6 +294,16 @@ export interface CanonicalGoalDto {
   updatedAt: string
   startedAt: string
   completedAt: string | null
+  verificationProposalId: string | null
+  latestCompletionReceiptId: string | null
+  latestStopReceiptId: string | null
+}
+
+export interface GoalVerificationHistoryDto {
+  proposals: Array<Record<string, unknown>>
+  attempts: Array<Record<string, unknown>>
+  receipts: Array<Record<string, unknown>>
+  stopReceipts: Array<Record<string, unknown>>
 }
 
 export type CanonicalStreamEventType =

@@ -12,7 +12,7 @@ import type {
   ProviderExecutionContext,
   SessionProviderAdapter,
 } from './adapter.ts'
-import type { NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import type { GoalEvidenceBundle, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
 import {
   CanonicalContextRuntime,
   ContextInputTooLargeError,
@@ -21,6 +21,30 @@ import { ConversationEventHub } from './event-hub.ts'
 import { chargeableGoalTokens, TurnOrchestrator } from './orchestrator.ts'
 import { ProviderReadinessError } from './service.ts'
 import { SqliteSessionStore } from './sqlite-store.ts'
+import type { GoalVerifier } from './goal-verifier.ts'
+import { goalEvidenceHash } from './goal-evidence.ts'
+
+const acceptingGoalVerifier: GoalVerifier = {
+  async verify({ bundle }) {
+    return {
+      decision: {
+        outcome: 'complete',
+        reason: 'Independent test verifier accepted the frozen evidence',
+        requirements: bundle.requirements.map((requirement) => ({
+          requirementId: requirement.id,
+          result: 'satisfied',
+          evidenceIds: bundle.evidence
+            .filter((entry) => entry.payload.requirementId === requirement.id)
+            .map((entry) => entry.id),
+          reason: 'The frozen terminal deliverable satisfies the requirement',
+        })),
+        missingEvidence: [],
+        impossibleEvidenceIds: [],
+      },
+      usage: { outputTokens: 1 },
+    }
+  },
+}
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: unknown) => void } {
   let resolve!: (value: T) => void
@@ -86,6 +110,31 @@ function toolCallingAdapter(
 ): SessionProviderAdapter {
   const adapter = safeAdapter([])
   adapter.execute = async (_request, context: ProviderExecutionContext): Promise<ProviderTurnExecution> => {
+    if (context.toolDefinitions.length === 0) {
+      const response = JSON.stringify({
+        outcome: 'complete',
+        reason: 'independent verifier accepted the frozen deliverable',
+        requirements: [{
+          requirementId: 'requirement-1',
+          result: 'satisfied',
+          evidenceIds: ['evidence-1-1'],
+          reason: 'the terminal deliverable satisfies the requirement',
+        }],
+        missingEvidence: [],
+        impossibleEvidenceIds: [],
+      })
+      return {
+        events: (async function* () {
+          yield {
+            eventId: 'verifier-completed', type: 'item/completed',
+            payload: { text: response }, durability: 'durable' as const,
+          }
+        })(),
+        terminal: Promise.resolve({ status: 'completed', usage: { outputTokens: 1 } }),
+        async cancel() {},
+        async dispose() {},
+      }
+    }
     const terminal = (async () => {
       const result = await context.executeTool({
         callId: `turn-call:${invocation.name}`,
@@ -153,7 +202,17 @@ function transientThenCompletingAdapter(): SessionProviderAdapter {
             : { status: 'failed' as const, error: result.error ?? undefined }
         })()
     return {
-      events: emptyEvents(terminal), terminal,
+      events: (async function* () {
+        const result = await terminal
+        if (result.status === 'completed') {
+          yield {
+            eventId: 'transient-complete-message',
+            type: 'item/completed',
+            payload: { text: 'recovered and completed' },
+            durability: 'durable' as const,
+          }
+        }
+      })(), terminal,
       async cancel() {}, async dispose() {},
     }
   }
@@ -1283,6 +1342,80 @@ test('an active Goal launches a continuation and can complete through the provid
   assert.equal(store.getGoalById(goal.id)?.status, 'complete')
   assert.equal(store.getSnapshot(session.activeThreadId)?.turns.length, 1)
   assert.equal(store.listItems(session.activeThreadId).some((item) => item.kind === 'tool_result'), true)
+  assert.equal(store.getGoalVerificationHistory(goal.id).attempts.length, 1)
+  assert.equal(store.getGoalVerificationHistory(goal.id).receipts.length, 1)
+})
+
+test('startup retries an unexpired verifier lease and recovers the durable pending Goal verification', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-goal-verification-recovery-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'recover verified completion',
+    provider: 'codex', model: 'gpt-test',
+  })
+  const started = store.beginTurn({
+    threadId: session.activeThreadId, provider: 'codex', model: 'gpt-test',
+    clientRequestId: 'verification-recovery-turn', requestHash: 'verification-recovery-hash', expectedRevision: 0,
+    input: [{ kind: 'user_message', payload: { text: 'finish' } }], adapterVersion: 'test/1',
+    policySnapshot: {
+      delegationMode: 'disabled', allowedTools: [], approvalPolicy: 'never', cwd: null,
+      maxDepth: 0, capabilityGrant: null,
+    },
+  })
+  store.appendProviderEvent({
+    turnId: started.turn.id, eventId: 'verification-recovery-answer',
+    items: [{ kind: 'assistant_message', payload: { text: 'finished deliverable' } }],
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id, goalId: goal.id, goalRevision: goal.revision,
+    tokensUsed: 1, timeUsedSeconds: 1, automatic: true, progressDigest: 'delivered',
+  })
+  const requirements = [{
+    id: 'requirement-1', requirement: goal.objective,
+    evidence: [{ kind: 'current_turn' as const, reference: null, claim: 'terminal deliverable' }],
+  }]
+  const content = {
+    goalId: goal.id, goalRevision: goal.revision, objective: goal.objective,
+    proposalSummary: 'deliverable finished', requirements,
+    evidence: [{
+      id: 'evidence-1-1', kind: 'current_turn' as const, reference: started.turn.id,
+      claim: 'terminal deliverable', authoritative: true,
+      payload: { requirementId: 'requirement-1', terminalStatus: 'completed' },
+    }],
+    terminalTurn: {
+      id: started.turn.id, status: 'completed' as const, provider: 'codex' as const, model: 'gpt-test',
+    },
+    omissions: [] as string[],
+  }
+  const evidenceBundle: GoalEvidenceBundle = { ...content, hash: goalEvidenceHash(content) }
+  const proposal = store.beginGoalVerification({
+    goalId: goal.id, goalRevision: goal.revision, turnId: started.turn.id,
+    summary: content.proposalSummary, requirements, evidenceBundle,
+  })
+  assert.ok(proposal)
+  assert.equal(store.getGoalById(goal.id)?.status, 'verifying')
+  assert.ok(store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    ownerId: 'crashed-verifier', leaseDurationMs: 20,
+  }))
+
+  const registry = new AdapterRegistry()
+  registry.register(safeAdapter([]))
+  const orchestrator = new TurnOrchestrator(
+    store, registry, new ConversationEventHub(), 10_000, null, null, acceptingGoalVerifier, 5,
+  )
+  t.after(async () => { await orchestrator.close(); rmSync(directory, { recursive: true, force: true }) })
+  await orchestrator.startGoalRuntime()
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (store.getGoalById(goal.id)?.status === 'complete') break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(store.getGoalById(goal.id)?.status, 'complete')
+  assert.equal(store.getGoalVerificationHistory(goal.id).attempts.length, 1)
+  assert.equal(store.getGoalVerificationHistory(goal.id).receipts.length, 1)
 })
 
 test('a staged Goal completion is discarded when the provider later fails', async (t) => {
@@ -1316,12 +1449,76 @@ test('a staged Goal completion is discarded when the provider later fails', asyn
   assert.equal(store.getGoalById(goal.id)?.statusReason?.code, 'provider_failure')
 })
 
+test('an incomplete independent verification feeds back into exactly one continued Goal turn', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-goal-incomplete-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  registry.register(toolCallingAdapter({
+    name: 'propose_goal_completion',
+    input: {
+      summary: 'deliverable produced',
+      requirements: [{
+        requirement: 'finish',
+        evidence: [{ kind: 'current_turn', claim: 'the current turn contains the deliverable' }],
+      }],
+    },
+  }))
+  let checks = 0
+  const verifier: GoalVerifier = {
+    async verify(input) {
+      checks += 1
+      if (checks === 1) {
+        return {
+          decision: {
+            outcome: 'incomplete',
+            reason: 'one more independent pass is required',
+            requirements: [{
+              requirementId: 'requirement-1', result: 'unproven', evidenceIds: [], reason: 'not proven yet',
+            }],
+            missingEvidence: ['a second confirmed deliverable'],
+            impossibleEvidenceIds: [],
+          },
+          usage: null,
+        }
+      }
+      return acceptingGoalVerifier.verify(input)
+    },
+  }
+  const orchestrator = new TurnOrchestrator(
+    store, registry, new ConversationEventHub(), 10_000, null, null, verifier,
+  )
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const session = orchestrator.createSession({ cwd: directory })
+  await orchestrator.startGoalRuntime()
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'finish after independent verification',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (store.getGoalById(goal.id)?.status === 'complete') break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(store.getGoalById(goal.id)?.status, 'complete')
+  assert.equal(store.getSnapshot(session.activeThreadId)?.turns.length, 2)
+  const history = store.getGoalVerificationHistory(goal.id)
+  assert.deepEqual(history.attempts.map((attempt) => attempt.outcome), ['incomplete', 'complete'])
+  assert.equal(history.receipts.length, 1)
+})
+
 test('an automatic Goal retries an exhausted transient provider failure within its Goal limits', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-transient-retry-'))
   const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
   const registry = new AdapterRegistry()
   registry.register(transientThenCompletingAdapter())
-  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  const orchestrator = new TurnOrchestrator(
+    store, registry, new ConversationEventHub(), 10_000, null, null, acceptingGoalVerifier,
+  )
   t.after(async () => {
     await orchestrator.close()
     rmSync(directory, { recursive: true, force: true })

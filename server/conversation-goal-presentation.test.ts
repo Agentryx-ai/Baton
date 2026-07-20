@@ -15,6 +15,7 @@ test('goal statuses have stable labels and semantic tones', () => {
   assert.deepEqual(goalStatusPresentation('active', 'awaiting_goal_turn'), { label: '다음 작업 준비 중', tone: 'active' })
   assert.deepEqual(goalStatusPresentation('active', 'queued'), { label: '대기 중', tone: 'active' })
   assert.deepEqual(goalStatusPresentation('active', 'waiting_tool'), { label: '도구 실행 중', tone: 'active' })
+  assert.deepEqual(goalStatusPresentation('verifying'), { label: '완료 검증 중', tone: 'active' })
   assert.deepEqual(goalStatusPresentation('paused'), { label: '일시 정지', tone: 'muted' })
   assert.deepEqual(goalStatusPresentation('blocked'), { label: '확인 필요', tone: 'warning' })
   assert.deepEqual(goalStatusPresentation('usage_limited'), { label: '사용량 제한', tone: 'warning' })

@@ -50,7 +50,7 @@ export function GoalControl({
   const showPersistentReason = status.tone === 'warning' && latestReason !== null
   const disabled = new Set(disabledActions)
   const isBusy = busyAction !== null
-  const canPause = goal.status === 'active'
+  const canPause = goal.status === 'active' || goal.status === 'verifying'
   const canResume = ['paused', 'blocked', 'usage_limited', 'budget_limited'].includes(goal.status)
 
   const actionButton = (
@@ -138,6 +138,13 @@ export function GoalControl({
               <span className="font-medium text-foreground">최근 상태</span>
               <span className="mx-1.5" aria-hidden>·</span>
               {latestReason}
+            </p>
+          ) : null}
+
+          {goal.latestCompletionReceiptId ? (
+            <p className="mt-3 break-all rounded-lg bg-emerald-500/8 px-2.5 py-2 text-xs leading-5 text-emerald-800 dark:text-emerald-200">
+              <span className="font-medium">완료 검증 영수증</span>
+              <span className="ml-1.5 font-mono">{goal.latestCompletionReceiptId}</span>
             </p>
           ) : null}
         </div>

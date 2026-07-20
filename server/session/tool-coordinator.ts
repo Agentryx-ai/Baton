@@ -7,8 +7,10 @@ import type {
   AgentToolResult,
   CanonicalGoal,
   CanonicalProvider,
+  GoalEvidenceReference,
   GoalId,
   GoalObservation,
+  GoalRequirementClaim,
   NewCanonicalItem,
   ThreadId,
   TurnId,
@@ -24,13 +26,51 @@ import { parseImageArtifactRef } from './image-artifacts.ts'
 
 type JsonObject = Record<string, unknown>
 
+const COMPLETION_REQUIREMENTS_SCHEMA = {
+  type: 'array',
+  minItems: 1,
+  maxItems: 64,
+  items: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['requirement', 'evidence'],
+    properties: {
+      requirement: { type: 'string', minLength: 1, maxLength: 500 },
+      evidence: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 32,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['kind', 'claim'],
+          properties: {
+            kind: { type: 'string', enum: ['tool_result', 'current_turn'] },
+            reference: { type: 'string', minLength: 1, maxLength: 500 },
+            claim: { type: 'string', minLength: 1, maxLength: 1_000 },
+          },
+        },
+      },
+    },
+  },
+} as const
+
 export const GOAL_TOOL_DEFINITIONS: readonly AgentToolDefinition[] = Object.freeze([
   definition('get_goal', 'Read the current Baton Goal, usage, and remaining token budget.', {}),
   definition('create_goal', 'Create a Goal only when the user explicitly requested one.', {
     objective: { type: 'string', minLength: 1, maxLength: 4_000 },
     tokenBudget: { type: 'integer', minimum: 1 },
   }, ['objective']),
-  definition('update_goal', 'Mark the current Goal complete after satisfying the Goal audit rules.', {
+  definition(
+    'propose_goal_completion',
+    'Propose completion for independent verification. This does not mark the Goal complete.',
+    {
+      summary: { type: 'string', minLength: 1, maxLength: 2_000 },
+      requirements: COMPLETION_REQUIREMENTS_SCHEMA,
+    },
+    ['summary', 'requirements'],
+  ),
+  definition('update_goal', 'Compatibility alias that stages a completion proposal for independent verification.', {
     status: { type: 'string', enum: ['complete'] },
     evidence: {
       type: 'array',
@@ -46,7 +86,7 @@ export const GOAL_TOOL_DEFINITIONS: readonly AgentToolDefinition[] = Object.free
         },
       },
     },
-  }, ['status', 'evidence']),
+  }, ['status']),
 ])
 
 /** The narrow durable API needed by the coordinator, intentionally easy to fake in tests. */
@@ -99,11 +139,12 @@ export interface ToolTerminalFailure {
   readonly message: string
 }
 
-export interface GoalTerminalIntent {
+export interface GoalCompletionProposalIntent {
   readonly goalId: GoalId
   readonly expectedRevision: number
-  readonly status: 'complete'
-  readonly completionEvidence?: readonly GoalCompletionEvidence[]
+  readonly summary: string
+  readonly requirements: readonly GoalRequirementClaim[]
+  readonly compatibilityAlias: boolean
 }
 
 export interface GoalCompletionEvidence {
@@ -136,7 +177,7 @@ export class ToolCoordinator {
   #goalObservation: GoalObservation
   #fatalError: unknown = null
   #terminalFailure: ToolTerminalFailure | null = null
-  #goalTerminalIntent: GoalTerminalIntent | null = null
+  #goalCompletionProposalIntent: GoalCompletionProposalIntent | null = null
 
   constructor(options: ToolCoordinatorOptions) {
     if (!options.model) throw new Error('ToolCoordinator model must not be empty')
@@ -205,9 +246,9 @@ export class ToolCoordinator {
     return this.#terminalFailure
   }
 
-  /** A model-requested Goal terminal transition, committed only after a valid provider terminal. */
-  get goalTerminalIntent(): GoalTerminalIntent | null {
-    return this.#goalTerminalIntent
+  /** A model-requested completion proposal, verified only after a valid provider terminal. */
+  get goalCompletionProposalIntent(): GoalCompletionProposalIntent | null {
+    return this.#goalCompletionProposalIntent
   }
 
   /** True when a durable workspace mutation/command call has no durable result. */
@@ -331,6 +372,7 @@ export class ToolCoordinator {
   ): Promise<AgentToolResult> {
     if (invocation.name === 'get_goal') return this.#getGoal(invocation)
     if (invocation.name === 'create_goal') return this.#createGoal(invocation)
+    if (invocation.name === 'propose_goal_completion') return this.#proposeGoalCompletion(invocation)
     if (invocation.name === 'update_goal') return this.#updateGoal(invocation)
     return executeWithTimeout(
       this.#runtime,
@@ -384,21 +426,83 @@ export class ToolCoordinator {
       || current.revision !== this.#goalObservation.revision) {
       return failure('stale_goal_revision', 'Current Goal changed after it was observed', { goal: current })
     }
-    const intent = Object.freeze({
-      goalId: this.#goalObservation.goalId,
-      expectedRevision: this.#goalObservation.revision,
-      status: input.status,
-      ...(input.status === 'complete' ? { completionEvidence: input.evidence } : {}),
-    } satisfies GoalTerminalIntent)
-    if (this.#goalTerminalIntent !== null
-      && canonicalJson(this.#goalTerminalIntent) !== canonicalJson(intent)) {
-      return failure(
-        'goal_terminal_intent_conflict',
-        `Goal terminal intent is already staged as ${this.#goalTerminalIntent.status}`,
-      )
+    const compatibilityEvidence = input.evidence.length > 0
+      ? input.evidence.map((entry, index) => ({
+        id: `requirement-${index + 1}`,
+        requirement: entry.requirement,
+        evidence: [{ kind: 'current_turn' as const, reference: null, claim: entry.proof }],
+      }))
+      : [{
+        id: 'requirement-1',
+        requirement: current.objective,
+        evidence: this.#compatibilityEvidenceReferences(),
+      }]
+    return this.#stageCompletionProposal(current, {
+      summary: 'Legacy update_goal completion proposal',
+      requirements: compatibilityEvidence,
+      compatibilityAlias: true,
+    })
+  }
+
+  #compatibilityEvidenceReferences(): GoalEvidenceReference[] {
+    const references: GoalEvidenceReference[] = []
+    for (const item of this.#store.listItems(this.#threadId)) {
+      if (item.turnId !== this.#turnId || item.kind !== 'tool_result') continue
+      const result = object(item.payload.result)
+      const reference = string(item.payload.callId) ?? string(item.payload.providerCallId) ?? item.nativeId
+      if (result?.success !== true || !reference) continue
+      references.push({
+        kind: 'tool_result',
+        reference,
+        claim: `Successful ${string(item.payload.toolName) ?? 'tool'} result from the terminal turn`,
+      })
+      if (references.length >= 31) break
     }
-    this.#goalTerminalIntent ??= intent
-    return success({ goal: current, stagedStatus: input.status, finalTokensUsed: this.#finalTokensUsed() })
+    references.push({
+      kind: 'current_turn',
+      reference: null,
+      claim: 'The terminal turn contains the claimed completed deliverable',
+    })
+    return references
+  }
+
+  async #proposeGoalCompletion(invocation: AgentToolInvocation): Promise<AgentToolResult> {
+    const input = validateCompletionProposal(invocation.input)
+    if ('error' in input) return input.error
+    await this.#flushGoalAccounting()
+    const current = this.#store.getGoal(this.#threadId)
+    if (this.#goalObservation.kind === 'none') {
+      return failure('goal_not_found', 'No Goal was observed for this turn')
+    }
+    if (!current || current.id !== this.#goalObservation.goalId
+      || current.revision !== this.#goalObservation.revision || current.status !== 'active') {
+      return failure('stale_goal_revision', 'Current Goal changed after it was observed', { goal: current })
+    }
+    return this.#stageCompletionProposal(current, { ...input, compatibilityAlias: false })
+  }
+
+  #stageCompletionProposal(
+    current: CanonicalGoal,
+    input: { summary: string; requirements: readonly GoalRequirementClaim[]; compatibilityAlias: boolean },
+  ): AgentToolResult {
+    const intent = Object.freeze({
+      goalId: current.id,
+      expectedRevision: current.revision,
+      summary: input.summary,
+      requirements: Object.freeze(input.requirements),
+      compatibilityAlias: input.compatibilityAlias,
+    } satisfies GoalCompletionProposalIntent)
+    if (this.#goalCompletionProposalIntent !== null
+      && canonicalJson(this.#goalCompletionProposalIntent) !== canonicalJson(intent)) {
+      return failure('goal_completion_proposal_conflict', 'A different Goal completion proposal is already staged')
+    }
+    this.#goalCompletionProposalIntent ??= intent
+    return success({
+      goal: current,
+      proposalStaged: true,
+      stagedStatus: 'verification_pending',
+      finalTokensUsed: this.#finalTokensUsed(),
+    })
   }
 
   #appendCall(invocation: AgentToolInvocation, sideEffect: string | null): void {
@@ -542,11 +646,13 @@ function validateUpdateGoal(input: JsonObject):
     return { error: invalidInput('update_goal received unsupported properties') }
   }
   if (input.status !== 'complete') return { error: invalidInput('status must be complete') }
-  if (!Array.isArray(input.evidence) || input.evidence.length < 1 || input.evidence.length > 64) {
-    return { error: invalidInput('complete status requires 1..64 evidence entries') }
+  if (input.evidence !== undefined && !Array.isArray(input.evidence)) {
+    return { error: invalidInput('evidence must be an array when provided') }
   }
+  const inputEvidence = input.evidence ?? []
+  if (inputEvidence.length > 64) return { error: invalidInput('evidence accepts at most 64 entries') }
   const evidence: GoalCompletionEvidence[] = []
-  for (const entry of input.evidence) {
+  for (const entry of inputEvidence) {
     const evidenceObject = object(entry)
     if (!evidenceObject || !onlyKeys(evidenceObject, ['requirement', 'proof'])
       || typeof evidenceObject.requirement !== 'string' || evidenceObject.requirement.trim().length < 1
@@ -558,6 +664,56 @@ function validateUpdateGoal(input: JsonObject):
     evidence.push(Object.freeze({ requirement: evidenceObject.requirement, proof: evidenceObject.proof }))
   }
   return { status: 'complete', evidence: Object.freeze(evidence) }
+}
+
+function validateCompletionProposal(input: JsonObject):
+  | { summary: string; requirements: readonly GoalRequirementClaim[] }
+  | { error: AgentToolResult } {
+  if (!onlyKeys(input, ['summary', 'requirements'])) {
+    return { error: invalidInput('propose_goal_completion received unsupported properties') }
+  }
+  if (typeof input.summary !== 'string' || input.summary.trim().length < 1
+    || [...input.summary].length > 2_000) {
+    return { error: invalidInput('summary must contain 1..2000 Unicode characters') }
+  }
+  if (!Array.isArray(input.requirements) || input.requirements.length < 1 || input.requirements.length > 64) {
+    return { error: invalidInput('requirements must contain 1..64 entries') }
+  }
+  const requirements: GoalRequirementClaim[] = []
+  for (let index = 0; index < input.requirements.length; index += 1) {
+    const candidate = object(input.requirements[index])
+    if (!candidate || !onlyKeys(candidate, ['requirement', 'evidence'])
+      || typeof candidate.requirement !== 'string' || candidate.requirement.trim().length < 1
+      || [...candidate.requirement].length > 500
+      || !Array.isArray(candidate.evidence) || candidate.evidence.length < 1 || candidate.evidence.length > 32) {
+      return { error: invalidInput('each requirement needs bounded text and 1..32 evidence references') }
+    }
+    const evidence: GoalEvidenceReference[] = []
+    for (const entry of candidate.evidence) {
+      const reference = object(entry)
+      if (!reference || !onlyKeys(reference, ['kind', 'reference', 'claim'])
+        || (reference.kind !== 'tool_result' && reference.kind !== 'current_turn')
+        || typeof reference.claim !== 'string' || reference.claim.trim().length < 1
+        || [...reference.claim].length > 1_000
+        || (reference.reference !== undefined
+          && (typeof reference.reference !== 'string' || reference.reference.trim().length < 1
+            || [...reference.reference].length > 500))
+        || (reference.kind === 'tool_result' && typeof reference.reference !== 'string')) {
+        return { error: invalidInput('evidence requires kind, claim, and a reference for tool_result') }
+      }
+      evidence.push(Object.freeze({
+        kind: reference.kind,
+        reference: typeof reference.reference === 'string' ? reference.reference : null,
+        claim: reference.claim,
+      }))
+    }
+    requirements.push(Object.freeze({
+      id: `requirement-${index + 1}`,
+      requirement: candidate.requirement,
+      evidence: Object.freeze(evidence) as GoalEvidenceReference[],
+    }))
+  }
+  return { summary: input.summary, requirements: Object.freeze(requirements) }
 }
 
 function goalFailure(error: unknown): AgentToolResult {

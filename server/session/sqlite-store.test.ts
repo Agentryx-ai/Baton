@@ -9,11 +9,13 @@ import type {
   BeginTurnInput,
   CanonicalSession,
   ExecutionPolicySnapshot,
+  GoalEvidenceBundle,
   ProviderCapabilities,
 } from './domain.ts'
 import { ContextPersistenceError, SqliteSessionStore } from './sqlite-store.ts'
 import { sourceHashForItems } from './context-materializer.ts'
 import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
+import { goalEvidenceHash } from './goal-evidence.ts'
 import type { BeginSessionInput } from './store.ts'
 import type { NativeSessionCandidate } from './native-import/contracts.ts'
 
@@ -61,6 +63,7 @@ function databasePath(_t: TestContext): string {
 
 function downgradeEmptyDerivedSchemaToV13(path: string): void {
   const database = new DatabaseSync(path)
+  removeGoalV2Schema(database)
   database.exec(`
     DROP INDEX context_compaction_jobs_active_frontier;
     DROP TRIGGER context_compaction_jobs_immutable_columns;
@@ -93,6 +96,26 @@ function downgradeEmptyDerivedSchemaToV13(path: string): void {
     PRAGMA user_version=13;
   `)
   database.close()
+}
+
+function removeGoalV2Schema(database: DatabaseSync): void {
+  database.exec(`
+    DROP TRIGGER IF EXISTS goal_completion_receipts_no_update;
+    DROP TRIGGER IF EXISTS goal_completion_receipts_no_delete;
+    DROP TRIGGER IF EXISTS goal_verification_attempts_no_update;
+    DROP TRIGGER IF EXISTS goal_verification_attempts_no_delete;
+    DROP TRIGGER IF EXISTS goal_stop_receipts_no_update;
+    DROP TRIGGER IF EXISTS goal_stop_receipts_no_delete;
+    DROP TABLE IF EXISTS goal_stop_receipts;
+    DROP TABLE IF EXISTS goal_completion_receipts;
+    DROP TABLE IF EXISTS goal_verification_attempts;
+    DROP TABLE IF EXISTS goal_verifier_leases;
+    DROP TABLE IF EXISTS goal_completion_proposals;
+    ALTER TABLE goals DROP COLUMN latest_completion_receipt_id;
+    ALTER TABLE goals DROP COLUMN latest_stop_receipt_id;
+    ALTER TABLE goals DROP COLUMN verification_proposal_id;
+    DELETE FROM schema_migrations WHERE version=19;
+  `)
 }
 
 function beginInput(threadId: string, request = 'request-1', hash = 'hash-1'): BeginTurnInput {
@@ -130,7 +153,7 @@ function beginSessionInput(
   }
 }
 
-test('initial session materialization is atomic, idempotent, and keeps schema v18', (t) => {
+test('initial session materialization is atomic, idempotent, and keeps schema v19', (t) => {
   const path = databasePath(t)
   const store = new SqliteSessionStore(path, deterministicOptions())
   const input = beginSessionInput()
@@ -178,7 +201,7 @@ test('initial session materialization is atomic, idempotent, and keeps schema v1
     const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
     assert.equal(row.count, expected, table)
   }
-  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18)
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   store.close()
 
   const reopened = new SqliteSessionStore(path, deterministicOptions())
@@ -276,7 +299,7 @@ function nativeCandidate(contents: string[], cwd: string, contentDigest: string)
   }
 }
 
-test('schema v1 migrates through v18 with generic permission storage', (t) => {
+test('schema v1 migrates through v19 with Goal verification storage', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -317,10 +340,10 @@ test('schema v1 migrates through v18 with generic permission storage', (t) => {
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -331,9 +354,14 @@ test('schema v1 migrates through v18 with generic permission storage', (t) => {
     SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'goal%'
   `).all() as Array<{ name: string }>
   assert.deepEqual(goalTables.map((table) => table.name).sort(), [
+    'goal_completion_proposals',
+    'goal_completion_receipts',
     'goal_events',
     'goal_scheduler_leases',
+    'goal_stop_receipts',
     'goal_turn_accounting',
+    'goal_verification_attempts',
+    'goal_verifier_leases',
     'goals',
   ])
   assert.equal((inspected.prepare(`
@@ -354,6 +382,7 @@ test('legacy emulator grants remain inert and are omitted from canonical session
   created.close()
 
   const database = new DatabaseSync(path)
+  removeGoalV2Schema(database)
   database.exec(`
     DELETE FROM schema_migrations WHERE version=18;
     PRAGMA user_version=17;
@@ -381,7 +410,7 @@ test('legacy emulator grants remain inert and are omitted from canonical session
   assert.equal(legacyValue.ldplayer_grant_json, null)
 })
 
-test('schema v6 migrates to v18 in place and reopens without replaying migrations', (t) => {
+test('schema v6 migrates to v19 in place and reopens without replaying migrations', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -434,11 +463,11 @@ test('schema v6 migrates to v18 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -450,7 +479,7 @@ test('schema v6 migrates to v18 in place and reopens without replaying migration
     .get() as { count: number }).count, 1)
 })
 
-test('schema v10 rebuilds follow-up constraints through v18 with foreign keys and reopens once', (t) => {
+test('schema v10 rebuilds follow-up constraints through v19 with foreign keys and reopens once', (t) => {
   const path = databasePath(t)
   const legacy = new DatabaseSync(path)
   legacy.exec(`
@@ -460,6 +489,7 @@ test('schema v10 rebuilds follow-up constraints through v18 with foreign keys an
     CREATE TABLE sessions(id TEXT PRIMARY KEY) STRICT;
     CREATE TABLE threads(id TEXT PRIMARY KEY) STRICT;
     CREATE TABLE turns(id TEXT PRIMARY KEY) STRICT;
+    CREATE TABLE goals(id TEXT PRIMARY KEY) STRICT;
     CREATE TABLE native_import_meta(key TEXT PRIMARY KEY,value BLOB NOT NULL) STRICT;
     INSERT INTO native_import_meta VALUES('identity_hmac_key',zeroblob(32));
     CREATE TABLE follow_ups(
@@ -483,7 +513,7 @@ test('schema v10 rebuilds follow-up constraints through v18 with foreign keys an
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
   assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
 })
@@ -495,6 +525,7 @@ test('schema v12 migrates once to immutable derived context tables and preserves
   initial.close()
 
   const legacy = new DatabaseSync(path)
+  removeGoalV2Schema(legacy)
   legacy.exec(`
     DROP TABLE execution_context_manifest_entries;
     DROP TABLE execution_context_manifests;
@@ -519,11 +550,11 @@ test('schema v12 migrates once to immutable derived context tables and preserves
 
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations WHERE version>=13 ORDER BY version')
       .all() as Array<{ version: number }>).map((row) => row.version),
-    [13, 14, 15, 16, 17, 18],
+    [13, 14, 15, 16, 17, 18, 19],
   )
   const tables = (inspected.prepare(`
     SELECT name FROM sqlite_schema WHERE type='table'
@@ -541,7 +572,7 @@ test('schema v12 migrates once to immutable derived context tables and preserves
   ])
 })
 
-test('schema v18 reopen fails closed when a derived-context protection trigger is missing', (t) => {
+test('schema v19 reopen fails closed when a derived-context protection trigger is missing', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   initial.close()
@@ -556,7 +587,22 @@ test('schema v18 reopen fails closed when a derived-context protection trigger i
   )
 })
 
-test('an empty released v13 database migrates through v18 and gains the authoritative frontier schema', (t) => {
+test('schema v19 reopen fails closed when a Goal receipt protection trigger is missing', (t) => {
+  const path = databasePath(t)
+  const initial = new SqliteSessionStore(path, deterministicOptions())
+  initial.close()
+  const external = new DatabaseSync(path)
+  external.exec('DROP TRIGGER goal_stop_receipts_no_update')
+  external.close()
+  assert.throws(
+    () => new SqliteSessionStore(path, deterministicOptions()),
+    (error: unknown) => error instanceof ContextPersistenceError
+      && error.code === 'integrity_violation'
+      && error.message.includes('trigger:goal_stop_receipts_no_update'),
+  )
+})
+
+test('an empty released v13 database migrates through v19 and gains the authoritative frontier schema', (t) => {
   const path = databasePath(t)
   const initial = new SqliteSessionStore(path, deterministicOptions())
   const session = initial.createSession({ title: 'old-v13 sentinel' })
@@ -568,7 +614,7 @@ test('an empty released v13 database migrates through v18 and gains the authorit
   migrated.close()
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
   assert.ok((inspected.prepare(`
     SELECT 1 FROM pragma_table_info('context_compaction_jobs')
     WHERE name='expected_previous_artifact_id'
@@ -1826,16 +1872,17 @@ test('Goal status transitions are deterministic and stopped states require expli
   assert.equal(resumedResult.goal?.provider, 'claude')
   assert.equal(resumedResult.goal?.model, 'claude-opus-4-8')
   assert.equal(resumedResult.goal?.effort, 'max')
-  const completedResult = store.updateGoalStatus({
-    goalId: created.id,
-    expectedRevision: resumedResult.goal?.revision ?? -1,
-    status: 'complete',
-  })
-  assert.equal(completedResult.goal?.status, 'complete')
-  assert.ok(completedResult.goal?.completedAt)
+  assert.throws(
+    () => store.updateGoalStatus({
+      goalId: created.id,
+      expectedRevision: resumedResult.goal?.revision ?? -1,
+      status: 'complete',
+    }),
+    (error: unknown) => error instanceof GoalStoreError && error.code === 'invalid_goal_transition',
+  )
   const reactivated = store.editGoal({
     goalId: created.id,
-    expectedRevision: completedResult.goal?.revision ?? -1,
+    expectedRevision: resumedResult.goal?.revision ?? -1,
     objective: 'complete the expanded task',
   })
   assert.equal(reactivated.status, 'active')
@@ -1871,6 +1918,302 @@ test('Goal status transitions are deterministic and stopped states require expli
     expectedRevision: limited.revision,
     tokenBudget: 20,
   }).status, 'active')
+})
+
+test('Goal V2 verifies a frozen proposal before writing an immutable completion receipt', (t) => {
+  const path = databasePath(t)
+  const store = new SqliteSessionStore(path, deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'produce and verify the answer',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = store.beginTurn(beginInput(session.activeThreadId, 'goal-v2-turn', 'goal-v2-hash'))
+  store.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'goal-v2:assistant',
+    items: [{ kind: 'assistant_message', payload: { text: 'Verified answer' } }],
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id,
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    tokensUsed: 10,
+    timeUsedSeconds: 1,
+    automatic: true,
+    progressDigest: 'progress',
+  })
+  const requirements = [{
+    id: 'requirement-1',
+    requirement: 'produce the answer',
+    evidence: [{ kind: 'current_turn' as const, reference: null, claim: 'The answer is the deliverable' }],
+  }]
+  const content = {
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    objective: goal.objective,
+    proposalSummary: 'answer delivered',
+    requirements,
+    evidence: [{
+      id: 'evidence-1-1',
+      kind: 'current_turn' as const,
+      reference: started.turn.id,
+      claim: 'The answer is the deliverable',
+      authoritative: true,
+      payload: { requirementId: 'requirement-1', terminalStatus: 'completed' },
+    }],
+    terminalTurn: {
+      id: started.turn.id,
+      status: 'completed' as const,
+      provider: 'codex' as const,
+      model: 'gpt-test',
+    },
+    omissions: [] as string[],
+  }
+  const evidenceBundle: GoalEvidenceBundle = { ...content, hash: goalEvidenceHash(content) }
+  const proposal = store.beginGoalVerification({
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    turnId: started.turn.id,
+    summary: 'answer delivered',
+    requirements,
+    evidenceBundle,
+  })
+  assert.ok(proposal)
+  assert.equal(store.getGoal(session.activeThreadId)?.status, 'verifying')
+  assert.deepEqual(store.listActiveGoals(), [])
+  const proposalDatabase = new DatabaseSync(path)
+  try {
+    assert.throws(
+      () => proposalDatabase.prepare(`
+        UPDATE goal_completion_proposals SET summary=?,status='rejected',resolved_at=? WHERE id=?
+      `).run('tampered summary', '2026-07-21T00:00:00.000Z', proposal.id),
+      /immutable/,
+    )
+  } finally {
+    proposalDatabase.close()
+  }
+  const verifierLease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'verifier-test',
+    leaseDurationMs: 3,
+  })
+  assert.ok(verifierLease)
+  assert.equal(store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'competing-verifier',
+  }), null)
+  const heartbeat = store.heartbeatGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    leaseId: verifierLease.leaseId, ownerId: verifierLease.ownerId, leaseDurationMs: 2,
+  })
+  assert.ok(heartbeat)
+  assert.notEqual(heartbeat.expiresAt, verifierLease.expiresAt)
+  assert.equal(store.finishGoalVerification({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    evaluatorProvider: 'codex', evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'indeterminate', reason: 'must hold the verifier lease', requirements: [],
+      missingEvidence: ['lease'], impossibleEvidenceIds: [],
+    },
+    leaseId: 'missing-lease', leaseOwner: 'not-owner',
+  }).status, 'stale')
+  const reclaimedLease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'recovered-verifier',
+  })
+  assert.ok(reclaimedLease)
+  assert.notEqual(reclaimedLease.leaseId, verifierLease.leaseId)
+  const finished = store.finishGoalVerification({
+    proposalId: proposal.id,
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    evaluatorProvider: 'codex',
+    evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'complete',
+      reason: 'The frozen deliverable satisfies the objective',
+      requirements: [{
+        requirementId: 'requirement-1',
+        result: 'satisfied',
+        evidenceIds: ['evidence-1-1'],
+        reason: 'The answer exists in the completed turn',
+      }],
+      missingEvidence: [],
+      impossibleEvidenceIds: [],
+    },
+    leaseId: reclaimedLease.leaseId,
+    leaseOwner: reclaimedLease.ownerId,
+  })
+  assert.equal(finished.status, 'applied')
+  assert.equal(finished.goal?.status, 'complete')
+  assert.equal(finished.goal?.revision, goal.revision)
+  assert.equal(finished.goal?.latestCompletionReceiptId, finished.receipt?.id)
+  assert.ok(finished.receipt)
+  const history = store.getGoalVerificationHistory(goal.id)
+  assert.equal(history.proposals[0]?.status, 'accepted')
+  assert.equal(history.attempts[0]?.outcome, 'complete')
+  assert.equal(history.receipts[0]?.id, finished.receipt?.id)
+  const database = new DatabaseSync(path)
+  t.after(() => database.close())
+  const receiptId = finished.receipt?.id
+  assert.ok(receiptId)
+  assert.throws(
+    () => database.prepare('DELETE FROM goal_completion_receipts WHERE id=?').run(receiptId),
+    /append-only/,
+  )
+  assert.throws(
+    () => database.prepare('UPDATE goal_verification_attempts SET outcome=? WHERE id=?')
+      .run('incomplete', history.attempts[0]?.id),
+    /append-only/,
+  )
+  assert.throws(
+    () => database.prepare('DELETE FROM goal_completion_proposals WHERE id=?').run(proposal.id),
+    /retained/,
+  )
+})
+
+test('Goal V2 records independently confirmed impossibility as a resumable stop receipt', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'perform an operation proven unavailable',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  const started = store.beginTurn(beginInput(session.activeThreadId, 'impossible-turn', 'impossible-hash'))
+  store.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'impossible:evidence',
+    items: [{
+      kind: 'tool_result',
+      payload: {
+        callId: 'capability-check', providerCallId: 'capability-check', toolName: 'inspect_capability',
+        result: { success: true, content: { available: false }, error: null },
+      },
+    }],
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id, goalId: goal.id, goalRevision: goal.revision,
+    tokensUsed: 1, timeUsedSeconds: 1, automatic: true, progressDigest: null,
+  })
+  const requirements = [{
+    id: 'requirement-1', requirement: 'perform the unavailable operation',
+    evidence: [{ kind: 'tool_result' as const, reference: 'capability-check', claim: 'capability check result' }],
+  }]
+  const content = {
+    goalId: goal.id, goalRevision: goal.revision, objective: goal.objective,
+    proposalSummary: 'capability is unavailable', requirements,
+    evidence: [{
+      id: 'evidence-1-1', kind: 'tool_result' as const, reference: 'capability-check',
+      claim: 'capability check result', authoritative: true,
+      payload: { requirementId: 'requirement-1', terminalStatus: 'completed' },
+    }],
+    terminalTurn: {
+      id: started.turn.id, status: 'completed' as const, provider: 'codex' as const, model: 'gpt-test',
+    },
+    omissions: [] as string[],
+  }
+  const proposal = store.beginGoalVerification({
+    goalId: goal.id, goalRevision: goal.revision, turnId: started.turn.id,
+    summary: content.proposalSummary, requirements,
+    evidenceBundle: { ...content, hash: goalEvidenceHash(content) },
+  })
+  assert.ok(proposal)
+  const verifierLease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'verifier-test',
+  })
+  assert.ok(verifierLease)
+  const stopped = store.finishGoalVerification({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    evaluatorProvider: 'codex', evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'impossible', reason: 'authoritative evidence confirms impossibility',
+      requirements: [{
+        requirementId: 'requirement-1', result: 'impossible', evidenceIds: ['evidence-1-1'],
+        reason: 'the required capability is absent',
+      }],
+      missingEvidence: [], impossibleEvidenceIds: ['evidence-1-1'],
+    },
+    leaseId: verifierLease.leaseId,
+    leaseOwner: verifierLease.ownerId,
+  })
+  assert.equal(stopped.goal?.status, 'blocked')
+  assert.equal(stopped.goal?.statusReason?.code, 'confirmed_impossible')
+  assert.equal(stopped.goal?.latestStopReceiptId, stopped.stopReceipt?.id)
+  assert.equal(stopped.stopReceipt?.resumable, true)
+  assert.equal(store.getGoalVerificationHistory(goal.id).stopReceipts.length, 1)
+})
+
+test('Goal V2 rejects impossibility based on a worker deliverable instead of authoritative tool evidence', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const session = store.createSession({})
+  const goal = store.createGoal({
+    threadId: session.activeThreadId, expected: { kind: 'none' }, objective: 'perform the operation',
+    provider: 'codex', model: 'gpt-test',
+  })
+  const started = store.beginTurn(beginInput(session.activeThreadId, 'claimed-impossible', 'claimed-impossible-hash'))
+  store.appendProviderEvent({
+    turnId: started.turn.id, eventId: 'claimed-impossible:assistant',
+    items: [{ kind: 'assistant_message', payload: { text: 'I cannot perform the operation' } }],
+  })
+  store.finishTurn({ turnId: started.turn.id, status: 'completed' })
+  store.recordGoalTurn({
+    turnId: started.turn.id, goalId: goal.id, goalRevision: goal.revision,
+    tokensUsed: 1, timeUsedSeconds: 1, automatic: true, progressDigest: null,
+  })
+  const requirements = [{
+    id: 'requirement-1', requirement: 'perform the operation',
+    evidence: [{ kind: 'current_turn' as const, reference: null, claim: 'worker says it is impossible' }],
+  }]
+  const content = {
+    goalId: goal.id, goalRevision: goal.revision, objective: goal.objective,
+    proposalSummary: 'worker reports impossibility', requirements,
+    evidence: [{
+      id: 'evidence-1-1', kind: 'current_turn' as const, reference: started.turn.id,
+      claim: 'worker says it is impossible', authoritative: true,
+      payload: { requirementId: 'requirement-1', terminalStatus: 'completed' },
+    }],
+    terminalTurn: {
+      id: started.turn.id, status: 'completed' as const, provider: 'codex' as const, model: 'gpt-test',
+    },
+    omissions: [] as string[],
+  }
+  const proposal = store.beginGoalVerification({
+    goalId: goal.id, goalRevision: goal.revision, turnId: started.turn.id,
+    summary: content.proposalSummary, requirements,
+    evidenceBundle: { ...content, hash: goalEvidenceHash(content) },
+  })
+  assert.ok(proposal)
+  const lease = store.claimGoalVerifierLease({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision, ownerId: 'verifier-test',
+  })
+  assert.ok(lease)
+  const result = store.finishGoalVerification({
+    proposalId: proposal.id, goalId: goal.id, goalRevision: goal.revision,
+    evaluatorProvider: 'codex', evaluatorModel: 'gpt-test',
+    decision: {
+      outcome: 'impossible', reason: 'the worker says the operation is impossible',
+      requirements: [{
+        requirementId: 'requirement-1', result: 'impossible', evidenceIds: ['evidence-1-1'],
+        reason: 'worker statement',
+      }],
+      missingEvidence: [], impossibleEvidenceIds: ['evidence-1-1'],
+    },
+    leaseId: lease.leaseId, leaseOwner: lease.ownerId,
+  })
+  assert.equal(result.status, 'applied')
+  assert.equal(result.goal?.status, 'active')
+  assert.equal(result.goal?.statusReason?.code, 'verification_host_rejected')
+  assert.equal(result.stopReceipt, null)
+  assert.equal(store.getGoalVerificationHistory(goal.id).stopReceipts.length, 0)
 })
 
 test('Goal projection mutations append objective-free durable SSE cursors', (t) => {

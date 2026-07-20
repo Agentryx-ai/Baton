@@ -10,6 +10,10 @@ import type {
   BeginSessionResult,
   BeginTurnResult,
   CanonicalGoal,
+  GoalCompletionProposal,
+  GoalEvidenceBundle,
+  GoalFrozenEvidence,
+  GoalVerificationDecision,
   CanonicalFollowUp,
   CanonicalExecution,
   CanonicalItem,
@@ -50,9 +54,11 @@ import { GoalStoreError, SessionStoreError } from './store.ts'
 import {
   GOAL_TOOL_DEFINITIONS,
   ToolCoordinator,
-  type GoalTerminalIntent,
+  type GoalCompletionProposalIntent,
   type ToolRuntime,
 } from './tool-coordinator.ts'
+import { ProviderGoalVerifier, type GoalVerifier } from './goal-verifier.ts'
+import { goalEvidenceHash } from './goal-evidence.ts'
 import {
   FullAccessCommandRunner,
   HostCommandToolRuntime,
@@ -92,6 +98,11 @@ export class TurnOrchestrator implements ConversationService {
   private readonly contextRuntime: CanonicalContextRuntimeContract | null
   private readonly hostRuntime: { artifacts: LocalImageArtifactStore } | null
   private readonly goalRuntime: GoalRuntime
+  private readonly goalVerifier: GoalVerifier
+  private readonly goalVerificationRetryMs: number
+  private readonly goalVerifications = new Map<string, Promise<void>>()
+  private readonly goalVerificationRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private readonly goalVerifierOwner = `goal-verifier-${process.pid}-${Date.now()}`
   private readonly active = new Map<TurnId, ActiveTurn>()
   private closed = false
   private readonly followUpOwner = `follow-up-${process.pid}-${Date.now()}`
@@ -107,6 +118,8 @@ export class TurnOrchestrator implements ConversationService {
     cancellationTimeoutMs = 10_000,
     contextRuntime: CanonicalContextRuntimeContract | null = null,
     hostRuntime: { artifacts: LocalImageArtifactStore } | null = null,
+    goalVerifier: GoalVerifier = new ProviderGoalVerifier(),
+    goalVerificationRetryMs = 10_000,
   ) {
     this.store = store
     this.adapters = adapters
@@ -114,6 +127,11 @@ export class TurnOrchestrator implements ConversationService {
     this.cancellationTimeoutMs = cancellationTimeoutMs
     this.contextRuntime = contextRuntime
     this.hostRuntime = hostRuntime
+    this.goalVerifier = goalVerifier
+    if (!Number.isSafeInteger(goalVerificationRetryMs) || goalVerificationRetryMs < 1) {
+      throw new TypeError('Goal verification retry interval must be a positive integer')
+    }
+    this.goalVerificationRetryMs = goalVerificationRetryMs
     this.goalRuntime = new GoalRuntime(store, {
       ownerId: `baton-${process.pid}-${Date.now()}`,
       launchContinuation: (request) => this.launchGoalContinuation(request),
@@ -258,6 +276,7 @@ export class TurnOrchestrator implements ConversationService {
   }
 
   getGoal(threadId: ThreadId): CanonicalGoal | null { return this.store.getGoal(threadId) }
+  getGoalVerificationHistory(goalId: string) { return this.store.getGoalVerificationHistory(goalId) }
 
   async createGoal(input: CreateGoalInput): Promise<CanonicalGoal> {
     const previous = this.store.getGoal(input.threadId)
@@ -727,6 +746,45 @@ export class TurnOrchestrator implements ConversationService {
       const thread = this.store.getThread(session.activeThreadId)
       if (thread?.status === 'idle') await this.drainNextFollowUp(thread.id)
     }
+    for (const proposal of this.store.listPendingGoalCompletionProposals()) {
+      const goal = this.store.getGoalById(proposal.goalId)
+      const snapshot = goal ? this.store.getSnapshot(goal.threadId) : null
+      if (!goal || !snapshot || goal.status !== 'verifying') continue
+      try {
+        const ready = await this.adapters.getReady(goal.provider)
+        await this.runGoalVerification(proposal, goal, ready.adapter, snapshot)
+      } catch (error) {
+        const lease = this.store.claimGoalVerifierLease({
+          proposalId: proposal.id,
+          goalId: proposal.goalId,
+          goalRevision: proposal.goalRevision,
+          ownerId: this.goalVerifierOwner,
+        })
+        if (!lease) continue
+        this.store.finishGoalVerification({
+          proposalId: proposal.id,
+          goalId: proposal.goalId,
+          goalRevision: proposal.goalRevision,
+          evaluatorProvider: goal.provider,
+          evaluatorModel: goal.model,
+          decision: {
+            outcome: 'indeterminate',
+            reason: `Verifier recovery failed: ${error instanceof Error ? error.message : String(error)}`,
+            requirements: proposal.requirements.map((requirement) => ({
+              requirementId: requirement.id,
+              result: 'unproven',
+              evidenceIds: [],
+              reason: 'Recovered verification could not be executed',
+            })),
+            missingEvidence: ['A successful independent verifier execution is required'],
+            impossibleEvidenceIds: [],
+          },
+          leaseId: lease.leaseId,
+          leaseOwner: this.goalVerifierOwner,
+        })
+        this.events.publish(goal.threadId)
+      }
+    }
     await this.goalRuntime.start()
   }
 
@@ -736,8 +794,11 @@ export class TurnOrchestrator implements ConversationService {
     for (const timer of this.followUpRetryTimers.values()) clearTimeout(timer)
     this.followUpRetryTimers.clear()
     this.followUpRetryCounts.clear()
+    for (const timer of this.goalVerificationRetryTimers.values()) clearTimeout(timer)
+    this.goalVerificationRetryTimers.clear()
     this.goalRuntime.stop()
     await Promise.allSettled([...this.followUpDrains.values()])
+    await Promise.allSettled([...this.goalVerifications.values()])
     const active = [...this.active.values()]
     for (const turn of active) turn.controller.abort(new Error('Baton is shutting down'))
     await this.adapters.shutdownAll()
@@ -947,9 +1008,10 @@ export class TurnOrchestrator implements ConversationService {
     const preserveGoalForUser = drained || this.hasPendingUserIntent(turn.threadId)
     await this.finishGoalTurn(
       turn, terminal, tokensUsed, automatic,
-      preserveGoalForUser ? null : coordinator.goalTerminalIntent,
+      preserveGoalForUser ? null : coordinator.goalCompletionProposalIntent,
       !preserveGoalForUser,
       preserveGoalForUser,
+      adapter,
     )
   }
 
@@ -1011,9 +1073,10 @@ export class TurnOrchestrator implements ConversationService {
     terminal: FinishTurnInput,
     tokensUsed: number,
     automatic: boolean,
-    goalIntent: GoalTerminalIntent | null,
+    goalIntent: GoalCompletionProposalIntent | null,
     notifyIdle = true,
     preserveGoalForUser = false,
+    adapter?: import('./adapter.ts').SessionProviderAdapter,
   ): Promise<void> {
     if (turn.goalId === null || turn.goalRevision === null) return
     const progressDigest = goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision, turn.id)
@@ -1045,16 +1108,147 @@ export class TurnOrchestrator implements ConversationService {
     if (goalIntent) {
       if (goalIntent.goalId !== accounted.goal.id
         || goalIntent.expectedRevision !== accounted.goal.revision) return
-      this.store.updateGoalStatus({
-        goalId: goalIntent.goalId,
-        expectedRevision: goalIntent.expectedRevision,
-        status: 'complete',
+      if (!adapter) throw new Error('Goal completion verification requires the worker adapter')
+      const snapshot = this.store.getSnapshot(turn.threadId)
+      if (!snapshot) throw new Error('Goal completion verification lost its thread snapshot')
+      const bundle = freezeGoalEvidence(accounted.goal, turn, goalIntent, snapshot)
+      const proposal = this.store.beginGoalVerification({
+        goalId: accounted.goal.id,
+        goalRevision: accounted.goal.revision,
+        turnId: turn.id,
+        summary: goalIntent.summary,
+        requirements: [...goalIntent.requirements],
+        evidenceBundle: bundle,
       })
       this.events.publish(turn.threadId)
+      if (proposal) await this.runGoalVerification(proposal, accounted.goal, adapter, snapshot)
       return
     }
     if (notifyIdle) await this.goalRuntime.notifyThreadIdle(turn.threadId)
     this.events.publish(turn.threadId)
+  }
+
+  private async runGoalVerification(
+    proposal: GoalCompletionProposal,
+    goal: CanonicalGoal,
+    adapter: import('./adapter.ts').SessionProviderAdapter,
+    snapshot: ThreadSnapshot,
+  ): Promise<void> {
+    const existing = this.goalVerifications.get(proposal.id)
+    if (existing) return existing
+    const execution = (async () => {
+      const lease = this.store.claimGoalVerifierLease({
+        proposalId: proposal.id,
+        goalId: proposal.goalId,
+        goalRevision: proposal.goalRevision,
+        ownerId: this.goalVerifierOwner,
+      })
+      if (!lease) {
+        this.scheduleGoalVerificationRetry(proposal.id)
+        return
+      }
+      const controller = new AbortController()
+      const abortForShutdown = () => controller.abort(this.shutdownController.signal.reason)
+      this.shutdownController.signal.addEventListener('abort', abortForShutdown, { once: true })
+      if (this.shutdownController.signal.aborted) abortForShutdown()
+      const heartbeat = setInterval(() => {
+        try {
+          const renewed = this.store.heartbeatGoalVerifierLease({
+            proposalId: proposal.id,
+            goalId: proposal.goalId,
+            goalRevision: proposal.goalRevision,
+            ownerId: this.goalVerifierOwner,
+            leaseId: lease.leaseId,
+          })
+          if (!renewed) controller.abort(new Error('Goal verifier lease was lost'))
+        } catch (error) {
+          controller.abort(error)
+        }
+      }, 10_000)
+      heartbeat.unref?.()
+      try {
+        let decision: GoalVerificationDecision
+        let usage: Record<string, unknown> | null = null
+        try {
+          const result = await this.goalVerifier.verify({
+            bundle: proposal.evidenceBundle,
+            adapter,
+            snapshot,
+            model: goal.model,
+            effort: goal.effort,
+            signal: controller.signal,
+          })
+          decision = result.decision
+          usage = result.usage
+        } catch (error) {
+          decision = {
+            outcome: 'indeterminate',
+            reason: `Independent verifier failed: ${error instanceof Error ? error.message : String(error)}`,
+            requirements: proposal.requirements.map((requirement) => ({
+              requirementId: requirement.id,
+              result: 'unproven',
+              evidenceIds: [],
+              reason: 'Verifier execution did not produce a valid decision',
+            })),
+            missingEvidence: ['A valid independent verifier result is required'],
+            impossibleEvidenceIds: [],
+          }
+        }
+        const result = this.store.finishGoalVerification({
+          proposalId: proposal.id,
+          goalId: proposal.goalId,
+          goalRevision: proposal.goalRevision,
+          evaluatorProvider: adapter.provider,
+          evaluatorModel: goal.model,
+          decision,
+          usage,
+          leaseId: lease.leaseId,
+          leaseOwner: this.goalVerifierOwner,
+        })
+        if (result.goal) {
+          this.events.publish(result.goal.threadId)
+          if (result.status === 'applied' && result.goal.status === 'active') {
+            await this.goalRuntime.notifyThreadIdle(result.goal.threadId)
+          }
+        }
+      } finally {
+        clearInterval(heartbeat)
+        this.shutdownController.signal.removeEventListener('abort', abortForShutdown)
+        this.store.releaseGoalVerifierLease({
+          proposalId: proposal.id,
+          leaseId: lease.leaseId,
+          ownerId: this.goalVerifierOwner,
+        })
+      }
+    })().finally(() => this.goalVerifications.delete(proposal.id))
+    this.goalVerifications.set(proposal.id, execution)
+    return execution
+  }
+
+  private scheduleGoalVerificationRetry(proposalId: string): void {
+    if (this.closed || this.goalVerificationRetryTimers.has(proposalId)) return
+    const timer = setTimeout(() => {
+      this.goalVerificationRetryTimers.delete(proposalId)
+      void this.retryGoalVerification(proposalId)
+    }, this.goalVerificationRetryMs)
+    timer.unref?.()
+    this.goalVerificationRetryTimers.set(proposalId, timer)
+  }
+
+  private async retryGoalVerification(proposalId: string): Promise<void> {
+    if (this.closed) return
+    const proposal = this.store.listPendingGoalCompletionProposals()
+      .find((candidate) => candidate.id === proposalId)
+    if (!proposal) return
+    const goal = this.store.getGoalById(proposal.goalId)
+    const snapshot = goal ? this.store.getSnapshot(goal.threadId) : null
+    if (!goal || !snapshot || goal.status !== 'verifying') return
+    try {
+      const ready = await this.adapters.getReady(goal.provider)
+      await this.runGoalVerification(proposal, goal, ready.adapter, snapshot)
+    } catch {
+      this.scheduleGoalVerificationRetry(proposalId)
+    }
   }
 
   private stopGoalForTerminal(goal: CanonicalGoal, error: Record<string, unknown> | null | undefined): void {
@@ -1418,6 +1612,98 @@ function goalProgressDigest(snapshot: ThreadSnapshot | null, goalRevision: numbe
     evidence: [...new Set(evidence)].sort(),
   })).digest('hex')
 }
+
+function freezeGoalEvidence(
+  goal: CanonicalGoal,
+  turn: CanonicalTurn,
+  intent: GoalCompletionProposalIntent,
+  snapshot: ThreadSnapshot,
+): GoalEvidenceBundle {
+  const evidence: GoalFrozenEvidence[] = []
+  const omissions: string[] = []
+  const turnItems = snapshot.items.filter((item) => item.turnId === turn.id)
+  const assistantItems = turnItems.filter((item) => item.kind === 'assistant_message')
+  for (let requirementIndex = 0; requirementIndex < intent.requirements.length; requirementIndex += 1) {
+    const requirement = intent.requirements[requirementIndex]!
+    for (let evidenceIndex = 0; evidenceIndex < requirement.evidence.length; evidenceIndex += 1) {
+      const reference = requirement.evidence[evidenceIndex]!
+      const id = `evidence-${requirementIndex + 1}-${evidenceIndex + 1}`
+      if (reference.kind === 'tool_result') {
+        const item = turnItems.find((candidate) => candidate.kind === 'tool_result'
+          && (candidate.payload.callId === reference.reference
+            || candidate.payload.providerCallId === reference.reference
+            || candidate.nativeId === reference.reference))
+        const bounded = item ? boundedGoalEvidencePayload(item.payload) : null
+        const result = item && typeof item.payload.result === 'object' && item.payload.result !== null
+          ? item.payload.result as Record<string, unknown>
+          : null
+        const authoritative = result?.success === true && bounded?.truncated === false
+        if (!item) omissions.push(`${id}: referenced tool result was not found`)
+        else if (bounded?.truncated) omissions.push(`${id}: tool result exceeded the verifier evidence limit`)
+        else if (!authoritative) omissions.push(`${id}: referenced tool result was not successful`)
+        evidence.push({
+          id,
+          kind: reference.kind,
+          reference: reference.reference ?? '',
+          claim: reference.claim,
+          authoritative,
+          payload: {
+            requirementId: requirement.id,
+            itemId: item?.id ?? null,
+            value: bounded?.value ?? null,
+          },
+        })
+        continue
+      }
+      const bounded = boundedGoalEvidencePayload(assistantItems.map((item) => ({ id: item.id, payload: item.payload })))
+      const authoritative = assistantItems.length > 0 && !bounded.truncated
+      if (assistantItems.length === 0) omissions.push(`${id}: the terminal turn has no assistant deliverable`)
+      if (bounded.truncated) omissions.push(`${id}: terminal deliverable exceeded the verifier evidence limit`)
+      evidence.push({
+        id,
+        kind: reference.kind,
+        reference: turn.id,
+        claim: reference.claim,
+        authoritative,
+        payload: {
+          requirementId: requirement.id,
+          terminalStatus: 'completed',
+          assistantItems: bounded.value,
+        },
+      })
+    }
+  }
+  const content = {
+    goalId: goal.id,
+    goalRevision: goal.revision,
+    objective: goal.objective,
+    proposalSummary: intent.summary,
+    requirements: intent.requirements.map((requirement) => ({
+      ...requirement,
+      evidence: requirement.evidence.map((entry) => ({ ...entry })),
+    })),
+    evidence,
+    terminalTurn: {
+      id: turn.id,
+      status: 'completed' as const,
+      provider: turn.provider,
+      model: turn.model,
+    },
+    omissions,
+  }
+  return { ...content, hash: goalEvidenceHash(content) }
+}
+
+function boundedGoalEvidencePayload(value: unknown): { value: unknown; truncated: boolean } {
+  const serialized = JSON.stringify(value)
+  const maximum = 40_000
+  if (serialized.length <= maximum) return { value, truncated: false }
+  return {
+    value: { truncated: true, preview: serialized.slice(0, maximum) },
+    truncated: true,
+  }
+}
+
 
 function stableProgressEvidence(kind: string, payload: Record<string, unknown>): string {
   if (kind === 'tool_result') {

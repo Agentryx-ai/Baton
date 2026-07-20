@@ -24,6 +24,7 @@ import type {
   ImageArtifactRefDto,
   PermissionProfile,
   PermissionSettingsDto,
+  GoalVerificationHistoryDto,
 } from './types.ts'
 
 const BASE_PATH = '/baton/v1'
@@ -206,6 +207,9 @@ export const conversationApi = {
 
   editGoal: (goalId: string, input: EditGoalDto): Promise<CanonicalGoalDto> =>
     request(`/goals/${encodeURIComponent(goalId)}`, jsonRequest('PATCH', input)),
+
+  getGoalVerificationHistory: (goalId: string): Promise<GoalVerificationHistoryDto> =>
+    request(`/goals/${encodeURIComponent(goalId)}/verifications`),
 
   setGoalStatus: (
     goalId: string,

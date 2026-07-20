@@ -301,6 +301,7 @@ class TestConversationService implements ConversationService {
   }
 
   getGoal(threadId: string): CanonicalGoal | null { return threadId === thread.id ? this.goal : null }
+  getGoalVerificationHistory(_goalId: string) { return { proposals: [], attempts: [], receipts: [], stopReceipts: [] } }
 
   async createGoal(input: CreateGoalInput): Promise<CanonicalGoal> {
     this.goal = testGoal({ objective: input.objective, provider: input.provider, model: input.model })
@@ -364,6 +365,7 @@ function testGoal(overrides: Partial<CanonicalGoal> = {}): CanonicalGoal {
     tokensUsed: 0, timeUsedSeconds: 0, maxAutomaticTurns: 24, automaticTurnsUsed: 0,
     maxActiveSeconds: 7_200, noProgressCount: 0, lastProgressDigest: null,
     createdAt: now, updatedAt: now, startedAt: now, completedAt: null,
+    verificationProposalId: null, latestCompletionReceiptId: null, latestStopReceiptId: null,
     ...overrides,
   }
 }
@@ -756,6 +758,10 @@ test('Goal routes validate revisions and expose create, edit, pause, resume, and
     assert.equal(editedResponse.status, 200)
     const edited = await editedResponse.json() as CanonicalGoal
     assert.equal(edited.objective, 'ship verified work')
+
+    const verificationHistory = await fetch(`${baseUrl}/goals/${created.id}/verifications`)
+    assert.equal(verificationHistory.status, 200)
+    assert.deepEqual(await verificationHistory.json(), { proposals: [], attempts: [], receipts: [], stopReceipts: [] })
 
     const paused = await fetch(`${baseUrl}/goals/${created.id}/status`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
