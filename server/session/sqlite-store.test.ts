@@ -676,6 +676,41 @@ test('compaction artifacts cover an exact immutable canonical prefix and survive
   assert.deepEqual(reopened.listItems(session.activeThreadId).map((item) => item.id), source.map((item) => item.id))
 })
 
+test('compaction source accepts a safe imported turnless prefix before canonical turns', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const imported = store.commitNativeImport({
+    candidate: nativeCandidate(['imported one', 'imported two'], 'C:\\source', 'turnless-prefix'),
+    previewedState: null,
+  })
+  assert.ok(imported.sessionId)
+  const session = store.getSession(imported.sessionId)
+  assert.ok(session)
+  const turn = store.beginTurn(beginInput(session.activeThreadId))
+  store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
+  const sourceItemIds = store.listItems(session.activeThreadId).map((item) => item.id)
+
+  assert.throws(() => store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'reject-partial-imported-turnless-prefix',
+    sourceItemIds: [sourceItemIds[0]!],
+    summaryInputHash: 'e'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }), (error: unknown) => error instanceof ContextPersistenceError
+    && error.code === 'invalid_input'
+    && error.message.includes('complete leading turnless prefix'))
+
+  const job = store.createContextCompactionJob({
+    threadId: session.activeThreadId,
+    requestKey: 'compact-imported-turnless-prefix',
+    sourceItemIds,
+    summaryInputHash: 'f'.repeat(64),
+    expectedPreviousArtifactId: null,
+  }).job
+
+  assert.deepEqual(job.sourceItemIds, sourceItemIds)
+})
+
 test('compaction creation is idempotent across connections and rejects source reordering or active turns', async (t) => {
   const path = databasePath(t)
   const firstStore = new SqliteSessionStore(path, deterministicOptions())
