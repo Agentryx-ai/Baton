@@ -6,10 +6,15 @@ import { CodexNativeCredentialError } from './codex-native-credentials.ts'
 import { CodexModelCatalogError } from './codex-native-models.ts'
 import { CodexNativeRuntime } from './codex-native-runtime.ts'
 import { NativeAccountVaultError } from './native-account-vault.ts'
+import {
+  pluginReferenceErrorStatus,
+  type CodexPluginReferenceService,
+} from './codex-plugin-reference-service.ts'
 
 export interface CodexNativeAccountRoutesOptions {
   runtime: CodexNativeRuntime
   oauth: CodexNativeOAuthManager
+  pluginReference?: CodexPluginReferenceService
 }
 
 function parseBody(body: unknown): Record<string, unknown> {
@@ -25,6 +30,14 @@ function parseBody(body: unknown): Record<string, unknown> {
 }
 
 function sendError(res: Response, error: unknown): void {
+  const pluginStatus = pluginReferenceErrorStatus(error)
+  if (pluginStatus !== null) {
+    res.status(pluginStatus).json({
+      error: error instanceof Error ? error.message : 'Codex plugin 기준계정 작업에 실패했습니다.',
+      code: error instanceof Error && 'code' in error ? String(error.code) : 'plugin_reference_error',
+    })
+    return
+  }
   if (error instanceof NativeAccountVaultError) {
     const status = error.code === 'not_found' ? 404 : error.code === 'conflict' ? 409 : error.code === 'invalid' ? 400 : 503
     res.status(status).json({ error: error.message, code: error.code })
@@ -48,6 +61,9 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
   router.get('/accounts', async (_req, res) => {
     try {
       const accounts = await options.runtime.vault.list('codex')
+      const pluginReferenceAccountId = options.pluginReference
+        ? (await options.pluginReference.status()).state.accountId
+        : null
       const defaultId = accounts.find((account) => account.enabled)?.id
       res.json({
         provider: 'codex',
@@ -61,6 +77,7 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
           createdAt: account.createdAt,
           priority: account.priority,
           revision: account.revision,
+          isPluginReference: account.id === pluginReferenceAccountId,
           models: options.runtime.catalog.get(account.id)?.models ?? [],
           plan: options.runtime.catalog.get(account.id)?.plan ?? null,
         })),
@@ -124,10 +141,10 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
 
   router.patch('/accounts/:id', async (req: Request<{ id: string }>, res) => {
     try {
-      const current = await options.runtime.vault.readAccount(req.params.id, 'codex')
       const body = parseBody(req.body)
+      const expectedRevision = requireExpectedRevision(body)
       const updated = await options.runtime.vault.update(req.params.id, {
-        expectedRevision: current.metadata.revision,
+        expectedRevision,
         ...(typeof body.alias === 'string' ? { alias: body.alias } : {}),
         ...(typeof body.priority === 'number' ? { priority: body.priority } : {}),
         ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
@@ -140,9 +157,9 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
 
   router.post('/accounts/:id/pause', async (req: Request<{ id: string }>, res) => {
     try {
-      const current = await options.runtime.vault.readAccount(req.params.id, 'codex')
+      const body = parseBody(req.body)
       await options.runtime.vault.update(req.params.id, {
-        expectedRevision: current.metadata.revision,
+        expectedRevision: requireExpectedRevision(body),
         enabled: false,
       })
       res.json({ paused: true })
@@ -153,9 +170,9 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
 
   router.post('/accounts/:id/resume', async (req: Request<{ id: string }>, res) => {
     try {
-      const current = await options.runtime.vault.readAccount(req.params.id, 'codex')
+      const body = parseBody(req.body)
       await options.runtime.vault.update(req.params.id, {
-        expectedRevision: current.metadata.revision,
+        expectedRevision: requireExpectedRevision(body),
         enabled: true,
       })
       res.json({ paused: false })
@@ -174,8 +191,9 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
 
   router.delete('/accounts/:id', async (req: Request<{ id: string }>, res) => {
     try {
-      const current = await options.runtime.vault.readAccount(req.params.id, 'codex')
-      await options.runtime.vault.remove(req.params.id, current.metadata.revision)
+      const body = parseBody(req.body)
+      await options.pluginReference?.assertAccountRemovable(req.params.id)
+      await options.runtime.vault.remove(req.params.id, requireExpectedRevision(body))
       options.runtime.forget(req.params.id)
       res.json({ deleted: true })
     } catch (error) {
@@ -184,4 +202,11 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
   })
 
   return router
+}
+
+function requireExpectedRevision(body: Record<string, unknown>): number {
+  if (!Number.isSafeInteger(body.expectedRevision) || Number(body.expectedRevision) < 1) {
+    throw new NativeAccountVaultError('invalid', 'expectedRevision이 올바르지 않습니다.')
+  }
+  return Number(body.expectedRevision)
 }

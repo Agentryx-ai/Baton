@@ -19,6 +19,9 @@ export interface Account {
   paused?: boolean
   /** Lower values are attempted first by Baton Native account routing. */
   priority?: number
+  revision?: number
+  /** This Codex account supplies remote plugin catalog and connector authorization. */
+  isPluginReference?: boolean
   createdAt?: string
   lastUsedAt?: string
 }

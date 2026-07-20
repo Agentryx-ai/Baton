@@ -109,6 +109,7 @@ Pareto orchestration plugin과 evolving graph의 확장안은
 | Baton Native Claude Proxy | 부분 완료 | OAuth vault, refresh, quota preflight, same-request failover, SSE 보존; 단일계정 live canary 완료, 2계정/rollback gate 대기 |
 | Baton Native Codex Proxy | 합성 검증 완료 | OAuth, live-claim plan, account별 model catalog, model-aware failover; 실제 OAuth/free→pro/2계정 canary 대기 |
 | Codex primary-runtime bridge | 구현·canary 완료 | CLI에 `load_workspace_dependencies`가 없을 때 검증된 공식 runtime만 노출; artifact-tool workbook render/export E2E 통과 |
+| Codex 플러그인 기준계정 | 구현·합성/로컬 canary 완료 | 모델 라우팅과 독립된 계정 선택, catalog diff, CAS 전환/rollback, 설치·제거, 삭제 보호; 실제 원격 계정 canary 대기 |
 | CLIProxy 호환 경로 | 유지됨 | 기존 gateway 계정 API와 custom-provider 모드 지원; Native core는 CLIProxy 코드나 프로세스에 의존하지 않음 |
 | 범용 모델 자동전환 | 부분 완료 | 기본 OFF, capability/mapping 기반 fallback과 복귀, Fable 5→Opus 4.8 live 전환 완료; 다중 fallback 후보와 실패 정리 보강 필요 |
 | Canonical conversation runtime | V1 부분 구현 | provider-neutral model/tool loop, SQLite/WAL, replay SSE, bounded cancel/recovery |
@@ -148,6 +149,11 @@ history에서 provider 요청을 재구성합니다.
 ## 구현된 주요 기능
 
 - Claude/Codex 계정 추가, 상태, quota, pause/resume/delete와 우선순위 관리
+- Codex 원격 플러그인 catalog용 기준계정 선택
+  - 모델 라우팅 pause와 독립적으로 OAuth refresh
+  - 전환 전 추가·제거 plugin diff와 connector 재인증 경고
+  - revision/digest 확인, 전환 후 catalog 검증 실패 시 rollback, 기준계정 삭제 보호
+  - 설치된 Codex app-server의 공식 `plugin/list`·`plugin/install`·`plugin/uninstall`만 사용
 - Claude/Codex CLI와 Desktop별 프록시 적용/해제
   - 대상 프로세스 종료와 file lock 확인
   - 구조화된 설정 parser, Baton 소유 값 검증, 원자적 파일 교체
@@ -200,6 +206,11 @@ CLI/Desktop을 완전히 종료했다가 다시 시작해야 합니다.
   `load_workspace_dependencies` 도구를 등록하지 않습니다. Baton runtime bridge가 공식 primary
   runtime을 검증해 우회하지만, upstream CLI/plugin 계약이 수정되면 native loader를 다시
   우선합니다.
+- Codex 플러그인 기준계정은 Baton Native vault에 등록한 계정 중 하나를 짧게 실행한
+  app-server에 `CODEX_ACCESS_TOKEN`으로 주입하는 기능입니다. 전역 `auth.json`을 바꾸거나
+  `codex login`에 두 번째 동시 로그인을 추가하지 않습니다. Local/repo plugin은 계정 소유가
+  아니며, remote connector/private workspace 권한은 계정 사이에 이전되지 않습니다. 실제
+  원격 계정 catalog canary는 Native Codex 계정이 등록된 환경에서 추가 검증해야 합니다.
 - 모델 fallback은 첫 후보 실패 후 다음 후보를 순회하고 실패한 override를 정리하는 보강이
   필요합니다. 현재 compatibility seed는 Fable 5→Opus 4.8이며 범용 schema 자체는 모델명과
   분리돼 있습니다.
@@ -241,3 +252,4 @@ CLI/Desktop을 완전히 종료했다가 다시 시작해야 합니다.
 - [Native session import and grouping](docs/NATIVE_SESSION_IMPORT_AND_GROUPING.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Codex primary-runtime bridge](docs/CODEX_PRIMARY_RUNTIME_BRIDGE.md)
+- [Codex plugin reference account](docs/CODEX_PLUGIN_REFERENCE_ACCOUNT.md)

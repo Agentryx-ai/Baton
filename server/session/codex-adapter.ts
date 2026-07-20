@@ -1452,7 +1452,7 @@ interface CodexInvocation {
 }
 
 /** Resolve the npm shim to the native Codex binary so Baton owns one OS process tree. */
-function resolveCodexInvocation(executable: string, args: readonly string[]): CodexInvocation {
+export function resolveCodexInvocation(executable: string, args: readonly string[]): CodexInvocation {
   if (process.platform !== 'win32') return { executable, args: [...args] }
   if (/\.exe$/i.test(executable)) return { executable, args: [...args] }
   if (!/^codex(?:\.cmd)?$/i.test(path.basename(executable))) {

@@ -153,8 +153,10 @@ function App() {
   const engineEnabled = policy?.enabled ?? false
 
   // Account actions — fire the mutation then refresh the affected data.
+  const accountRevision = (prov: Provider, id: string) =>
+    accounts?.[prov]?.find((account) => account.id === id)?.revision
   const onPause = (prov: Provider, id: string) =>
-    void client.pauseAccount(prov, id).then(refreshAccounts)
+    void client.pauseAccount(prov, id, accountRevision(prov, id)).then(refreshAccounts)
   // "이 계정만"(solo): pause every currently-unpaused sibling so this account is
   // the only one CLIProxy rotates to. Honest "prefer this account" — enacted via
   // pause, the only real routing lever (manual mode only; see AccountCard).
@@ -163,14 +165,21 @@ function App() {
     if (siblings.length === 0) return
     // Always refresh (even on partial failure) so the card grid reflects the real
     // post-solo pool rather than an assumed all-or-nothing outcome.
-    void Promise.all(siblings.map((a) => client.pauseAccount(prov, a.id)))
+    void Promise.all(siblings.map((a) => client.pauseAccount(prov, a.id, a.revision)))
       .catch(() => toast.error('일부 계정 일시정지에 실패했습니다'))
       .finally(refreshAccounts)
   }
   const onResume = (prov: Provider, id: string) =>
-    void client.resumeAccount(prov, id).then(refreshAccounts)
+    void client.resumeAccount(prov, id, accountRevision(prov, id)).then(refreshAccounts)
   const onRemove = (prov: Provider, id: string) =>
-    void client.removeAccount(prov, id).then(refreshAll)
+    void client.removeAccount(prov, id, accountRevision(prov, id)).then(refreshAll)
+  const onReassignCodexPluginReference = async (accountId: string | null) => {
+    const preview = await client.previewCodexPluginReference(accountId === null
+      ? { mode: 'local_only', accountId: null }
+      : { mode: 'account', accountId })
+    await client.switchCodexPluginReference(preview)
+    refreshAccounts()
+  }
   const onAddAccount = (_prov: Provider) => setWizardOpen(true)
 
   // Settings actions.
@@ -290,6 +299,9 @@ function App() {
                   ? onPreferClaudeAccount
                   : undefined}
                 onRemove={onRemove}
+                onReassignPluginReference={prov === 'codex'
+                  ? onReassignCodexPluginReference
+                  : undefined}
                 onAddAccount={onAddAccount}
               />
             ))}
@@ -329,6 +341,8 @@ function App() {
               onRemoveClientIntegration={onRemoveClientIntegration}
               conversationPreferences={conversationPreferences}
               onConversationPreferencesChange={setConversationPreferences}
+              codexAccounts={accounts?.codex ?? []}
+              onPluginReferenceChanged={refreshAccounts}
             />
           </section>
         </main>

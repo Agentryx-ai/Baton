@@ -10,10 +10,12 @@ import type {
   ClaudeProxyMode,
   CodexIntegrationMode,
   ModelFallbackStatus,
+  Account,
   ProxyStatus,
   RoutingStrategy,
   SessionAffinity,
 } from '@/api/types'
+import type { CodexPluginCatalog, CodexPluginReferencePreview } from '@/api/codex-plugins'
 import { client } from '@/api/client'
 import { pendingModelFallbackOffers } from '@/api/model-fallback'
 import { Button } from '@/components/ui/button'
@@ -51,6 +53,8 @@ interface SettingsSectionProps {
   ) => Promise<ClientIntegrationRemoveResult>
   conversationPreferences: SessionViewPreferences
   onConversationPreferencesChange: (preferences: SessionViewPreferences) => void
+  codexAccounts: Account[]
+  onPluginReferenceChanged: () => void
 }
 
 const INTEGRATION_TARGETS: ReadonlyArray<{
@@ -114,6 +118,8 @@ export function SettingsSection({
   onRemoveClientIntegration,
   conversationPreferences,
   onConversationPreferencesChange,
+  codexAccounts,
+  onPluginReferenceChanged,
 }: SettingsSectionProps) {
   const affinityManageable = affinity?.manageable ?? true
 
@@ -136,6 +142,12 @@ export function SettingsSection({
   const [modelFallback, setModelFallback] = useState<ModelFallbackStatus | null>(null)
   const [modelFallbackError, setModelFallbackError] = useState<string | null>(null)
   const [modelFallbackBusy, setModelFallbackBusy] = useState(false)
+  const [pluginReferenceValue, setPluginReferenceValue] = useState('local_only')
+  const [pluginReferenceLabel, setPluginReferenceLabel] = useState('local-only')
+  const [pluginPreview, setPluginPreview] = useState<CodexPluginReferencePreview | null>(null)
+  const [pluginReferenceError, setPluginReferenceError] = useState<string | null>(null)
+  const [pluginReferenceBusy, setPluginReferenceBusy] = useState(false)
+  const [pluginCatalog, setPluginCatalog] = useState<CodexPluginCatalog | null>(null)
   useEffect(() => {
     const appliedMode = clientIntegration?.targets.find(
       (target) => target.target === 'codex',
@@ -158,6 +170,67 @@ export function SettingsSection({
     })
     return () => { cancelled = true }
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([client.getCodexPluginReference(), client.getCodexPluginCatalog()]).then(([status, catalog]) => {
+      if (cancelled) return
+      const value = status.state.mode === 'account' ? status.state.accountId : 'local_only'
+      setPluginReferenceValue(value)
+      setPluginReferenceLabel(status.account?.alias ?? 'local-only')
+      setPluginReferenceError(null)
+      setPluginCatalog(catalog)
+    }).catch((error: unknown) => {
+      if (!cancelled) setPluginReferenceError(error instanceof Error ? error.message : String(error))
+    })
+    return () => { cancelled = true }
+  }, [codexAccounts])
+
+  const previewPluginReference = async () => {
+    setPluginReferenceBusy(true)
+    setPluginReferenceError(null)
+    try {
+      const target = pluginReferenceValue === 'local_only'
+        ? { mode: 'local_only' as const, accountId: null }
+        : { mode: 'account' as const, accountId: pluginReferenceValue }
+      setPluginPreview(await client.previewCodexPluginReference(target))
+    } catch (error) {
+      setPluginReferenceError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setPluginReferenceBusy(false)
+    }
+  }
+
+  const switchPluginReference = async () => {
+    if (!pluginPreview) return
+    setPluginReferenceBusy(true)
+    try {
+      const result = await client.switchCodexPluginReference(pluginPreview)
+      setPluginReferenceLabel(result.status.account?.alias ?? 'local-only')
+      setPluginCatalog(result.catalog)
+      setPluginPreview(null)
+      setPluginReferenceError(null)
+      onPluginReferenceChanged()
+      toast.success('Codex 플러그인 기준계정을 변경했습니다')
+    } catch (error) {
+      setPluginReferenceError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setPluginReferenceBusy(false)
+    }
+  }
+
+  const mutatePlugin = async (operation: () => Promise<unknown>) => {
+    setPluginReferenceBusy(true)
+    setPluginReferenceError(null)
+    try {
+      await operation()
+      setPluginCatalog(await client.getCodexPluginCatalog())
+    } catch (error) {
+      setPluginReferenceError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setPluginReferenceBusy(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -630,6 +703,89 @@ export function SettingsSection({
                 {clientIntegration?.error ?? clientIntegrationError?.message}
               </p>
             ) : null}
+          </div>
+        </Row>
+
+        <Separator />
+
+        <Row label="Codex 플러그인 기준계정">
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              현재 기준: <span className="font-medium text-foreground">{pluginReferenceLabel}</span>. 모델 요청의 pause·우선순위와 독립적으로 원격 플러그인 catalog와 connector 권한만 결정합니다.
+            </p>
+            <select
+              className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+              value={pluginReferenceValue}
+              onChange={(event) => {
+                setPluginReferenceValue(event.target.value)
+                setPluginPreview(null)
+              }}
+              disabled={pluginReferenceBusy}
+            >
+              <option value="local_only">local-only (로컬·저장소 플러그인만)</option>
+              {codexAccounts.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.nickname || account.email}{account.paused ? ' · 모델 라우팅 중지됨' : ''}
+                </option>
+              ))}
+            </select>
+            <Button variant="outline" size="sm" disabled={pluginReferenceBusy} onClick={() => void previewPluginReference()}>
+              {pluginReferenceBusy ? '확인 중…' : '변경 내용 미리보기'}
+            </Button>
+            {pluginPreview ? (
+              <div className="space-y-2 rounded-md border p-3 text-xs">
+                <p>추가 {pluginPreview.addedPluginIds.length}개 · 제거 {pluginPreview.removedPluginIds.length}개 · 유지 {pluginPreview.unchangedPluginIds.length}개</p>
+                {pluginPreview.addedPluginIds.length > 0 ? <p className="text-emerald-700 dark:text-emerald-300">추가: {pluginPreview.addedPluginIds.join(', ')}</p> : null}
+                {pluginPreview.removedPluginIds.length > 0 ? <p className="text-amber-700 dark:text-amber-300">제거: {pluginPreview.removedPluginIds.join(', ')}</p> : null}
+                <p className="text-amber-700 dark:text-amber-300">
+                  Connector 및 private workspace 권한은 계정 사이에 이전되지 않습니다. 전환 후 필요한 connector를 다시 인증해야 할 수 있습니다.
+                </p>
+                <Button size="sm" disabled={pluginReferenceBusy} onClick={() => void switchPluginReference()}>
+                  확인하고 전환
+                </Button>
+              </div>
+            ) : null}
+            {pluginCatalog ? (
+              <div className="space-y-2 rounded-md border p-3">
+                <p className="text-xs font-medium">현재 catalog</p>
+                {pluginCatalog.marketplaces.flatMap((marketplace) => marketplace.plugins.map((plugin) => (
+                  <div key={`${marketplace.name}/${plugin.id}`} className="flex items-center justify-between gap-3 text-xs">
+                    <span className="min-w-0 truncate" title={`${marketplace.name}/${plugin.id}`}>
+                      {plugin.displayName ?? plugin.name}
+                      <span className="ml-1 text-muted-foreground">· {marketplace.displayName ?? marketplace.name}</span>
+                    </span>
+                    {plugin.installed ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={pluginReferenceBusy}
+                        onClick={() => void mutatePlugin(() => client.uninstallCodexPlugin(plugin.id))}
+                      >
+                        제거
+                      </Button>
+                    ) : plugin.installPolicy !== 'NOT_AVAILABLE' ? (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={pluginReferenceBusy}
+                        onClick={() => void mutatePlugin(() => client.installCodexPlugin({
+                          ...(marketplace.path
+                            ? { marketplacePath: marketplace.path }
+                            : { remoteMarketplaceName: marketplace.name }),
+                          pluginName: plugin.name,
+                        }))}
+                      >
+                        설치
+                      </Button>
+                    ) : null}
+                  </div>
+                )))}
+                {pluginCatalog.marketplaces.every((marketplace) => marketplace.plugins.length === 0) ? (
+                  <p className="text-xs text-muted-foreground">표시할 플러그인이 없습니다.</p>
+                ) : null}
+              </div>
+            ) : null}
+            {pluginReferenceError ? <p className="text-xs text-destructive">{pluginReferenceError}</p> : null}
           </div>
         </Row>
 

@@ -48,6 +48,8 @@ export interface AccountCardProps {
   onRefreshEntitlements?: () => void
   onPrefer?: () => void
   onRemove: () => void
+  pluginReferenceAlternatives?: Account[]
+  onReassignPluginReference?: (accountId: string | null) => Promise<void>
 }
 
 const STATUS_BADGE: Record<
@@ -105,8 +107,13 @@ export function AccountCard({
   onRefreshEntitlements,
   onPrefer,
   onRemove,
+  pluginReferenceAlternatives = [],
+  onReassignPluginReference,
 }: AccountCardProps) {
   const [confirmOpen, setConfirmOpen] = React.useState(false)
+  const [replacementAccountId, setReplacementAccountId] = React.useState('local_only')
+  const [replacementBusy, setReplacementBusy] = React.useState(false)
+  const [replacementError, setReplacementError] = React.useState<string | null>(null)
 
   const hasNickname = account.nickname && account.nickname !== account.email
   const badge = STATUS_BADGE[status]
@@ -117,6 +124,21 @@ export function AccountCard({
   const handleConfirmRemove = () => {
     setConfirmOpen(false)
     onRemove()
+  }
+
+  const handleReassignAndRemove = async () => {
+    if (!onReassignPluginReference) return
+    setReplacementBusy(true)
+    setReplacementError(null)
+    try {
+      await onReassignPluginReference(replacementAccountId === 'local_only' ? null : replacementAccountId)
+      setConfirmOpen(false)
+      onRemove()
+    } catch (error) {
+      setReplacementError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setReplacementBusy(false)
+    }
   }
 
   return (
@@ -148,6 +170,12 @@ export function AccountCard({
             <Badge variant="outline" className="gap-1 text-ok">
               <Star className="size-3" aria-hidden />
               Native 우선계정
+            </Badge>
+          ) : null}
+          {account.isPluginReference ? (
+            <Badge variant="outline" className="gap-1 text-sky-700 dark:text-sky-300">
+              <Shield className="size-3" aria-hidden />
+              플러그인 기준계정
             </Badge>
           ) : null}
         </div>
@@ -224,13 +252,41 @@ export function AccountCard({
               삭제합니다. 이 작업은 되돌릴 수 없습니다.
             </DialogDescription>
           </DialogHeader>
+          {account.isPluginReference ? (
+            <div className="space-y-2">
+              <p className="text-sm text-amber-700 dark:text-amber-300">
+                이 계정은 Codex 플러그인 기준계정입니다. 삭제 전에 다른 계정이나 local-only로 전환해야 합니다.
+              </p>
+              <select
+                className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                value={replacementAccountId}
+                onChange={(event) => setReplacementAccountId(event.target.value)}
+                disabled={replacementBusy}
+              >
+                <option value="local_only">local-only</option>
+                {pluginReferenceAlternatives.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.nickname || candidate.email}{candidate.paused ? ' · 모델 라우팅 중지됨' : ''}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Connector와 private workspace 권한은 계정 간 이전되지 않으며 다시 인증해야 할 수 있습니다.
+              </p>
+              {replacementError ? <p className="text-xs text-destructive">{replacementError}</p> : null}
+            </div>
+          ) : null}
           <DialogFooter>
             <DialogClose asChild>
               <Button variant="outline">취소</Button>
             </DialogClose>
-            <Button variant="destructive" onClick={handleConfirmRemove}>
+            <Button
+              variant="destructive"
+              disabled={replacementBusy || (account.isPluginReference && !onReassignPluginReference)}
+              onClick={() => void (account.isPluginReference ? handleReassignAndRemove() : handleConfirmRemove())}
+            >
               <Trash2 className="size-4" aria-hidden />
-              삭제
+              {replacementBusy ? '전환 중…' : account.isPluginReference ? '전환 후 삭제' : '삭제'}
             </Button>
           </DialogFooter>
         </DialogContent>

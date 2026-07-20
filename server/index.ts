@@ -38,6 +38,9 @@ import { createConversationRuntime } from './session/runtime.ts'
 import { ModelFallbackRuntime, modelFallbackStatePath } from './model-fallback-runtime.ts'
 import { createModelFallbackRouter } from './model-fallback-routes.ts'
 import { NativeProxyHealthTracker } from './native-proxy-health.ts'
+import { CodexPluginReferenceStore, codexPluginReferenceStatePath } from './codex-plugin-reference-store.ts'
+import { CodexPluginReferenceService } from './codex-plugin-reference-service.ts'
+import { createCodexPluginRouter } from './codex-plugin-routes.ts'
 
 const app = express()
 const conversationRuntime = createConversationRuntime({ dataDir: config.dataDir })
@@ -48,6 +51,12 @@ const modelFallbackRuntime = new ModelFallbackRuntime({
 })
 const claudeNativeHealth = new NativeProxyHealthTracker({ provider: 'claude' })
 const codexNativeHealth = new NativeProxyHealthTracker({ provider: 'codex' })
+const codexPluginReference = new CodexPluginReferenceService({
+  runtime: codexNativeRuntime,
+  store: new CodexPluginReferenceStore({
+    filePath: codexPluginReferenceStatePath(config.dataDir),
+  }),
+})
 
 // Canonical JSON routes must consume their body before the raw gateway proxy middleware.
 app.use('/baton/v1', conversationRuntime.router)
@@ -76,7 +85,9 @@ app.use(CODEX_NATIVE_PROXY_PATH, createCodexNativeProxy({
 app.use('/baton/codex-native', createCodexNativeAccountRouter({
   runtime: codexNativeRuntime,
   oauth: codexNativeOAuthManager,
+  pluginReference: codexPluginReference,
 }))
+app.use('/baton/codex-plugins', createCodexPluginRouter(codexPluginReference))
 
 // Baton-owned Claude data plane. It is always available on the loopback-only
 // BFF, but Claude clients use it only after explicit integration selection.

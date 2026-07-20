@@ -171,6 +171,12 @@ export class CodexNativeRuntime {
     }
   }
 
+  /** Plugin catalog auth is independent from model-routing enabled/paused state. */
+  async getPluginCredential(accountId: string, forceRefresh = false): Promise<CodexNativeCredential> {
+    await this.vault.readAccount<CodexCredentialsFile>(accountId, 'codex')
+    return await this.manager(accountId).getCredential({ forceRefresh })
+  }
+
   forget(accountId: string): void {
     this.managers.delete(accountId)
     this.credentialFingerprints.delete(accountId)

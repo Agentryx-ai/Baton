@@ -26,6 +26,13 @@ import type {
   SessionAffinity,
 } from './types.ts'
 import { UI_PROVIDERS } from './types.ts'
+import type {
+  CodexPluginCatalog,
+  CodexPluginInstallResult,
+  CodexPluginReference,
+  CodexPluginReferencePreview,
+  CodexPluginReferenceStatus,
+} from './codex-plugins.ts'
 
 /** Thrown on any non-2xx API response. `status` is the HTTP status code. */
 export class ApiError extends Error {
@@ -71,13 +78,13 @@ function extractMessage(status: number, raw: string, parsed: unknown): string {
  */
 async function request<T>(
   path: string,
-  options: { method?: string; json?: unknown } = {},
+  options: { method?: string; json?: unknown; headers?: Record<string, string> } = {},
 ): Promise<T> {
-  const { method = 'GET', json } = options
+  const { method = 'GET', json, headers } = options
   const init: RequestInit = {
     method,
     credentials: 'same-origin',
-    headers: { Accept: 'application/json' },
+    headers: { Accept: 'application/json', ...headers },
   }
   if (json !== undefined) {
     init.headers = { ...init.headers, 'Content-Type': 'application/json' }
@@ -191,38 +198,82 @@ export const client = {
   getClientIntegrationStatus: (): Promise<ClientIntegrationStatus> =>
     request<ClientIntegrationStatus>('/baton/client-integration'),
 
+  getCodexPluginReference: (): Promise<CodexPluginReferenceStatus> =>
+    request<CodexPluginReferenceStatus>('/baton/codex-plugins/reference'),
+
+  getCodexPluginCatalog: (): Promise<CodexPluginCatalog> =>
+    request<CodexPluginCatalog>('/baton/codex-plugins/catalog'),
+
+  previewCodexPluginReference: (target: CodexPluginReference): Promise<CodexPluginReferencePreview> =>
+    request<CodexPluginReferencePreview>('/baton/codex-plugins/reference/preview', {
+      method: 'POST',
+      headers: { 'x-baton-interaction': 'codex-plugin-control' },
+      json: target,
+    }),
+
+  switchCodexPluginReference: (preview: CodexPluginReferencePreview): Promise<{
+    status: CodexPluginReferenceStatus
+    catalog: CodexPluginCatalog
+  }> => request('/baton/codex-plugins/reference/switch', {
+    method: 'POST',
+    headers: { 'x-baton-interaction': 'codex-plugin-control' },
+    json: {
+      ...preview.target,
+      expectedStateRevision: preview.current.state.revision,
+      expectedTargetAccountRevision: preview.targetAccountRevision,
+      previewDigest: preview.previewDigest,
+    },
+  }),
+
+  installCodexPlugin: (input: {
+    marketplacePath?: string
+    remoteMarketplaceName?: string
+    pluginName: string
+  }): Promise<CodexPluginInstallResult> => request('/baton/codex-plugins/install', {
+    method: 'POST',
+    headers: { 'x-baton-interaction': 'codex-plugin-control' },
+    json: input,
+  }),
+
+  uninstallCodexPlugin: (pluginId: string): Promise<void> =>
+    request('/baton/codex-plugins/uninstall', {
+      method: 'POST',
+      headers: { 'x-baton-interaction': 'codex-plugin-control' },
+      json: { pluginId },
+    }),
+
   // ---- 변경 (mutations) ---------------------------------------------------
   // Note: there is deliberately no setDefault — the CCS "default account" flag
   // does not affect CLIProxy routing (round-robin over all non-paused creds).
   // Account steering is done purely via pause/resume.
 
-  pauseAccount: async (provider: Provider, accountId: string): Promise<void> => {
+  pauseAccount: async (provider: Provider, accountId: string, expectedRevision?: number): Promise<void> => {
     const native = await usesNativeAccountBackend(provider)
     await request(
       native
         ? `${nativeProviderBase(provider)}/accounts/${encodeURIComponent(accountId)}/pause`
         : `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}/pause`,
-      { method: 'POST' },
+      { method: 'POST', ...(native && provider === 'codex' ? { json: { expectedRevision } } : {}) },
     )
   },
 
-  resumeAccount: async (provider: Provider, accountId: string): Promise<void> => {
+  resumeAccount: async (provider: Provider, accountId: string, expectedRevision?: number): Promise<void> => {
     const native = await usesNativeAccountBackend(provider)
     await request(
       native
         ? `${nativeProviderBase(provider)}/accounts/${encodeURIComponent(accountId)}/resume`
         : `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}/resume`,
-      { method: 'POST' },
+      { method: 'POST', ...(native && provider === 'codex' ? { json: { expectedRevision } } : {}) },
     )
   },
 
-  removeAccount: async (provider: Provider, accountId: string): Promise<void> => {
+  removeAccount: async (provider: Provider, accountId: string, expectedRevision?: number): Promise<void> => {
     const native = await usesNativeAccountBackend(provider)
     await request(
       native
         ? `${nativeProviderBase(provider)}/accounts/${encodeURIComponent(accountId)}`
         : `/api/cliproxy/auth/accounts/${provider}/${encodeURIComponent(accountId)}`,
-      { method: 'DELETE' },
+      { method: 'DELETE', ...(native && provider === 'codex' ? { json: { expectedRevision } } : {}) },
     )
   },
 

@@ -177,6 +177,53 @@ test('model fallback settings use the Baton-owned control plane', async () => {
   ])
 })
 
+test('Codex plugin reference mutations use the explicit interaction contract', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; method: string | undefined; interaction: string | null; body: unknown }> = []
+  globalThis.fetch = (async (input, init) => {
+    calls.push({
+      url: String(input),
+      method: init?.method,
+      interaction: new Headers(init?.headers).get('x-baton-interaction'),
+      body: init?.body ? JSON.parse(String(init.body)) : null,
+    })
+    if (String(input).endsWith('/preview')) {
+      return Response.json({
+        current: { state: { revision: 2 } },
+        target: { mode: 'local_only', accountId: null },
+        targetAccountRevision: null,
+        previewDigest: 'a'.repeat(64),
+      })
+    }
+    return Response.json({})
+  }) as typeof fetch
+  try {
+    const preview = await client.previewCodexPluginReference({ mode: 'local_only', accountId: null })
+    await client.switchCodexPluginReference(preview)
+    await client.installCodexPlugin({ marketplacePath: 'C:\\market', pluginName: 'plugin-a' })
+    await client.uninstallCodexPlugin('plugin-a')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(calls.map((call) => ({
+    url: call.url,
+    method: call.method,
+    interaction: call.interaction,
+  })), [
+    { url: '/baton/codex-plugins/reference/preview', method: 'POST', interaction: 'codex-plugin-control' },
+    { url: '/baton/codex-plugins/reference/switch', method: 'POST', interaction: 'codex-plugin-control' },
+    { url: '/baton/codex-plugins/install', method: 'POST', interaction: 'codex-plugin-control' },
+    { url: '/baton/codex-plugins/uninstall', method: 'POST', interaction: 'codex-plugin-control' },
+  ])
+  assert.deepEqual(calls[1]?.body, {
+    mode: 'local_only',
+    accountId: null,
+    expectedStateRevision: 2,
+    expectedTargetAccountRevision: null,
+    previewDigest: 'a'.repeat(64),
+  })
+})
+
 test('native-openai Codex account operations never call CLIProxy', async () => {
   const originalFetch = globalThis.fetch
   const urls: string[] = []

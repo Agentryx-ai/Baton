@@ -50,6 +50,7 @@ export interface ProviderSectionProps {
   onRefreshEntitlements?: (accountId: string) => void
   onPrefer?: (accountId: string) => void
   onRemove: (provider: Provider, accountId: string) => void
+  onReassignPluginReference?: (accountId: string | null) => Promise<void>
   onAddAccount: (provider: Provider) => void
 }
 
@@ -65,6 +66,7 @@ export function ProviderSection({
   onRefreshEntitlements,
   onPrefer,
   onRemove,
+  onReassignPluginReference,
   onAddAccount,
 }: ProviderSectionProps) {
   // A sibling exists to "solo against" when ≥1 other account is currently unpaused.
@@ -114,6 +116,12 @@ export function ProviderSection({
                   ? () => onPrefer(account.id)
                   : undefined}
                 onRemove={() => onRemove(provider, account.id)}
+                pluginReferenceAlternatives={provider === 'codex'
+                  ? accounts.filter((candidate) => candidate.id !== account.id)
+                  : undefined}
+                onReassignPluginReference={provider === 'codex'
+                  ? onReassignPluginReference
+                  : undefined}
               />
             )
           })}

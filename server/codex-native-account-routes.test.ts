@@ -15,6 +15,10 @@ import { createCodexNativeProxy } from './codex-native-proxy.ts'
 import { CodexNativeRuntime } from './codex-native-runtime.ts'
 import type { NativeAccountSecretProtector } from './native-account-vault.ts'
 import { NativeAccountVault } from './native-account-vault.ts'
+import {
+  CodexPluginReferenceServiceError,
+  type CodexPluginReferenceService,
+} from './codex-plugin-reference-service.ts'
 
 class TestProtector implements NativeAccountSecretProtector {
   async seal(plaintext: string): Promise<string> {
@@ -135,4 +139,61 @@ test('Codex entitlement refresh exposes and serves an upgraded model without re-
   assert.equal(after.status, 200)
   assert.deepEqual(await after.json(), { status: 'completed' })
   assert.equal(upstreamCalls, 1)
+})
+
+test('Codex account mutations require caller revisions and protect the plugin reference account', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-codex-account-cas-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const vault = new NativeAccountVault({
+    vaultPath: path.join(directory, 'accounts.json'),
+    protector: new TestProtector(),
+    createId: () => 'account-1',
+  })
+  const account = await vault.add({ provider: 'codex', alias: 'Primary', credential: {} })
+  const runtime = new CodexNativeRuntime({ vault })
+  const pluginReference = {
+    status: async () => ({
+      state: { version: 1, mode: 'account', accountId: 'account-1', revision: 1, updatedAt: new Date().toISOString() },
+      account: null,
+    }),
+    assertAccountRemovable: async (accountId: string) => {
+      if (accountId === 'account-1') {
+        throw new CodexPluginReferenceServiceError('invalid', 'reference account')
+      }
+    },
+  } as unknown as CodexPluginReferenceService
+  const app = express()
+  app.use(express.raw({ type: () => true }))
+  app.use('/baton/codex-native', createCodexNativeAccountRouter({
+    runtime,
+    oauth: new CodexNativeOAuthManager({ vault }),
+    pluginReference,
+  }))
+  const server = app.listen(0, '127.0.0.1')
+  t.after(() => server.close())
+  await once(server, 'listening')
+  const address = server.address()
+  assert.ok(address && typeof address === 'object')
+  const base = `http://127.0.0.1:${address.port}/baton/codex-native`
+
+  const listed = await fetch(`${base}/accounts`).then((response) => response.json()) as {
+    accounts: Array<{ isPluginReference: boolean }>
+  }
+  assert.equal(listed.accounts[0]?.isPluginReference, true)
+  assert.equal((await fetch(`${base}/accounts/account-1/pause`, { method: 'POST' })).status, 400)
+  assert.equal((await fetch(`${base}/accounts/account-1/pause`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedRevision: account.revision + 1 }),
+  })).status, 409)
+  assert.equal((await fetch(`${base}/accounts/account-1/pause`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedRevision: account.revision }),
+  })).status, 200)
+  assert.equal((await fetch(`${base}/accounts/account-1`, {
+    method: 'DELETE',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ expectedRevision: account.revision + 1 }),
+  })).status, 409)
 })
