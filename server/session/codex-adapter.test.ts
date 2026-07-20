@@ -35,6 +35,8 @@ type Scenario =
   | 'collabChildTool'
   | 'foreignCollabSender'
   | 'childStartsBeforeCollab'
+  | 'foreignNotification'
+  | 'nonSpawnUnknownReceiver'
   | 'forbiddenExecution'
   | 'cancel'
   | 'hangInterrupt'
@@ -355,9 +357,91 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
         turn: { id: 'native-child-turn', status: 'inProgress', items: [] },
       },
     })
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'native-child-thread',
+        turnId: 'native-child-turn',
+        item: { id: 'child-message-1', type: 'agentMessage', text: 'private child output' },
+      },
+    })
+    process.emit({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'native-child-thread',
+        turnId: 'native-child-turn',
+        tokenUsage: { total: { totalTokens: 999 } },
+      },
+    })
+    process.emit({
+      method: 'model/rerouted',
+      params: {
+        threadId: 'native-child-thread',
+        turnId: 'native-child-turn',
+        fromModel: 'child-model',
+        toModel: 'child-rerouted',
+        reason: 'serverReroute',
+      },
+    })
+    process.emit({
+      method: 'turn/completed',
+      params: {
+        threadId: 'native-child-thread',
+        turn: { id: 'native-child-turn', status: 'completed', error: null },
+      },
+    })
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'native-thread',
+        turnId: 'native-turn',
+        item: {
+          id: 'collab-child-1',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'completed',
+          senderThreadId: 'native-thread',
+          receiverThreadIds: ['native-child-thread'],
+        },
+      },
+    })
+  }
+  if (scenario === 'foreignNotification') {
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'unrelated-native-root',
+        turnId: 'unrelated-native-turn',
+        item: { id: 'foreign-message-1', type: 'agentMessage', text: 'unrelated output' },
+      },
+    })
+  }
+  if (scenario === 'nonSpawnUnknownReceiver') {
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'native-thread',
+        turnId: 'native-turn',
+        item: {
+          id: 'collab-wait-1',
+          type: 'collabAgentToolCall',
+          tool: 'wait',
+          status: 'completed',
+          senderThreadId: 'native-thread',
+          receiverThreadIds: ['unowned-native-thread'],
+        },
+      },
+    })
+    return
   }
   if (scenario === 'collab' || scenario === 'collabChildEvent'
     || scenario === 'collabChildTool' || scenario === 'foreignCollabSender') {
+    if (scenario === 'collabChildEvent') {
+      process.emit({
+        method: 'thread/started',
+        params: { thread: { id: 'native-child-thread', parentThreadId: 'native-thread' } },
+      })
+    }
     process.emit({
       method: 'item/completed',
       params: {
@@ -1072,10 +1156,40 @@ test('adapter registers an owned child from thread/started before collaboration 
     shutdownTimeoutMs: 20,
   })
   const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
-  assert.equal((await execution.terminal).status, 'completed')
+  const events = await collect(execution.events)
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'completed')
+  assert.deepEqual(terminal.usage, { totalTokens: 5, usageSource: 'tokenUsage.total' })
+  const normalized = events.flatMap((event) => adapter.normalize(event))
+  assert.ok(normalized.some((item) => item.kind === 'provider_event'
+    && item.payload.event === 'provider_native_collaboration'))
+  assert.ok(!normalized.some((item) => item.kind === 'assistant_message'
+    && item.payload.text === 'private child output'))
+  assert.equal(normalized.find((item) => item.kind === 'assistant_message')?.payload.resolvedModel, 'gpt-resolved')
   await execution.dispose()
   assert.ok(created[1].writes.some((message) => message.method === 'thread/archive'
     && (message.params as Record<string, unknown>).threadId === 'native-child-thread'))
+})
+
+test('adapter ignores notifications from an unrelated native root thread', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('foreignNotification', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const events = await collect(execution.events)
+  assert.equal((await execution.terminal).status, 'completed')
+  assert.ok(!events.some((event) => (event.payload as Record<string, unknown> | null)?.threadId
+    === 'unrelated-native-root'))
+})
+
+test('adapter does not grant ownership from non-spawn collaboration receivers', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('nonSpawnUnknownReceiver', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  assert.equal((await execution.terminal).status, 'failed')
 })
 
 test('adapter still rejects unrelated native execution items', async () => {
