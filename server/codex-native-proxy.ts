@@ -1,11 +1,12 @@
 import { timingSafeEqual } from 'node:crypto'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { promisify } from 'node:util'
 import {
-  brotliDecompressSync,
-  gunzipSync,
-  inflateSync,
-  zstdDecompressSync,
+  brotliDecompress,
+  gunzip,
+  inflate,
+  zstdDecompress,
 } from 'node:zlib'
 
 import { Router } from 'express'
@@ -103,26 +104,88 @@ function upstreamHeaders(req: Request, credential: CodexNativeCredential): Heade
   return headers
 }
 
-function requestedModel(req: Request): string | null {
+// Decompress off the event loop (libuv threadpool). Codex zstd-compresses large
+// session-resume prompts; a synchronous decompress here stalls every unrelated
+// request (health, web UI) under concurrent load.
+const asyncDecompressors: Record<string, (buffer: Buffer) => Promise<Buffer>> = {
+  zstd: promisify(zstdDecompress),
+  gzip: promisify(gunzip),
+  deflate: promisify(inflate),
+  br: promisify(brotliDecompress),
+}
+
+// The routing model is a small root field. Scanning a bounded prefix avoids a
+// full multi-MB JSON.parse on the event loop: Codex session-resume bodies carry
+// the entire conversation history, and parsing all of it per request (and per
+// client retry) pegs a core and starves every other request.
+function extractJsonString(text: string, start: number): { end: number, value: string } | null {
+  if (text[start] !== '"') return null
+  let escaped = false
+  for (let index = start + 1; index < text.length; index += 1) {
+    const character = text[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (character === '\\') {
+      escaped = true
+      continue
+    }
+    if (character !== '"') continue
+    try {
+      return { end: index + 1, value: JSON.parse(text.slice(start, index + 1)) as string }
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+function extractRootModel(body: Buffer): string | null {
+  const prefix = body.subarray(0, 65_536).toString('utf8')
+  let depth = 0
+  for (let index = 0; index < prefix.length;) {
+    const character = prefix[index]
+    if (character === '{' || character === '[') {
+      depth += 1
+      index += 1
+      continue
+    }
+    if (character === '}' || character === ']') {
+      depth -= 1
+      index += 1
+      continue
+    }
+    if (character !== '"') {
+      index += 1
+      continue
+    }
+    const token = extractJsonString(prefix, index)
+    if (!token) return null
+    index = token.end
+    if (depth !== 1 || token.value !== 'model') continue
+    while (/\s/.test(prefix[index] ?? '')) index += 1
+    if (prefix[index] !== ':') continue
+    index += 1
+    while (/\s/.test(prefix[index] ?? '')) index += 1
+    const model = extractJsonString(prefix, index)
+    return model?.value ? model.value : null
+  }
+  return null
+}
+
+async function requestedModel(req: Request): Promise<string | null> {
   if (!Buffer.isBuffer(req.body)) return null
   try {
     const encoding = (req.get('content-encoding') ?? 'identity').trim().toLowerCase()
+    const decompress = asyncDecompressors[encoding]
     const body = encoding === 'identity'
       ? req.body
-      : encoding === 'zstd'
-        ? zstdDecompressSync(req.body)
-        : encoding === 'gzip'
-          ? gunzipSync(req.body)
-          : encoding === 'deflate'
-            ? inflateSync(req.body)
-            : encoding === 'br'
-              ? brotliDecompressSync(req.body)
-              : null
+      : decompress
+        ? await decompress(req.body)
+        : null
     if (!body) return null
-    const parsed = JSON.parse(body.toString('utf8')) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
-    const model = (parsed as Record<string, unknown>).model
-    return typeof model === 'string' && model.length > 0 ? model : null
+    return extractRootModel(body)
   } catch {
     return null
   }
@@ -226,7 +289,7 @@ export function createCodexNativeProxy(options: CodexNativeProxyOptions): Router
       return
     }
 
-    const model = requestedModel(req)
+    const model = await requestedModel(req)
     if (!model) {
       res.status(400).json({ error: { type: 'invalid_request_error', message: '요청 model이 없습니다.' } })
       return

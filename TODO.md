@@ -30,8 +30,10 @@
 - [ ] Built-in browser의 durable navigation/action/result 계약 구현
 - [ ] Computer Use screenshot→approval→action→result loop 구현
 - [ ] 범용 모델 fallback 다중 후보 순회와 실패 override 정리
+      (`issues/model-fallback-must-exhaust-candidates-and-clear-failed-overrides.md`)
 - [ ] Native priority-failover 외 선택적 부하분산 정책 설계
 - [ ] Codex Responses WebSocket transport를 구현해 HTTP fallback 시작 지연 제거
+      (`issues/codex-native-proxy-needs-responses-websocket-transport.md`)
 
 ## 마이그레이션 회귀 후속 (2026-07-21 발견)
 

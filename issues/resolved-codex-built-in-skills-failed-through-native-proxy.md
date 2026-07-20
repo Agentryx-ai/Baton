@@ -82,4 +82,4 @@ Codex model manager는 `{ models: ModelInfo[] }`를 기대하지만 Native proxy
 
 Codex CLI 0.144.6은 Responses WebSocket을 먼저 시도한다. Baton은 아직 HTTP/SSE만 지원하므로
 405 뒤 HTTP로 fallback하며 시작 지연이 생긴다. 요청 성공과 이 이슈의 완료 판정에는 영향을
-주지 않지만 별도 transport TODO다.
+주지 않지만 `codex-native-proxy-needs-responses-websocket-transport.md`에서 별도로 추적한다.
