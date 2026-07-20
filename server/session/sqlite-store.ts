@@ -4255,7 +4255,21 @@ export class SqliteSessionStore implements SessionStore {
       )
     }
     const frontierSequence = lineage[previousIndex]!.sequence
-    const covered = lineage.filter((item) => item.sequence <= frontierSequence && item.turnId !== null)
+    const leadingTurnless: CanonicalItem[] = []
+    for (const item of lineage) {
+      if (item.turnId !== null) break
+      leadingTurnless.push(item)
+    }
+    const leadingTurnlessEnd = leadingTurnless.at(-1)?.sequence
+    if (leadingTurnlessEnd !== undefined && leadingTurnlessEnd > frontierSequence) {
+      throw new ContextPersistenceError(
+        'invalid_input',
+        'Compaction source must cover the complete leading turnless prefix',
+      )
+    }
+    const leadingTurnlessIds = new Set(leadingTurnless.map((item) => item.id))
+    const covered = lineage.filter((item) => item.sequence <= frontierSequence
+      && (item.turnId !== null || leadingTurnlessIds.has(item.id)))
     if (covered.length !== sourceItemIds.length
       || covered.some((item, index) => item.id !== sourceItemIds[index])) {
       throw new ContextPersistenceError(
@@ -4263,11 +4277,18 @@ export class SqliteSessionStore implements SessionStore {
         'Compaction source must cover every canonical item in the terminal turn prefix',
       )
     }
+    if (leadingTurnless.length > 0 && !hasSafeContextToolState(leadingTurnless)) {
+      throw new ContextPersistenceError(
+        'invalid_input',
+        'Compaction source must stay within a terminal prefix with resolved tool state',
+      )
+    }
     const coveredByTurn = new Map<string, CanonicalItem[]>()
     for (const item of covered) {
-      const turnItems = coveredByTurn.get(item.turnId!) ?? []
+      if (item.turnId === null) continue
+      const turnItems = coveredByTurn.get(item.turnId) ?? []
       turnItems.push(item)
-      coveredByTurn.set(item.turnId!, turnItems)
+      coveredByTurn.set(item.turnId, turnItems)
     }
     for (const [turnId, turnItems] of coveredByTurn) {
       const turn = this.#one(this.#db.prepare('SELECT status FROM turns WHERE id=?'), turnId)
