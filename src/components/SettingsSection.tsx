@@ -403,7 +403,7 @@ export function SettingsSection({
             </div>
           </RadioGroup>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            전체 액세스에서는 별도 연결 없이 adb, LDPlayer 명령, Git, PowerShell 등 설치된 도구를 사용할 수 있습니다.
+            전체 액세스에서는 별도 연결 없이 adb, Git, PowerShell 등 설치된 도구를 사용할 수 있습니다.
             대화별로 재정의할 수 있으며 실행 중인 턴의 권한은 바뀌지 않습니다.
           </p>
           {permissionError ? <p className="mt-2 text-xs text-destructive">{permissionError}</p> : null}

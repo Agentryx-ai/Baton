@@ -40,7 +40,7 @@ Authoritative references:
 | --- | --- | --- |
 | `read_only` | Read, list, and literal search | No command execution and no mutating legacy host tool |
 | `workspace` | Read, write, exact replacement, list, and search | Direct argv only through the Codex workspace sandbox; workspace write, bounded minimal system reads, network disabled |
-| `full_access` | Same deterministic workspace file tools when a folder is connected | Direct argv on the host without an OS sandbox; works without a connected folder and may invoke `adb`, `ldconsole`, PowerShell, Git, or any installed executable |
+| `full_access` | Same deterministic workspace file tools when a folder is connected | Direct argv on the host without an OS sandbox; works without a connected folder and may invoke `adb`, PowerShell, Git, or any installed executable |
 
 `run_command` never accepts a shell string. It accepts an argv array, uses `shell: false`, caps output,
 enforces a timeout, and terminates the child process tree on cancellation or timeout. A user can still
@@ -68,20 +68,19 @@ global default
   an additional prompt; everything outside it fails closed. A future approval layer must remain
   separate from profile resolution.
 
-## ADB, LDPlayer, and images
+## ADB, emulator extensions, and images
 
-Full access does not require an LDPlayer “connection.” The agent discovers the host in the same way it
-discovers any other installed tool, for example `adb devices -l` or `ldconsole list2`, then uses direct
-argv calls. This also permits multiple emulator instances without adding per-instance permission
-fields.
+Full access does not require an emulator-specific “connection.” The agent discovers Android targets
+with standard ADB commands such as `adb devices -l` and addresses the intended device by serial.
+This permits multiple physical devices and emulator instances without adding product-specific fields
+to the canonical session.
 
-The older exact-instance LDPlayer grant remains a constrained convenience adapter. It supplies typed
-start/tap/swipe/text/key/capture and declarative UX-flow tools, plus content-addressed screenshot
-artifacts that can be attached to provider context. It is useful in `workspace` mode and for reliable
-image return, but it is not the permission authority and is not required in `full_access`.
+Product-specific emulator discovery or structured actions belong in optional plugins or internal
+extensions. Such extensions must support explicit target selection and must not add product-specific
+state, routes, or permission columns to Baton core.
 
-Uploads and typed emulator screenshots share the local immutable image store. Canonical JSON stores
-artifact references rather than image bytes. Codex receives local/dynamic-tool images, Claude receives
+Uploads and extension-produced screenshots can share the local immutable image store. Canonical JSON
+stores artifact references rather than image bytes. Codex receives local/dynamic-tool images, Claude receives
 an Anthropic image block at its outbound boundary, and Gemini receives an OpenAI-compatible image URL
 part at its outbound boundary.
 

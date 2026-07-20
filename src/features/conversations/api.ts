@@ -21,7 +21,6 @@ import type {
   ReconcileUnknownMutationDto,
   ReconcileUnknownMutationResultDto,
   ImageArtifactRefDto,
-  LdPlayerInstanceDto,
   PermissionProfile,
   PermissionSettingsDto,
 } from './types.ts'
@@ -180,23 +179,6 @@ export const conversationApi = {
 
   imageUrl: (artifactId: string): string =>
     `${BASE_PATH}/artifacts/images/${encodeURIComponent(artifactId)}`,
-
-  listLdPlayerInstances: async (): Promise<LdPlayerInstanceDto[]> => {
-    const result = await request<{ instances: LdPlayerInstanceDto[] }>('/host/ldplayer/instances')
-    return result.instances
-  },
-
-  connectLdPlayer: (
-    sessionId: string,
-    instance: Pick<LdPlayerInstanceDto, 'installationRoot' | 'instanceIndex'>,
-    expectedRevision: number,
-  ): Promise<CanonicalSessionDto> => request(
-    `/sessions/${encodeURIComponent(sessionId)}/ldplayer`,
-    jsonRequest('PUT', { ...instance, expectedRevision }),
-  ),
-
-  disconnectLdPlayer: (sessionId: string, expectedRevision: number): Promise<CanonicalSessionDto> =>
-    request(`/sessions/${encodeURIComponent(sessionId)}/ldplayer`, jsonRequest('DELETE', { expectedRevision })),
 
   archiveSession: (sessionId: string): Promise<CanonicalSessionDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' }),

@@ -28,7 +28,6 @@ import type {
   TurnId,
   UpsertProviderBindingInput,
   ProviderBinding,
-  LdPlayerGrant,
   GlobalPermissionSettings,
   PermissionProfile,
 } from './domain.ts'
@@ -243,13 +242,6 @@ export interface UpdateSessionPermissionProfileInput {
   profile: PermissionProfile | null
 }
 
-export interface UpdateLdPlayerGrantInput {
-  sessionId: SessionId
-  expectedThreadRevision: number
-  /** Verified against the current host inventory by the service; null revokes access. */
-  grant: LdPlayerGrant | null
-}
-
 export interface SessionStore extends NativeImportStore {
   getPermissionSettings(): GlobalPermissionSettings
   updateDefaultPermissionProfile(profile: PermissionProfile): GlobalPermissionSettings
@@ -262,7 +254,6 @@ export interface SessionStore extends NativeImportStore {
   archiveSession(sessionId: SessionId): CanonicalSession
   restoreSession(sessionId: SessionId): CanonicalSession
   updateWorkspace(input: UpdateWorkspaceInput): CanonicalSession
-  updateLdPlayerGrant(input: UpdateLdPlayerGrantInput): CanonicalSession
   purgeExpiredSessions(cutoffIso: string, batchSize?: number): number
   getThread(threadId: ThreadId): CanonicalThread | null
   getSnapshot(threadId: ThreadId): ThreadSnapshot | null

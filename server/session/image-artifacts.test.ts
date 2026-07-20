@@ -12,7 +12,7 @@ test('stores immutable content-addressed PNG artifacts without embedding bytes i
   const root = mkdtempSync(path.join(tmpdir(), 'baton-images-'))
   const store = new LocalImageArtifactStore(root)
   const first = store.put(PNG, 'image/png', 'screen.png', 'upload')
-  const second = store.put(PNG, 'image/png', 'other.png', 'ldplayer_capture')
+  const second = store.put(PNG, 'image/png', 'other.png', 'tool_capture')
 
   assert.equal(first.id, second.id)
   assert.equal(first.width, 1)
@@ -29,4 +29,12 @@ test('rejects declared image types that do not match their bytes', () => {
     () => store.put(Buffer.from('not an image'), 'image/png', 'fake.png', 'upload'),
     (error: unknown) => error instanceof ImageArtifactError && error.code === 'invalid_image',
   )
+})
+
+test('normalizes screenshot references from the retired emulator adapter', () => {
+  const store = new LocalImageArtifactStore(mkdtempSync(path.join(tmpdir(), 'baton-images-')))
+  const current = store.put(PNG, 'image/png', 'screen.png', 'tool_capture')
+  const legacy = { ...current, source: 'ldplayer_capture' }
+
+  assert.equal(parseImageArtifactRef(legacy).source, 'tool_capture')
 })

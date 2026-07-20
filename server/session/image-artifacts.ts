@@ -12,7 +12,7 @@ export interface ImageArtifactRef {
   width: number | null
   height: number | null
   fileName: string
-  source: 'upload' | 'ldplayer_capture'
+  source: 'upload' | 'tool_capture'
 }
 
 export interface ImageArtifactResolver {
@@ -132,7 +132,8 @@ export function parseImageArtifactRef(value: unknown): ImageArtifactRef {
     width: ref.width,
     height: ref.height,
     fileName: ref.fileName,
-    source: ref.source,
+    // Normalize references produced by the retired core emulator adapter.
+    source: ref.source === 'ldplayer_capture' ? 'tool_capture' : ref.source,
   }
   validateRef(parsed)
   return Object.freeze(parsed as ImageArtifactRef)
@@ -174,7 +175,7 @@ function validateRef(value: Record<string, unknown>): void {
     }
   }
   if (typeof value.fileName !== 'string' || value.fileName.length < 1 || value.fileName.length > 255
-    || (value.source !== 'upload' && value.source !== 'ldplayer_capture')) {
+    || (value.source !== 'upload' && value.source !== 'tool_capture')) {
     throw new ImageArtifactError('invalid_image_ref', 'Image metadata is invalid')
   }
 }

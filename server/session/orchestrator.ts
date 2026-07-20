@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto'
-import path from 'node:path'
 import { AdapterRegistry } from './adapter-registry.ts'
 import type { ProviderBindingPatch, ProviderTurnExecution } from './adapter.ts'
 import { ContextInputTooLargeError, type CanonicalContextRuntimeContract } from './canonical-context-runtime.ts'
@@ -27,13 +26,12 @@ import type {
   ThreadId,
   ThreadSnapshot,
   TurnId,
-  LdPlayerGrant,
 } from './domain.ts'
 import { ConversationEventHub } from './event-hub.ts'
 import { GoalRuntime, type GoalContinuationRequest } from './goal-runtime.ts'
 import { goalContinuationPrompt } from './goal-prompts.ts'
 import { ProviderReadinessError } from './service.ts'
-import type { ConversationService, LdPlayerMutationInput, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
+import type { ConversationService, StartSessionInput, StartTurnInput, SubmitFollowUpInput, UserGoalStatusInput, WorkspaceMutationInput } from './service.ts'
 import { normalizeInstructionSnapshot } from './instruction-snapshot.ts'
 import type {
   ClearGoalInput,
@@ -60,8 +58,6 @@ import {
   HostCommandToolRuntime,
   LocalWorkspaceToolRuntime,
 } from './tools/local-workspace-runtime.ts'
-import { CompositeToolRuntime } from './tools/composite-runtime.ts'
-import { LdPlayerHost, LdPlayerToolRuntime } from './tools/ldplayer-runtime.ts'
 import type { LocalImageArtifactStore } from './image-artifacts.ts'
 import { hasPortableUserContent, imageAttachments } from './image-artifacts.ts'
 import { assertWorkspaceRoot, resolveWorkspaceRoot } from './workspace-root.ts'
@@ -93,7 +89,7 @@ export class TurnOrchestrator implements ConversationService {
   private readonly events: ConversationEventHub
   private readonly cancellationTimeoutMs: number
   private readonly contextRuntime: CanonicalContextRuntimeContract | null
-  private readonly hostRuntime: { ldPlayer: LdPlayerHost; artifacts: LocalImageArtifactStore } | null
+  private readonly hostRuntime: { artifacts: LocalImageArtifactStore } | null
   private readonly goalRuntime: GoalRuntime
   private readonly active = new Map<TurnId, ActiveTurn>()
   private closed = false
@@ -109,7 +105,7 @@ export class TurnOrchestrator implements ConversationService {
     events: ConversationEventHub,
     cancellationTimeoutMs = 10_000,
     contextRuntime: CanonicalContextRuntimeContract | null = null,
-    hostRuntime: { ldPlayer: LdPlayerHost; artifacts: LocalImageArtifactStore } | null = null,
+    hostRuntime: { artifacts: LocalImageArtifactStore } | null = null,
   ) {
     this.store = store
     this.adapters = adapters
@@ -153,7 +149,7 @@ export class TurnOrchestrator implements ConversationService {
       throw new ProviderReadinessError(normalized.provider, { cause: error })
     }
     const permissionProfile = this.store.getPermissionSettings().defaultProfile
-    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, null, permissionProfile)
+    const workspaceRuntime = this.sessionToolRuntime(workspaceCwd, permissionProfile)
     const toolDefinitions: readonly AgentToolDefinition[] = [
       ...workspaceRuntime.definitions,
       ...GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal'),
@@ -238,50 +234,6 @@ export class TurnOrchestrator implements ConversationService {
       sessionId,
       expectedThreadRevision: expectedRevision,
       cwd: null,
-    })
-    this.events.publish(session.activeThreadId)
-    return session
-  }
-  async listLdPlayerInstances(): Promise<Array<LdPlayerGrant & { running: boolean; androidStarted: boolean }>> {
-    if (!this.hostRuntime) return []
-    return (await this.hostRuntime.ldPlayer.listInstances()).map((instance) => ({
-      kind: 'ldplayer',
-      installationRoot: instance.installationRoot,
-      instanceIndex: instance.index,
-      instanceName: instance.name,
-      running: instance.running,
-      androidStarted: instance.androidStarted,
-    }))
-  }
-
-  async connectLdPlayer(input: LdPlayerMutationInput): Promise<CanonicalSession> {
-    if (!this.hostRuntime) throw new SessionStoreError('not_found', 'LDPlayer integration is unavailable')
-    const candidate: LdPlayerGrant = {
-      kind: 'ldplayer',
-      installationRoot: input.installationRoot,
-      instanceIndex: input.instanceIndex,
-      instanceName: '',
-    }
-    const requestedRoot = path.resolve(candidate.installationRoot)
-    const discovered = (await this.hostRuntime.ldPlayer.listInstances()).find((instance) => (
-      path.resolve(instance.installationRoot).toLowerCase() === requestedRoot.toLowerCase()
-      && instance.index === candidate.instanceIndex
-    ))
-    if (!discovered) throw new SessionStoreError('not_found', 'LDPlayer instance was not found')
-    const session = this.store.updateLdPlayerGrant({
-      sessionId: input.sessionId,
-      expectedThreadRevision: input.expectedRevision,
-      grant: { ...candidate, instanceName: discovered.name },
-    })
-    this.events.publish(session.activeThreadId)
-    return session
-  }
-
-  disconnectLdPlayer(sessionId: SessionId, expectedRevision: number): CanonicalSession {
-    const session = this.store.updateLdPlayerGrant({
-      sessionId,
-      expectedThreadRevision: expectedRevision,
-      grant: null,
     })
     this.events.publish(session.activeThreadId)
     return session
@@ -490,7 +442,6 @@ export class TurnOrchestrator implements ConversationService {
       const workspaceCwd = snapshot.session.cwd ? assertWorkspaceRoot(snapshot.session.cwd) : null
       const workspaceRuntime = this.sessionToolRuntime(
         workspaceCwd,
-        snapshot.session.ldPlayer ?? null,
         snapshot.session.permissions.effectiveProfile,
       )
       const toolDefinitions = [
@@ -508,9 +459,7 @@ export class TurnOrchestrator implements ConversationService {
         policySnapshot: {
           delegationMode: 'disabled', allowedTools: toolDefinitions.map((tool) => tool.name),
           approvalPolicy: 'never', cwd: workspaceCwd, maxDepth: 0,
-          capabilityGrant: snapshot.session.ldPlayer
-            ? `ldplayer:${snapshot.session.ldPlayer.instanceIndex}`
-            : null,
+          capabilityGrant: null,
           permissionProfile: snapshot.session.permissions.effectiveProfile,
           permissionProfileSource: snapshot.session.permissions.source,
         },
@@ -582,7 +531,6 @@ export class TurnOrchestrator implements ConversationService {
     const permissionProfileSource = beforeTurn?.session.permissions.source ?? 'global'
     const workspaceRuntime = this.sessionToolRuntime(
       workspaceCwd,
-      beforeTurn?.session.ldPlayer ?? null,
       permissionProfile,
     )
     const goalToolDefinitions = GOAL_TOOL_DEFINITIONS.filter((tool) => tool.name !== 'create_goal')
@@ -618,9 +566,7 @@ export class TurnOrchestrator implements ConversationService {
         approvalPolicy: 'never',
         cwd: workspaceCwd,
         maxDepth: 0,
-        capabilityGrant: beforeTurn?.session.ldPlayer
-          ? `ldplayer:${beforeTurn.session.ldPlayer.instanceIndex}`
-          : null,
+        capabilityGrant: null,
         permissionProfile,
         permissionProfileSource,
       },
@@ -1006,25 +952,17 @@ export class TurnOrchestrator implements ConversationService {
 
   private sessionToolRuntime(
     cwd: string | null,
-    ldPlayer: LdPlayerGrant | null,
     profile: PermissionProfile,
   ): ToolRuntime {
-    const runtimes: ToolRuntime[] = []
     if (cwd) {
-      runtimes.push(new LocalWorkspaceToolRuntime({
+      return new LocalWorkspaceToolRuntime({
         cwd,
         access: profile === 'read_only' ? 'read_only' : 'workspace',
         enableCommands: profile !== 'read_only',
         ...(profile === 'full_access' ? { commandRunner: new FullAccessCommandRunner() } : {}),
-      }))
-    } else if (profile === 'full_access') {
-      runtimes.push(new HostCommandToolRuntime())
+      })
     }
-    if (profile !== 'read_only' && ldPlayer && this.hostRuntime) {
-      runtimes.push(new LdPlayerToolRuntime(ldPlayer, this.hostRuntime.ldPlayer, this.hostRuntime.artifacts))
-    }
-    if (runtimes.length === 0) return NO_WORKSPACE_RUNTIME
-    return runtimes.length === 1 ? runtimes[0]! : new CompositeToolRuntime(runtimes)
+    return profile === 'full_access' ? new HostCommandToolRuntime() : NO_WORKSPACE_RUNTIME
   }
 
   private validateImageInputs(items: readonly NewCanonicalItem[]): void {

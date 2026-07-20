@@ -998,6 +998,21 @@ test('SessionStoreError codes map to stable HTTP statuses', async () => {
   }
 })
 
+test('core exposes no product-specific emulator routes', async () => {
+  const service = new TestConversationService()
+  await withServer(service, async (baseUrl) => {
+    const paths = [
+      '/host/ldplayer/instances',
+      `/sessions/${session.id}/ldplayer`,
+    ]
+    for (const path of paths) {
+      assert.equal((await fetch(`${baseUrl}${path}`)).status, 404)
+      assert.equal((await fetch(`${baseUrl}${path}`, { method: 'PUT' })).status, 404)
+      assert.equal((await fetch(`${baseUrl}${path}`, { method: 'DELETE' })).status, 404)
+    }
+  })
+})
+
 test('SSE subscribes before replay and resumes from the greatest durable cursor', async () => {
   const service = new TestConversationService()
   service.events = [streamEvent(2), streamEvent(3)]

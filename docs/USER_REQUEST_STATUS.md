@@ -256,12 +256,12 @@
 - [ ] native import의 명시적 Goal lifecycle 복원과 기존 import dry-run backfill
 - [ ] Gemini 인증 복구 후 catalog/turn/tool live 검증(사용자의 live-message 금지 해제 전 실행 금지)
 
-## 15. 로컬 LDPlayer·이미지 컨텍스트
+## 15. 로컬 ADB·이미지 컨텍스트
 
 | ID | 요청 | 상태 | 근거와 남은 일 |
 |---|---|---|---|
-| HOST-01 | 범용 권한으로 로컬 도구·ADB·LDPlayer를 사용 | 구현 완료·typed LD live 통과 | 전역 기본+대화별 `read_only`/`workspace`/`full_access`와 턴별 immutable snapshot을 구현했다. Full access는 별도 인스턴스 grant 없이 direct argv로 ADB·LDPlayer·Git·PowerShell 등 설치 도구를 사용할 수 있다. 기존 exact-instance 도구는 구조화된 조작·이미지 반환용 선택 어댑터로 유지한다. |
-| HOST-02 | UX-flow 캡처와 템플릿 기반 전수조사 | 구현 완료(V1) | 최대 50개의 제한된 조작·대기·캡처 단계와 총 대기 30초 상한을 가진 선언형 `ldplayer_run_flow`를 제공한다. host mutation 선기록·직렬화·unknown-outcome 비재실행 규칙을 적용한다. |
+| HOST-01 | 범용 권한으로 로컬 도구와 ADB를 사용 | 구현 완료 | 전역 기본+대화별 `read_only`/`workspace`/`full_access`와 턴별 immutable snapshot을 구현했다. Full access는 제품 전용 grant 없이 direct argv로 ADB·Git·PowerShell 등 설치 도구를 사용할 수 있다. |
+| HOST-02 | 제품별 에뮬레이터 편의 기능 | core에서 제거 | 제품 탐지, 단일 인스턴스 연결, 전용 조작 route/tool은 canonical core에서 제거했다. 필요하면 다중 ADB target을 지원하는 선택적 플러그인/내부 확장으로 제공한다. |
 | HOST-03 | 파일로 저장한 캡처·업로드 이미지를 실제 모델 context에 첨부 | 구현 완료·provider wire 회귀 통과 | content-addressed artifact ref를 정본에 저장하고 Codex `localImage`/dynamic-tool `inputImage`, Claude image block, Gemini `image_url`로 실행 경계에서 변환한다. provider-private continuation에도 base64 대신 artifact ref만 저장한다. |
 | HOST-04 | Claude/Codex CLI·Desktop 권한 구현 참고 | 완료 | Claude Code 공식 permissions 문서, 현재 Codex 공개 소스, 설치된 Codex/Claude Desktop 번들의 turn/session permission 전달 계약을 비교해 Baton의 범용 프로필로 설계했다. 자세한 경계는 [`HOST_AUTOMATION.md`](HOST_AUTOMATION.md). |
 | HOST-05 | Computer Use와 built-in browser | TODO로 명시 | 현재 요구에는 필요하지 않아 실행면을 추가하지 않았다. Baton canonical permission/cancel/replay 계약을 별도 설계하기 전까지 비활성이다. |

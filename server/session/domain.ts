@@ -185,8 +185,6 @@ export interface CanonicalSession {
   projectKey: string | null
   cwd: string | null
   permissions: SessionPermissionState
-  /** Exact local emulator capability explicitly connected by the user; null grants no ADB access. */
-  ldPlayer?: LdPlayerGrant | null
   schemaVersion: number
   createdAt: string
   updatedAt: string
@@ -214,13 +212,6 @@ export interface SessionPermissionState {
   override: PermissionProfile | null
   effectiveProfile: PermissionProfile
   source: PermissionProfileSource
-}
-
-export interface LdPlayerGrant {
-  kind: 'ldplayer'
-  installationRoot: string
-  instanceIndex: number
-  instanceName: string
 }
 
 export interface CanonicalThread {
