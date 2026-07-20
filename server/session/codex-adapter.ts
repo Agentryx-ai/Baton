@@ -72,6 +72,7 @@ const ALLOWED_ITEM_TYPES = new Set([
   'dynamicToolCall',
   'contextCompaction',
   'collabAgentToolCall',
+  'subAgentActivity',
 ])
 
 const CODEX_NATIVE_AGENT_TOOLS = Object.freeze([
