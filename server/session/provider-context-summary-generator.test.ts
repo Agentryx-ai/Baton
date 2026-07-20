@@ -135,10 +135,10 @@ test('provider summary retries only the interrupted chunk after a transient stre
   )
 })
 
-test('large target windows still cap each summary prompt below the summary turn budget', async () => {
+test('large target windows use the model budget while keeping each summary prompt bounded', async () => {
   const adapter = new SummaryAdapter()
   const snapshot = fixtureSnapshot()
-  const items: CanonicalItem[] = Array.from({ length: 60 }, (_, index) => ({
+  const items: CanonicalItem[] = Array.from({ length: 120 }, (_, index) => ({
     id: `bounded-${index}`,
     sessionId: snapshot.session.id,
     threadId: snapshot.thread.id,
@@ -176,7 +176,7 @@ test('large target windows still cap each summary prompt below the summary turn 
 
   assert.ok(adapter.requestsSeen.length > 1)
   assert.equal(adapter.requestsSeen.every((request) =>
-    estimateUtf8Tokens(String(request.input[0]?.payload.text)) <= 75_000), true)
+    estimateUtf8Tokens(String(request.input[0]?.payload.text)) <= 141_000), true)
 })
 
 test('provider summary deterministically bounds oversized output while retaining its beginning and end', async () => {

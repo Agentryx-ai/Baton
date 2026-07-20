@@ -28,7 +28,7 @@ test('configuration conflicts are repairable but applied and unknown states are 
   assert.equal(canApplyConfiguration('unknown'), false)
 })
 
-test('native Codex mode changes only openai_base_url and round-trips bytes safely', () => {
+test('native Codex mode keeps openai identity plus a legacy resume alias and round-trips safely', () => {
   const original = [
     '# keep provider identity and comments',
     'model_provider = "openai"',
@@ -45,6 +45,13 @@ test('native Codex mode changes only openai_base_url and round-trips bytes safel
   assert.equal(patchCodexNativeConfig(applied, baseUrl), applied)
   assert.equal(parsed.model_provider, 'openai')
   assert.equal(parsed.openai_base_url, baseUrl)
+  assert.deepEqual((parsed.model_providers as Record<string, unknown>).baton, {
+    name: 'Baton Native (resume compatibility)',
+    base_url: baseUrl,
+    wire_api: 'responses',
+    request_max_retries: 0,
+    stream_max_retries: 0,
+  })
   assert.match(applied, /# keep provider identity and comments/)
   assert.match(applied, /\[projects\."C:\\\\work"\]/)
   assert.equal(unpatchCodexNativeConfig(applied, baseUrl), original)
@@ -63,7 +70,7 @@ test('native Codex mode refuses to overwrite user transport or another provider'
   )
 })
 
-test('native Codex mode migrates the exact Baton-owned legacy provider without touching user settings', () => {
+test('native Codex mode migrates the exact Baton-owned legacy provider to an unauthenticated Native resume alias', () => {
   const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
   const source = [
     '# keep me',
@@ -84,10 +91,32 @@ test('native Codex mode migrates the exact Baton-owned legacy provider without t
   const parsed = parseToml(migrated) as Record<string, unknown>
   assert.equal(parsed.model_provider, undefined)
   assert.equal(parsed.openai_base_url, baseUrl)
-  assert.equal((parsed.model_providers as Record<string, unknown> | undefined)?.baton, undefined)
+  assert.deepEqual((parsed.model_providers as Record<string, unknown>).baton, {
+    name: 'Baton Native (resume compatibility)',
+    base_url: baseUrl,
+    wire_api: 'responses',
+    request_max_retries: 0,
+    stream_max_retries: 0,
+  })
   assert.equal(parsed.model, 'gpt-5.6-sol')
   assert.match(migrated, /# keep me/)
   assert.match(migrated, /\[features\]/)
+})
+
+test('native Codex mode repairs a removed resume alias and rejects a user-owned baton provider', () => {
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  const repaired = patchCodexNativeConfig(`openai_base_url = "${baseUrl}"\n`, baseUrl)
+  assert.equal(inspectCodexNativeConfig(repaired, baseUrl).configuration, 'applied')
+  assert.throws(
+    () => patchCodexNativeConfig([
+      '[model_providers.baton]',
+      'name = "My provider"',
+      'base_url = "https://example.invalid/v1"',
+      'wire_api = "responses"',
+      '',
+    ].join('\n'), baseUrl),
+    /사용자가 정의한 model_providers\.baton/,
+  )
 })
 
 test('configuration inspection distinguishes applied, absent, and conflicting values', () => {
@@ -210,6 +239,15 @@ test('classifyProcessRecords does not guess CLI when executable evidence is unav
     'unknown-claude',
     'unknown-codex-desktop',
   ])
+})
+
+test('classifyProcessRecords excludes Baton-owned internal Codex app-server processes', () => {
+  assert.deepEqual(classifyProcessRecords([{
+    ProcessId: 41,
+    Name: 'codex.exe',
+    ExecutablePath: 'C:\\tools\\codex.exe',
+    CommandLine: 'codex.exe --config model_catalog_json="C:\\Temp\\baton-model-catalog.json" app-server --stdio',
+  }]), [])
 })
 
 test('parseIntegrationTargets validates and canonicalizes partial selections', () => {

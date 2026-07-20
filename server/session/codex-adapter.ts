@@ -46,11 +46,11 @@ const VERIFIED_FEATURES = [
   'plugins',
 ] as const
 
-// These app-server lifecycle notifications describe every thread known to the
-// process, including detached/internal threads. They are not execution events
-// for the active canonical turn and are explicitly opted out at initialize.
+// Status notifications describe every thread known to the process, including
+// detached/internal threads, and are not execution events for the active turn.
+// thread/started stays enabled because its parentThreadId is the authoritative
+// ownership link for provider-native children that start before the collab item.
 const IGNORED_GLOBAL_NOTIFICATIONS = new Set([
-  'thread/started',
   'thread/status/changed',
 ])
 
@@ -731,14 +731,21 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 }
                 rpcRequestIds.add(message.id)
                 const toolCall = parseDynamicToolCall(message.params)
-                if (toolCall.threadId !== nativeThreadId || toolCall.turnId !== nativeTurnId) {
+                const childToolCall = nativeChildThreadIds.has(toolCall.threadId)
+                if ((!childToolCall && toolCall.threadId !== nativeThreadId)
+                  || (!childToolCall && toolCall.turnId !== nativeTurnId)) {
                   throw capabilityViolation('dynamic tool call referenced a foreign thread or turn')
                 }
                 if (!context.toolDefinitions.some((definition) => definition.name === toolCall.tool)) {
                   throw capabilityViolation(`dynamic tool call requested unregistered tool ${toolCall.tool}`)
                 }
                 const signature = canonicalJson([toolCall.tool, toolCall.arguments])
-                const existing = providerCalls.get(toolCall.callId)
+                const providerCallKey = canonicalJson([
+                  toolCall.threadId,
+                  toolCall.turnId,
+                  toolCall.callId,
+                ])
+                const existing = providerCalls.get(providerCallKey)
                 if (existing && existing.signature !== signature) {
                   throw capabilityViolation(`dynamic tool call id ${toolCall.callId} was reused with different input`)
                 }
@@ -753,12 +760,14 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 let resultPromise = existing?.result
                 if (!resultPromise) {
                   resultPromise = context.executeTool({
-                    callId: `${body.turnId}:${toolCall.callId}`,
+                    callId: childToolCall
+                      ? `${body.turnId}:${toolCall.threadId}:${toolCall.turnId}:${toolCall.callId}`
+                      : `${body.turnId}:${toolCall.callId}`,
                     providerCallId: toolCall.callId,
                     name: toolCall.tool,
                     input: toolCall.arguments,
                   })
-                  providerCalls.set(toolCall.callId, { signature, result: resultPromise })
+                  providerCalls.set(providerCallKey, { signature, result: resultPromise })
                 }
                 const result = await resultPromise
                 if (terminalResult !== null) return
@@ -777,14 +786,18 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
             }
             if (IGNORED_GLOBAL_NOTIFICATIONS.has(message.method)) continue
             const params = asOptionalObject(message.params)
-            assertActiveNativeIds(params, nativeThreadId, nativeTurnId)
+            if (message.method === 'thread/started') {
+              trackNativeStartedThread(params, nativeThreadId, nativeChildThreadIds)
+              continue
+            }
+            trackNativeChildThreads(params, nativeThreadId, nativeChildThreadIds)
+            assertActiveNativeIds(params, nativeThreadId, nativeTurnId, nativeChildThreadIds)
             const forbiddenItemType = forbiddenNotificationItemType(message.method, params)
             if (forbiddenItemType !== null) {
               throw capabilityViolation(
                 `unexpected native execution event ${message.method}:${forbiddenItemType}`,
               )
             }
-            trackNativeChildThreads(params, nativeChildThreadIds)
             if (message.method === 'thread/tokenUsage/updated') {
               const snapshot = codexUsageSnapshot(params)
               cumulativeUsage = snapshot === null
@@ -1354,20 +1367,45 @@ function assertActiveNativeIds(
   params: JsonObject | null,
   threadId: string,
   turnId: string,
+  childThreadIds: ReadonlySet<string>,
 ): void {
-  if (typeof params?.threadId === 'string' && params.threadId !== threadId) {
+  const eventThreadId = typeof params?.threadId === 'string' ? params.threadId : null
+  if (eventThreadId !== null && eventThreadId !== threadId && !childThreadIds.has(eventThreadId)) {
     throw capabilityViolation('Codex event referenced a foreign native thread')
   }
+  if (eventThreadId !== null && eventThreadId !== threadId) return
   if (typeof params?.turnId === 'string' && params.turnId !== turnId) {
     throw capabilityViolation('Codex event referenced a foreign native turn')
   }
 }
 
-function trackNativeChildThreads(params: JsonObject | null, threadIds: Set<string>): void {
+function trackNativeChildThreads(
+  params: JsonObject | null,
+  rootThreadId: string,
+  threadIds: Set<string>,
+): void {
   const item = asOptionalObject(params?.item)
   if (item?.type !== 'collabAgentToolCall' || !Array.isArray(item.receiverThreadIds)) return
+  if (typeof item.senderThreadId !== 'string'
+    || (item.senderThreadId !== rootThreadId && !threadIds.has(item.senderThreadId))) {
+    throw capabilityViolation('Codex collaboration event referenced a foreign native sender thread')
+  }
   for (const threadId of item.receiverThreadIds) {
     if (typeof threadId === 'string' && threadId.length > 0) threadIds.add(threadId)
+  }
+}
+
+function trackNativeStartedThread(
+  params: JsonObject | null,
+  rootThreadId: string,
+  threadIds: Set<string>,
+): void {
+  const thread = asOptionalObject(params?.thread)
+  if (thread === null || typeof thread.id !== 'string') return
+  if (thread.id === rootThreadId) return
+  const parentThreadId = typeof thread.parentThreadId === 'string' ? thread.parentThreadId : null
+  if (parentThreadId === rootThreadId || (parentThreadId !== null && threadIds.has(parentThreadId))) {
+    threadIds.add(thread.id)
   }
 }
 

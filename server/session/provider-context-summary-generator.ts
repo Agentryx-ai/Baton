@@ -22,7 +22,7 @@ import { estimateUtf8Tokens } from './context-materializer.js'
 const SUMMARY_GENERATOR_ID = 'baton-provider-context-summary'
 const SUMMARY_GENERATOR_VERSION = '6'
 const SUMMARY_PROMPT_ATTEMPTS = 2
-const DEFAULT_SUMMARY_INPUT_BUDGET_TOKENS = 104_000
+const DEFAULT_SUMMARY_INPUT_BUDGET_TOKENS = 200_000
 const SUMMARY_PROMPT_BUDGET_RATIO = 0.7
 const SUMMARY_TARGET_RATIO = 0.75
 const SUMMARY_TRUNCATION_MARKER = '\n\n[...middle omitted to enforce Baton summary limit...]\n\n'

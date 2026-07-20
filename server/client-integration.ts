@@ -168,6 +168,9 @@ export function classifyProcessRecords(records: ProcessRecord[]): ClientProcess[
         label = desktop ? 'Claude Desktop' : 'Claude CLI'
       }
     } else if (name === 'codex.exe') {
+      if (evidence.includes('app-server --stdio') && evidence.includes('baton-model-catalog.json')) {
+        continue
+      }
       if (!evidence.trim()) {
         client = 'unknown-codex-desktop'
         label = 'Codex CLI/Desktop 여부 확인 불가'
@@ -653,17 +656,24 @@ export function inspectCodexNativeConfig(
 
   const configuredBaseUrl = parsed.openai_base_url
   const provider = parsed.model_provider
-  if (configuredBaseUrl === baseUrl && (provider === undefined || provider === 'openai')) {
+  const batonProvider = codexProvider(parsed, 'baton')
+  if (
+    configuredBaseUrl === baseUrl
+    && (provider === undefined || provider === 'openai')
+    && isManagedBatonCompatProvider(batonProvider, baseUrl)
+  ) {
     return {
       configuration: 'applied',
-      configurationDetail: '적용됨 · 기존 OpenAI 세션 목록 유지',
+      configurationDetail: '적용됨 · OpenAI identity 및 기존 Baton 세션 resume 호환 유지',
       codexMode: 'native-openai',
     }
   }
   if (configuredBaseUrl === baseUrl) {
     return {
       configuration: 'conflict',
-      configurationDetail: 'Baton openai_base_url이 있으나 model_provider가 openai가 아닙니다.',
+      configurationDetail: provider !== undefined && provider !== 'openai'
+        ? 'Baton openai_base_url이 있으나 model_provider가 openai가 아닙니다.'
+        : 'Baton openai_base_url이 있으나 기존 Baton 세션 resume 호환 provider가 없습니다.',
       codexMode: 'native-openai',
     }
   }
@@ -902,8 +912,9 @@ function parseJsonObject(content: string, label: string): Record<string, unknown
 }
 
 /**
- * Keep Codex's reserved built-in `openai` provider identity and change only its
- * transport URL. Existing user/provider values are never overwritten.
+ * Keep Codex's reserved built-in `openai` provider identity, change its
+ * transport URL, and retain a Baton-owned alias for resuming legacy threads
+ * whose session metadata pins `model_provider = "baton"`.
  */
 export function patchCodexNativeConfig(content: string, baseUrl: string): string {
   let parsed: Record<string, unknown>
@@ -913,18 +924,19 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
     throw new ClientIntegrationError(422, `Codex 설정 TOML을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
   }
 
-  const providers = parsed.model_providers
-  const batonValue = providers && typeof providers === 'object' && !Array.isArray(providers)
-    ? (providers as Record<string, unknown>).baton
-    : undefined
-  const batonProvider = batonValue && typeof batonValue === 'object' && !Array.isArray(batonValue)
-    ? batonValue as Record<string, unknown>
-    : undefined
-  const migratesLegacyBaton = parsed.model_provider === 'baton'
-    && batonProvider?.env_key === 'BATON_PROXY_TOKEN'
+  const batonProvider = codexProvider(parsed, 'baton')
+  const managedCompat = isManagedBatonCompatProvider(batonProvider, baseUrl)
+  const migratesLegacyBaton = batonProvider?.env_key === 'BATON_PROXY_TOKEN'
     && batonProvider?.wire_api === 'responses'
     && typeof batonProvider?.base_url === 'string'
-  if (parsed.model_provider !== undefined && parsed.model_provider !== 'openai' && !migratesLegacyBaton) {
+  if (batonProvider !== undefined && !managedCompat && !migratesLegacyBaton) {
+    throw new ClientIntegrationError(409, '사용자가 정의한 model_providers.baton이 있어 Baton Native 설정을 적용하지 않았습니다.')
+  }
+  if (
+    parsed.model_provider !== undefined
+    && parsed.model_provider !== 'openai'
+    && !(parsed.model_provider === 'baton' && (managedCompat || migratesLegacyBaton))
+  ) {
     throw new ClientIntegrationError(409, '사용자가 지정한 model_provider가 있어 Baton Native 설정을 적용하지 않았습니다.')
   }
   if (parsed.openai_base_url !== undefined && parsed.openai_base_url !== baseUrl) {
@@ -937,14 +949,17 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
   if (endedWithNewline) lines.pop()
   const legacyRootMatches = lines.filter((line) => canonicalRootModelProvider(line)).length
   const legacyTableMatches = lines.filter((line) => isOwnedProviderHeader(line)).length
-  if (migratesLegacyBaton && (legacyRootMatches !== 1 || legacyTableMatches < 1)) {
+  if (
+    parsed.model_provider === 'baton'
+    && (legacyRootMatches !== 1 || legacyTableMatches < 1)
+  ) {
     throw new ClientIntegrationError(422, '기존 Baton provider가 비표준 표기라 안전하게 Native 설정으로 이전할 수 없습니다.')
   }
   const migratedLines: string[] = []
   let skipLegacyTable = false
   for (const line of lines) {
-    if (migratesLegacyBaton && canonicalRootModelProvider(line)) continue
-    if (isTableHeader(line)) skipLegacyTable = migratesLegacyBaton && isOwnedProviderHeader(line)
+    if (parsed.model_provider === 'baton' && canonicalRootModelProvider(line)) continue
+    if (isTableHeader(line)) skipLegacyTable = (managedCompat || migratesLegacyBaton) && isOwnedProviderHeader(line)
     if (!skipLegacyTable) migratedLines.push(line)
   }
   lines.splice(0, lines.length, ...migratedLines)
@@ -959,19 +974,22 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
   if (matches > 1) {
     throw new ClientIntegrationError(422, 'Codex 설정의 openai_base_url이 중복되어 있습니다.')
   }
-  if (matches === 1 && !migratesLegacyBaton) return content
+  if (matches === 1 && managedCompat && parsed.model_provider !== 'baton') return content
 
   if (matches === 0) {
     const insertion = firstTable === -1 ? lines.length : firstTable
     const setting = stringifyToml({ openai_base_url: baseUrl }).trimEnd()
     lines.splice(insertion, 0, setting)
   }
+  while (lines.length > 0 && lines.at(-1) === '') lines.pop()
+  if (lines.length > 0) lines.push('')
+  lines.push(...managedBatonCompatProviderLines(baseUrl))
   const result = `${lines.join(newline)}${endedWithNewline ? newline : ''}`
   const next = parseToml(result) as Record<string, unknown>
   if (
     next.openai_base_url !== baseUrl
     || (next.model_provider !== undefined && next.model_provider !== 'openai')
-    || ((next.model_providers as Record<string, unknown> | undefined)?.baton !== undefined)
+    || !isManagedBatonCompatProvider(codexProvider(next, 'baton'), baseUrl)
   ) {
     throw new ClientIntegrationError(422, '변경된 Codex 네이티브 설정의 검증 결과가 예상과 다릅니다.')
   }
@@ -989,6 +1007,7 @@ export function unpatchCodexNativeConfig(content: string, baseUrl: string): stri
   if (
     parsed.openai_base_url !== baseUrl
     || (parsed.model_provider !== undefined && parsed.model_provider !== 'openai')
+    || !isManagedBatonCompatProvider(codexProvider(parsed, 'baton'), baseUrl)
   ) {
     throw new ClientIntegrationError(409, 'Codex 네이티브 Baton 설정이 현재 값과 달라 안전하게 해제할 수 없습니다.')
   }
@@ -1006,14 +1025,19 @@ export function unpatchCodexNativeConfig(content: string, baseUrl: string): stri
     throw new ClientIntegrationError(422, 'Codex openai_base_url이 비표준 또는 중복 표기라 안전하게 해제할 수 없습니다.')
   }
 
-  const output = lines.filter((line, index) => (
-    index >= preambleEnd || !canonicalRootOpenAiBaseUrl(line)
-  ))
+  const output: string[] = []
+  let skipCompatTable = false
+  for (const [index, line] of lines.entries()) {
+    if (isTableHeader(line)) skipCompatTable = isOwnedProviderHeader(line)
+    if (skipCompatTable || (index < preambleEnd && canonicalRootOpenAiBaseUrl(line))) continue
+    output.push(line)
+  }
+  while (output.length > 0 && output.at(-1) === '') output.pop()
   const result = output.length > 0
     ? `${output.join(newline)}${endedWithNewline ? newline : ''}`
     : ''
   const next = parseToml(result) as Record<string, unknown>
-  if (next.openai_base_url !== undefined) {
+  if (next.openai_base_url !== undefined || codexProvider(next, 'baton') !== undefined) {
     throw new ClientIntegrationError(422, '해제된 Codex 네이티브 설정의 검증 결과가 예상과 다릅니다.')
   }
   return result
@@ -1033,6 +1057,42 @@ function isTableHeader(line: string): boolean {
 
 function isOwnedProviderHeader(line: string): boolean {
   return /^\s*\[\s*model_providers\s*\.\s*baton(?:\s*\.[^\]]+)?\s*\]\s*(?:#.*)?$/.test(line)
+}
+
+function codexProvider(parsed: Record<string, unknown>, id: string): Record<string, unknown> | undefined {
+  const providers = parsed.model_providers
+  if (!providers || typeof providers !== 'object' || Array.isArray(providers)) return undefined
+  const provider = (providers as Record<string, unknown>)[id]
+  return provider && typeof provider === 'object' && !Array.isArray(provider)
+    ? provider as Record<string, unknown>
+    : undefined
+}
+
+function isManagedBatonCompatProvider(
+  provider: Record<string, unknown> | undefined,
+  baseUrl: string,
+): boolean {
+  return provider?.name === 'Baton Native (resume compatibility)'
+    && provider.base_url === baseUrl
+    && provider.wire_api === 'responses'
+    && provider.request_max_retries === 0
+    && provider.stream_max_retries === 0
+    && provider.env_key === undefined
+    && provider.requires_openai_auth === undefined
+}
+
+function managedBatonCompatProviderLines(baseUrl: string): string[] {
+  return stringifyToml({
+    model_providers: {
+      baton: {
+        name: 'Baton Native (resume compatibility)',
+        base_url: baseUrl,
+        wire_api: 'responses',
+        request_max_retries: 0,
+        stream_max_retries: 0,
+      },
+    },
+  }).trimEnd().split('\n')
 }
 
 async function assertFilesUnlocked(files: PreparedFile[]): Promise<void> {

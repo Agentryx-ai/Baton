@@ -8,6 +8,7 @@ import { batonRouter } from './baton-routes.ts'
 import { createHostRouter } from './host-routes.ts'
 import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
 import { createCodexNativeProxy } from './codex-native-proxy.ts'
+import { createRawPassthroughBody } from './raw-passthrough-body.ts'
 import { codexNativeRuntime, loadNativeCodexProxyConnection } from './codex-native-runtime.ts'
 import { CodexNativeOAuthManager } from './codex-native-oauth.ts'
 import { createCodexNativeAccountRouter } from './codex-native-account-routes.ts'
@@ -49,7 +50,16 @@ const codexPluginReference = new CodexPluginReferenceService({
 // Canonical JSON routes must consume their body before the raw gateway proxy middleware.
 app.use('/baton/v1', conversationRuntime.router)
 
-// Raw passthrough: bodies forwarded byte-for-byte (JSON stays JSON).
+// Codex can zstd-compress large prompts. Capture those bytes before Express's
+// raw parser attempts (and fails) to decode an unsupported content encoding.
+app.use(CODEX_NATIVE_PROXY_PATH, createRawPassthroughBody(), createCodexNativeProxy({
+  loadAccounts: () => codexNativeRuntime.loadProxyAccounts(),
+  loadClientToken: async () => (await loadNativeCodexProxyConnection(false)).token,
+  trustLoopbackClient: true,
+  health: codexNativeHealth,
+}))
+
+// Remaining control-plane bodies are ordinary uncompressed JSON.
 app.use(express.raw({ type: () => true, limit: '10mb' }))
 
 app.get('/baton/health', (_req, res) => {
@@ -73,12 +83,6 @@ app.get('/baton/proxy-status', (_req, res) => {
   })
 })
 
-// Baton-owned Codex data plane.
-app.use(CODEX_NATIVE_PROXY_PATH, createCodexNativeProxy({
-  loadAccounts: () => codexNativeRuntime.loadProxyAccounts(),
-  loadClientToken: async () => (await loadNativeCodexProxyConnection(false)).token,
-  health: codexNativeHealth,
-}))
 app.use('/baton/codex-native', createCodexNativeAccountRouter({
   runtime: codexNativeRuntime,
   oauth: codexNativeOAuthManager,
