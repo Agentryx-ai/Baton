@@ -111,11 +111,13 @@ export class CodexNativeRuntime {
     const results = await Promise.allSettled(metadata.map(async (account) => {
       const credential = await this.manager(account.id).getCredential()
       await this.ensureCatalog(credential)
+      const catalog = this.catalog.get(account.id)
       return {
         id: account.id,
         priority: account.priority,
         enabled: account.enabled,
-        models: this.catalog.get(account.id)?.models ?? [],
+        models: catalog?.models ?? [],
+        modelDetails: catalog?.modelDetails ?? [],
         credential,
       } satisfies CodexNativeProxyAccount
     }))

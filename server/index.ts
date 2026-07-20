@@ -77,6 +77,7 @@ app.get('/baton/proxy-status', (_req, res) => {
 app.use(CODEX_NATIVE_PROXY_PATH, createCodexNativeProxy({
   loadAccounts: () => codexNativeRuntime.loadProxyAccounts(),
   loadClientToken: async () => (await loadNativeCodexProxyConnection(false)).token,
+  trustLoopbackClient: true,
   health: codexNativeHealth,
 }))
 app.use('/baton/codex-native', createCodexNativeAccountRouter({

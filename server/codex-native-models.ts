@@ -2,8 +2,8 @@ import type { CodexNativeCredential } from './codex-native-credentials.ts'
 
 export const CODEX_MODELS_URL = 'https://chatgpt.com/backend-api/codex/models'
 
-interface CodexRemoteModel {
-  slug?: unknown
+export interface CodexRemoteModel {
+  slug: string
   [key: string]: unknown
 }
 
@@ -20,6 +20,7 @@ export interface CodexModelCatalogOptions {
 export interface CodexAccountModels {
   accountId: string
   models: string[]
+  modelDetails: CodexRemoteModel[]
   fetchedAt: string
   plan?: string
 }
@@ -87,14 +88,16 @@ export class CodexModelCatalog {
     if (!Array.isArray(body.models)) {
       throw new CodexModelCatalogError('invalid', 'Codex 모델 카탈로그에 models 배열이 없습니다.')
     }
-    const models = Array.from(new Set(
-      (body.models as CodexRemoteModel[])
-        .map((model) => model?.slug)
-        .filter((slug): slug is string => typeof slug === 'string' && slug.length > 0),
-    )).sort(compareText)
+    const modelDetails = (body.models as Array<Record<string, unknown>>).flatMap((model) => (
+      model && typeof model === 'object' && typeof model.slug === 'string' && model.slug.length > 0
+        ? [model as CodexRemoteModel]
+        : []
+    ))
+    const models = Array.from(new Set(modelDetails.map((model) => model.slug))).sort(compareText)
     const result: CodexAccountModels = {
       accountId: credential.accountId,
       models,
+      modelDetails,
       fetchedAt: new Date().toISOString(),
       ...(credential.plan ? { plan: credential.plan } : {}),
     }

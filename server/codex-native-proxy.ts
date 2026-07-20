@@ -6,6 +6,7 @@ import { Router } from 'express'
 import type { Request } from 'express'
 
 import type { CodexNativeCredential } from './codex-native-credentials.ts'
+import type { CodexRemoteModel } from './codex-native-models.ts'
 import {
   NativeAccountCooldowns,
   NativeRouteUnavailableError,
@@ -54,12 +55,14 @@ export interface CodexNativeProxyAccount {
   priority: number
   enabled: boolean
   models: readonly string[]
+  modelDetails?: readonly CodexRemoteModel[]
   credential: CodexNativeCredential
 }
 
 export interface CodexNativeProxyOptions {
   loadAccounts(): Promise<CodexNativeProxyAccount[]>
   loadClientToken?: () => Promise<string>
+  trustLoopbackClient?: boolean
   fetchImpl?: typeof fetch
   upstreamBaseUrl?: string
   requestTimeoutMs?: number
@@ -139,6 +142,16 @@ function modelList(accounts: readonly CodexNativeProxyAccount[]): string[] {
   )).sort((left, right) => left.localeCompare(right, 'en'))
 }
 
+function modelDetails(accounts: readonly CodexNativeProxyAccount[]): CodexRemoteModel[] {
+  const bySlug = new Map<string, CodexRemoteModel>()
+  for (const account of [...accounts].filter((item) => item.enabled).sort((a, b) => a.priority - b.priority)) {
+    for (const model of account.modelDetails ?? []) {
+      if (!bySlug.has(model.slug)) bySlug.set(model.slug, model)
+    }
+  }
+  return Array.from(bySlug.values()).sort((left, right) => left.slug.localeCompare(right.slug, 'en'))
+}
+
 export function createCodexNativeProxy(options: CodexNativeProxyOptions): Router {
   const router = Router()
   const fetchImpl = options.fetchImpl ?? fetch
@@ -174,7 +187,8 @@ export function createCodexNativeProxy(options: CodexNativeProxyOptions): Router
     } catch {
       // OAuth-bearing Codex clients remain independently authenticatable.
     }
-    const authenticated = Boolean(presented && (
+    const trustedLoopback = options.trustLoopbackClient === true && isLoopback(req.socket.remoteAddress)
+    const authenticated = trustedLoopback || Boolean(presented && (
       (localToken && secureEquals(presented, localToken))
       || accounts.some((account) => secureEquals(presented, account.credential.accessToken))
     ))
@@ -184,7 +198,9 @@ export function createCodexNativeProxy(options: CodexNativeProxyOptions): Router
     }
 
     if (req.path === '/models') {
+      const details = modelDetails(accounts)
       res.json({
+        models: details,
         object: 'list',
         data: modelList(accounts).map((id) => ({ id, object: 'model', owned_by: 'openai' })),
       })
@@ -284,4 +300,8 @@ export function createCodexNativeProxy(options: CodexNativeProxyOptions): Router
   })
 
   return router
+}
+
+function isLoopback(address: string | undefined): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }

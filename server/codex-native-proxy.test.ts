@@ -67,6 +67,7 @@ test('Native Codex proxy retries an actual 429 on the next model-capable account
   app.use('/native', createCodexNativeProxy({
     loadAccounts: async () => accounts,
     loadClientToken: async () => 'local-token',
+    trustLoopbackClient: true,
     upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
     now: () => 1_000,
   }))
@@ -79,7 +80,7 @@ test('Native Codex proxy retries an actual 429 on the next model-capable account
   const requestBody = JSON.stringify({ model: 'gpt-5.6-sol', input: 'Hi', stream: true })
   const response = await fetch(`http://127.0.0.1:${address.port}/native/responses`, {
     method: 'POST',
-    headers: { authorization: 'Bearer local-token', 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json' },
     body: requestBody,
   })
   assert.equal(response.status, 200)
@@ -106,8 +107,17 @@ test('Native Codex proxy preserves the pinned model catalog and fails clearly wh
   app.use(express.raw({ type: () => true }))
   app.use('/native', createCodexNativeProxy({
     loadAccounts: async () => [
-      account('free', 20, 'free-access', ['gpt-5.6-terra']),
-      account('pro', 10, 'pro-access', ['gpt-5.6-sol', 'gpt-5.6-terra']),
+      {
+        ...account('free', 20, 'free-access', ['gpt-5.6-terra']),
+        modelDetails: [{ slug: 'gpt-5.6-terra', display_name: 'Terra' }],
+      },
+      {
+        ...account('pro', 10, 'pro-access', ['gpt-5.6-sol', 'gpt-5.6-terra']),
+        modelDetails: [
+          { slug: 'gpt-5.6-sol', display_name: 'Sol' },
+          { slug: 'gpt-5.6-terra', display_name: 'Terra from pro' },
+        ],
+      },
     ],
     loadClientToken: async () => 'local-token',
     fetchImpl: async () => {
@@ -125,8 +135,15 @@ test('Native Codex proxy preserves the pinned model catalog and fails clearly wh
 
   const models = await fetch(`${base}/models`, {
     headers: { authorization: 'Bearer local-token' },
-  }).then(async (response) => response.json()) as { data: Array<{ id: string }> }
+  }).then(async (response) => response.json()) as {
+    data: Array<{ id: string }>
+    models: Array<{ slug: string; display_name: string }>
+  }
   assert.deepEqual(models.data.map((model) => model.id), ['gpt-5.6-sol', 'gpt-5.6-terra'])
+  assert.deepEqual(models.models, [
+    { slug: 'gpt-5.6-sol', display_name: 'Sol' },
+    { slug: 'gpt-5.6-terra', display_name: 'Terra from pro' },
+  ])
 
   const unsupported = await fetch(`${base}/responses`, {
     method: 'POST',

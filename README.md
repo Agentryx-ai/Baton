@@ -160,6 +160,7 @@ history에서 provider 요청을 재구성합니다.
   - 대상 프로세스 종료와 file lock 확인
   - 구조화된 설정 parser, Baton 소유 값 검증, 원자적 파일 교체
   - Codex built-in `openai` provider identity를 유지하고 `openai_base_url`만 Baton Native로 연결
+  - 과거 `model_provider=baton` 세션의 resume를 위해 인증 없는 loopback compatibility alias 유지
 - Baton Native Claude/Codex data plane, OAuth refresh, encrypted local vault와 account router
 - preferred model과 effective model을 분리한 opt-in 자동 fallback/복귀 및 대화 event
 - session/thread/turn/item/execution/provider binding의 SQLite/WAL 영속화
@@ -194,6 +195,8 @@ npm start
   `load_workspace_dependencies` 도구를 등록하지 않습니다. Baton runtime bridge가 공식 primary
   runtime을 검증해 연결하지만, upstream CLI/plugin 계약이 수정되면 native loader를 다시
   우선합니다.
+- Codex CLI 0.144.6은 Responses WebSocket을 먼저 시도하지만 Baton Native proxy는 아직 HTTP/SSE만
+  지원합니다. CLI가 HTTP로 fallback해 요청은 성공하지만 시작 시 약 7초 지연될 수 있습니다.
 - Codex 플러그인 기준계정은 Baton Native vault에 등록한 계정 중 하나를 짧게 실행한
   app-server에 `chatgptAuthTokens` 계약으로 전달합니다. 전역 `auth.json`을 바꾸거나
   `codex login`에 두 번째 동시 로그인을 추가하지 않습니다. Local/repo plugin은 계정 소유가

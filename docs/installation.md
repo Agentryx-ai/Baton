@@ -74,6 +74,11 @@ codex plugin add baton-codex-runtime-bridge@baton-local
 확인합니다. 이 bridge는 `load_workspace_dependencies`가 없는 CLI에서만 쓰며, 공식 loader가
 추가되면 loader를 우선합니다.
 
+Codex 연동 적용은 새 세션에 built-in `openai` provider를 사용합니다. Baton은 과거 세션
+metadata의 `model_provider=baton`도 재개할 수 있도록 같은 Native endpoint를 가리키는 인증 없는
+loopback compatibility provider를 함께 유지합니다. 이 alias는 CLIProxy 선택지가 아니며
+`BATON_PROXY_TOKEN` 환경변수에 의존하지 않습니다.
+
 검증이 실패하면 오류 원인을 확인하고 설치에 필요한 최소 변경만 적용한 뒤 실패한 검사와 관련
 전체 검사를 다시 실행합니다. Provider OAuth나 추가 계정이 없어 live 검증만 실패한 경우에도
 Baton 자체 build/test 결과와 외부 blocker를 구분해 보고합니다.
