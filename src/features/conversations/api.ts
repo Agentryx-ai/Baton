@@ -162,10 +162,14 @@ export const conversationApi = {
   ): Promise<FirstTurnResultDto> =>
     request(`/sessions/${encodeURIComponent(sessionId)}/first-turn`, jsonRequest('PUT', input)),
 
-  pickNativeFolder: (): Promise<NativeFolderPickResultDto> =>
+  pickNativeFolder: (initialCwd?: string | null): Promise<NativeFolderPickResultDto> =>
     hostRequest('/baton/host/folders/pick', {
       method: 'POST',
-      headers: { 'X-Baton-Interaction': 'native-folder-picker' },
+      headers: {
+        'X-Baton-Interaction': 'native-folder-picker',
+        ...(initialCwd ? { 'Content-Type': 'application/json' } : {}),
+      },
+      ...(initialCwd ? { body: JSON.stringify({ cwd: initialCwd }) } : {}),
     }),
 
   uploadImage: (file: File): Promise<ImageArtifactRefDto> =>

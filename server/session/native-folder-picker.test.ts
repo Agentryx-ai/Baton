@@ -29,6 +29,21 @@ test('Windows picker uses a fixed hidden STA command and returns an existing dir
   assert.doesNotMatch(script, /Get-ChildItem|Get-Content|Environment/)
 })
 
+test('Windows picker forwards an existing initial directory as an env var and drops invalid ones', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-native-picker-initial-'))
+  const runner = new FakeRunner(result(selectedResponse(directory)))
+
+  await pickNativeFolder({ platform: 'win32', runner, initialDirectory: directory })
+  assert.equal(runner.requests[0]?.env?.BATON_PICKER_INITIAL_DIR, Buffer.from(directory, 'utf8').toString('base64'))
+  assert.equal(runner.requests[0]?.args.some((argument) => argument.includes(directory)), false)
+
+  for (const invalid of [path.join(directory, 'missing-child'), 'relative\\path', null, undefined]) {
+    const ignored = new FakeRunner(result(selectedResponse(directory)))
+    await pickNativeFolder({ platform: 'win32', runner: ignored, initialDirectory: invalid })
+    assert.equal(ignored.requests[0]?.env, undefined)
+  }
+})
+
 test('Windows picker falls back to Windows PowerShell when pwsh is not installed', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'baton-native-picker-fallback-'))
   const runner = new MissingPwshRunner(result(selectedResponse(directory)))

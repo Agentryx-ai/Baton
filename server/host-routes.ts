@@ -9,12 +9,13 @@ const INTERACTION_HEADER = 'x-baton-interaction'
 const FOLDER_PICKER_INTERACTION = 'native-folder-picker'
 
 export interface HostRouteOptions {
-  pickFolder?: () => Promise<string | null>
+  pickFolder?: (initialDirectory?: string | null) => Promise<string | null>
 }
 
 export function createHostRouter(options: HostRouteOptions = {}): Router {
   const router = Router()
-  const pickFolder = options.pickFolder ?? (() => pickNativeFolder())
+  const pickFolder = options.pickFolder
+    ?? ((initialDirectory?: string | null) => pickNativeFolder({ initialDirectory }))
 
   router.post('/baton/host/folders/pick', async (req, res) => {
     if (req.get(INTERACTION_HEADER) !== FOLDER_PICKER_INTERACTION) {
@@ -22,7 +23,7 @@ export function createHostRouter(options: HostRouteOptions = {}): Router {
       return
     }
     try {
-      const cwd = await pickFolder()
+      const cwd = await pickFolder(requestedInitialDirectory(req.body))
       res.json(cwd === null ? { status: 'cancelled' } : { status: 'selected', cwd })
     } catch (error) {
       if (error instanceof NativeFolderPickerError) {
@@ -34,6 +35,21 @@ export function createHostRouter(options: HostRouteOptions = {}): Router {
   })
 
   return router
+}
+
+/** Body arrives as a raw Buffer (global express.raw); the suggestion is optional and advisory. */
+function requestedInitialDirectory(body: unknown): string | null {
+  if (!Buffer.isBuffer(body) || body.length === 0 || body.length > 4096) return null
+  try {
+    const parsed = JSON.parse(body.toString('utf8')) as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const cwd = (parsed as Record<string, unknown>).cwd
+      if (typeof cwd === 'string' && cwd.trim().length > 0) return cwd
+    }
+  } catch {
+    /* malformed body: open the picker without a suggestion */
+  }
+  return null
 }
 
 function folderPickerStatus(code: NativeFolderPickerError['code']): number {

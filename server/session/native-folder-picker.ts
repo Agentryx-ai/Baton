@@ -38,6 +38,18 @@ try {
   if ($null -ne $dialog.PSObject.Properties['UseDescriptionForTitle']) {
     $dialog.UseDescriptionForTitle = $true
   }
+  $initialBase64 = $env:BATON_PICKER_INITIAL_DIR
+  if (-not [string]::IsNullOrEmpty($initialBase64)) {
+    try {
+      $initial = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($initialBase64))
+      if (Test-Path -LiteralPath $initial -PathType Container) {
+        $dialog.SelectedPath = $initial
+        if ($null -ne $dialog.PSObject.Properties['InitialDirectory']) {
+          $dialog.InitialDirectory = $initial
+        }
+      }
+    } catch { }
+  }
   $result = $dialog.ShowDialog($owner)
   if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($dialog.SelectedPath)
@@ -85,6 +97,8 @@ export interface NativeFolderPickerProcessRequest {
   args: readonly string[]
   timeoutMs: number
   maxOutputBytes: number
+  /** Extra environment variables for the picker process. */
+  env?: Readonly<Record<string, string>>
 }
 
 export interface NativeFolderPickerProcessResult {
@@ -103,6 +117,8 @@ export interface NativeFolderPickerOptions {
   timeoutMs?: number
   maxOutputBytes?: number
   runner?: NativeFolderPickerRunner
+  /** Directory the dialog starts in; ignored when missing or not a directory. */
+  initialDirectory?: string | null
 }
 
 /**
@@ -118,6 +134,7 @@ export async function pickNativeFolder(options: NativeFolderPickerOptions = {}):
   const timeoutMs = positiveInteger(options.timeoutMs ?? DEFAULT_TIMEOUT_MS, 'timeoutMs')
   const maxOutputBytes = positiveInteger(options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES, 'maxOutputBytes')
   const runner = options.runner ?? new SpawnNativeFolderPickerRunner()
+  const initialDirectory = await usableInitialDirectory(options.initialDirectory)
 
   let result: NativeFolderPickerProcessResult | null = null
   for (const executable of POWERSHELL_CANDIDATES) {
@@ -127,6 +144,9 @@ export async function pickNativeFolder(options: NativeFolderPickerOptions = {}):
         args: WINDOWS_PICKER_ARGS,
         timeoutMs,
         maxOutputBytes,
+        ...(initialDirectory
+          ? { env: { BATON_PICKER_INITIAL_DIR: Buffer.from(initialDirectory, 'utf8').toString('base64') } }
+          : {}),
       })
       break
     } catch (error) {
@@ -151,6 +171,17 @@ export async function pickNativeFolder(options: NativeFolderPickerOptions = {}):
   return parsePickerResponse(result.stdout)
 }
 
+/** Best-effort: use the suggestion only when it is an absolute, existing directory. */
+async function usableInitialDirectory(value: string | null | undefined): Promise<string | null> {
+  const trimmed = value?.trim()
+  if (!trimmed || !path.isAbsolute(trimmed) || trimmed.includes('\0')) return null
+  try {
+    return (await stat(trimmed)).isDirectory() ? trimmed : null
+  } catch {
+    return null
+  }
+}
+
 export class SpawnNativeFolderPickerRunner implements NativeFolderPickerRunner {
   async run(request: NativeFolderPickerProcessRequest): Promise<NativeFolderPickerProcessResult> {
     return await new Promise((resolve, reject) => {
@@ -158,6 +189,7 @@ export class SpawnNativeFolderPickerRunner implements NativeFolderPickerRunner {
         windowsHide: true,
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
+        ...(request.env ? { env: { ...process.env, ...request.env } } : {}),
       })
       const stdout: Buffer[] = []
       let stdoutBytes = 0

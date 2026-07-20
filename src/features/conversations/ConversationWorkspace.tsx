@@ -1000,11 +1000,16 @@ export function ConversationWorkspace({
 
   const pickFolder = async (target: 'draft' | 'workspace') => {
     const requestedDraftSessionId = target === 'draft' ? draftRef.current?.sessionId ?? null : null
+    // Start the dialog at the best known folder: the value being edited, the
+    // connected workspace, or the imported conversation's original folder.
+    const initialCwd = target === 'workspace'
+      ? workspaceCwd.trim() || snapshot?.session.cwd || snapshot?.session.source?.cwd || null
+      : draftRef.current?.cwd ?? null
     setFolderPickerBusy(true)
     if (target === 'workspace') setWorkspaceError(null)
     else setError(null)
     try {
-      const result = await conversationApi.pickNativeFolder()
+      const result = await conversationApi.pickNativeFolder(initialCwd)
       if (result.status === 'cancelled') return
       if (target === 'workspace') setWorkspaceCwd(result.cwd)
       else if (requestedDraftSessionId) {

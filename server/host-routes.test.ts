@@ -48,6 +48,40 @@ test('native folder route distinguishes cancellation and typed safe failures', a
   assert.deepEqual(await failed.json(), { code: 'picker_failed', error: 'The native folder picker failed' })
 })
 
+test('native folder route forwards an advisory initial directory only from a well-formed body', async (t) => {
+  const seen: Array<string | null> = []
+  const app = express()
+  // Mirror production: bodies arrive as raw Buffers (server/index.ts express.raw).
+  app.use(express.raw({ type: () => true, limit: '10mb' }))
+  app.use(createHostRouter({ pickFolder: async (initialDirectory) => {
+    seen.push(initialDirectory ?? null)
+    return 'C:\\workspace'
+  } }))
+  const server = app.listen(0, '127.0.0.1')
+  await new Promise<void>((resolve, reject) => {
+    server.once('listening', resolve)
+    server.once('error', reject)
+  })
+  t.after(() => new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve())
+  }))
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+
+  const send = (body?: string) => fetch(`${baseUrl}/baton/host/folders/pick`, {
+    method: 'POST',
+    headers: {
+      'X-Baton-Interaction': 'native-folder-picker',
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body }),
+  })
+  assert.equal((await send(JSON.stringify({ cwd: 'C:\\projects\\demo' }))).status, 200)
+  assert.equal((await send()).status, 200)
+  assert.equal((await send('not-json')).status, 200)
+  assert.equal((await send(JSON.stringify({ cwd: 42 }))).status, 200)
+  assert.deepEqual(seen, ['C:\\projects\\demo', null, null, null])
+})
+
 async function post(baseUrl: string): Promise<Response> {
   return fetch(`${baseUrl}/baton/host/folders/pick`, {
     method: 'POST',
