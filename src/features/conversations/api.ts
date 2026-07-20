@@ -1,5 +1,6 @@
 import type {
   BeginTurnResultDto,
+  CanonicalProvider,
   CanonicalItemDto,
   CanonicalGoalDto,
   CanonicalFollowUpDto,
@@ -208,7 +209,14 @@ export const conversationApi = {
 
   setGoalStatus: (
     goalId: string,
-    input: { expectedRevision: number; status: 'active' | 'paused'; resetLimitCounters?: boolean },
+    input: {
+      expectedRevision: number
+      status: 'active' | 'paused'
+      provider?: CanonicalProvider
+      model?: string
+      effort?: string | null
+      resetLimitCounters?: boolean
+    },
   ): Promise<{ status: 'applied' | 'stale'; goal: CanonicalGoalDto | null }> =>
     request(`/goals/${encodeURIComponent(goalId)}/status`, jsonRequest('POST', input)),
 

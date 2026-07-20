@@ -70,6 +70,53 @@ test('rejects changed bytes or source identity and safely falls back to full his
     entry.type === 'canonical_item' ? entry.item.id : 'summary'), ['one-user', 'one-assistant'])
 })
 
+test('uses only a compatible native compact checkpoint plus its canonical suffix', () => {
+  const checkpointPayload = {
+    nativeContextCheckpoint: {
+      version: 1, provider: 'codex', format: 'codex_replacement_history',
+      history: [{ type: 'compaction', encrypted_content: 'opaque' }], sourceModel: 'gpt-test',
+    },
+  }
+  const checkpoint = {
+    ...item('native-compact', 'import', 2, 'provider_event', checkpointPayload, 'provider_private'),
+    provider: 'codex' as const,
+  }
+  const snapshot = makeSnapshot([], [
+    item('full-prefix', 'import', 1, 'user_message', { text: 'full transcript remains canonical' }),
+    checkpoint,
+    item('suffix', 'import', 3, 'assistant_message', { text: 'after compact' }),
+  ])
+
+  const codex = materializeContext(snapshot, [], 'codex')
+  assert.deepEqual(codex.entries.map((entry) => entry.type === 'canonical_item' ? entry.item.id : 'summary'), [
+    'native-compact', 'suffix',
+  ])
+  const claude = materializeContext(snapshot, [], 'claude')
+  assert.deepEqual(claude.entries.map((entry) => entry.type === 'canonical_item' ? entry.item.id : 'summary'), [
+    'full-prefix', 'native-compact', 'suffix',
+  ])
+  assert.equal(snapshot.items.length, 3, 'display ledger stays complete')
+})
+
+test('treats a safe turnless native import as a compactable canonical prefix', () => {
+  const snapshot = makeSnapshot([], [
+    item('import-user', 'unused', 1, 'user_message', { text: 'question' }),
+    item('import-call', 'unused', 2, 'tool_call', { callId: 'call-1', name: 'read', input: {} }),
+    item('import-result', 'unused', 3, 'tool_result', { callId: 'call-1', output: 'ok' }),
+    item('import-assistant', 'unused', 4, 'assistant_message', { text: 'answer' }),
+  ])
+  snapshot.items = snapshot.items.map((entry) => ({ ...entry, turnId: null }))
+
+  const [prefix] = stableContextPrefixes(snapshot)
+  assert.equal(prefix?.throughSequence, 4)
+  assert.deepEqual(coverageItems(snapshot, prefix!).map((entry) => entry.id), [
+    'import-user', 'import-call', 'import-result', 'import-assistant',
+  ])
+  assert.deepEqual(summarySourceItems(snapshot, prefix!).map((entry) => entry.id), [
+    'import-user', 'import-call', 'import-result', 'import-assistant',
+  ])
+})
+
 test('validates the exact prompt provenance and complete previous-artifact chain', () => {
   const snapshot = makeSnapshot([
     turn('turn-1', 1, 'completed'),

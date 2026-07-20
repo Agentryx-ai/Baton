@@ -189,6 +189,7 @@ in plaintext. Native IDs and non-secret compatibility metadata may still be stor
 | Visible reasoning summary | Yes | Mark provenance; treat as untrusted context |
 | Hidden reasoning/signature | **No** | Encrypted opaque binding only |
 | Remote response/conversation ID | **No** | Same-provider optimization only |
+| Native compact checkpoint | **No** | Same-provider execution view only; keep the full visible ledger |
 | Approval/process/UI state | Usually no | Store Baton approval event; native UI state is not imported |
 
 Provider switching is allowed only when the current turn is terminal and has no unresolved tool call. On a switch, Baton materializes context from portable items. It never sends Claude thinking signatures to Gemini, Gemini thought signatures to OpenAI, or any provider's opaque continuation token to another provider.
@@ -338,6 +339,14 @@ The implemented V1 keeps this boundary deterministic:
 - a queued orphan or expired competing lease becomes a durable failed receipt before another generation contract can own the same frontier;
 - an intact competing lease is never preempted, and incomplete/cyclic artifact chains fail closed;
 - first-turn oversize and post-compaction oversize are rejected before an unsafe provider request.
+
+Imported native sessions use the same display/execution separation. Codex `compacted.replacement_history`
+and Claude `compact_boundary` + `isCompactSummary` are retained as hidden provider-private checkpoint
+items at their native frontier. The transcript continues to render the complete portable import, while
+same-provider execution starts at the newest compatible checkpoint and appends only its uncovered suffix.
+A checkpoint is never replayed to a different provider. If no compatible native checkpoint exists, Baton
+uses its own derived compaction path; safe leading import items with `turn_id = NULL` are valid compaction
+sources as long as their tool state is resolved.
 
 Cache identity is separate from compaction identity. Baton derives a stable, non-reversible cache key from the installation secret and canonical thread ID. The same conversation reuses it across turns; different Baton conversations cannot alias it. Provider-private credentials and continuation bytes are not inputs to that key.
 

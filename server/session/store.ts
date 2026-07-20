@@ -94,6 +94,9 @@ export interface UpdateGoalStatusInput {
   goalId: GoalId
   expectedRevision: number
   status: GoalStatus
+  provider?: CanonicalProvider
+  model?: string
+  effort?: string | null
   reason?: GoalStatusReason | null
   resetLimitCounters?: boolean
 }

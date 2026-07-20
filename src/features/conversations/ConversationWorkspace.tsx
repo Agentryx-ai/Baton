@@ -1177,6 +1177,7 @@ export function ConversationWorkspace({
       const result = await conversationApi.setGoalStatus(current.id, {
         expectedRevision: current.revision,
         status: action === 'pause' ? 'paused' : 'active',
+        ...(action === 'resume' ? { provider, model, effort } : {}),
       })
       requireAppliedGoalStatus(result)
       setError(null)
@@ -1495,6 +1496,9 @@ export function ConversationWorkspace({
         const result = await conversationApi.setGoalStatus(current.id, {
           expectedRevision: current.revision,
           status: 'active',
+          provider,
+          model,
+          effort,
           resetLimitCounters: true,
         })
         requireAppliedGoalStatus(result)
@@ -2257,7 +2261,9 @@ export function ConversationWorkspace({
                     >
                       {(catalog?.models ?? []).map((option) => (
                         <option key={option.id} value={`${candidate}:${option.id}`}>
-                          {option.displayName}
+                          {option.displayName} · {option.contextWindowTokens >= 1_000_000
+                            ? `${option.contextWindowTokens / 1_000_000}M`
+                            : `${Math.round(option.contextWindowTokens / 1_000)}K`}
                         </option>
                       ))}
                     </optgroup>

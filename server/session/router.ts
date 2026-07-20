@@ -796,7 +796,9 @@ export function createConversationRouter(
 
   router.post('/goals/:goalId/status', route(async (req, res) => {
     const body = bodyRecord(req.body)
-    requireOnlyKeys(body, ['expectedRevision', 'status', 'resetLimitCounters'])
+    requireOnlyKeys(body, [
+      'expectedRevision', 'status', 'provider', 'model', 'effort', 'resetLimitCounters',
+    ])
     if (body.status !== 'active' && body.status !== 'paused') {
       throw new RequestValidationError('status must be active or paused')
     }
@@ -807,6 +809,9 @@ export function createConversationRouter(
       goalId: pathParam(req, 'goalId'),
       expectedRevision: requiredPositiveInteger(body, 'expectedRevision'),
       status: body.status,
+      ...(body.provider === undefined ? {} : { provider: requiredProvider(body) }),
+      ...(body.model === undefined ? {} : { model: requiredNonEmptyString(body, 'model') }),
+      ...(body.effort === undefined ? {} : { effort: optionalNullableString(body, 'effort') }),
       ...(body.resetLimitCounters === undefined ? {} : { resetLimitCounters: body.resetLimitCounters }),
     }))
   }))

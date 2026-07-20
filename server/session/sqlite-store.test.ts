@@ -1782,9 +1782,15 @@ test('Goal status transitions are deterministic and stopped states require expli
     goalId: paused.id,
     expectedRevision: paused.revision,
     status: 'active',
+    provider: 'claude',
+    model: 'claude-opus-4-8',
+    effort: 'max',
   })
   assert.equal(resumedResult.status, 'applied')
   assert.equal(resumedResult.goal?.statusReason, null)
+  assert.equal(resumedResult.goal?.provider, 'claude')
+  assert.equal(resumedResult.goal?.model, 'claude-opus-4-8')
+  assert.equal(resumedResult.goal?.effort, 'max')
   const completedResult = store.updateGoalStatus({
     goalId: created.id,
     expectedRevision: resumedResult.goal?.revision ?? -1,

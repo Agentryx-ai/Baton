@@ -176,6 +176,7 @@ class TestConversationService implements ConversationService {
   permissionInput: { sessionId: string; profile: 'read_only' | 'workspace' | 'full_access' | null } | null = null
   permissionDefault: 'read_only' | 'workspace' | 'full_access' = 'workspace'
   goal: CanonicalGoal | null = null
+  goalStatusInput: UserGoalStatusInput | null = null
   followUpInput: SubmitFollowUpInput | null = null
 
   createSession(input: CreateSessionInput): CanonicalSession {
@@ -313,8 +314,16 @@ class TestConversationService implements ConversationService {
   }
 
   async updateGoalStatus(input: UserGoalStatusInput): Promise<GoalCasResult> {
+    this.goalStatusInput = input
     if (!this.goal || this.goal.revision !== input.expectedRevision) return { status: 'stale', goal: this.goal }
-    this.goal = { ...this.goal, status: input.status, revision: this.goal.revision + 1 }
+    this.goal = {
+      ...this.goal,
+      status: input.status,
+      provider: input.provider ?? this.goal.provider,
+      model: input.model ?? this.goal.model,
+      effort: Object.prototype.hasOwnProperty.call(input, 'effort') ? (input.effort ?? null) : this.goal.effort,
+      revision: this.goal.revision + 1,
+    }
     return { status: 'applied', goal: this.goal }
   }
 
@@ -399,6 +408,9 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
           description: '기본 모델',
           effortLevels: ['low', 'high'],
           defaultEffort: 'high',
+          contextWindowTokens: 272_000,
+          usableInputTokens: 258_400,
+          autoCompactTokens: 244_800,
         },
       ],
       defaultModel: 'gpt-5.6-sol',
@@ -418,6 +430,9 @@ test('provider model route exposes the runtime catalog and rejects unknown provi
           description: '기본 모델',
           effortLevels: ['low', 'high'],
           defaultEffort: 'high',
+          contextWindowTokens: 272_000,
+          usableInputTokens: 258_400,
+          autoCompactTokens: 244_800,
         }],
         defaultModel: 'gpt-5.6-sol',
       }
@@ -750,7 +765,22 @@ test('Goal routes validate revisions and expose create, edit, pause, resume, and
     const pausedResult = await paused.json() as GoalCasResult
     assert.equal(pausedResult.goal?.status, 'paused')
 
-    const cleared = await fetch(`${baseUrl}/goals/${created.id}?expectedRevision=${pausedResult.goal?.revision}`, {
+    const resumed = await fetch(`${baseUrl}/goals/${created.id}/status`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: pausedResult.goal?.revision, status: 'active',
+        provider: 'claude', model: 'claude-opus-4-8', effort: 'max',
+      }),
+    })
+    assert.equal(resumed.status, 200)
+    const resumedResult = await resumed.json() as GoalCasResult
+    assert.equal(resumedResult.goal?.provider, 'claude')
+    assert.deepEqual(service.goalStatusInput, {
+      goalId: created.id, expectedRevision: pausedResult.goal?.revision, status: 'active',
+      provider: 'claude', model: 'claude-opus-4-8', effort: 'max',
+    })
+
+    const cleared = await fetch(`${baseUrl}/goals/${created.id}?expectedRevision=${resumedResult.goal?.revision}`, {
       method: 'DELETE',
     })
     assert.equal(cleared.status, 204)

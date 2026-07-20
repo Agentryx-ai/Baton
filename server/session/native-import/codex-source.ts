@@ -17,6 +17,7 @@ import {
   parseCodexGoalToolAction, parseExplicitGoalCommand,
   type CodexGoalToolAction,
 } from './goal-reconstruction.ts'
+import { nativeContextCheckpointPayload } from '../native-context-checkpoint.ts'
 
 export interface CodexSourceReaderOptions {
   codexHome?: string
@@ -36,11 +37,11 @@ interface ParsedCodexRecords {
 
 const CODEX_TOP_LEVEL_TYPES = new Set([
   'session_meta', 'response_item', 'event_msg', 'turn_context',
-  // Current Codex bookkeeping/compaction records. Their framing is known, but the payload is
-  // provider-private state and is therefore counted as loss rather than copied.
+  // Current Codex bookkeeping records. Valid replacement history is retained only as a
+  // provider-private execution checkpoint; other private bookkeeping remains loss.
   'world_state', 'compacted', 'inter_agent_communication_metadata',
 ])
-const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-turn-context-goal-v3`
+const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v4`
 
 export class CodexLocalSourceReader implements NativeSourceReader {
   readonly sourceClient = 'codex_local' as const
@@ -274,6 +275,22 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       skipped += 1
       continue
     }
+    if (eventType === 'compacted') {
+      const history = payload.replacement_history
+      if (!Array.isArray(history) || !history.every((item) => object(item) !== null)) {
+        skipped += 1
+        continue
+      }
+      const timestamp = string(event.timestamp)
+      addRecord(records, `${sessionId}:${lineIndex + 1}:compact`, 'provider_event', nativeContextCheckpointPayload({
+        version: 1,
+        provider: 'codex',
+        format: 'codex_replacement_history',
+        history: history as Record<string, unknown>[],
+        sourceModel: currentModel,
+      }), timestamp, 'provider_private')
+      continue
+    }
     if (eventType !== 'response_item') { skipped += 1; continue }
     const payloadType = string(payload.type)
     if (!payloadType) throw new Error('codex_response_item_framing_invalid')
@@ -353,7 +370,7 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
   return {
     records: records.records,
     contentDigest: records.contentDigest,
-    portableItemCount: records.count,
+    portableItemCount: records.portableCount,
     skipped,
     warnings: skipped ? [`${skipped} known non-portable or hidden Codex records were not imported`] : [],
     goal: goal.snapshot('codex', currentModel, currentEffort),
