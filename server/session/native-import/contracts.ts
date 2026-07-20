@@ -74,7 +74,7 @@ export interface NativeSessionCandidate extends NativeSourceIdentity {
   nativeArchived?: boolean
   sourceHead: NativeSourceHead
   contentDigest: string
-  /** Prefix digest at portableItemCount, used as the append-only record cursor. */
+  /** Prefix digest across every imported record, used as the append-only record cursor. */
   prefixDigest: string
   /** Zero during inventory scans and populated only after materialization. */
   portableItemCount: number
