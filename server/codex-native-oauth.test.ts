@@ -89,6 +89,30 @@ test('Codex OAuth rejects a callback outside the registered redirect path', asyn
   )
 })
 
+test('plugin-only Codex OAuth stores the account paused for model routing', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-codex-plugin-oauth-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const vault = new NativeAccountVault({
+    vaultPath: path.join(directory, 'accounts.json'),
+    protector: new TestProtector(),
+  })
+  const oauth = new CodexNativeOAuthManager({
+    vault,
+    random: (size) => Buffer.alloc(size, 3),
+    fetchImpl: async () => Response.json({
+      id_token: jwt({ exp: 9_999_999_999 }),
+      access_token: jwt({ exp: 9_999_999_999 }),
+      refresh_token: 'plugin-refresh-secret',
+    }),
+  })
+  const started = oauth.start('Plugin only', false)
+  const result = await oauth.submit(
+    `http://localhost:1455/auth/callback?code=plugin-code&state=${started.state}`,
+  )
+  assert.equal(result.status, 'success')
+  assert.equal(result.account?.enabled, false)
+})
+
 test('Codex OAuth expires, cancels, rejects replay after failure, and fails closed across restart', async () => {
   const vault = new NativeAccountVault({ protector: new TestProtector() })
   let now = 1_000

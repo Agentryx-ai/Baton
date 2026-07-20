@@ -26,6 +26,7 @@ interface OAuthFlow {
   state: string
   verifier: string
   alias: string
+  enabled: boolean
   createdAt: number
   expiresAt: number
   status: OAuthFlowStatus
@@ -88,7 +89,7 @@ export class CodexNativeOAuthManager {
     this.scopes = options.scopes ?? CODEX_NATIVE_OAUTH_CONTRACT.scopes
   }
 
-  start(alias?: string): { authUrl: string, state: string } {
+  start(alias?: string, enabled = true): { authUrl: string, state: string } {
     this.cleanup()
     const verifier = this.random(32).toString('base64url')
     const state = this.random(24).toString('base64url')
@@ -97,6 +98,7 @@ export class CodexNativeOAuthManager {
       state,
       verifier,
       alias: alias?.trim() || 'Codex account',
+      enabled,
       createdAt,
       expiresAt: createdAt + this.flowTtlMs,
       status: 'wait',
@@ -161,6 +163,7 @@ export class CodexNativeOAuthManager {
       flow.account = await this.vault.add({
         provider: 'codex',
         alias: flow.alias,
+        enabled: flow.enabled,
         credential,
       })
     } catch {

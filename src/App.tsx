@@ -46,6 +46,8 @@ function App() {
   const { state: policy, setEnabled, refresh: refreshPolicy } = usePolicy()
   const { status: proxy, refresh: refreshProxyStatus } = useProxyStatus()
   const [wizardOpen, setWizardOpen] = useState(false)
+  const [pluginAccountWizard, setPluginAccountWizard] = useState(false)
+  const [pluginAccountRefreshKey, setPluginAccountRefreshKey] = useState(0)
   const [apiKey, setApiKey] = useState<string | null>(null)
   const [conversationPreferences, setConversationPreferences] = useState<SessionViewPreferences>(loadSessionViewPreferences)
 
@@ -180,7 +182,14 @@ function App() {
     await client.switchCodexPluginReference(preview)
     refreshAccounts()
   }
-  const onAddAccount = (_prov: Provider) => setWizardOpen(true)
+  const onAddAccount = (_prov: Provider) => {
+    setPluginAccountWizard(false)
+    setWizardOpen(true)
+  }
+  const onAddCodexPluginAccount = () => {
+    setPluginAccountWizard(true)
+    setWizardOpen(true)
+  }
 
   // Settings actions.
   const onSetStrategy = (s: 'round-robin' | 'fill-first') =>
@@ -341,14 +350,27 @@ function App() {
               onRemoveClientIntegration={onRemoveClientIntegration}
               conversationPreferences={conversationPreferences}
               onConversationPreferencesChange={setConversationPreferences}
-              codexAccounts={accounts?.codex ?? []}
               onPluginReferenceChanged={refreshAccounts}
+              onAddCodexPluginAccount={onAddCodexPluginAccount}
+              pluginAccountRefreshKey={pluginAccountRefreshKey}
             />
           </section>
         </main>
       </div>
 
-      <AddAccountWizard open={wizardOpen} onOpenChange={setWizardOpen} onAdded={refreshAll} />
+      <AddAccountWizard
+        open={wizardOpen}
+        onOpenChange={(open) => {
+          setWizardOpen(open)
+          if (!open) setPluginAccountWizard(false)
+        }}
+        onAdded={() => {
+          refreshAll()
+          if (pluginAccountWizard) setPluginAccountRefreshKey((value) => value + 1)
+        }}
+        fixedProvider={pluginAccountWizard ? 'codex' : undefined}
+        forceNative={pluginAccountWizard}
+      />
     </div>
   )
 }

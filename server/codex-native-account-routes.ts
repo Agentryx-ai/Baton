@@ -103,7 +103,7 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
         : typeof body.nickname === 'string'
           ? body.nickname
           : undefined
-      const started = options.oauth.start(alias)
+      const started = options.oauth.start(alias, body.enabledForModelRouting !== false)
       res.json({ started: true, url: started.authUrl, state: started.state })
     } catch (error) {
       sendError(res, error)
@@ -192,9 +192,13 @@ export function createCodexNativeAccountRouter(options: CodexNativeAccountRoutes
   router.delete('/accounts/:id', async (req: Request<{ id: string }>, res) => {
     try {
       const body = parseBody(req.body)
-      await options.pluginReference?.assertAccountRemovable(req.params.id)
-      await options.runtime.vault.remove(req.params.id, requireExpectedRevision(body))
-      options.runtime.forget(req.params.id)
+      const expectedRevision = requireExpectedRevision(body)
+      if (options.pluginReference) {
+        await options.pluginReference.removeAccount(req.params.id, expectedRevision)
+      } else {
+        await options.runtime.vault.remove(req.params.id, expectedRevision)
+        options.runtime.forget(req.params.id)
+      }
       res.json({ deleted: true })
     } catch (error) {
       sendError(res, error)

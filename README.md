@@ -150,6 +150,7 @@ history에서 provider 요청을 재구성합니다.
 
 - Claude/Codex 계정 추가, 상태, quota, pause/resume/delete와 우선순위 관리
 - Codex 원격 플러그인 catalog용 기준계정 선택
+  - 모델 integration이 CLIProxy여도 별도 Native OAuth로 기준계정 후보 등록
   - 모델 라우팅 pause와 독립적으로 OAuth refresh
   - 전환 전 추가·제거 plugin diff와 connector 재인증 경고
   - revision/digest 확인, 전환 후 catalog 검증 실패 시 rollback, 기준계정 삭제 보호
@@ -211,6 +212,7 @@ CLI/Desktop을 완전히 종료했다가 다시 시작해야 합니다.
   `codex login`에 두 번째 동시 로그인을 추가하지 않습니다. Local/repo plugin은 계정 소유가
   아니며, remote connector/private workspace 권한은 계정 사이에 이전되지 않습니다. 실제
   원격 계정 catalog canary는 Native Codex 계정이 등록된 환경에서 추가 검증해야 합니다.
+  현재는 기준계정 하나만 활성화하며 여러 계정의 원격 catalog를 동시에 합치지는 않습니다.
 - 모델 fallback은 첫 후보 실패 후 다음 후보를 순회하고 실패한 override를 정리하는 보강이
   필요합니다. 현재 compatibility seed는 Fable 5→Opus 4.8이며 범용 schema 자체는 모델명과
   분리돼 있습니다.

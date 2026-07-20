@@ -161,6 +161,11 @@ test('Codex account mutations require caller revisions and protect the plugin re
         throw new CodexPluginReferenceServiceError('invalid', 'reference account')
       }
     },
+    removeAccount: async (accountId: string) => {
+      if (accountId === 'account-1') {
+        throw new CodexPluginReferenceServiceError('invalid', 'reference account')
+      }
+    },
   } as unknown as CodexPluginReferenceService
   const app = express()
   app.use(express.raw({ type: () => true }))

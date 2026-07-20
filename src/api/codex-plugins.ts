@@ -4,6 +4,7 @@ export type CodexPluginReference =
 
 export interface CodexPluginReferenceStatus {
   state: CodexPluginReference & { version: 1; revision: number; updatedAt: string }
+  problem: 'selected_account_missing' | null
   account: null | {
     id: string
     alias: string
@@ -40,7 +41,9 @@ export interface CodexPluginReferencePreview {
   current: CodexPluginReferenceStatus
   target: CodexPluginReference
   targetAccountRevision: number | null
-  currentCatalog: CodexPluginCatalog
+  currentCatalog: CodexPluginCatalog | null
+  currentCatalogError: string | null
+  diffAvailable: boolean
   targetCatalog: CodexPluginCatalog
   addedPluginIds: string[]
   removedPluginIds: string[]

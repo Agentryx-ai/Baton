@@ -9,6 +9,9 @@ Codex의 모델 요청을 보내는 계정과 원격 플러그인 catalog·conne
 이 기능은 Codex 자체에 여러 동시 로그인을 추가하지 않습니다. Baton Native vault에 이미 등록된
 Codex 계정의 OAuth credential을 갱신하고, 짧게 실행한 공식 Codex app-server 자식 프로세스에
 `CODEX_ACCESS_TOKEN`으로만 전달합니다. 사용자의 전역 `auth.json`은 수정하지 않습니다.
+Settings의 `플러그인 계정 추가`는 현재 모델 integration이 CLIProxy 호환 모드여도 Native OAuth
+라우트를 직접 사용하므로, 모델 경로를 바꾸지 않고 기준계정 후보를 등록할 수 있습니다. 전용
+경로로 추가한 계정은 모델 라우팅이 기본 중지된 상태로 저장됩니다.
 
 ## 공식 API 경계
 
@@ -33,6 +36,10 @@ Desktop의 비공개 프로토콜을 역공학하거나 별도 marketplace backe
 4. 대상 credential을 강제 refresh하고 catalog를 다시 확인합니다.
 5. 확인이 실패하면 이전 기준으로 rollback합니다.
 
+현재 기준계정이 삭제됐거나 credential이 폐기되어 기존 catalog를 읽을 수 없는 경우에는 차이를
+추측하지 않고 `변경 차이 확인 불가`로 표시합니다. 새 대상 catalog 검증은 그대로 요구하며,
+검증된 다른 계정 또는 local-only로 복구하는 전환은 허용합니다.
+
 선택된 기준계정은 바로 삭제할 수 없습니다. UI에서 다른 계정 또는 local-only로 전환한 뒤
 삭제하며, 이 과정도 동일한 preview와 확인 계약을 거칩니다.
 
@@ -44,8 +51,15 @@ Desktop의 비공개 프로토콜을 역공학하거나 별도 marketplace backe
   workspace 정책의 영향을 받습니다.
 - Connector authorization은 계정 사이에 자동 이전되지 않습니다. 전환 후 재인증이 필요할 수
   있습니다.
+- 설치 응답이 인증이 필요한 app을 반환하면 Baton은 이름을 표시하지만, 실제 connector
+  authorization은 Codex/ChatGPT의 지원 UI에서 완료해야 합니다.
 - ChatGPT plan, workspace role과 관리자의 허용 정책에 따라 같은 Codex 버전에서도 catalog가
   달라질 수 있습니다.
+
+현재 Baton은 한 번에 하나의 기준계정만 활성화합니다. 두 계정의 원격 catalog를 동시에 합쳐
+노출하거나 connector authorization을 중계하지 않습니다. 전환 preview를 위해 현재/대상 catalog를
+각각 조회할 뿐이며, 다중 계정 catalog federation은 별도 provenance·cache invalidation·권한 모델이
+필요한 후속 범위입니다.
 
 ## 검증 상태
 

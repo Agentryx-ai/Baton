@@ -16,6 +16,7 @@ import { NativeAccountVaultError } from './native-account-vault.ts'
 
 export interface CodexPluginReferenceStatus {
   state: CodexPluginReferenceState
+  problem: 'selected_account_missing' | null
   account: null | {
     id: string
     alias: string
@@ -28,7 +29,9 @@ export interface CodexPluginReferencePreview {
   current: CodexPluginReferenceStatus
   target: CodexPluginReference
   targetAccountRevision: number | null
-  currentCatalog: CodexPluginCatalogSnapshot
+  currentCatalog: CodexPluginCatalogSnapshot | null
+  currentCatalogError: string | null
+  diffAvailable: boolean
   targetCatalog: CodexPluginCatalogSnapshot
   addedPluginIds: string[]
   removedPluginIds: string[]
@@ -62,6 +65,7 @@ export class CodexPluginReferenceService {
   readonly controlPlane: CodexPluginControlPlane
   private readonly runtime: CodexNativeRuntime
   private readonly store: CodexPluginReferenceStore
+  private mutationTail: Promise<void> = Promise.resolve()
 
   constructor(options: CodexPluginReferenceServiceOptions) {
     this.runtime = options.runtime
@@ -71,16 +75,14 @@ export class CodexPluginReferenceService {
 
   async status(): Promise<CodexPluginReferenceStatus> {
     const state = await this.store.get()
-    if (state.mode === 'local_only') return { state, account: null }
+    if (state.mode === 'local_only') return { state, account: null, problem: null }
     const account = (await this.runtime.vault.list('codex')).find((candidate) => candidate.id === state.accountId)
     if (!account) {
-      throw new CodexPluginReferenceServiceError(
-        'verification_failed',
-        '지정된 플러그인 기준계정이 vault에 없습니다. local-only 또는 다른 계정으로 전환해야 합니다.',
-      )
+      return { state, account: null, problem: 'selected_account_missing' }
     }
     return {
       state,
+      problem: null,
       account: {
         id: account.id,
         alias: account.alias,
@@ -120,11 +122,15 @@ export class CodexPluginReferenceService {
     const targetAccount = target.mode === 'account'
       ? await this.runtime.vault.readAccount(target.accountId, 'codex')
       : null
-    const [currentCatalog, targetCatalog] = await Promise.all([
-      this.catalogFor(current.state, cwds),
+    const [currentCatalogResult, targetCatalog] = await Promise.all([
+      this.catalogFor(current.state, cwds).then(
+        (catalog) => ({ catalog, failed: false as const }),
+        () => ({ catalog: null, failed: true as const }),
+      ),
       this.catalogFor(target, cwds),
     ])
-    const currentIds = pluginIds(currentCatalog.marketplaces)
+    const currentCatalog = currentCatalogResult.catalog
+    const currentIds = pluginIds(currentCatalog?.marketplaces ?? [])
     const targetIds = pluginIds(targetCatalog.marketplaces)
     const addedPluginIds = [...targetIds].filter((id) => !currentIds.has(id)).sort()
     const removedPluginIds = [...currentIds].filter((id) => !targetIds.has(id)).sort()
@@ -142,6 +148,10 @@ export class CodexPluginReferenceService {
       target,
       targetAccountRevision,
       currentCatalog,
+      currentCatalogError: currentCatalogResult.failed
+        ? '현재 기준계정의 catalog를 읽지 못해 정확한 변경 차이를 계산할 수 없습니다.'
+        : null,
+      diffAvailable: !currentCatalogResult.failed,
       targetCatalog,
       addedPluginIds,
       removedPluginIds,
@@ -151,6 +161,21 @@ export class CodexPluginReferenceService {
   }
 
   async switch(input: SwitchCodexPluginReferenceInput, cwds: string[] = []): Promise<{
+    status: CodexPluginReferenceStatus
+    catalog: CodexPluginCatalogSnapshot
+  }> {
+    return await this.mutate(() => this.switchUnlocked(input, cwds))
+  }
+
+  async removeAccount(accountId: string, expectedRevision: number): Promise<void> {
+    await this.mutate(async () => {
+      await this.assertAccountRemovable(accountId)
+      await this.runtime.vault.remove(accountId, expectedRevision)
+      this.runtime.forget(accountId)
+    })
+  }
+
+  private async switchUnlocked(input: SwitchCodexPluginReferenceInput, cwds: string[]): Promise<{
     status: CodexPluginReferenceStatus
     catalog: CodexPluginCatalogSnapshot
   }> {
@@ -201,20 +226,46 @@ export class CodexPluginReferenceService {
     }
   }
 
+  private async mutate<T>(operation: () => Promise<T>): Promise<T> {
+    let release!: () => void
+    const previous = this.mutationTail
+    this.mutationTail = new Promise<void>((resolve) => { release = resolve })
+    await previous
+    try {
+      return await operation()
+    } finally {
+      release()
+    }
+  }
+
   private async catalogFor(
     reference: CodexPluginReference,
     cwds: string[],
     forceRefresh = false,
   ): Promise<CodexPluginCatalogSnapshot> {
     if (reference.mode === 'local_only') {
-      return await this.controlPlane.list({ accountId: null, cwds, marketplaceKinds: ['local'] })
+      return this.requireCompleteCatalog(await this.controlPlane.list({
+        accountId: null,
+        cwds,
+        marketplaceKinds: ['local'],
+      }))
     }
     const credential = await this.runtime.getPluginCredential(reference.accountId, forceRefresh)
-    return await this.controlPlane.list({
+    return this.requireCompleteCatalog(await this.controlPlane.list({
       accountId: reference.accountId,
       accessToken: credential.accessToken,
       cwds,
-    })
+    }))
+  }
+
+  private requireCompleteCatalog(catalog: CodexPluginCatalogSnapshot): CodexPluginCatalogSnapshot {
+    if (catalog.loadErrors.length > 0) {
+      throw new CodexPluginReferenceServiceError(
+        'verification_failed',
+        'Codex plugin marketplace 일부를 불러오지 못해 catalog 검증을 완료할 수 없습니다.',
+      )
+    }
+    return catalog
   }
 }
 
@@ -224,7 +275,8 @@ function pluginIds(marketplaces: CodexPluginMarketplace[]): Set<string> {
   )))
 }
 
-function catalogDigest(catalog: CodexPluginCatalogSnapshot): string {
+function catalogDigest(catalog: CodexPluginCatalogSnapshot | null): string {
+  if (catalog === null) return digest({ unavailable: true })
   return digest(catalog.marketplaces.map((marketplace) => ({
     name: marketplace.name,
     plugins: marketplace.plugins.map((plugin) => ({

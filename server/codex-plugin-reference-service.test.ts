@@ -122,3 +122,113 @@ test('failed post-switch catalog confirmation restores the previous plugin refer
   assert.equal(restored.mode, 'local_only')
   assert.equal(restored.revision, 2)
 })
+
+test('a missing or revoked current account can recover to local-only with an explicit degraded preview', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-plugin-recovery-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
+  await store.set({ mode: 'account', accountId: 'missing-account' }, 0)
+  const runtime = {
+    vault: {
+      list: async () => [],
+      readAccount: async () => { throw new Error('missing') },
+    },
+    getPluginCredential: async () => { throw new Error('credential revoked') },
+  } as unknown as CodexNativeRuntime
+  const control = new CodexPluginControlPlane({
+    invoke: async () => rawCatalog(['local']),
+  })
+  const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
+
+  const status = await service.status()
+  assert.equal(status.problem, 'selected_account_missing')
+  const preview = await service.preview({ mode: 'local_only', accountId: null })
+  assert.equal(preview.diffAvailable, false)
+  assert.equal(preview.currentCatalog, null)
+  assert.match(preview.currentCatalogError ?? '', /정확한 변경 차이/)
+  const switched = await service.switch({
+    mode: 'local_only',
+    accountId: null,
+    expectedStateRevision: preview.current.state.revision,
+    expectedTargetAccountRevision: null,
+    previewDigest: preview.previewDigest,
+  })
+  assert.equal(switched.status.state.mode, 'local_only')
+  assert.equal(switched.status.problem, null)
+})
+
+test('account deletion and reference switching share one mutation boundary', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-plugin-delete-race-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const accounts = [{ id: 'account-1', alias: 'Account', enabled: true, revision: 1 }]
+  let releaseRemoval!: () => void
+  let removalEntered!: () => void
+  const removalGate = new Promise<void>((resolve) => { releaseRemoval = resolve })
+  const entered = new Promise<void>((resolve) => { removalEntered = resolve })
+  const runtime = {
+    vault: {
+      list: async () => accounts,
+      readAccount: async (accountId: string) => {
+        const account = accounts.find((candidate) => candidate.id === accountId)
+        if (!account) throw new Error('not found')
+        return { metadata: account, credential: {} }
+      },
+      remove: async () => {
+        removalEntered()
+        await removalGate
+        accounts.splice(0, accounts.length)
+      },
+    },
+    getPluginCredential: async () => ({ accessToken: 'token' }),
+    forget: () => undefined,
+  } as unknown as CodexNativeRuntime
+  const control = new CodexPluginControlPlane({
+    invoke: async ({ accessToken }) => rawCatalog(accessToken ? ['remote'] : ['local']),
+  })
+  const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
+  const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
+  const preview = await service.preview({ mode: 'account', accountId: 'account-1' })
+
+  const removal = service.removeAccount('account-1', 1)
+  await entered
+  const switching = service.switch({
+    mode: 'account',
+    accountId: 'account-1',
+    expectedStateRevision: preview.current.state.revision,
+    expectedTargetAccountRevision: preview.targetAccountRevision,
+    previewDigest: preview.previewDigest,
+  })
+  releaseRemoval()
+  await removal
+  await assert.rejects(switching)
+  assert.equal((await store.get()).mode, 'local_only')
+})
+
+test('target catalog marketplace load errors fail closed before reference mutation', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-plugin-load-errors-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const accounts = [{ id: 'account-1', alias: 'Account', enabled: true, revision: 1 }]
+  const runtime = {
+    vault: {
+      list: async () => accounts,
+      readAccount: async () => ({ metadata: accounts[0], credential: {} }),
+    },
+    getPluginCredential: async () => ({ accessToken: 'token' }),
+  } as unknown as CodexNativeRuntime
+  const control = new CodexPluginControlPlane({
+    invoke: async ({ accessToken }) => ({
+      ...rawCatalog(accessToken ? ['remote'] : ['local']),
+      marketplaceLoadErrors: accessToken
+        ? [{ marketplacePath: 'remote', message: 'unauthorized' }]
+        : [],
+    }),
+  })
+  const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
+  const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
+  await assert.rejects(
+    service.preview({ mode: 'account', accountId: 'account-1' }),
+    (error: unknown) => error instanceof CodexPluginReferenceServiceError
+      && error.code === 'verification_failed',
+  )
+  assert.equal((await store.get()).mode, 'local_only')
+})

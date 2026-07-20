@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Check, Copy, Info, RefreshCw, RotateCw, ShieldCheck, ShieldOff, TriangleAlert } from 'lucide-react'
+import { Check, Copy, Info, RefreshCw, RotateCw, ShieldCheck, ShieldOff, Trash2, TriangleAlert } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type {
@@ -25,6 +25,15 @@ import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import type { AssistantLabelMode, SessionViewPreferences } from '@/features/conversations/session-view-preferences'
 import { conversationApi } from '@/features/conversations/api'
@@ -53,8 +62,9 @@ interface SettingsSectionProps {
   ) => Promise<ClientIntegrationRemoveResult>
   conversationPreferences: SessionViewPreferences
   onConversationPreferencesChange: (preferences: SessionViewPreferences) => void
-  codexAccounts: Account[]
   onPluginReferenceChanged: () => void
+  onAddCodexPluginAccount: () => void
+  pluginAccountRefreshKey: number
 }
 
 const INTEGRATION_TARGETS: ReadonlyArray<{
@@ -118,8 +128,9 @@ export function SettingsSection({
   onRemoveClientIntegration,
   conversationPreferences,
   onConversationPreferencesChange,
-  codexAccounts,
   onPluginReferenceChanged,
+  onAddCodexPluginAccount,
+  pluginAccountRefreshKey,
 }: SettingsSectionProps) {
   const affinityManageable = affinity?.manageable ?? true
 
@@ -144,10 +155,17 @@ export function SettingsSection({
   const [modelFallbackBusy, setModelFallbackBusy] = useState(false)
   const [pluginReferenceValue, setPluginReferenceValue] = useState('local_only')
   const [pluginReferenceLabel, setPluginReferenceLabel] = useState('local-only')
+  const [pluginReferenceProblem, setPluginReferenceProblem] = useState<'selected_account_missing' | null>(null)
   const [pluginPreview, setPluginPreview] = useState<CodexPluginReferencePreview | null>(null)
   const [pluginReferenceError, setPluginReferenceError] = useState<string | null>(null)
   const [pluginReferenceBusy, setPluginReferenceBusy] = useState(false)
   const [pluginCatalog, setPluginCatalog] = useState<CodexPluginCatalog | null>(null)
+  const [codexPluginAccounts, setCodexPluginAccounts] = useState<Account[]>([])
+  const [pluginActionNotice, setPluginActionNotice] = useState<string | null>(null)
+  const [pluginDeleteAccount, setPluginDeleteAccount] = useState<Account | null>(null)
+  const [pluginDeleteReplacement, setPluginDeleteReplacement] = useState('local_only')
+  const [pluginDeleteBusy, setPluginDeleteBusy] = useState(false)
+  const [pluginDeleteError, setPluginDeleteError] = useState<string | null>(null)
   useEffect(() => {
     const appliedMode = clientIntegration?.targets.find(
       (target) => target.target === 'codex',
@@ -173,18 +191,37 @@ export function SettingsSection({
 
   useEffect(() => {
     let cancelled = false
-    Promise.all([client.getCodexPluginReference(), client.getCodexPluginCatalog()]).then(([status, catalog]) => {
-      if (cancelled) return
-      const value = status.state.mode === 'account' ? status.state.accountId : 'local_only'
-      setPluginReferenceValue(value)
-      setPluginReferenceLabel(status.account?.alias ?? 'local-only')
-      setPluginReferenceError(null)
-      setPluginCatalog(catalog)
-    }).catch((error: unknown) => {
-      if (!cancelled) setPluginReferenceError(error instanceof Error ? error.message : String(error))
-    })
+    void (async () => {
+      try {
+        const [status, pluginAccounts] = await Promise.all([
+          client.getCodexPluginReference(),
+          client.getCodexPluginAccounts(),
+        ])
+        if (cancelled) return
+        const value = status.state.mode === 'account' ? status.state.accountId : 'local_only'
+        setPluginReferenceValue(value)
+        setPluginReferenceProblem(status.problem)
+        setPluginReferenceLabel(status.account?.alias
+          ?? (status.problem === 'selected_account_missing' ? '찾을 수 없는 계정' : 'local-only'))
+        setCodexPluginAccounts(pluginAccounts)
+        try {
+          const catalog = await client.getCodexPluginCatalog()
+          if (!cancelled) {
+            setPluginCatalog(catalog)
+            setPluginReferenceError(null)
+          }
+        } catch (error) {
+          if (!cancelled) {
+            setPluginCatalog(null)
+            setPluginReferenceError(error instanceof Error ? error.message : String(error))
+          }
+        }
+      } catch (error) {
+        if (!cancelled) setPluginReferenceError(error instanceof Error ? error.message : String(error))
+      }
+    })()
     return () => { cancelled = true }
-  }, [codexAccounts])
+  }, [pluginAccountRefreshKey])
 
   const previewPluginReference = async () => {
     setPluginReferenceBusy(true)
@@ -207,7 +244,9 @@ export function SettingsSection({
     try {
       const result = await client.switchCodexPluginReference(pluginPreview)
       setPluginReferenceLabel(result.status.account?.alias ?? 'local-only')
+      setPluginReferenceProblem(result.status.problem)
       setPluginCatalog(result.catalog)
+      setCodexPluginAccounts(await client.getCodexPluginAccounts())
       setPluginPreview(null)
       setPluginReferenceError(null)
       onPluginReferenceChanged()
@@ -219,16 +258,54 @@ export function SettingsSection({
     }
   }
 
-  const mutatePlugin = async (operation: () => Promise<unknown>) => {
+  const mutatePlugin = async (operation: () => Promise<unknown>, successMessage: string) => {
     setPluginReferenceBusy(true)
     setPluginReferenceError(null)
     try {
-      await operation()
+      const result = await operation()
+      const appsNeedingAuth = result && typeof result === 'object' && 'appsNeedingAuth' in result
+        && Array.isArray(result.appsNeedingAuth)
+        ? result.appsNeedingAuth.flatMap((app) => (
+          app && typeof app === 'object' && 'name' in app && typeof app.name === 'string' ? [app.name] : []
+        ))
+        : []
+      setPluginActionNotice(appsNeedingAuth.length > 0
+        ? `${successMessage} Codex/ChatGPT에서 connector 인증 필요: ${appsNeedingAuth.join(', ')}`
+        : successMessage)
       setPluginCatalog(await client.getCodexPluginCatalog())
     } catch (error) {
       setPluginReferenceError(error instanceof Error ? error.message : String(error))
     } finally {
       setPluginReferenceBusy(false)
+    }
+  }
+
+  const deleteCodexPluginAccount = async () => {
+    const account = pluginDeleteAccount
+    if (!account || account.revision === undefined) return
+    setPluginDeleteBusy(true)
+    setPluginDeleteError(null)
+    try {
+      if (account.isPluginReference) {
+        const target = pluginDeleteReplacement === 'local_only'
+          ? { mode: 'local_only' as const, accountId: null }
+          : { mode: 'account' as const, accountId: pluginDeleteReplacement }
+        const preview = await client.previewCodexPluginReference(target)
+        const switched = await client.switchCodexPluginReference(preview)
+        setPluginReferenceValue(target.mode === 'account' ? target.accountId : 'local_only')
+        setPluginReferenceLabel(switched.status.account?.alias ?? 'local-only')
+        setPluginReferenceProblem(switched.status.problem)
+        setPluginCatalog(switched.catalog)
+      }
+      await client.removeCodexPluginAccount(account.id, account.revision)
+      setCodexPluginAccounts(await client.getCodexPluginAccounts())
+      setPluginDeleteAccount(null)
+      onPluginReferenceChanged()
+      toast.success('Codex 플러그인 계정을 삭제했습니다')
+    } catch (error) {
+      setPluginDeleteError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setPluginDeleteBusy(false)
     }
   }
 
@@ -723,7 +800,10 @@ export function SettingsSection({
               disabled={pluginReferenceBusy}
             >
               <option value="local_only">local-only (로컬·저장소 플러그인만)</option>
-              {codexAccounts.map((account) => (
+              {pluginReferenceProblem === 'selected_account_missing' ? (
+                <option value={pluginReferenceValue} disabled>현재 선택 계정 · 찾을 수 없음</option>
+              ) : null}
+              {codexPluginAccounts.map((account) => (
                 <option key={account.id} value={account.id}>
                   {account.nickname || account.email}{account.paused ? ' · 모델 라우팅 중지됨' : ''}
                 </option>
@@ -732,11 +812,47 @@ export function SettingsSection({
             <Button variant="outline" size="sm" disabled={pluginReferenceBusy} onClick={() => void previewPluginReference()}>
               {pluginReferenceBusy ? '확인 중…' : '변경 내용 미리보기'}
             </Button>
+            <Button variant="outline" size="sm" disabled={pluginReferenceBusy} onClick={onAddCodexPluginAccount}>
+              플러그인 계정 추가
+            </Button>
+            {codexPluginAccounts.length > 0 ? (
+              <div className="space-y-2 rounded-md border p-3">
+                <p className="text-xs font-medium">Native 기준계정 후보</p>
+                {codexPluginAccounts.map((account) => (
+                  <div key={account.id} className="flex items-center justify-between gap-3 text-xs">
+                    <span className="min-w-0 truncate">
+                      {account.nickname || account.email}
+                      {account.isPluginReference ? ' · 현재 기준' : ''}
+                      {account.paused ? ' · 모델 라우팅 중지' : ''}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={`${account.nickname || account.email} 삭제`}
+                      disabled={pluginReferenceBusy}
+                      onClick={() => {
+                        setPluginDeleteAccount(account)
+                        setPluginDeleteReplacement('local_only')
+                        setPluginDeleteError(null)
+                      }}
+                    >
+                      <Trash2 className="size-4" aria-hidden />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
             {pluginPreview ? (
               <div className="space-y-2 rounded-md border p-3 text-xs">
-                <p>추가 {pluginPreview.addedPluginIds.length}개 · 제거 {pluginPreview.removedPluginIds.length}개 · 유지 {pluginPreview.unchangedPluginIds.length}개</p>
-                {pluginPreview.addedPluginIds.length > 0 ? <p className="text-emerald-700 dark:text-emerald-300">추가: {pluginPreview.addedPluginIds.join(', ')}</p> : null}
-                {pluginPreview.removedPluginIds.length > 0 ? <p className="text-amber-700 dark:text-amber-300">제거: {pluginPreview.removedPluginIds.join(', ')}</p> : null}
+                {pluginPreview.diffAvailable ? (
+                  <>
+                    <p>추가 {pluginPreview.addedPluginIds.length}개 · 제거 {pluginPreview.removedPluginIds.length}개 · 유지 {pluginPreview.unchangedPluginIds.length}개</p>
+                    {pluginPreview.addedPluginIds.length > 0 ? <p className="text-emerald-700 dark:text-emerald-300">추가: {pluginPreview.addedPluginIds.join(', ')}</p> : null}
+                    {pluginPreview.removedPluginIds.length > 0 ? <p className="text-amber-700 dark:text-amber-300">제거: {pluginPreview.removedPluginIds.join(', ')}</p> : null}
+                  </>
+                ) : (
+                  <p className="text-amber-700 dark:text-amber-300">{pluginPreview.currentCatalogError}</p>
+                )}
                 <p className="text-amber-700 dark:text-amber-300">
                   Connector 및 private workspace 권한은 계정 사이에 이전되지 않습니다. 전환 후 필요한 connector를 다시 인증해야 할 수 있습니다.
                 </p>
@@ -759,7 +875,10 @@ export function SettingsSection({
                         variant="outline"
                         size="sm"
                         disabled={pluginReferenceBusy}
-                        onClick={() => void mutatePlugin(() => client.uninstallCodexPlugin(plugin.id))}
+                        onClick={() => void mutatePlugin(
+                          () => client.uninstallCodexPlugin(plugin.id),
+                          '플러그인을 제거했습니다.',
+                        )}
                       >
                         제거
                       </Button>
@@ -768,12 +887,15 @@ export function SettingsSection({
                         variant="outline"
                         size="sm"
                         disabled={pluginReferenceBusy}
-                        onClick={() => void mutatePlugin(() => client.installCodexPlugin({
-                          ...(marketplace.path
-                            ? { marketplacePath: marketplace.path }
-                            : { remoteMarketplaceName: marketplace.name }),
-                          pluginName: plugin.name,
-                        }))}
+                        onClick={() => void mutatePlugin(
+                          () => client.installCodexPlugin({
+                            ...(marketplace.path
+                              ? { marketplacePath: marketplace.path }
+                              : { remoteMarketplaceName: marketplace.name }),
+                            pluginName: plugin.name,
+                          }),
+                          '플러그인을 설치했습니다.',
+                        )}
                       >
                         설치
                       </Button>
@@ -785,7 +907,52 @@ export function SettingsSection({
                 ) : null}
               </div>
             ) : null}
+            {pluginActionNotice ? <p className="text-xs text-muted-foreground">{pluginActionNotice}</p> : null}
             {pluginReferenceError ? <p className="text-xs text-destructive">{pluginReferenceError}</p> : null}
+            <Dialog
+              open={pluginDeleteAccount !== null}
+              onOpenChange={(open) => { if (!open && !pluginDeleteBusy) setPluginDeleteAccount(null) }}
+            >
+              <DialogContent className="sm:max-w-sm">
+                <DialogHeader>
+                  <DialogTitle>Codex 플러그인 계정 삭제</DialogTitle>
+                  <DialogDescription>
+                    {pluginDeleteAccount?.nickname || pluginDeleteAccount?.email} 계정을 Native vault에서 삭제합니다.
+                  </DialogDescription>
+                </DialogHeader>
+                {pluginDeleteAccount?.isPluginReference ? (
+                  <div className="space-y-2">
+                    <p className="text-sm text-amber-700 dark:text-amber-300">
+                      현재 플러그인 기준계정이므로 먼저 다른 계정 또는 local-only로 전환해야 합니다.
+                    </p>
+                    <select
+                      className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                      value={pluginDeleteReplacement}
+                      onChange={(event) => setPluginDeleteReplacement(event.target.value)}
+                      disabled={pluginDeleteBusy}
+                    >
+                      <option value="local_only">local-only</option>
+                      {codexPluginAccounts.filter((account) => account.id !== pluginDeleteAccount.id).map((account) => (
+                        <option key={account.id} value={account.id}>{account.nickname || account.email}</option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-muted-foreground">
+                      Connector와 private workspace 권한은 이전되지 않으며 다시 인증해야 할 수 있습니다.
+                    </p>
+                  </div>
+                ) : null}
+                {pluginDeleteError ? <p className="text-xs text-destructive">{pluginDeleteError}</p> : null}
+                <DialogFooter>
+                  <DialogClose asChild>
+                    <Button variant="outline" disabled={pluginDeleteBusy}>취소</Button>
+                  </DialogClose>
+                  <Button variant="destructive" disabled={pluginDeleteBusy} onClick={() => void deleteCodexPluginAccount()}>
+                    <Trash2 className="size-4" aria-hidden />
+                    {pluginDeleteBusy ? '처리 중…' : pluginDeleteAccount?.isPluginReference ? '전환 후 삭제' : '삭제'}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </div>
         </Row>
 

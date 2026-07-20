@@ -105,15 +105,20 @@ export interface AddAccountWizardProps {
   onOpenChange: (open: boolean) => void
   /** Called once an account is successfully added (parent refreshes lists). */
   onAdded: () => void
+  /** Fix the provider and bypass model-integration routing for a dedicated Native vault account. */
+  fixedProvider?: Provider
+  forceNative?: boolean
 }
 
 export function AddAccountWizard({
   open,
   onOpenChange,
   onAdded,
+  fixedProvider,
+  forceNative = false,
 }: AddAccountWizardProps) {
   const [step, setStep] = useState<Step>("start")
-  const [provider, setProvider] = useState<Provider>("claude")
+  const [provider, setProvider] = useState<Provider>(fixedProvider ?? "claude")
   const [nickname, setNickname] = useState("")
 
   const [authUrl, setAuthUrl] = useState("")
@@ -124,12 +129,16 @@ export function AddAccountWizard({
   const [submitting, setSubmitting] = useState(false)
   const [flowError, setFlowError] = useState<string | null>(null)
 
+  useEffect(() => {
+    if (fixedProvider) setProvider(fixedProvider)
+  }, [fixedProvider])
+
   // Guards against onAdded firing twice (poll + submit racing to success).
   const completedRef = useRef(false)
 
   const reset = useCallback(() => {
     setStep("start")
-    setProvider("claude")
+    setProvider(fixedProvider ?? "claude")
     setNickname("")
     setAuthUrl("")
     setOauthState(null)
@@ -138,7 +147,7 @@ export function AddAccountWizard({
     setSubmitting(false)
     setFlowError(null)
     completedRef.current = false
-  }, [])
+  }, [fixedProvider])
 
   const markComplete = useCallback(() => {
     if (completedRef.current) return
@@ -155,7 +164,7 @@ export function AddAccountWizard({
     let timeoutId: number | undefined
     const poll = async () => {
       try {
-        const res = await client.getAddStatus(provider, oauthState)
+        const res = await client.getAddStatus(provider, oauthState, forceNative)
         if (!active) return
         if (res.status === "success") markComplete()
         else if (res.status === "error")
@@ -172,7 +181,7 @@ export function AddAccountWizard({
       active = false
       if (timeoutId !== undefined) window.clearTimeout(timeoutId)
     }
-  }, [step, oauthState, provider, markComplete])
+  }, [step, oauthState, provider, forceNative, markComplete])
 
   const openAuthTab = useCallback((url: string) => {
     const win = window.open(url, "_blank", "noopener,noreferrer")
@@ -189,7 +198,8 @@ export function AddAccountWizard({
     try {
       const { url, state } = await client.startAddAccount(
         provider,
-        nickname.trim() || undefined
+        nickname.trim() || undefined,
+        forceNative,
       )
       setAuthUrl(url)
       setOauthState(state)
@@ -210,7 +220,7 @@ export function AddAccountWizard({
     setSubmitting(true)
     setFlowError(null)
     try {
-      const res = await client.submitCallback(provider, callbackUrl.trim())
+      const res = await client.submitCallback(provider, callbackUrl.trim(), forceNative)
       if (res.status === "success") markComplete()
       else if (res.status === "error")
         setFlowError(res.error || "콜백 제출에 실패했습니다.")
@@ -229,7 +239,7 @@ export function AddAccountWizard({
   async function handleRestart() {
     if (oauthState) {
       try {
-        await client.cancelAddAccount(provider)
+        await client.cancelAddAccount(provider, forceNative)
       } catch {
         // Best-effort — server may have already discarded the state.
       }
@@ -256,13 +266,13 @@ export function AddAccountWizard({
       if (!next) {
         // Closing mid-flow: cancel the in-progress OAuth attempt server-side.
         if (oauthState && step !== "done") {
-          client.cancelAddAccount(provider).catch(() => {})
+          client.cancelAddAccount(provider, forceNative).catch(() => {})
         }
         reset()
       }
       onOpenChange(next)
     },
-    [oauthState, step, provider, reset, onOpenChange]
+    [oauthState, step, provider, forceNative, reset, onOpenChange]
   )
 
   const validation = useMemo(
@@ -277,9 +287,11 @@ export function AddAccountWizard({
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>계정 추가</DialogTitle>
+          <DialogTitle>{forceNative ? 'Codex 플러그인 계정 추가' : '계정 추가'}</DialogTitle>
           <DialogDescription>
-            OAuth로 Claude 또는 Codex 계정을 Baton에 연결합니다.
+            {forceNative
+              ? '모델 integration 설정을 바꾸지 않고 Codex 계정을 Baton Native vault에 연결합니다.'
+              : 'OAuth로 Claude 또는 Codex 계정을 Baton에 연결합니다.'}
           </DialogDescription>
         </DialogHeader>
 
@@ -319,7 +331,7 @@ export function AddAccountWizard({
         {/* ---- STEP 1: 시작 ---- */}
         {step === "start" && (
           <div className="flex flex-col gap-4">
-            <div className="flex flex-col gap-2">
+            {!fixedProvider ? <div className="flex flex-col gap-2">
               <Label>제공자</Label>
               <RadioGroup
                 value={provider}
@@ -344,7 +356,7 @@ export function AddAccountWizard({
                   </Label>
                 ))}
               </RadioGroup>
-            </div>
+            </div> : null}
 
             <div className="flex flex-col gap-2">
               <Label htmlFor="nickname">닉네임 (선택)</Label>
@@ -492,7 +504,9 @@ export function AddAccountWizard({
             </div>
             <p className="text-base font-medium">계정이 추가되었습니다</p>
             <p className="text-sm text-muted-foreground">
-              {PROVIDER_LABELS[provider]} 계정이 로테이션에 등록되었습니다.
+              {forceNative
+                ? `${PROVIDER_LABELS[provider]} 계정이 플러그인 기준계정 후보로 등록되었습니다.`
+                : `${PROVIDER_LABELS[provider]} 계정이 로테이션에 등록되었습니다.`}
             </p>
             <DialogFooter className="w-full sm:justify-center">
               <Button onClick={() => handleOpenChange(false)}>닫기</Button>

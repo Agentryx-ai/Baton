@@ -224,6 +224,56 @@ test('Codex plugin reference mutations use the explicit interaction contract', a
   })
 })
 
+test('Codex plugin reference candidates always use the Native vault endpoint', async () => {
+  const originalFetch = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (input) => {
+    urls.push(String(input))
+    return Response.json({ accounts: [{ id: 'native-account' }] })
+  }) as typeof fetch
+  try {
+    assert.deepEqual(await client.getCodexPluginAccounts(), [{ id: 'native-account' }])
+    await client.removeCodexPluginAccount('native-account', 7)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(urls, [
+    '/baton/codex-native/accounts',
+    '/baton/codex-native/accounts/native-account',
+  ])
+})
+
+test('dedicated Codex plugin OAuth bypasses the model integration backend', async () => {
+  const originalFetch = globalThis.fetch
+  const urls: string[] = []
+  let startBody: unknown = null
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input)
+    urls.push(url)
+    if (url.endsWith('/auth/start-url')) {
+      startBody = init?.body ? JSON.parse(String(init.body)) : null
+      return Response.json({ url: 'https://auth.openai.com/oauth/authorize', state: 'plugin-state' })
+    }
+    if (url.includes('/auth/status?')) return Response.json({ status: 'wait' })
+    return Response.json({ success: true })
+  }) as typeof fetch
+  try {
+    await client.startAddAccount('codex', 'Plugin Account', true)
+    await client.getAddStatus('codex', 'plugin-state', true)
+    await client.submitCallback('codex', 'http://localhost:1455/auth/callback?code=x&state=plugin-state', true)
+    await client.cancelAddAccount('codex', true)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(urls, [
+    '/baton/codex-native/auth/start-url',
+    '/baton/codex-native/auth/status?state=plugin-state',
+    '/baton/codex-native/auth/submit-callback',
+    '/baton/codex-native/auth/cancel',
+  ])
+  assert.deepEqual(startBody, { nickname: 'Plugin Account', enabledForModelRouting: false })
+})
+
 test('native-openai Codex account operations never call CLIProxy', async () => {
   const originalFetch = globalThis.fetch
   const urls: string[] = []

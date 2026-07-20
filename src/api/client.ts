@@ -198,6 +198,19 @@ export const client = {
   getClientIntegrationStatus: (): Promise<ClientIntegrationStatus> =>
     request<ClientIntegrationStatus>('/baton/client-integration'),
 
+  /** Plugin reference candidates always come from Baton's Native vault, independent of model integration mode. */
+  getCodexPluginAccounts: async (): Promise<Account[]> => {
+    const body = await request<{ accounts?: Account[] }>('/baton/codex-native/accounts')
+    return body.accounts ?? []
+  },
+
+  removeCodexPluginAccount: async (accountId: string, expectedRevision: number): Promise<void> => {
+    await request(`/baton/codex-native/accounts/${encodeURIComponent(accountId)}`, {
+      method: 'DELETE',
+      json: { expectedRevision },
+    })
+  },
+
   getCodexPluginReference: (): Promise<CodexPluginReferenceStatus> =>
     request<CodexPluginReferenceStatus>('/baton/codex-plugins/reference'),
 
@@ -361,8 +374,9 @@ export const client = {
   startAddAccount: async (
     provider: Provider,
     nickname?: string,
+    forceNative = false,
   ): Promise<{ url: string; state: string }> => {
-    const native = await usesNativeAccountBackend(provider)
+    const native = forceNative || await usesNativeAccountBackend(provider)
     const body = await request<{
       url?: string
       auth_url?: string
@@ -372,7 +386,7 @@ export const client = {
       ? `${nativeProviderBase(provider)}/auth/start-url`
       : `/api/cliproxy/auth/${provider}/start-url`, {
       method: 'POST',
-      json: { nickname },
+      json: { nickname, ...(forceNative ? { enabledForModelRouting: false } : {}) },
     })
     const url = body.authUrl ?? body.url ?? body.auth_url ?? ''
     // State may be a top-level field or only embedded in the auth URL.
@@ -387,8 +401,8 @@ export const client = {
     return { url, state }
   },
 
-  getAddStatus: async (provider: Provider, state: string): Promise<AddStatus> => {
-    const native = await usesNativeAccountBackend(provider)
+  getAddStatus: async (provider: Provider, state: string, forceNative = false): Promise<AddStatus> => {
+    const native = forceNative || await usesNativeAccountBackend(provider)
     return normalizeAddStatus(await request<GatewayAddStatus>(
       native
         ? `${nativeProviderBase(provider)}/auth/status?state=${encodeURIComponent(state)}`
@@ -399,8 +413,9 @@ export const client = {
   submitCallback: async (
     provider: Provider,
     redirectUrl: string,
+    forceNative = false,
   ): Promise<AddStatus> => {
-    const native = await usesNativeAccountBackend(provider)
+    const native = forceNative || await usesNativeAccountBackend(provider)
     return request<GatewayAddStatus>(native
       ? `${nativeProviderBase(provider)}/auth/submit-callback`
       : `/api/cliproxy/auth/${provider}/submit-callback`, {
@@ -409,8 +424,8 @@ export const client = {
     }).then(normalizeAddStatus)
   },
 
-  cancelAddAccount: async (provider: Provider): Promise<void> => {
-    const native = await usesNativeAccountBackend(provider)
+  cancelAddAccount: async (provider: Provider, forceNative = false): Promise<void> => {
+    const native = forceNative || await usesNativeAccountBackend(provider)
     await request(native
       ? `${nativeProviderBase(provider)}/auth/cancel`
       : `/api/cliproxy/auth/${provider}/cancel`, { method: 'POST' })
