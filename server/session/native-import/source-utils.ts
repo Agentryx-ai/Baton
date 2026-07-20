@@ -93,6 +93,18 @@ export function cwdAlias(cwd: string | null, fallback: string): string {
   return cwd ? safeAlias(path.basename(cwd), fallback) : fallback
 }
 
+/**
+ * Strip Windows verbatim prefixes that native CLIs record via canonicalize
+ * (\\?\C:\... and \\?\UNC\host\share\...). They are valid filesystem paths but
+ * render confusingly in the UI and never match user-entered paths.
+ */
+export function normalizeNativeCwd(cwd: string | null | undefined): string | null {
+  if (!cwd) return null
+  if (cwd.startsWith('\\\\?\\UNC\\')) return `\\\\${cwd.slice(8)}`
+  if (cwd.startsWith('\\\\?\\')) return cwd.slice(4)
+  return cwd
+}
+
 export async function readStableFile(filePath: string): Promise<{ text: string, head: NativeSourceHead }> {
   const before = await stat(filePath)
   if (before.size > MAX_NATIVE_FILE_BYTES) throw new Error('native_source_file_size_limit')

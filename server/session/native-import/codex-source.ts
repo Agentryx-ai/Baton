@@ -8,7 +8,7 @@ import type {
 } from './contracts.ts'
 import {
   candidateId, canonicalRoot, containedRealPath, cwdAlias, inspectStableFile, mapWithConcurrency, messageText,
-  MAX_NATIVE_CANDIDATES, nativePhysicalLines, NativeRecordAccumulator, PARSER_VERSION,
+  MAX_NATIVE_CANDIDATES, nativePhysicalLines, NativeRecordAccumulator, normalizeNativeCwd, PARSER_VERSION,
   pseudonymousNamespace, readStableFile, safeAlias, sanitizeToolInput, sanitizeToolResult,
   sanitizeReasoningSummary, sha256, stableJson,
 } from './source-utils.ts'
@@ -158,7 +158,7 @@ export class CodexLocalSourceReader implements NativeSourceReader {
     const source = includeRecords ? await readStableFile(canonicalRolloutPath) : null
     const sourceHead = source?.head ?? await inspectStableFile(canonicalRolloutPath)
     const parsed = source ? parseCodexRecords(source.text, nativeSessionId, true) : null
-    const cwd = string(row.cwd)
+    const cwd = normalizeNativeCwd(string(row.cwd))
     const explicitTitle = string(row.title)
     const fallback = cwdAlias(cwd, 'Codex task')
     const alias = explicitTitle ? safeAlias(explicitTitle, fallback) : fallback

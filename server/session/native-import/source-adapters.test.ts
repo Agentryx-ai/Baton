@@ -9,7 +9,7 @@ import { ClaudeLocalSourceReader } from './claude-source.ts'
 import { CodexLocalSourceReader } from './codex-source.ts'
 import {
   mapWithConcurrency, MAX_NATIVE_CANDIDATES, MAX_NATIVE_FILE_BYTES, MAX_NATIVE_PHYSICAL_LINES,
-  sha256, stableJson,
+  normalizeNativeCwd, sha256, stableJson,
 } from './source-utils.ts'
 
 const NAMESPACE_SECRET = Buffer.alloc(32, 7)
@@ -283,6 +283,27 @@ test('Codex local inventory defaults to active user surfaces and opts into inter
   assert.deepEqual(expanded.map((candidate) => candidate.nativeSessionId).sort(), [
     'cli-active', 'cli-archived', 'exec-active', 'ide-active', 'subagent-active',
   ])
+})
+
+test('Codex adapter strips Windows verbatim prefixes from recorded cwd values', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-verbatim-'))
+  const sessions = path.join(home, 'sessions')
+  await mkdir(sessions)
+  const rollout = path.join(sessions, 'verbatim.jsonl')
+  await writeFile(rollout, JSON.stringify({ type: 'session_meta', payload: { id: 'verbatim' } }))
+  const db = createCodexDatabase(home)
+  db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)')
+    .run('verbatim', rollout, 1, 2, '\\\\?\\C:\\work\\alpha', null, null)
+  db.close()
+
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
+  const [candidate] = await reader.scan({ includeRecords: false })
+  assert.equal(candidate?.cwd, 'C:\\work\\alpha')
+  assert.equal(candidate?.projectAlias, 'alpha')
+
+  assert.equal(normalizeNativeCwd('\\\\?\\UNC\\host\\share\\repo'), '\\\\host\\share\\repo')
+  assert.equal(normalizeNativeCwd('C:\\plain'), 'C:\\plain')
+  assert.equal(normalizeNativeCwd(null), null)
 })
 
 test('Codex adapter reports unavailable and unsupported stores instead of a silent empty inventory', async () => {

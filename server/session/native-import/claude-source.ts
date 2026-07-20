@@ -8,7 +8,7 @@ import type {
 } from './contracts.ts'
 import {
   candidateId, canonicalRoot, containedRealPath, cwdAlias, inspectStableFile, mapWithConcurrency,
-  MAX_NATIVE_CANDIDATES, messageText, nativePhysicalLines, NativeRecordAccumulator, PARSER_VERSION,
+  MAX_NATIVE_CANDIDATES, messageText, nativePhysicalLines, NativeRecordAccumulator, normalizeNativeCwd, PARSER_VERSION,
   pseudonymousNamespace, readStableFile, safeAlias, sanitizeToolInput, sanitizeToolResult,
   sha256, stableJson,
 } from './source-utils.ts'
@@ -236,7 +236,7 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
     const source = includeRecords ? await readStableFile(canonicalTranscript) : null
     const sourceHead = source?.head ?? await inspectStableFile(canonicalTranscript)
     const parsed = source ? parseClaudeRecords(source.text, cliSessionId, sourceClient, true) : null
-    const cwd = string(metadata.cwd) ?? parsed?.cwd ?? null
+    const cwd = normalizeNativeCwd(string(metadata.cwd) ?? parsed?.cwd)
     const metadataTitle = string(metadata.title)
     const fallback = cwdAlias(cwd, 'Claude task')
     const title = metadataTitle
@@ -305,7 +305,7 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
         || parsed.skipped !== candidate.skippedItemCount))) {
       throw new Error('source_changed_after_scan')
     }
-    const cwd = candidate.cwd ?? parsed.cwd
+    const cwd = normalizeNativeCwd(candidate.cwd ?? parsed.cwd)
     const fallback = cwdAlias(cwd, 'Claude task')
     const parsedAlias = parsed.title ? safeAlias(parsed.title.value, fallback) : fallback
     const preserveAlias = candidate.aliasSource === 'native'
