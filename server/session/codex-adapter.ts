@@ -28,8 +28,8 @@ import { hasPortableUserContent, imageAttachments, type ImageArtifactResolver } 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
   project_doc_max_bytes: 0,
-  'features.multi_agent': false,
-  'features.multi_agent_v2': false,
+  'features.multi_agent': true,
+  'features.multi_agent_v2': true,
   'features.enable_fanout': false,
   'features.shell_tool': false,
   'features.standalone_web_search': false,
@@ -38,8 +38,6 @@ const HARDENING_OVERRIDES = Object.freeze({
 })
 
 const VERIFIED_FEATURES = [
-  'multi_agent',
-  'multi_agent_v2',
   'enable_fanout',
   'shell_tool',
   'standalone_web_search',
@@ -56,10 +54,11 @@ const IGNORED_GLOBAL_NOTIFICATIONS = new Set([
 ])
 
 const CANONICAL_TOOL_BOUNDARY_INSTRUCTIONS = `Baton is the canonical execution owner.
-Use only the dynamic tools exposed by Baton in this turn. Do not invoke Codex-native collaboration,
-subagent, shell, web search, MCP, app, plugin, approval, or task-execution tools. If requested work
-requires an unavailable capability, continue safely with available Baton tools or report the exact
-limitation; never create execution outside Baton's canonical ledger.
+Use the dynamic tools exposed by Baton and Codex-native collaboration/subagent tools. Native child
+agents are provider-managed, inherit this turn's safety and workspace boundaries, and are recorded
+as private provider audit events rather than Baton-owned child executions. Do not invoke Codex-native
+shell, web search, MCP, app, plugin, approval, or other task-execution tools. If requested work requires
+an unavailable capability, continue safely with available tools or report the exact limitation.
 When a selected skill provides a filesystem location, read its files with read_skill_resource using
 the skill name and a skill-relative path (normally SKILL.md). Never pass an absolute skill path to
 read_file.`
@@ -71,6 +70,15 @@ const ALLOWED_ITEM_TYPES = new Set([
   'plan',
   'dynamicToolCall',
   'contextCompaction',
+  'collabAgentToolCall',
+])
+
+const CODEX_NATIVE_AGENT_TOOLS = Object.freeze([
+  'spawn_agent',
+  'send_input',
+  'resume_agent',
+  'wait',
+  'close_agent',
 ])
 
 type JsonObject = Record<string, unknown>
@@ -431,8 +439,10 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       terminalResolve = resolve
     })
     let disposed = false
+    let disposePromise: Promise<void> | null = null
     let nativeThreadId: string | null = null
     let nativeTurnId: string | null = null
+    const nativeChildThreadIds = new Set<string>()
     let cumulativeUsage: Record<string, unknown> | null = null
     let cancelPromise: Promise<void> | null = null
     let terminalOverride: ProviderTerminalResult | null = null
@@ -512,27 +522,39 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       fail(new Error(message), code)
     }
 
-    const dispose = async (): Promise<void> => {
-      if (disposed) return
-      disposed = true
-      acceptingSteers = false
-      await Promise.race([closeSteers(), delay(this.shutdownTimeoutMs)])
-      const inputClosed = await Promise.race([
-        process.closeInput().then(() => true, () => true),
-        delay(this.shutdownTimeoutMs).then(() => false),
-      ])
-      const exited = inputClosed && await Promise.race([
-        process.exited.then(() => true, () => true),
-        delay(this.shutdownTimeoutMs).then(() => false),
-      ])
-      if (!exited) {
-        await process.kill().catch(() => undefined)
-        await Promise.race([
-          process.exited.catch(() => undefined),
-          delay(this.shutdownTimeoutMs),
+    const dispose = (): Promise<void> => {
+      disposePromise ??= (async () => {
+        disposed = true
+        acceptingSteers = false
+        await Promise.race([closeSteers(), delay(this.shutdownTimeoutMs)])
+        const threadIds = [...nativeChildThreadIds, nativeThreadId].filter(
+          (threadId): threadId is string => threadId !== null,
+        )
+        for (const threadId of threadIds) {
+          await withTimeout(
+            client.request('thread/archive', { threadId }),
+            this.shutdownTimeoutMs,
+            'Codex thread/archive request',
+          ).catch(() => undefined)
+        }
+        const inputClosed = await Promise.race([
+          process.closeInput().then(() => true, () => true),
+          delay(this.shutdownTimeoutMs).then(() => false),
         ])
-      }
-      await cacheBridge?.close().catch(() => undefined)
+        const exited = inputClosed && await Promise.race([
+          process.exited.then(() => true, () => true),
+          delay(this.shutdownTimeoutMs).then(() => false),
+        ])
+        if (!exited) {
+          await process.kill().catch(() => undefined)
+          await Promise.race([
+            process.exited.catch(() => undefined),
+            delay(this.shutdownTimeoutMs),
+          ])
+        }
+        await cacheBridge?.close().catch(() => undefined)
+      })()
+      return disposePromise
     }
 
     const cancel = async (code = 'user_cancelled', message = 'Codex turn was cancelled'): Promise<void> => {
@@ -637,7 +659,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           developerInstructions: body.developerInstructions,
           environments: [],
           runtimeWorkspaceRoots: [],
-          ephemeral: true,
+          ephemeral: false,
           approvalPolicy: 'never',
           approvalsReviewer: 'user',
           dynamicTools: context.toolDefinitions.map(dynamicToolSpec),
@@ -654,8 +676,8 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         )
       }
       const thread = asObject(start.thread, 'thread/start thread')
-      if (thread.ephemeral !== true || thread.path !== null) {
-        throw new Error('Codex canonical mode requires an ephemeral thread with no rollout path')
+      if (thread.ephemeral !== false || typeof thread.path !== 'string' || thread.path.length === 0) {
+        throw new Error('Codex provider-native delegation requires a persisted thread with a rollout path')
       }
       if (!Array.isArray(start.runtimeWorkspaceRoots) || start.runtimeWorkspaceRoots.length !== 0) {
         throw new Error('Codex canonical mode requires zero execution environment roots')
@@ -754,6 +776,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 `unexpected native execution event ${message.method}:${forbiddenItemType}`,
               )
             }
+            trackNativeChildThreads(params, nativeChildThreadIds)
             if (message.method === 'thread/tokenUsage/updated') {
               const snapshot = codexUsageSnapshot(params)
               cumulativeUsage = snapshot === null
@@ -878,6 +901,23 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           nativeId,
         }]
       }
+      if (type === 'collabAgentToolCall') {
+        return [{
+          kind: 'provider_event',
+          visibility: 'baton_private',
+          payload: {
+            event: 'provider_native_collaboration',
+            tool: typeof item.tool === 'string' ? item.tool : null,
+            status: typeof item.status === 'string' ? item.status : 'completed',
+            senderThreadId: typeof item.senderThreadId === 'string' ? item.senderThreadId : null,
+            receiverThreadIds: Array.isArray(item.receiverThreadIds)
+              ? item.receiverThreadIds.filter((value): value is string => typeof value === 'string')
+              : [],
+          },
+          provider: 'codex',
+          nativeId,
+        }]
+      }
     }
     if (event.type === 'turn/plan/updated') {
       return [{
@@ -911,8 +951,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
     return []
   }
 
-  // Every safe Codex turn owns an ephemeral process/thread that is disposed at
-  // completion. Persisting its native id would create a false resumable binding.
+  // Every Codex turn owns a transient provider thread which is persisted only
+  // long enough for native child threads to resolve, then archived on dispose.
+  // Persisting its native id would create a false resumable Baton binding.
   extractBinding(_event: NativeProviderEvent) { return null }
 
   skillResources(): readonly ProviderSkillResource[] {
@@ -959,9 +1000,9 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         continuation: 'stateless',
         reasoningState: 'portable-summary',
         taskMetadata: true,
-        nativeChildExecution: 'disabled',
+        nativeChildExecution: 'exposed',
       },
-      exposedNativeAgentTools: [],
+      exposedNativeAgentTools: [...CODEX_NATIVE_AGENT_TOOLS],
       enforcementEvidence: {
         ...evidence,
         mcpServersDisabled: Object.keys(this.mcpDisableOverrides).length,
@@ -969,7 +1010,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
         providerLocalMetadataTools: ['update_plan'],
         modelSelectedMultiAgent: this.modelCatalogPath === null
           ? 'test-process-factory'
-          : `disabled-for-${this.modelCatalogModelCount}-models`,
+          : `provider-native-for-${this.modelCatalogModelCount}-models`,
         canonicalCacheIdentity: this.cacheIdentitySecret
           ? 'hmac-sha256-loopback-responses-bridge-v1'
           : 'disabled-no-installation-secret',
@@ -1067,7 +1108,7 @@ export function hardenCodexModelCatalog(raw: string): { json: string; modelCount
     if (typeof model.slug !== 'string' || model.slug.trim().length === 0) {
       throw new Error(`Codex model catalog entry ${String(index)} omitted its slug`)
     }
-    return { ...model, multi_agent_version: 'disabled' }
+    return { ...model }
   })
   return { json: JSON.stringify({ ...catalog, models }), modelCount: models.length }
 }
@@ -1311,6 +1352,14 @@ function assertActiveNativeIds(
   }
   if (typeof params?.turnId === 'string' && params.turnId !== turnId) {
     throw capabilityViolation('Codex event referenced a foreign native turn')
+  }
+}
+
+function trackNativeChildThreads(params: JsonObject | null, threadIds: Set<string>): void {
+  const item = asOptionalObject(params?.item)
+  if (item?.type !== 'collabAgentToolCall' || !Array.isArray(item.receiverThreadIds)) return
+  for (const threadId of item.receiverThreadIds) {
+    if (typeof threadId === 'string' && threadId.length > 0) threadIds.add(threadId)
   }
 }
 

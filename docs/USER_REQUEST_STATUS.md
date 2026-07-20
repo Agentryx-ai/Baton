@@ -101,7 +101,7 @@
 | SESSION-01 | provider-neutral 공통 세션 관리 계층 설계, Gemini 포함 | 완료(설계)·V1 구현 | canonical session/thread/turn/item/execution SQLite와 Claude/Codex/Gemini adapter가 존재. |
 | SESSION-02 | Baton만 대화 정본이고 provider는 현재 턴 실행 어댑터 | 완료(계약)·핵심 V1 구현 | README/설계/SQLite/adapter 경계와 canonical turn loop에 반영했다. ordered canonical items, provider별 materialization, immutable derived auto compaction까지 구현·승인했다. Baton-managed child execution은 별도 후속 범위다. |
 | SESSION-03 | 응답마다 요청 model/실제 model/effort 등 turn 메타데이터 보존 | 완료 | assistant payload/turn provenance와 UI model label을 보존하며 Fable→Opus fallback도 구분. |
-| SESSION-04 | Codex/Claude native subagent·task가 정본 밖 대화를 만들지 못하도록 차단 | 완료(차단 모드) | Codex app-server native child/MCP/plugin/shell surface 검증 및 차단. Claude/Gemini는 Baton 도구만 전달. |
+| SESSION-04 | Codex native subagent 금지 계약을 provider-native 허용 계약으로 변경 | 구현·live 검증 대기 | Codex collaboration tools를 명시적으로 노출하고 lifecycle을 Baton-private audit로 기록하며 transient parent/child thread를 archive. Baton-owned child execution으로 오인하지 않고 MCP/plugin/shell은 계속 차단. |
 | SESSION-05 | 향후 child execution은 Baton이 ID·계보·예산·권한을 소유 | 부분 완료 | execution schema와 delegation disabled 계약만 존재. child API/scheduler/join/cancel은 미구현. |
 | SESSION-06 | Codex native thread SSOT 모드와 Baton canonical runtime을 모순 없이 분리 | 완료(설계/설정) | native client proxy는 Codex thread SSOT, canonical runtime은 Baton SSOT로 명시. 자동 merge하지 않음. |
 | SESSION-07 | provider 간 fork/DB 직접 수정으로 이중 SSOT를 만들지 않음 | 완료(정책) | DB/JSONL 직접 mutation 금지, native import는 명시적 fork-copy만 수행. |

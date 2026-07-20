@@ -175,7 +175,9 @@ export class TurnOrchestrator implements ConversationService {
       input: normalized.input,
       adapterVersion: ready.handshake.adapterVersion,
       policySnapshot: {
-        delegationMode: 'disabled',
+        delegationMode: ready.handshake.capabilities.nativeChildExecution === 'exposed'
+          ? 'provider-native'
+          : 'disabled',
         allowedTools: toolDefinitions.map((tool) => tool.name),
         approvalPolicy: 'never',
         cwd: workspaceCwd,
@@ -459,7 +461,10 @@ export class TurnOrchestrator implements ConversationService {
         effort: prior.effort,
         adapterVersion: ready.handshake.adapterVersion,
         policySnapshot: {
-          delegationMode: 'disabled', allowedTools: toolDefinitions.map((tool) => tool.name),
+          delegationMode: ready.handshake.capabilities.nativeChildExecution === 'exposed'
+            ? 'provider-native'
+            : 'disabled',
+          allowedTools: toolDefinitions.map((tool) => tool.name),
           approvalPolicy: 'never', cwd: workspaceCwd, maxDepth: 0,
           capabilityGrant: null,
           permissionProfile: snapshot.session.permissions.effectiveProfile,
@@ -564,7 +569,9 @@ export class TurnOrchestrator implements ConversationService {
       input: input.input,
       adapterVersion: ready.handshake.adapterVersion,
       policySnapshot: {
-        delegationMode: 'disabled',
+        delegationMode: ready.handshake.capabilities.nativeChildExecution === 'exposed'
+          ? 'provider-native'
+          : 'disabled',
         allowedTools: toolDefinitions.map((tool) => tool.name),
         approvalPolicy: 'never',
         cwd: workspaceCwd,

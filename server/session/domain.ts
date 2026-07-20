@@ -467,7 +467,7 @@ export interface CanonicalExecution {
 }
 
 export interface ExecutionPolicySnapshot {
-  delegationMode: 'disabled' | 'baton-managed'
+  delegationMode: 'disabled' | 'provider-native' | 'baton-managed'
   allowedTools: string[]
   approvalPolicy: string
   cwd: string | null
