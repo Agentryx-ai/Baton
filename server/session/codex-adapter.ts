@@ -782,15 +782,21 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
               trackNativeStartedThread(params, nativeThreadId, nativeChildThreadIds)
               continue
             }
+            const eventScope = activeNativeEventScope(
+              params,
+              nativeThreadId,
+              nativeTurnId,
+              nativeChildThreadIds,
+            )
+            if (eventScope === 'foreign') continue
             trackNativeChildThreads(params, nativeThreadId, nativeChildThreadIds)
-            assertActiveNativeIds(params, nativeThreadId, nativeTurnId, nativeChildThreadIds)
             const forbiddenItemType = forbiddenNotificationItemType(message.method, params)
             if (forbiddenItemType !== null) {
               throw capabilityViolation(
                 `unexpected native execution event ${message.method}:${forbiddenItemType}`,
               )
             }
-            if (message.method === 'thread/tokenUsage/updated') {
+            if (eventScope === 'root' && message.method === 'thread/tokenUsage/updated') {
               const snapshot = codexUsageSnapshot(params)
               cumulativeUsage = snapshot === null
                 ? null
@@ -806,7 +812,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 }
               }
             }
-            if (message.method === 'model/rerouted') {
+            if (eventScope === 'root' && message.method === 'model/rerouted') {
               const fromModel = requiredString(params?.fromModel, 'Codex reroute source model')
               const toModel = requiredString(params?.toModel, 'Codex reroute target model')
               if (fromModel !== resolvedModel) {
@@ -826,8 +832,11 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
                 resolvedProvider: requiredString(resolvedProvider, 'active Codex model provider'),
               }),
             )
-            eventQueue.push(event)
-            if (message.method === 'turn/completed') {
+            const item = asOptionalObject(params?.item)
+            if (eventScope === 'root' || item?.type === 'collabAgentToolCall') {
+              eventQueue.push(event)
+            }
+            if (eventScope === 'root' && message.method === 'turn/completed') {
               const turn = asObject(params?.turn, 'turn/completed turn')
               if (turn.id !== nativeTurnId) {
                 throw capabilityViolation('turn completion referenced a foreign native turn')
@@ -1355,20 +1364,20 @@ function codexUsageSnapshot(params: JsonObject | null): {
   return { usage: tokenUsage, source: 'tokenUsage' }
 }
 
-function assertActiveNativeIds(
+function activeNativeEventScope(
   params: JsonObject | null,
   threadId: string,
   turnId: string,
   childThreadIds: ReadonlySet<string>,
-): void {
+): 'root' | 'child' | 'foreign' {
   const eventThreadId = typeof params?.threadId === 'string' ? params.threadId : null
-  if (eventThreadId !== null && eventThreadId !== threadId && !childThreadIds.has(eventThreadId)) {
-    throw capabilityViolation('Codex event referenced a foreign native thread')
+  if (eventThreadId !== null && eventThreadId !== threadId) {
+    return childThreadIds.has(eventThreadId) ? 'child' : 'foreign'
   }
-  if (eventThreadId !== null && eventThreadId !== threadId) return
   if (typeof params?.turnId === 'string' && params.turnId !== turnId) {
     throw capabilityViolation('Codex event referenced a foreign native turn')
   }
+  return 'root'
 }
 
 function trackNativeChildThreads(
@@ -1382,8 +1391,15 @@ function trackNativeChildThreads(
     || (item.senderThreadId !== rootThreadId && !threadIds.has(item.senderThreadId))) {
     throw capabilityViolation('Codex collaboration event referenced a foreign native sender thread')
   }
-  for (const threadId of item.receiverThreadIds) {
-    if (typeof threadId === 'string' && threadId.length > 0) threadIds.add(threadId)
+  const receivers = item.receiverThreadIds.filter(
+    (threadId): threadId is string => typeof threadId === 'string' && threadId.length > 0,
+  )
+  if (item.tool === 'spawnAgent') {
+    for (const threadId of receivers) threadIds.add(threadId)
+    return
+  }
+  if (receivers.some((threadId) => threadId !== rootThreadId && !threadIds.has(threadId))) {
+    throw capabilityViolation('Codex collaboration event referenced an unowned native receiver thread')
   }
 }
 
