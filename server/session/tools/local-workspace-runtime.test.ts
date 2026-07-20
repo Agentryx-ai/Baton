@@ -289,31 +289,57 @@ test('host command runtime exposes only run_command without a connected workspac
   assert.equal(result.content?.stdout, 'host-ok')
 })
 
-test('full-access runner uses direct argv and strips Baton-owned secrets', async (t) => {
+test('full-access runner injects runtime PATH and strips Baton-owned secrets', async (t) => {
   const cwd = await workspace(t)
   const previousSecret = process.env.BATON_PROXY_TOKEN
+  const previousGatewaySecret = process.env.GATEWAY_ACCESS_TOKEN
   const previousMarker = process.env.BATON_FULL_ACCESS_TEST
   process.env.BATON_PROXY_TOKEN = 'must-not-leak'
+  process.env.GATEWAY_ACCESS_TOKEN = 'must-not-leak-either'
   process.env.BATON_FULL_ACCESS_TEST = 'also-stripped'
   process.env.FULL_ACCESS_PUBLIC_MARKER = 'visible'
   t.after(() => {
     if (previousSecret === undefined) delete process.env.BATON_PROXY_TOKEN
     else process.env.BATON_PROXY_TOKEN = previousSecret
+    if (previousGatewaySecret === undefined) delete process.env.GATEWAY_ACCESS_TOKEN
+    else process.env.GATEWAY_ACCESS_TOKEN = previousGatewaySecret
     if (previousMarker === undefined) delete process.env.BATON_FULL_ACCESS_TEST
     else process.env.BATON_FULL_ACCESS_TEST = previousMarker
     delete process.env.FULL_ACCESS_PUBLIC_MARKER
   })
   const stdout: Buffer[] = []
-  const runner = new FullAccessCommandRunner()
+  const runtimePath = path.dirname(process.execPath)
+  const runner = new FullAccessCommandRunner([runtimePath, runtimePath])
   const result = await runner.run({
-    argv: [process.execPath, '-e', "process.stdout.write(String(Boolean(process.env.BATON_PROXY_TOKEN))+','+String(Boolean(process.env.BATON_FULL_ACCESS_TEST))+','+process.env.FULL_ACCESS_PUBLIC_MARKER)"],
+    argv: [path.basename(process.execPath), '-e', "process.stdout.write(JSON.stringify({baton:Boolean(process.env.BATON_PROXY_TOKEN),gateway:Boolean(process.env.GATEWAY_ACCESS_TOKEN),test:Boolean(process.env.BATON_FULL_ACCESS_TEST),marker:process.env.FULL_ACCESS_PUBLIC_MARKER,path:process.env.PATH}))"],
     cwd,
     signal: new AbortController().signal,
     onStdout: (chunk) => stdout.push(Buffer.from(chunk)),
     onStderr: () => undefined,
   })
   assert.equal(result.exitCode, 0)
-  assert.equal(Buffer.concat(stdout).toString('utf8'), 'false,false,visible')
+  const output = JSON.parse(Buffer.concat(stdout).toString('utf8')) as Record<string, unknown>
+  assert.deepEqual({ baton: output.baton, gateway: output.gateway, test: output.test, marker: output.marker }, {
+    baton: false, gateway: false, test: false, marker: 'visible',
+  })
+  const childPath = String(output.path).split(path.delimiter)
+  assert.equal(path.resolve(childPath[0]!), path.resolve(runtimePath))
+  assert.equal(childPath.filter((entry) => path.resolve(entry).toLowerCase() === path.resolve(runtimePath).toLowerCase()).length, 1)
+  const inheritedEntry = (process.env.PATH ?? '').split(path.delimiter).find((entry) => entry.length > 0 && path.resolve(entry).toLowerCase() !== path.resolve(runtimePath).toLowerCase())
+  if (inheritedEntry) {
+    assert.equal(childPath.some((entry) => path.resolve(entry).toLowerCase() === path.resolve(inheritedEntry).toLowerCase()), true)
+  }
+})
+
+test('run_command reports a missing executable as command_not_found', async (t) => {
+  const cwd = await workspace(t)
+  const runtime = new HostCommandToolRuntime({ cwd, commandRunner: new FullAccessCommandRunner([]) })
+  const missing = `baton-command-that-does-not-exist-${Date.now()}`
+  const result = await runtime.execute(invocation('run_command', { argv: [missing] }))
+  assert.equal(result.success, false)
+  assert.equal(result.error?.code, 'command_not_found')
+  assert.equal(result.error?.message, `Command executable was not found: ${missing}`)
+  assert.equal(result.error?.retryable, false)
 })
 
 test('list_files and search_text return deterministic workspace-relative results', async (t) => {

@@ -75,9 +75,14 @@ export interface SandboxCommandRunner {
 
 export class CodexSandboxCommandRunner implements SandboxCommandRunner {
   readonly #executable: string
+  readonly #runtimePathEntries: readonly string[]
 
   constructor(executable?: string) {
-    this.#executable = executable ?? resolveCodexExecutable()
+    const runtime = executable
+      ? { executable, pathEntries: codexRuntimePathEntries(executable) }
+      : resolveCodexRuntime()
+    this.#executable = runtime.executable
+    this.#runtimePathEntries = runtime.pathEntries
   }
 
   async run(request: SandboxCommandRequest): Promise<{ exitCode: number | null }> {
@@ -95,7 +100,7 @@ export class CodexSandboxCommandRunner implements SandboxCommandRunner {
         '--sandbox-state-disable-network', '--', ...request.argv,
       ], {
         cwd: request.cwd,
-        env: commandEnvironment(sandboxHome, commandTemp),
+        env: commandEnvironment(sandboxHome, commandTemp, this.#runtimePathEntries),
         windowsHide: true,
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -133,11 +138,17 @@ export class CodexSandboxCommandRunner implements SandboxCommandRunner {
 
 /** Executes argv directly on the local host. Selection of this runner is the full-access boundary. */
 export class FullAccessCommandRunner implements SandboxCommandRunner {
+  readonly #runtimePathEntries: readonly string[]
+
+  constructor(runtimePathEntries: readonly string[] = resolveCodexRuntime().pathEntries) {
+    this.#runtimePathEntries = runtimePathEntries
+  }
+
   async run(request: SandboxCommandRequest): Promise<{ exitCode: number | null }> {
     return await new Promise((resolve, reject) => {
       const child = spawn(request.argv[0]!, [...request.argv.slice(1)], {
         cwd: request.cwd,
-        env: fullAccessCommandEnvironment(),
+        env: fullAccessCommandEnvironment(this.#runtimePathEntries),
         windowsHide: true,
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -671,6 +682,13 @@ async function executeCommand(
     } catch (error) {
       if (!timedOut) {
         if (signal.aborted) throw new ToolRuntimeError('tool_aborted', 'Tool execution was cancelled', false)
+        if (error instanceof Error && 'code' in error && String(error.code) === 'ENOENT') {
+          throw new ToolRuntimeError(
+            'command_not_found',
+            `Command executable was not found: ${input.argv[0]}`,
+            false,
+          )
+        }
         throw error
       }
       exitCode = null
@@ -861,7 +879,11 @@ function commandSandboxConfig(cwd: string, commandTemp: string): string {
   ].join('\n')
 }
 
-function commandEnvironment(sandboxHome: string, commandTemp: string): NodeJS.ProcessEnv {
+function commandEnvironment(
+  sandboxHome: string,
+  commandTemp: string,
+  runtimePathEntries: readonly string[],
+): NodeJS.ProcessEnv {
   const inherited = ['PATH', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'COMSPEC', 'OS',
     'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS']
   const environment: NodeJS.ProcessEnv = {}
@@ -873,15 +895,33 @@ function commandEnvironment(sandboxHome: string, commandTemp: string): NodeJS.Pr
   environment.USERPROFILE = sandboxHome
   environment.TEMP = commandTemp
   environment.TMP = commandTemp
+  prependPathEntries(environment, runtimePathEntries)
   return environment
 }
 
-function fullAccessCommandEnvironment(): NodeJS.ProcessEnv {
+function fullAccessCommandEnvironment(runtimePathEntries: readonly string[]): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env }
   for (const key of Object.keys(environment)) {
     if (/^(?:BATON_|GATEWAY_)/iu.test(key)) delete environment[key]
   }
+  prependPathEntries(environment, runtimePathEntries)
   return environment
+}
+
+function prependPathEntries(environment: NodeJS.ProcessEnv, entries: readonly string[]): void {
+  if (entries.length === 0) return
+  const pathKey = Object.keys(environment).find((key) => key.toUpperCase() === 'PATH') ?? 'PATH'
+  const existing = (environment[pathKey] ?? '').split(path.delimiter).filter(Boolean)
+  const normalized = new Set<string>()
+  const unique: string[] = []
+  for (const entry of [...entries, ...existing]) {
+    const resolved = path.resolve(entry)
+    const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved
+    if (normalized.has(key)) continue
+    normalized.add(key)
+    unique.push(resolved)
+  }
+  environment[pathKey] = unique.join(path.delimiter)
 }
 
 async function withMutationLock<T>(target: string, operation: () => Promise<T>): Promise<T> {
@@ -900,8 +940,10 @@ async function withMutationLock<T>(target: string, operation: () => Promise<T>):
   }
 }
 
-function resolveCodexExecutable(): string {
-  if (process.platform !== 'win32') return 'codex'
+interface CodexRuntime { executable: string; pathEntries: readonly string[] }
+
+function resolveCodexRuntime(): CodexRuntime {
+  if (process.platform !== 'win32') return { executable: 'codex', pathEntries: [] }
   const architecture = process.arch === 'arm64'
     ? { packageName: 'codex-win32-arm64', triple: 'aarch64-pc-windows-msvc' }
     : { packageName: 'codex-win32-x64', triple: 'x86_64-pc-windows-msvc' }
@@ -910,12 +952,27 @@ function resolveCodexExecutable(): string {
   const roots = [...new Set([...pathDirectories, ...(appDataNpm ? [appDataNpm] : [])])]
   for (const root of roots) {
     const direct = path.join(root, 'codex.exe')
-    if (existsSync(direct)) return direct
-    const packaged = path.join(
+    if (existsSync(direct)) {
+      return { executable: direct, pathEntries: codexRuntimePathEntries(direct) }
+    }
+    const packageRoot = path.join(
       root, 'node_modules', '@openai', 'codex', 'node_modules', '@openai', architecture.packageName,
-      'vendor', architecture.triple, 'bin', 'codex.exe',
+      'vendor', architecture.triple,
     )
-    if (existsSync(packaged)) return packaged
+    const packaged = path.join(packageRoot, 'bin', 'codex.exe')
+    if (existsSync(packaged)) {
+      const pathDirectory = path.join(packageRoot, 'codex-path')
+      return {
+        executable: packaged,
+        pathEntries: existsSync(path.join(pathDirectory, 'rg.exe')) ? [pathDirectory] : [],
+      }
+    }
   }
-  return 'codex.exe'
+  return { executable: 'codex.exe', pathEntries: [] }
+}
+
+function codexRuntimePathEntries(executable: string): readonly string[] {
+  if (process.platform !== 'win32' || path.basename(executable).toLowerCase() !== 'codex.exe') return []
+  const pathDirectory = path.join(path.dirname(path.dirname(path.resolve(executable))), 'codex-path')
+  return existsSync(path.join(pathDirectory, 'rg.exe')) ? [pathDirectory] : []
 }
