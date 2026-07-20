@@ -262,7 +262,7 @@ test('TurnOrchestrator durably executes one canonical turn and deduplicates retr
   const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
   const registry = new AdapterRegistry()
   const snapshots: ThreadSnapshot[] = []
-  registry.register(safeAdapter(snapshots))
+  registry.register(safeAdapter(snapshots, 'exposed'))
   const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
   t.after(async () => {
     await orchestrator.close()
@@ -284,6 +284,7 @@ test('TurnOrchestrator durably executes one canonical turn and deduplicates retr
   const snapshot = orchestrator.getSnapshot(session.activeThreadId)
   assert.deepEqual(snapshot?.items.map((item) => item.kind), ['user_message', 'assistant_message'])
   assert.equal(snapshot?.turns[0]?.status, 'completed')
+  assert.equal(started.execution.policySnapshot.delegationMode, 'provider-native')
   assert.equal(snapshots[0]?.items.length, 0, 'current input must not be duplicated into provider history')
 
   const duplicate = await orchestrator.startTurn(request)
@@ -1018,7 +1019,7 @@ test('a Goal created after turn start forces follow-up to the next turn without 
   assert.equal(store.getGoalById(goal.id)?.revision, goal.revision)
 })
 
-test('TurnOrchestrator rejects an adapter that exposes native child execution before persistence', async (t) => {
+test('TurnOrchestrator persists provider-native delegation declared by the adapter', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-'))
   const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
   const registry = new AdapterRegistry()
@@ -1030,15 +1031,17 @@ test('TurnOrchestrator rejects an adapter that exposes native child execution be
   })
 
   const session = orchestrator.createSession({})
-  await assert.rejects(orchestrator.startTurn({
+  const started = await orchestrator.startTurn({
     threadId: session.activeThreadId,
     provider: 'codex',
     model: 'gpt-test',
     clientRequestId: 'unsafe',
     expectedRevision: 0,
     input: [{ kind: 'user_message', payload: { text: 'hello' } }],
-  }), /native child execution/)
-  assert.equal(orchestrator.getSnapshot(session.activeThreadId)?.turns.length, 0)
+  })
+  await waitForTerminal(store, started.turn.id)
+  assert.equal(started.execution.policySnapshot.delegationMode, 'provider-native')
+  assert.equal(orchestrator.getSnapshot(session.activeThreadId)?.turns.length, 1)
 })
 
 test('TurnOrchestrator connects provider calls to durable workspace tools', async (t) => {

@@ -46,10 +46,24 @@ function adapter(nativeChildExecution: 'disabled' | 'exposed'): SessionProviderA
   }
 }
 
-test('AdapterRegistry rejects native child execution before a turn can start', async () => {
+test('AdapterRegistry accepts declared provider-native child execution', async () => {
   const registry = new AdapterRegistry()
   registry.register(adapter('exposed'))
-  await assert.rejects(registry.getReady('codex'), /native child execution/)
+  const ready = await registry.getReady('codex')
+  assert.equal(ready.handshake.capabilities.nativeChildExecution, 'exposed')
+  assert.deepEqual(ready.handshake.exposedNativeAgentTools, ['spawn_agent'])
+})
+
+test('AdapterRegistry rejects inconsistent native child capability declarations', async () => {
+  const inconsistent = adapter('disabled')
+  const initialize = inconsistent.initialize.bind(inconsistent)
+  inconsistent.initialize = async () => ({
+    ...await initialize(),
+    exposedNativeAgentTools: ['spawn_agent'],
+  })
+  const registry = new AdapterRegistry()
+  registry.register(inconsistent)
+  await assert.rejects(registry.getReady('codex'), /declared disabled native child execution/)
 })
 
 test('AdapterRegistry returns a canonical-safe adapter', async () => {
