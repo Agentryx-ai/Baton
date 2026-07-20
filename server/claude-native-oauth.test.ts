@@ -43,15 +43,21 @@ test('native Claude OAuth start uses the installed Claude Code PKCE contract', a
   assert.equal(url.searchParams.get('scope'), 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload')
 })
 
-test('native Claude OAuth exchanges once, stores protected credentials, and rejects replay', async () => {
+test('native Claude OAuth exchanges once, enriches identity, stores protected credentials, and rejects replay', async () => {
   const vault = await createVault()
-  const requests: Array<{ url: string; body: Record<string, unknown> }> = []
+  const requests: Array<{ url: string; body?: Record<string, unknown> }> = []
   const manager = new ClaudeNativeOAuthManager({
     vault,
     random: (size) => Buffer.alloc(size, size),
     now: () => 10_000,
     fetchImpl: async (input, init) => {
-      requests.push({ url: String(input), body: JSON.parse(String(init?.body)) })
+      const url = String(input)
+      requests.push({ url, ...(init?.body ? { body: JSON.parse(String(init.body)) as Record<string, unknown> } : {}) })
+      if (url === 'https://api.anthropic.com/api/oauth/profile') {
+        return new Response(JSON.stringify({
+          account: { uuid: 'acct-uuid', email: 'user@example.com', display_name: 'User Example' },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
       return new Response(JSON.stringify({
         access_token: 'access-secret',
         refresh_token: 'refresh-secret',
@@ -61,16 +67,20 @@ test('native Claude OAuth exchanges once, stores protected credentials, and reje
       }), { status: 200, headers: { 'content-type': 'application/json' } })
     },
   })
-  const { state } = manager.start('Primary')
+  const { state } = manager.start()
   const callback = `http://localhost:54545/callback?code=authorization-code&state=${state}`
   const result = await manager.submit(callback)
 
+  const tokenExchanges = () => requests.filter((request) => request.url === 'https://platform.claude.com/v1/oauth/token')
   assert.equal(result.status, 'success')
-  assert.equal(requests.length, 1)
-  assert.equal(requests[0]?.url, 'https://platform.claude.com/v1/oauth/token')
-  assert.equal(requests[0]?.body.state, state)
-  assert.equal(requests[0]?.body.code, 'authorization-code')
-  assert.equal(typeof requests[0]?.body.code_verifier, 'string')
+  assert.equal(tokenExchanges().length, 1)
+  assert.equal(tokenExchanges()[0]?.body?.state, state)
+  assert.equal(tokenExchanges()[0]?.body?.code, 'authorization-code')
+  assert.equal(typeof tokenExchanges()[0]?.body?.code_verifier, 'string')
+  // Identity enrichment: real email + stable account id + email-derived nickname.
+  assert.equal(result.account?.email, 'user@example.com')
+  assert.equal(result.account?.accountId, 'acct-uuid')
+  assert.equal(result.account?.nickname, 'user')
   assert.deepEqual(await vault.getSecret('account-1'), {
     accessToken: 'access-secret',
     refreshToken: 'refresh-secret',
@@ -80,7 +90,7 @@ test('native Claude OAuth exchanges once, stores protected credentials, and reje
   })
   assert.deepEqual(manager.status(state), result)
   await assert.rejects(manager.submit(callback), /이미 사용되었거나 처리 중/)
-  assert.equal(requests.length, 1)
+  assert.equal(tokenExchanges().length, 1)
 })
 
 test('native Claude OAuth rejects foreign callbacks and mismatched state without token exchange', async () => {

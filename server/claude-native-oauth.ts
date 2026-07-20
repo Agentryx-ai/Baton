@@ -9,6 +9,7 @@ import {
 export const CLAUDE_NATIVE_OAUTH_CONTRACT = {
   authorizeUrl: 'https://claude.ai/oauth/authorize',
   tokenUrl: 'https://platform.claude.com/v1/oauth/token',
+  profileUrl: 'https://api.anthropic.com/api/oauth/profile',
   clientId: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
   redirectUri: 'http://localhost:54545/callback',
   scopes: [
@@ -26,6 +27,7 @@ interface OAuthFlow {
   state: string
   verifier: string
   nickname: string
+  explicitNickname: boolean
   createdAt: number
   expiresAt: number
   status: OAuthFlowStatus
@@ -47,6 +49,7 @@ export interface ClaudeNativeOAuthManagerOptions {
   flowTtlMs?: number
   authorizeUrl?: string
   tokenUrl?: string
+  profileUrl?: string
   redirectUri?: string
   clientId?: string
   scopes?: readonly string[]
@@ -70,6 +73,7 @@ export class ClaudeNativeOAuthManager {
   private readonly flowTtlMs: number
   private readonly authorizeUrl: string
   private readonly tokenUrl: string
+  private readonly profileUrl: string
   private readonly redirectUri: string
   private readonly clientId: string
   private readonly scopes: readonly string[]
@@ -83,6 +87,7 @@ export class ClaudeNativeOAuthManager {
     this.flowTtlMs = options.flowTtlMs ?? 10 * 60_000
     this.authorizeUrl = options.authorizeUrl ?? CLAUDE_NATIVE_OAUTH_CONTRACT.authorizeUrl
     this.tokenUrl = options.tokenUrl ?? CLAUDE_NATIVE_OAUTH_CONTRACT.tokenUrl
+    this.profileUrl = options.profileUrl ?? CLAUDE_NATIVE_OAUTH_CONTRACT.profileUrl
     this.redirectUri = options.redirectUri ?? CLAUDE_NATIVE_OAUTH_CONTRACT.redirectUri
     this.clientId = options.clientId ?? CLAUDE_NATIVE_OAUTH_CONTRACT.clientId
     this.scopes = options.scopes ?? CLAUDE_NATIVE_OAUTH_CONTRACT.scopes
@@ -94,10 +99,12 @@ export class ClaudeNativeOAuthManager {
     const challenge = createHash('sha256').update(verifier).digest('base64url')
     const state = this.random(24).toString('base64url')
     const createdAt = this.now()
+    const trimmedNickname = nickname?.trim()
     this.flows.set(state, {
       state,
       verifier,
-      nickname: nickname?.trim() || 'Claude account',
+      nickname: trimmedNickname || 'Claude account',
+      explicitNickname: Boolean(trimmedNickname),
       createdAt,
       expiresAt: createdAt + this.flowTtlMs,
       status: 'wait',
@@ -160,13 +167,63 @@ export class ClaudeNativeOAuthManager {
     } catch (error) {
       return this.fail(flow, error instanceof Error ? error.message : 'Claude OAuth token 응답이 올바르지 않습니다.')
     }
+    // Best-effort identity enrichment: fill the account email and a stable
+    // account id so the UI shows the real account instead of a placeholder.
+    // A profile failure must not fail the connection.
+    const profile = await this.fetchProfile(secret.accessToken)
+    const nickname = flow.explicitNickname
+      ? flow.nickname
+      : profile.email?.split('@')[0] || profile.displayName || flow.nickname
     try {
-      flow.account = await this.vault.put({ nickname: flow.nickname, secret })
+      flow.account = await this.vault.put({
+        nickname,
+        ...(profile.email ? { email: profile.email } : {}),
+        ...(profile.accountUuid ? { accountId: profile.accountUuid } : {}),
+        secret,
+      })
     } catch {
       return this.fail(flow, 'Claude OAuth 자격증명을 보안 vault에 저장하지 못했습니다.')
     }
     flow.status = 'success'
     return { status: 'success', account: flow.account }
+  }
+
+  /** Fetch the OAuth account profile (email, display name, stable uuid). */
+  private async fetchProfile(accessToken: string): Promise<{
+    email?: string
+    accountUuid?: string
+    displayName?: string
+  }> {
+    try {
+      const response = await this.fetchImpl(this.profileUrl, {
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          'anthropic-beta': 'oauth-2025-04-20',
+          'anthropic-version': '2023-06-01',
+          accept: 'application/json',
+        },
+        signal: AbortSignal.timeout(10_000),
+      })
+      if (!response.ok) return {}
+      const body = await response.json() as { account?: unknown }
+      const account = body.account && typeof body.account === 'object' && !Array.isArray(body.account)
+        ? body.account as Record<string, unknown>
+        : {}
+      const email = typeof account.email === 'string' && account.email.length > 0 ? account.email : undefined
+      const accountUuid = typeof account.uuid === 'string' && account.uuid.length > 0 ? account.uuid : undefined
+      const displayName = typeof account.display_name === 'string' && account.display_name.length > 0
+        ? account.display_name
+        : typeof account.full_name === 'string' && account.full_name.length > 0
+          ? account.full_name
+          : undefined
+      return {
+        ...(email ? { email } : {}),
+        ...(accountUuid ? { accountUuid } : {}),
+        ...(displayName ? { displayName } : {}),
+      }
+    } catch {
+      return {}
+    }
   }
 
   cancel(state?: string): void {
