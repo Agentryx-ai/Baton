@@ -120,7 +120,7 @@
 | IMPORT-06 | `request contains unsupported fields` 수정 | 검증 필요 | 현재 API DTO는 허용 필드를 엄격히 제한하며 UI와 공유 타입을 사용한다. 사용자가 본 실제 요청을 다시 재현한 E2E 증거는 부족하다. |
 | IMPORT-07 | 최근 대화의 프로젝트 가시성·그룹 간격·세션 간격·정렬 개선 | 완료(현재 UI)·시각 재검수 필요 | project identity 충돌 방지, alias 표시, 정렬/간격 개선 커밋(`b9ebfff`, `86467a4`). 실제 4400 시각 회귀 검수는 최종 단계에서 반복. |
 | IMPORT-08 | native 원본과 Baton 사이 authority 승계/동기화 | 미구현 | 현재 import는 별도 Baton logical-work fork다. authority epoch migration은 설계만 존재. |
-| IMPORT-09 | native 원본의 명시적 `/goal`/goal lifecycle을 import 후 복원 | 미구현(발견 결함) | 현재 importer는 transcript만 가져오고 canonical `goals` projection을 만들지 않는다. 제목/첫 메시지로 추론하지 않고 명시 이벤트만 복원하는 요구는 [`../issues/native-import-must-restore-explicit-goals.md`](../issues/native-import-must-restore-explicit-goals.md)에 기록했다. |
+| IMPORT-09 | native 원본의 명시적 `/goal`/goal lifecycle을 import 후 복원 | 구현·실데이터 복원 완료 | 명시적 goal 이벤트만 복원하고 추론은 금지한다. 신규 import와 기존 데이터 backfill, 충돌 보존 및 멱등성 검증을 완료했다. 근거는 [`../issues/_archived/native-import-must-restore-explicit-goals.md`](../issues/_archived/native-import-must-restore-explicit-goals.md)에 보관했다. |
 
 ## 6. 대화 UI/UX
 

@@ -3,6 +3,7 @@
 ## 상태
 
 - 상태: **해결됨**
+- 보관일: 2026-07-21
 - 발견일: 2026-07-21
 - 우선순위: P0
 - 범위: `POST /baton/inference/openai/v1/responses*`

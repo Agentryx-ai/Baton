@@ -2,8 +2,9 @@
 
 ## 상태
 
-- 확인됨
-- 구현 및 기존 데이터 복원 완료 (`feat/canonical-runtime-workspace`)
+- 상태: **해결됨**
+- 보관일: 2026-07-21
+- 구현 및 기존 데이터 복원 완료 (`1fc1017`, `feat/canonical-runtime-workspace`)
 - 발견일: 2026-07-19
 
 ## 구현 결과

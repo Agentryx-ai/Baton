@@ -1,6 +1,11 @@
 # Pre-b813d7c migrated Codex configs lack the baton compat alias → legacy `codex resume` fails
 
-발견: 2026-07-21. 코드 레벨은 이미 대응됨(아래) — 남은 것은 **이미 마이그레이션된 사용자 config의 복구**.
+## 상태
+
+- 상태: **부분 해결**
+- 발견일: 2026-07-21
+- 신규 apply/repair 경로는 구현됨
+- 기존 마이그레이션 사용자에 대한 자동 detect-and-heal 또는 명시적 repair UX는 미완료
 
 ## 증상
 

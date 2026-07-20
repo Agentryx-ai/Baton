@@ -1,6 +1,11 @@
 # Migrated Claude accounts fail quota; pre-migration canary account survives as a placeholder duplicate
 
-발견: 2026-07-21 (Native 단일 코어 전환 후 UI 점검 중). 이 문서는 진단만 기록하며 아직 수정하지 않았습니다.
+## 상태
+
+- 상태: **부분 해결**
+- 발견일: 2026-07-21
+- 신규 OAuth의 profile email/stable account ID 저장과 기존 계정 backfill 도구는 `ef68dd5`에서 구현
+- refresh 실패 원인 확증, vault 중복 병합과 live quota 검증은 미완료
 
 ## 증상 (사용자 관찰)
 
@@ -43,14 +48,16 @@ canary가 먼저 로그인/갱신하며 토큰을 회전시켜 **CLIProxy가 보
   사용자가 **중복 계정 + 사용량 표시 오배치**를 겪을 수 있음.
 - email 미기입 계정은 UI에서 `Claude Code`처럼 구분 불가능한 placeholder로 표시됨.
 
-## 제안 수정 (미적용, 우선순위 순)
+## 조치 상태
 
-1. **원인 확증**: `loadNativeClaudeAccountCredential` 실패 경로가 `invalid_grant`인지 확인하고,
+1. **원인 확증 — 미완료**: `loadNativeClaudeAccountCredential` 실패 경로가 `invalid_grant`인지 확인하고,
    quota 라우트의 generic 500 대신 refresh 실패를 구분 가능한 에러로 표면화.
-2. **중복 정리**: 같은 Anthropic 계정(동일 sub/account id)에 대한 Native vault 중복을 감지·병합.
+2. **중복 정리 — 미완료**: 같은 Anthropic 계정(동일 sub/account id)에 대한 Native vault 중복을 감지·병합.
    마이그레이션 매칭을 refresh-token fingerprint 외에 **불변 계정 식별자(account id / id_token sub)**로도 수행.
-3. **placeholder 제거**: OAuth id_token/userinfo에서 email을 채워 저장. 비면 재로그인 유도.
-4. **깨진 credential 복구 UX**: quota가 refresh 실패로 죽은 계정은 카드에 "재로그인 필요"를
+3. **placeholder 제거 — 구현됨**: 신규 OAuth는 `/api/oauth/profile`의 email과 stable UUID를
+   저장한다. `scripts/backfill-claude-emails.ts`가 기존 계정의 email/UUID/nickname을 멱등 보강한다.
+   profile 조회 실패는 로그인 자체를 실패시키지 않는다.
+4. **깨진 credential 복구 UX — 미완료**: quota가 refresh 실패로 죽은 계정은 카드에 "재로그인 필요"를
    명확히 노출(현재는 무표시).
 
 ## 검증 (수정 후)

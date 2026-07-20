@@ -2,6 +2,7 @@
 
 ## 상태
 
+- 상태: **부분 해결**
 - 코드·단위 검증: 95/100% 자동 pause 및 pool 축소 해결
 - live 검증 대기: 실제 429 same-request failover와 reset 복귀
 - 403 durable 상태 계약 대기

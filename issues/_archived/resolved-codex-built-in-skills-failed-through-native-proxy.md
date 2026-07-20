@@ -3,6 +3,7 @@
 ## 상태
 
 - 상태: **해결됨**
+- 보관일: 2026-07-21
 - 발견·해결일: 2026-07-20
 - 영향 경로: Codex CLI 및 동일 Native transport를 사용하는 Codex client
 - live 검증: CLI 완료. Desktop UI에서 개별 plugin을 누르는 별도 canary는 수행하지 않음
