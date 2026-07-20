@@ -45,11 +45,11 @@ const VERIFIED_FEATURES = [
   'plugins',
 ] as const
 
-// These app-server lifecycle notifications describe every thread known to the
-// process, including detached/internal threads. They are not execution events
-// for the active canonical turn and are explicitly opted out at initialize.
+// Status notifications describe every thread known to the process, including
+// detached/internal threads, and are not execution events for the active turn.
+// thread/started stays enabled because its parentThreadId is the authoritative
+// ownership link for provider-native children that start before the collab item.
 const IGNORED_GLOBAL_NOTIFICATIONS = new Set([
-  'thread/started',
   'thread/status/changed',
 ])
 
@@ -778,6 +778,10 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
             }
             if (IGNORED_GLOBAL_NOTIFICATIONS.has(message.method)) continue
             const params = asOptionalObject(message.params)
+            if (message.method === 'thread/started') {
+              trackNativeStartedThread(params, nativeThreadId, nativeChildThreadIds)
+              continue
+            }
             trackNativeChildThreads(params, nativeThreadId, nativeChildThreadIds)
             assertActiveNativeIds(params, nativeThreadId, nativeTurnId, nativeChildThreadIds)
             const forbiddenItemType = forbiddenNotificationItemType(message.method, params)
@@ -1380,6 +1384,20 @@ function trackNativeChildThreads(
   }
   for (const threadId of item.receiverThreadIds) {
     if (typeof threadId === 'string' && threadId.length > 0) threadIds.add(threadId)
+  }
+}
+
+function trackNativeStartedThread(
+  params: JsonObject | null,
+  rootThreadId: string,
+  threadIds: Set<string>,
+): void {
+  const thread = asOptionalObject(params?.thread)
+  if (thread === null || typeof thread.id !== 'string') return
+  if (thread.id === rootThreadId) return
+  const parentThreadId = typeof thread.parentThreadId === 'string' ? thread.parentThreadId : null
+  if (parentThreadId === rootThreadId || (parentThreadId !== null && threadIds.has(parentThreadId))) {
+    threadIds.add(thread.id)
   }
 }
 
