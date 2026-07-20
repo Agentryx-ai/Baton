@@ -34,6 +34,7 @@ type Scenario =
   | 'collabChildEvent'
   | 'collabChildTool'
   | 'foreignCollabSender'
+  | 'childStartsBeforeCollab'
   | 'forbiddenExecution'
   | 'cancel'
   | 'hangInterrupt'
@@ -339,6 +340,21 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
   if (scenario === 'exit') {
     process.exit({ code: 7, signal: null, stderr: 'invalid test configuration' })
     return
+  }
+  if (scenario === 'childStartsBeforeCollab') {
+    process.emit({
+      method: 'thread/started',
+      params: {
+        thread: { id: 'native-child-thread', parentThreadId: 'native-thread' },
+      },
+    })
+    process.emit({
+      method: 'turn/started',
+      params: {
+        threadId: 'native-child-thread',
+        turn: { id: 'native-child-turn', status: 'inProgress', items: [] },
+      },
+    })
   }
   if (scenario === 'collab' || scenario === 'collabChildEvent'
     || scenario === 'collabChildTool' || scenario === 'foreignCollabSender') {
@@ -804,7 +820,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.ok(initialize)
   assert.deepEqual(
     (initialize.params as Record<string, Record<string, unknown>>).capabilities.optOutNotificationMethods,
-    ['thread/started', 'thread/status/changed'],
+    ['thread/status/changed'],
   )
   const threadStart = turnProcess.writes.find((message) => message.method === 'thread/start')
   assert.ok(threadStart)
@@ -1047,6 +1063,19 @@ test('adapter executes Baton dynamic tools for a registered provider-native chil
     name: 'read_file',
     input: { path: 'README.md' },
   }])
+})
+
+test('adapter registers an owned child from thread/started before collaboration completes', async () => {
+  const created: FakeProcess[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('childStartsBeforeCollab', created, []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  assert.equal((await execution.terminal).status, 'completed')
+  await execution.dispose()
+  assert.ok(created[1].writes.some((message) => message.method === 'thread/archive'
+    && (message.params as Record<string, unknown>).threadId === 'native-child-thread'))
 })
 
 test('adapter still rejects unrelated native execution items', async () => {
