@@ -75,3 +75,14 @@ Desktop의 비공개 프로토콜을 역공학하거나 별도 marketplace backe
 - 설치된 Codex app-server invalid-token canary: `account/read` 단계에서 authentication으로 거부
 - 남은 live gate: Baton Native Codex 계정을 등록한 환경에서 remote account catalog와 connector
   재인증을 실제 확인
+
+Native 계정 등록 후 다음 명령으로 검증합니다. 기본 명령은 preview만 수행하며, `--apply`는
+기준계정을 잠시 전환해 catalog를 확인한 뒤 원래 기준으로 복원합니다.
+
+```bash
+npm run smoke:codex-plugins -- --account <native-account-id>
+npm run smoke:codex-plugins -- --account <native-account-id> --apply
+```
+
+다른 Baton 포트를 검증할 때는 `BATON_URL`을 지정합니다. 기존 기준이 이미 손상된 상태에서는
+자동 복원을 보장할 수 없으므로 `--apply`를 거부하고 Settings에서 먼저 복구하도록 합니다.
