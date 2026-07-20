@@ -103,6 +103,7 @@ test('session lists retain only an explicit valid selection and never auto-open 
     retainExplicitSessionSelection,
     isConversationSelectionPending,
     shouldApplyThreadSnapshot,
+    shouldResetThreadSnapshot,
   } = await import(workspaceModulePath) as {
     retainExplicitSessionSelection: (
       selectedSessionId: string | null,
@@ -115,6 +116,10 @@ test('session lists retain only an explicit valid selection and never auto-open 
     shouldApplyThreadSnapshot: (
       selectedSessionId: string | null,
       snapshotSessionId: string,
+    ) => boolean
+    shouldResetThreadSnapshot: (
+      selectedSessionId: string | null,
+      routeSessionId: string,
     ) => boolean
   }
   const sessions = [{ id: 'newest' }, { id: 'explicit' }]
@@ -129,6 +134,9 @@ test('session lists retain only an explicit valid selection and never auto-open 
   assert.equal(shouldApplyThreadSnapshot('explicit', 'explicit'), true)
   assert.equal(shouldApplyThreadSnapshot('other', 'explicit'), false)
   assert.equal(shouldApplyThreadSnapshot(null, 'explicit'), false)
+  assert.equal(shouldResetThreadSnapshot('explicit', 'explicit'), false)
+  assert.equal(shouldResetThreadSnapshot('other', 'explicit'), true)
+  assert.equal(shouldResetThreadSnapshot(null, 'explicit'), true)
 })
 
 test('background session projection polling runs only while visible and cleans up listeners', async () => {

@@ -283,6 +283,13 @@ export function shouldApplyThreadSnapshot(
   return selectedSessionId === snapshotSessionId
 }
 
+export function shouldResetThreadSnapshot(
+  selectedSessionId: string | null,
+  routeSessionId: string,
+): boolean {
+  return selectedSessionId !== routeSessionId
+}
+
 export interface UnknownMutationCall {
   turnId: string
   callId: string
@@ -897,13 +904,14 @@ export function ConversationWorkspace({
         return
       }
       setDraftOpen(false)
-      setSnapshot(null)
       setPrompt('')
       if (route.kind === 'session') {
         setSessionScope('active')
+        if (shouldResetThreadSnapshot(selectedSessionIdRef.current, route.sessionId)) setSnapshot(null)
         setSelectedSessionId(route.sessionId)
         return
       }
+      setSnapshot(null)
       if (route.kind === 'draft') {
         window.history.replaceState(
           { batonConversation: null },
