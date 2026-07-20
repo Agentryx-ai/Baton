@@ -162,6 +162,8 @@ history에서 provider 요청을 재구성합니다.
   - Codex built-in `openai` provider identity를 유지하고 `openai_base_url`만 Baton Native로 연결
   - 과거 `model_provider=baton` 세션의 resume를 위해 인증 없는 loopback compatibility alias 유지
 - Baton Native Claude/Codex data plane, OAuth refresh, encrypted local vault와 account router
+  - Codex의 큰 built-in-provider 요청은 zstd 압축 body를 해제하지 않고 upstream에 보존 전달하며,
+    routing에 필요한 model만 별도 decode
 - preferred model과 effective model을 분리한 opt-in 자동 fallback/복귀 및 대화 event
 - session/thread/turn/item/execution/provider binding의 SQLite/WAL 영속화
 - `/baton/v1` REST API, cursor replay SSE, idempotent retry, fork와 crash recovery

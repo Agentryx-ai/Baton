@@ -12,6 +12,11 @@ provider에 `requires_openai_auth=true`를 부여해도 결과는 같다.
 시작되기 전에 Codex가 구성하는 로컬 tool schema를 추가할 수 없으므로 proxy/model catalog
 수정으로 해결할 수 없다.
 
+별개로 built-in `openai` provider는 스킬 목록이 포함된 큰 요청을 `Content-Encoding: zstd`로
+압축한다. 초기 Native proxy는 Express raw parser가 이를 해제하려다 HTTP 415를 반환해, 작은 prompt는
+성공하지만 문서 스킬만 실패하는 것처럼 보였다. 현재는 encoded body를 byte-for-byte 보존해 upstream에
+전달하고 routing에 필요한 model만 Node의 zstd decoder로 별도 확인한다.
+
 ## 해결 경계
 
 `plugins/baton-codex-runtime-bridge`는 다음 좁은 계약만 제공한다.

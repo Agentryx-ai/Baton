@@ -1,6 +1,12 @@
 import { timingSafeEqual } from 'node:crypto'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import {
+  brotliDecompressSync,
+  gunzipSync,
+  inflateSync,
+  zstdDecompressSync,
+} from 'node:zlib'
 
 import { Router } from 'express'
 import type { Request } from 'express'
@@ -100,7 +106,20 @@ function upstreamHeaders(req: Request, credential: CodexNativeCredential): Heade
 function requestedModel(req: Request): string | null {
   if (!Buffer.isBuffer(req.body)) return null
   try {
-    const parsed = JSON.parse(req.body.toString('utf8')) as unknown
+    const encoding = (req.get('content-encoding') ?? 'identity').trim().toLowerCase()
+    const body = encoding === 'identity'
+      ? req.body
+      : encoding === 'zstd'
+        ? zstdDecompressSync(req.body)
+        : encoding === 'gzip'
+          ? gunzipSync(req.body)
+          : encoding === 'deflate'
+            ? inflateSync(req.body)
+            : encoding === 'br'
+              ? brotliDecompressSync(req.body)
+              : null
+    if (!body) return null
+    const parsed = JSON.parse(body.toString('utf8')) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
     const model = (parsed as Record<string, unknown>).model
     return typeof model === 'string' && model.length > 0 ? model : null

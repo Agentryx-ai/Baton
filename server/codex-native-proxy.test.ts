@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
+import { zstdCompressSync } from 'node:zlib'
 import test from 'node:test'
 
 import express from 'express'
@@ -8,6 +9,7 @@ import express from 'express'
 import { createCodexNativeProxy } from './codex-native-proxy.ts'
 import type { CodexNativeProxyAccount } from './codex-native-proxy.ts'
 import { NativeProxyHealthTracker } from './native-proxy-health.ts'
+import { createRawPassthroughBody } from './raw-passthrough-body.ts'
 
 async function listen(server: ReturnType<typeof createServer>): Promise<number> {
   server.listen(0, '127.0.0.1')
@@ -98,6 +100,45 @@ test('Native Codex proxy retries an actual 429 on the next model-capable account
   assert.equal(second.status, 200)
   await second.text()
   assert.deepEqual(authorizations, ['Bearer access-a', 'Bearer access-b', 'Bearer access-b'])
+})
+
+test('Native Codex proxy preserves zstd request bytes while routing by the decoded model', async (t) => {
+  const source = Buffer.from(JSON.stringify({ model: 'gpt-5.6-sol', input: 'large prompt' }))
+  const compressed = zstdCompressSync(source)
+  let received: Buffer | null = null
+  let receivedEncoding = ''
+  const upstream = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    req.on('end', () => {
+      received = Buffer.concat(chunks)
+      receivedEncoding = String(req.headers['content-encoding'] ?? '')
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"status":"completed"}')
+    })
+  })
+  t.after(() => upstream.close())
+  const upstreamPort = await listen(upstream)
+  const app = express()
+  app.use('/native', createRawPassthroughBody(), createCodexNativeProxy({
+    loadAccounts: async () => [account('a', 10, 'access-a', ['gpt-5.6-sol'])],
+    trustLoopbackClient: true,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
+  }))
+  const proxy = app.listen(0, '127.0.0.1')
+  t.after(() => proxy.close())
+  await once(proxy, 'listening')
+  const address = proxy.address()
+  assert.ok(address && typeof address === 'object')
+
+  const response = await fetch(`http://127.0.0.1:${address.port}/native/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'content-encoding': 'zstd' },
+    body: compressed,
+  })
+  assert.equal(response.status, 200)
+  assert.equal(receivedEncoding, 'zstd')
+  assert.deepEqual(received, compressed)
 })
 
 test('Native Codex proxy preserves the pinned model catalog and fails clearly when unsupported', async (t) => {
