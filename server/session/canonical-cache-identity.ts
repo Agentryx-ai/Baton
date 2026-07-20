@@ -26,7 +26,7 @@ const RESPONSE_HEADER_BLOCKLIST = new Set([
 ])
 
 export interface CanonicalResponsesBridge {
-  /** Loopback origin only. The Codex provider appends `/v1/responses`. */
+  /** Loopback base URL only. The Codex provider appends `/v1/responses`. */
   readonly baseUrl: string
   /** Per-bridge bearer credential. It is never forwarded upstream. */
   readonly token: string
@@ -164,7 +164,8 @@ async function handleResponsesRequest(
     response.once('close', () => {
       if (!response.writableEnded) abort.abort()
     })
-    const upstreamUrl = new URL('/v1/responses', upstreamOrigin)
+    const upstreamUrl = new URL(upstreamOrigin)
+    upstreamUrl.pathname = `${upstreamOrigin.pathname.replace(/\/$/u, '')}/v1/responses`
     upstreamUrl.search = parsedRequestUrl.search
     const upstream = await fetchImpl(upstreamUrl, {
       method: 'POST',
@@ -224,8 +225,8 @@ function validatedUpstreamOrigin(value: string): URL {
   if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1') {
     throw new TypeError('Canonical Responses bridge requires a 127.0.0.1 HTTP upstream')
   }
-  if (url.username || url.password || url.search || url.hash || (url.pathname !== '/' && url.pathname !== '')) {
-    throw new TypeError('Canonical Responses bridge upstream must be an origin without credentials or a query')
+  if (url.username || url.password || url.search || url.hash) {
+    throw new TypeError('Canonical Responses bridge upstream must not contain credentials, a query, or a fragment')
   }
   return url
 }

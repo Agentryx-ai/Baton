@@ -107,7 +107,11 @@ test('Native Claude proxy preserves Anthropic SSE transport and replaces client 
   assert.equal(observedAuthorization, 'Bearer oauth-secret')
   assert.equal(observedApiKey, '')
   assert.equal(observedBeta, 'server-side-fallback-2026-06-01,oauth-2025-04-20')
-  assert.equal(observedBody, body)
+  assert.deepEqual(JSON.parse(observedBody), {
+    model: 'claude-fable-5',
+    stream: true,
+    system: [{ type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." }],
+  })
   assert.equal(observedUrl, '/v1/messages?beta=true')
   assert.equal(health.snapshot().sampleCount, 1)
   assert.equal(health.snapshot().streamFailureRate, 0)
@@ -686,6 +690,7 @@ test('Native Claude proxy delegates safety fallback once to the server and prese
   assert.deepEqual(observedBody, {
     model: 'claude-fable-5',
     stream: true,
+    system: [{ type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." }],
     fallbacks: [{ model: 'claude-opus-4-8' }],
   })
   assert.match(observedBeta, /server-side-fallback-2026-06-01/)

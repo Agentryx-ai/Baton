@@ -40,6 +40,7 @@ const ALLOWED_ENDPOINTS = new Map<string, ReadonlySet<string>>([
 ])
 const CLAUDE_OAUTH_BETA = 'oauth-2025-04-20'
 const CLAUDE_SERVER_FALLBACK_BETA = 'server-side-fallback-2026-06-01'
+const CLAUDE_CODE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI for Claude."
 
 export const CLAUDE_NATIVE_PROXY_PATH = '/baton/inference/claude'
 
@@ -112,6 +113,32 @@ function persistFallbackState(runtime: ModelFallbackRuntime): void {
   } catch {
     // Diagnostics persistence is secondary to the provider's authoritative response.
     console.error('[baton] Native Claude fallback state persistence failed')
+  }
+}
+
+function claudeCodeCompatibleRequest(
+  request: Record<string, unknown>,
+  model: string | null,
+  safetyCapability: { fallbackModels: readonly string[] } | null,
+): Record<string, unknown> {
+  const system = request.system
+  const blocks = typeof system === 'string'
+    ? [{ type: 'text', text: system }]
+    : Array.isArray(system) ? system : []
+  const identified = blocks.some((block) => (
+    block && typeof block === 'object' && !Array.isArray(block)
+    && typeof (block as Record<string, unknown>).text === 'string'
+    && String((block as Record<string, unknown>).text).includes(CLAUDE_CODE_SYSTEM_PROMPT)
+  ))
+  return {
+    ...request,
+    ...(model ? { model } : {}),
+    system: identified
+      ? blocks
+      : [{ type: 'text', text: CLAUDE_CODE_SYSTEM_PROMPT }, ...blocks],
+    ...(safetyCapability
+      ? { fallbacks: safetyCapability.fallbackModels.map((fallbackModel) => ({ model: fallbackModel })) }
+      : {}),
   }
 }
 
@@ -380,14 +407,8 @@ export function createClaudeNativeProxy(options: ClaudeNativeProxyOptions): Rout
           && parsedRequest?.fallbacks === undefined
           ? options.modelFallback.controller.capability(targetModel, 'safety_refusal')
           : null
-        const requestBody = targetModel && parsedRequest && (targetModel !== model || safetyCapability)
-          ? Buffer.from(JSON.stringify({
-              ...parsedRequest,
-              model: targetModel,
-              ...(safetyCapability
-                ? { fallbacks: safetyCapability.fallbackModels.map((fallbackModel) => ({ model: fallbackModel })) }
-                : {}),
-            }))
+        const requestBody = parsedRequest
+          ? Buffer.from(JSON.stringify(claudeCodeCompatibleRequest(parsedRequest, targetModel, safetyCapability)))
           : Buffer.isBuffer(req.body) && req.body.length > 0 ? req.body : undefined
         return await routeNativeRequest<Response>({
           accounts: candidates.map((candidate, index) => ({

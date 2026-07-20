@@ -1,35 +1,29 @@
 # Baton TODO
 
-## 탈-Docker (native gateway) — 우선순위: 중
+완료 판정은 합성 테스트, local/live canary, 외부 계정 조건을 구분합니다.
 
-**현황(2026-07-18 확인):** 실제 로테이션/추론 프록시는 Baton이 아니라 **Docker 컨테이너 `ccs-ccs-1`**
-(compose 프로젝트 "ccs", 위치 `C:\_tools\ccs`, 이미지 `ghcr.io/kaitranntt/ccs:latest`)이 서빙한다.
-- `:3000` = CCS Dashboard(관리 API), `:8317` = CLIProxy API(클라이언트가 붙는 추론 엔드포인트)
-- Baton(`:4400`)은 `GATEWAY_URL=http://localhost:3000` 으로 CCS를 호출하는 **관리 UI + 조향 엔진**일 뿐,
-  추론 트래픽은 Baton을 경유하지 않는다(README / DESIGN §1.3 / ADR-3에 명시).
-- 따라서 **현재 Baton은 Docker 의존을 없애주지 않는다.** Docker Desktop이 떠 있어야 :8317이 산다.
+## P0 — Native 단일 코어 전환 마무리
 
-**목표:** Docker Desktop을 매번 켜는 번거로움 제거 = CCS(게이트웨이 + CLIProxy)를 **네이티브로 상시 구동**.
+- [x] Claude/Codex OAuth를 Baton Native vault로 무재로그인 이전
+- [x] canonical runtime, account/quota API와 UI를 Baton Native 경로로 전환
+- [x] 외부 gateway session, inference bridge, proxy mode 선택과 관리 API 제거
+- [x] Codex plugin catalog를 동일 Native OAuth의 `chatgptAuthTokens`로 인증
+- [ ] 실행 중인 Codex CLI/Desktop을 사용자가 종료한 뒤 `~/.codex/config.toml`을
+      built-in `openai` + Baton `openai_base_url`로 원자적 이전
+- [ ] 이전 직후 기존 Codex session 목록/재개와 Native 모델 200 응답 재검증
+- [ ] 원본 OAuth backup을 보존한 채 legacy proxy 컨테이너를 중지하고 포트 의존성 부재 확인
 
-**조사/작업 항목:**
-- [ ] CCS(`kaitranntt/ccs`)가 비-Docker(네이티브) 배포/실행 모드를 제공하는지 확인
-      (CLIProxy는 Go 단일 바이너리라 네이티브 구동 가능성 높음. CCS Dashboard는 Node).
-      → 불가하면 CLIProxy 바이너리만 네이티브로 띄우고 CCS Dashboard는 선택적으로 둘지 검토.
-- [ ] 네이티브 구동 시 상태 저장 위치(현재 Docker 볼륨 `ccs_home:/root/.ccs`, `ccs_logs`)의
-      네이티브 대응 경로 및 OAuth 토큰 마이그레이션.
-- [ ] 네이티브 프로세스의 부팅 시 자동시작(Windows 작업 스케줄러 또는 서비스 등록).
-- [ ] 전환 후 Baton `.env`의 `GATEWAY_URL`을 네이티브 엔드포인트로 변경(DESIGN §3.2에 이미 예고된 절연 지점).
-- [ ] 전환 후 M1 스모크 재검증(`curl :4400/api/cliproxy/auth/accounts/claude` → 실계정 JSON).
+## P1 — 외부 조건이 필요한 검수
 
-**"크게 문제없으면"의 판단 기준:** 네이티브 CLIProxy가 Docker판과 동일한 라우팅/429 페일오버/쿼터 조회를
-제공하고, 토큰/상태가 온전히 이전되면 문제없음. 하나라도 어긋나면 Docker 유지가 안전.
+- [ ] Claude 2계정에서 동일 요청 429 failover와 우선순위 검증
+- [ ] Codex 2계정에서 model-aware failover 검증
+- [ ] Codex free→pro 결제 변경 후 재로그인 없는 claim/catalog 갱신 검증
+- [ ] Claude/Codex 24시간 canary와 설정 rollback 검증
 
----
+## P2 — 제품 기능
 
-## 참고: 연결 스니펫 경로 불일치 (별도 확인 필요)
-
-`src/App.tsx`의 `buildConnectionSnippet`은 `ANTHROPIC_BASE_URL=http://127.0.0.1:8317/api/provider/claude`를
-안내하지만, 실측(CLIProxy 7.2.83)에서 그 경로는 **404**다. 실제 동작 경로는 루트 `http://127.0.0.1:8317`
-(클라이언트가 `/v1/messages`를 붙임). 스니펫 문구를 실제 경로로 교정할지 검토.
-- [ ] `buildConnectionSnippet` 경로를 `http://127.0.0.1:8317` 로 수정(또는 CLIProxy가 `/api/provider/*`를
-      지원하는 버전/설정인지 재확인).
+- [ ] WorkSet/WorkGraph scheduler, child execution API, acceptance receipt 구현
+- [ ] Built-in browser의 durable navigation/action/result 계약 구현
+- [ ] Computer Use screenshot→approval→action→result loop 구현
+- [ ] 범용 모델 fallback 다중 후보 순회와 실패 override 정리
+- [ ] Native priority-failover 외 선택적 부하분산 정책 설계

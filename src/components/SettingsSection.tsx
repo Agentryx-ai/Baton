@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Check, Copy, Info, RefreshCw, RotateCw, ShieldCheck, ShieldOff, Trash2, TriangleAlert } from 'lucide-react'
+import { RefreshCw, ShieldCheck, ShieldOff, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type {
@@ -11,16 +11,12 @@ import type {
   CodexIntegrationMode,
   ModelFallbackStatus,
   Account,
-  ProxyStatus,
-  RoutingStrategy,
-  SessionAffinity,
 } from '@/api/types'
 import type { CodexPluginCatalog, CodexPluginReferencePreview } from '@/api/codex-plugins'
 import { client } from '@/api/client'
 import { pendingModelFallbackOffers } from '@/api/model-fallback'
 import { Button } from '@/components/ui/button'
 import { BatonStatusCard } from '@/components/BatonStatusCard'
-import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Separator } from '@/components/ui/separator'
@@ -40,17 +36,9 @@ import { conversationApi } from '@/features/conversations/api'
 import type { PermissionProfile, PermissionSettingsDto } from '@/features/conversations/types'
 
 interface SettingsSectionProps {
-  routing: RoutingStrategy | null
-  policyEnabled: boolean
-  affinity: SessionAffinity | null
-  proxy: ProxyStatus | null
-  connectionSnippet: string
   clientIntegration: ClientIntegrationStatus | null
   clientIntegrationError: Error | null
   clientIntegrationLoading: boolean
-  onSetStrategy: (s: 'round-robin' | 'fill-first') => void
-  onSetAffinity: (enabled: boolean, ttl?: string) => void
-  onRestartProxy: () => void
   onRefreshClientIntegration: () => void
   onApplyClientIntegration: (
     targets: ClientIntegrationTarget[],
@@ -63,7 +51,6 @@ interface SettingsSectionProps {
   conversationPreferences: SessionViewPreferences
   onConversationPreferencesChange: (preferences: SessionViewPreferences) => void
   onPluginReferenceChanged: () => void
-  onAddCodexPluginAccount: () => void
   pluginAccountRefreshKey: number
 }
 
@@ -75,7 +62,7 @@ const INTEGRATION_TARGETS: ReadonlyArray<{
   {
     target: 'claude-cli',
     label: 'Claude CLI',
-    description: '로컬 --continue/--resume 세션은 gateway 설정과 분리되어 유지됩니다.',
+    description: '로컬 --continue/--resume 세션은 Baton Native 연결 설정과 분리되어 유지됩니다.',
   },
   {
     target: 'claude-desktop',
@@ -112,44 +99,25 @@ function Row({
 }
 
 export function SettingsSection({
-  routing,
-  policyEnabled,
-  affinity,
-  proxy,
-  connectionSnippet,
   clientIntegration,
   clientIntegrationError,
   clientIntegrationLoading,
-  onSetStrategy,
-  onSetAffinity,
-  onRestartProxy,
   onRefreshClientIntegration,
   onApplyClientIntegration,
   onRemoveClientIntegration,
   conversationPreferences,
   onConversationPreferencesChange,
   onPluginReferenceChanged,
-  onAddCodexPluginAccount,
   pluginAccountRefreshKey,
 }: SettingsSectionProps) {
-  const affinityManageable = affinity?.manageable ?? true
-
-  // Local, editable TTL — seeded from props, re-synced when the server value changes.
-  const [ttl, setTtl] = useState(affinity?.ttl ?? '')
-  useEffect(() => {
-    setTtl(affinity?.ttl ?? '')
-  }, [affinity?.ttl])
-
-  const [copied, setCopied] = useState(false)
-  const [restarting, setRestarting] = useState(false)
   const [permissionSettings, setPermissionSettings] = useState<PermissionSettingsDto | null>(null)
   const [permissionError, setPermissionError] = useState<string | null>(null)
   const [permissionBusy, setPermissionBusy] = useState(false)
   const [changingIntegrationTarget, setChangingIntegrationTarget] = useState<
     ClientIntegrationTarget | null
   >(null)
-  const [codexMode, setCodexMode] = useState<CodexIntegrationMode>('native-openai')
-  const [claudeProxyMode, setClaudeProxyMode] = useState<ClaudeProxyMode>('native')
+  const codexMode: CodexIntegrationMode = 'native-openai'
+  const claudeProxyMode: ClaudeProxyMode = 'native'
   const [modelFallback, setModelFallback] = useState<ModelFallbackStatus | null>(null)
   const [modelFallbackError, setModelFallbackError] = useState<string | null>(null)
   const [modelFallbackBusy, setModelFallbackBusy] = useState(false)
@@ -166,19 +134,6 @@ export function SettingsSection({
   const [pluginDeleteReplacement, setPluginDeleteReplacement] = useState('local_only')
   const [pluginDeleteBusy, setPluginDeleteBusy] = useState(false)
   const [pluginDeleteError, setPluginDeleteError] = useState<string | null>(null)
-  useEffect(() => {
-    const appliedMode = clientIntegration?.targets.find(
-      (target) => target.target === 'codex',
-    )?.codexMode
-    if (appliedMode) setCodexMode(appliedMode)
-  }, [clientIntegration])
-  useEffect(() => {
-    const appliedMode = clientIntegration?.targets.find(
-      (target) => target.target !== 'codex' && target.configuration === 'applied',
-    )?.claudeProxyMode
-    if (appliedMode) setClaudeProxyMode(appliedMode)
-  }, [clientIntegration])
-
   useEffect(() => {
     let cancelled = false
     conversationApi.getPermissionSettings().then((result) => {
@@ -360,30 +315,6 @@ export function SettingsSection({
     }
   }
 
-  const commitTtl = () => {
-    if (!affinity) return
-    const next = ttl.trim()
-    if (!next || next === affinity.ttl) return
-    onSetAffinity(affinity.enabled, next)
-  }
-
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(connectionSnippet)
-      setCopied(true)
-      toast.success('복사됨')
-      window.setTimeout(() => setCopied(false), 1500)
-    } catch {
-      toast.error('복사 실패')
-    }
-  }
-
-  const handleRestart = () => {
-    setRestarting(true)
-    onRestartProxy()
-    window.setTimeout(() => setRestarting(false), 1200)
-  }
-
   const handleApplyIntegration = async (target: ClientIntegrationTarget) => {
     setChangingIntegrationTarget(target)
     try {
@@ -417,39 +348,6 @@ export function SettingsSection({
   return (
     <section aria-label="세부 설정">
       <div className="rounded-xl border bg-card px-4 text-card-foreground sm:px-6">
-        {/* (a) CLIProxy strategy */}
-        <Row label="CLIProxy 전략">
-          <RadioGroup
-            value={routing?.strategy}
-            onValueChange={(v) => onSetStrategy(v as 'round-robin' | 'fill-first')}
-            disabled={policyEnabled}
-            className="gap-2"
-          >
-            <div className="flex items-start gap-2">
-              <RadioGroupItem value="round-robin" id="strategy-round-robin" className="mt-0.5" />
-              <Label htmlFor="strategy-round-robin" className="font-normal">
-                <span className="block font-medium text-foreground">round-robin</span>
-                <span className="block text-xs text-muted-foreground">활성 계정에 요청을 순서대로 분산합니다.</span>
-              </Label>
-            </div>
-            <div className="flex items-start gap-2">
-              <RadioGroupItem value="fill-first" id="strategy-fill-first" className="mt-0.5" />
-              <Label htmlFor="strategy-fill-first" className="font-normal">
-                <span className="block font-medium text-foreground">fill-first</span>
-                <span className="block text-xs text-muted-foreground">한 계정을 우선 사용하고 사용할 수 없을 때 다음 계정으로 이동합니다.</span>
-              </Label>
-            </div>
-          </RadioGroup>
-          <p className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Info className="size-3.5 shrink-0" aria-hidden />
-            {policyEnabled
-              ? '정책 ON 동안 fill-first가 필수입니다. 전략을 바꾸려면 정책을 먼저 끄세요.'
-              : 'round-robin은 균등 분산, fill-first는 계정별 순차 소진에 적합합니다.'}
-          </p>
-        </Row>
-
-        <Separator />
-
         <Row label="대화 권한">
           <RadioGroup
             value={permissionSettings?.defaultProfile}
@@ -515,110 +413,13 @@ export function SettingsSection({
 
         <Separator />
 
-        {/* (b) Session affinity */}
-        <Row label="세션 고정">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-            <div className="flex items-center gap-2">
-              <Switch
-                id="affinity-enabled"
-                checked={affinity?.enabled ?? false}
-                disabled={!affinity || !affinityManageable}
-                onCheckedChange={(checked) =>
-                  onSetAffinity(checked, ttl.trim() || undefined)
-                }
-              />
-              <Label htmlFor="affinity-enabled" className="font-normal">
-                {affinity?.enabled ? 'ON' : 'OFF'}
-              </Label>
-            </div>
-            <div className="flex items-center gap-2">
-              <Label htmlFor="affinity-ttl" className="font-normal text-muted-foreground">
-                TTL
-              </Label>
-              <Input
-                id="affinity-ttl"
-                value={ttl}
-                disabled={!affinity || !affinityManageable}
-                onChange={(e) => setTtl(e.target.value)}
-                onBlur={commitTtl}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    commitTtl()
-                  }
-                }}
-                className="h-8 w-24"
-                placeholder="1h"
-              />
-            </div>
-          </div>
-          <p className="mt-2 text-xs text-muted-foreground">
-            같은 세션의 요청을 TTL 동안 동일한 계정에 고정합니다.
-          </p>
-        </Row>
-
-        <Separator />
-
-        {/* (c) Connection info */}
-        <Row label="연결 정보">
-          <details className="rounded-md border bg-muted/20 px-3 py-2">
-            <summary className="cursor-pointer select-none text-sm font-medium">수동 연결 정보 보기</summary>
-            <div className="mt-3 flex items-start gap-2">
-              <pre className="min-w-0 flex-1 overflow-x-auto rounded-md border bg-background px-3 py-2 text-xs">
-                <code>{connectionSnippet}</code>
-              </pre>
-              <Button
-                variant="outline"
-                size="icon-sm"
-                aria-label="연결 정보 복사"
-                title="복사"
-                onClick={handleCopy}
-              >
-                {copied ? <Check /> : <Copy />}
-              </Button>
-            </div>
-          </details>
-        </Row>
-
-        <Separator />
-
         <Row label="클라이언트 자동 설정">
           <div className="space-y-3">
             <div className="rounded-md border bg-background/70 p-3">
               <span className="block text-sm font-medium">Claude 프록시 코어</span>
-              <RadioGroup
-                value={claudeProxyMode}
-                onValueChange={(value) => setClaudeProxyMode(value as ClaudeProxyMode)}
-                className="mt-2 gap-2"
-              >
-                <div className="flex items-start gap-2">
-                  <RadioGroupItem value="native" id="claude-proxy-native" className="mt-0.5" />
-                  <Label htmlFor="claude-proxy-native" className="space-y-0.5 font-normal">
-                    <span className="block text-xs font-medium">Baton Native (권장)</span>
-                    <span className="block text-[11px] leading-4 text-muted-foreground">
-                      Baton이 Anthropic에 직접 연결합니다. OAuth 갱신과 모델별 한도 판별을 보존하며 Fable 5 소진을 구체적으로 표시합니다.
-                    </span>
-                  </Label>
-                </div>
-                <div className="flex items-start gap-2">
-                  <RadioGroupItem value="cliproxy" id="claude-proxy-cliproxy" className="mt-0.5" />
-                  <Label htmlFor="claude-proxy-cliproxy" className="space-y-0.5 font-normal">
-                    <span className="block text-xs font-medium">CLIProxy (호환/rollback)</span>
-                    <span className="block text-[11px] leading-4 text-muted-foreground">
-                      기존 gateway 경로를 유지합니다. Native 전환에 문제가 있을 때만 사용하세요.
-                    </span>
-                  </Label>
-                </div>
-              </RadioGroup>
-              {claudeProxyMode === 'cliproxy' ? (
-                <div className="mt-3 flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-amber-800 dark:text-amber-200">
-                  <TriangleAlert className="mt-0.5 size-4 shrink-0" />
-                  <p className="text-xs leading-5">
-                    확인된 제한: Fable 같은 모델별 한도와 계정 전체 429를 구분하지 못하고 일반 429로 표시하거나 장시간 재시도할 수 있습니다.
-                    Baton의 모델별 quota preflight와 향후 자동 모델전환도 적용되지 않습니다.
-                  </p>
-                </div>
-              ) : null}
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                Baton Native가 OAuth 갱신, 모델별 한도 판별, 계정 failover를 직접 소유합니다. 별도 프록시 코어 선택은 제공하지 않습니다.
+              </p>
             </div>
             <div className="grid gap-2 sm:grid-cols-3">
               {INTEGRATION_TARGETS.map((option) => {
@@ -684,51 +485,13 @@ export function SettingsSection({
                         </span>
                       ) : null}
                       {option.target === 'codex' ? (
-                        isApplied ? (
-                          <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                            {status?.codexMode === 'native-openai'
-                              ? 'Baton Native Proxy · 기존 OpenAI 세션 유지'
-                              : 'CLIProxy 호환 Provider · 기존 OpenAI 대화와 분리'}
-                          </span>
-                        ) : (
-                          <RadioGroup
-                            value={codexMode}
-                            onValueChange={(value) => setCodexMode(value as CodexIntegrationMode)}
-                            className="mt-3 gap-2 rounded-md border bg-background/70 p-2"
-                          >
-                            <div className="flex items-start gap-2">
-                              <RadioGroupItem value="native-openai" id="codex-native-openai" className="mt-0.5" />
-                              <Label htmlFor="codex-native-openai" className="space-y-0.5 font-normal">
-                                <span className="block text-xs font-medium">Baton Native Proxy · 기존 세션 유지 (권장)</span>
-                                <span className="block text-[11px] leading-4 text-muted-foreground">
-                                  Baton이 Codex OAuth refresh, live 모델 카탈로그, 모델-aware 계정 failover를 직접 수행합니다. Desktop과 CLI의 기존 OpenAI 목록을 유지합니다.
-                                </span>
-                              </Label>
-                            </div>
-                            <div className="flex items-start gap-2">
-                              <RadioGroupItem value="custom-provider" id="codex-custom-provider" className="mt-0.5" />
-                              <Label htmlFor="codex-custom-provider" className="space-y-0.5 font-normal">
-                                <span className="block text-xs font-medium">CLIProxy 호환 Provider (rollback)</span>
-                                <span className="block text-[11px] leading-4 text-amber-700 dark:text-amber-300">
-                                  실제 usage-limit 뒤 same-request failover가 되지 않거나, stale plan 때문에 상위 모델이 사라질 수 있습니다. 플랜 변경 반영에 재로그인이 필요할 수 있습니다.
-                                </span>
-                              </Label>
-                            </div>
-                          </RadioGroup>
-                        )
+                        <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                          Baton Native Proxy · 기존 OpenAI 세션 유지
+                        </span>
                       ) : isApplied ? (
-                        <>
-                          <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
-                            {status?.claudeProxyMode === 'native'
-                              ? 'Baton Native Proxy 적용됨'
-                              : 'CLIProxy 호환 경로 적용됨'}
-                          </span>
-                          {status?.claudeProxyMode === 'cliproxy' ? (
-                            <span className="block text-xs leading-5 text-amber-700 dark:text-amber-300">
-                              모델별 429 식별과 자동전환을 사용할 수 없습니다.
-                            </span>
-                          ) : null}
-                        </>
+                        <span className="block text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                          Baton Native Proxy 적용됨
+                        </span>
                       ) : null}
                     </div>
                     <Button
@@ -811,9 +574,6 @@ export function SettingsSection({
             </select>
             <Button variant="outline" size="sm" disabled={pluginReferenceBusy} onClick={() => void previewPluginReference()}>
               {pluginReferenceBusy ? '확인 중…' : '변경 내용 미리보기'}
-            </Button>
-            <Button variant="outline" size="sm" disabled={pluginReferenceBusy} onClick={onAddCodexPluginAccount}>
-              플러그인 계정 추가
             </Button>
             {codexPluginAccounts.length > 0 ? (
               <div className="space-y-2 rounded-md border p-3">
@@ -1034,32 +794,8 @@ export function SettingsSection({
 
         <Separator />
 
-        {/* (d) Proxy restart */}
         <Row label="진단">
           <BatonStatusCard />
-        </Row>
-
-        <Separator />
-
-        <Row label="프록시">
-          <div className="flex items-center gap-3">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={restarting}
-              onClick={handleRestart}
-            >
-              <RotateCw className={cn(restarting && 'animate-spin')} />
-              {restarting ? '재시작 중…' : '재시작'}
-            </Button>
-            {proxy?.running ? (
-              <span className="text-xs text-muted-foreground tabular-nums">
-                :{proxy.port} · pid {proxy.pid}
-              </span>
-            ) : (
-              <span className="text-xs text-muted-foreground">정지됨</span>
-            )}
-          </div>
         </Row>
       </div>
     </section>

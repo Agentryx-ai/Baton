@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 
+import { config } from './config.ts'
+import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
+import { loadOrCreateNativeClaudeProxyToken } from './claude-native-credentials.ts'
 import {
   CodexCredentialManager,
 } from './codex-native-credentials.ts'
@@ -212,6 +215,38 @@ export class CodexNativeRuntime {
 }
 
 export const codexNativeRuntime = new CodexNativeRuntime()
+
+export interface NativeCodexProxyConnection {
+  baseUrl: string
+  token: string
+  models: string[]
+}
+
+export function codexNativeProxyBaseUrl(
+  port: number = Number(process.env.BATON_PORT ?? 4400),
+): string {
+  return `http://127.0.0.1:${port}${CODEX_NATIVE_PROXY_PATH}`
+}
+
+export async function loadNativeCodexProxyConnection(
+  includeModels: boolean,
+): Promise<NativeCodexProxyConnection> {
+  const baseUrl = codexNativeProxyBaseUrl().replace(/\/v1$/u, '')
+  const token = await loadOrCreateNativeClaudeProxyToken(config.dataDir)
+  if (!includeModels) return { baseUrl, token, models: [] }
+  const response = await fetch(`${baseUrl}/v1/models`, {
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(10_000),
+  })
+  if (!response.ok) throw new Error(`Baton Native Codex 모델 목록이 HTTP ${response.status}로 실패했습니다.`)
+  const body = await response.json() as { data?: Array<{ id?: unknown }> }
+  const models = Array.from(new Set(
+    (Array.isArray(body.data) ? body.data : [])
+      .map((item) => item.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0),
+  )).sort((left, right) => left.localeCompare(right, 'en'))
+  return { baseUrl, token, models }
+}
 
 function codexQuotaWindows(body: Record<string, unknown>): Array<{
   rateLimitType: string

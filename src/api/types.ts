@@ -1,6 +1,6 @@
 /**
  * Shared API contract types for Baton SPA.
- * Sourced from live gateway responses — see docs/DESIGN.md §2.4.
+ * Shared by the Baton Native server and SPA.
  * OWNED BY FOUNDATION. Do not edit in parallel tasks (read-only).
  */
 
@@ -45,7 +45,7 @@ export interface AccountQuota {
   success: boolean
   /** Empty array = provider exposes no limit info for this account (a first-class state). */
   windows: QuotaWindow[]
-  /** epoch ms when the gateway fetched this (server cache TTL is 2 min). */
+  /** epoch ms when Baton Native fetched this value. */
   lastUpdated: number
   accountId: string
 }
@@ -75,7 +75,7 @@ export interface BatonRuntimeStatus {
     modelProvider: 'baton' | 'openai' | 'unknown'
     providerAuth: 'available' | 'missing-or-conflicting' | 'unknown'
     openAiLogin: {
-      kind: 'chatgpt' | 'api-key' | 'access-token' | 'personal-access-token' | 'none' | 'unknown'
+      kind: 'native-vault' | 'none' | 'unknown'
       label: string
     }
     remotePluginCatalog: {
@@ -88,7 +88,7 @@ export interface BatonRuntimeStatus {
   inferenceAccount: {
     label: string
     observedAt: string | null
-    basis: 'most-recent-last-used' | 'unavailable'
+    basis: 'native-priority' | 'unavailable'
   } | null
   warnings: string[]
 }
@@ -117,8 +117,8 @@ export type ClientKind =
   | 'unknown-codex-desktop'
 
 export type ClientIntegrationTarget = 'claude-cli' | 'claude-desktop' | 'codex'
-export type CodexIntegrationMode = 'custom-provider' | 'native-openai'
-export type ClaudeProxyMode = 'native' | 'cliproxy'
+export type CodexIntegrationMode = 'native-openai'
+export type ClaudeProxyMode = 'native'
 
 export interface ClientProcess {
   pid: number

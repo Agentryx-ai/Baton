@@ -7,6 +7,12 @@ import {
   resolveCodexInvocation,
   type CodexAppServerProcess,
 } from './session/codex-adapter.ts'
+import type { CodexNativeCredential } from './codex-native-credentials.ts'
+
+export type CodexPluginCredential = Pick<
+  CodexNativeCredential,
+  'accessToken' | 'chatgptAccountId' | 'plan'
+>
 
 export type CodexPluginMarketplaceKind =
   | 'local'
@@ -46,13 +52,13 @@ export interface CodexPluginCatalogSnapshot {
 
 export interface CodexPluginListInput {
   accountId: string | null
-  accessToken?: string
+  credential?: CodexPluginCredential
   cwds?: string[]
   marketplaceKinds?: CodexPluginMarketplaceKind[]
 }
 
 export interface CodexPluginInstallInput {
-  accessToken?: string
+  credential?: CodexPluginCredential
   marketplacePath?: string
   remoteMarketplaceName?: string
   pluginName: string
@@ -70,7 +76,7 @@ export interface CodexPluginControlPlaneOptions {
   invoke?: (input: {
     method: string
     params: unknown
-    accessToken?: string
+    credential?: CodexPluginCredential
   }) => Promise<unknown>
   now?: () => Date
 }
@@ -103,17 +109,16 @@ export class CodexPluginControlPlane {
   }
 
   async list(input: CodexPluginListInput): Promise<CodexPluginCatalogSnapshot> {
-    if (input.accountId !== null && !input.accessToken) {
-      throw new CodexPluginControlPlaneError('authentication', '플러그인 기준계정 access token이 없습니다.')
+    if (input.accountId !== null && !input.credential) {
+      throw new CodexPluginControlPlaneError('authentication', '플러그인 기준계정 credential이 없습니다.')
     }
-    if (input.accessToken) await this.verifyAccessToken(input.accessToken)
     const marketplaceKinds = input.marketplaceKinds ?? (input.accountId === null
       ? ['local']
       : ['local', 'vertical', 'workspace-directory', 'shared-with-me', 'created-by-me-remote'])
     const raw = await this.invoke('plugin/list', {
       cwds: input.cwds ?? [],
       marketplaceKinds,
-    }, input.accessToken)
+    }, input.credential)
     return normalizeCatalog(raw, input.accountId, this.now().toISOString())
   }
 
@@ -124,17 +129,14 @@ export class CodexPluginControlPlane {
         'plugin install은 marketplacePath와 remoteMarketplaceName 중 하나만 요구합니다.',
       )
     }
-    if (input.remoteMarketplaceName && !input.accessToken) {
+    if (input.remoteMarketplaceName && !input.credential) {
       throw new CodexPluginControlPlaneError('authentication', '원격 plugin 설치에는 플러그인 기준계정이 필요합니다.')
-    }
-    if (input.remoteMarketplaceName && input.accessToken) {
-      await this.verifyAccessToken(input.accessToken)
     }
     const raw = object(await this.invoke('plugin/install', {
       marketplacePath: input.marketplacePath ?? null,
       remoteMarketplaceName: input.remoteMarketplaceName ?? null,
       pluginName: requiredText(input.pluginName, 'pluginName'),
-    }, input.accessToken), 'plugin/install response')
+    }, input.credential), 'plugin/install response')
     const authPolicy = enumValue(raw.authPolicy, ['ON_INSTALL', 'ON_USE'] as const, 'authPolicy')
     return {
       authPolicy,
@@ -149,31 +151,20 @@ export class CodexPluginControlPlane {
     }
   }
 
-  async uninstall(pluginId: string, accessToken?: string): Promise<void> {
-    if (accessToken) await this.verifyAccessToken(accessToken)
-    await this.invoke('plugin/uninstall', { pluginId: requiredText(pluginId, 'pluginId') }, accessToken)
+  async uninstall(pluginId: string, credential?: CodexPluginCredential): Promise<void> {
+    await this.invoke('plugin/uninstall', { pluginId: requiredText(pluginId, 'pluginId') }, credential)
   }
 
-  private async verifyAccessToken(accessToken: string): Promise<void> {
-    const raw = object(await this.invoke('account/read', { refreshToken: false }, accessToken), 'account/read response')
-    const account = optionalObject(raw.account)
-    if (account?.type !== 'chatgpt') {
-      throw new CodexPluginControlPlaneError(
-        'authentication',
-        '선택한 credential을 Codex app-server의 ChatGPT 계정으로 확인하지 못했습니다.',
-      )
-    }
-  }
-
-  private async invoke(method: string, params: unknown, accessToken?: string): Promise<unknown> {
-    if (this.invokeOverride) return await this.invokeOverride({ method, params, accessToken })
+  private async invoke(method: string, params: unknown, credential?: CodexPluginCredential): Promise<unknown> {
+    if (credential) codexPluginLoginParams(credential)
+    if (this.invokeOverride) return await this.invokeOverride({ method, params, credential })
     return await invokeAppServer({
       executable: this.executable,
       codexHome: this.codexHome,
       timeoutMs: this.timeoutMs,
       method,
       params,
-      accessToken,
+      credential,
     })
   }
 }
@@ -184,9 +175,9 @@ async function invokeAppServer(input: {
   timeoutMs: number
   method: string
   params: unknown
-  accessToken?: string
+  credential?: CodexPluginCredential
 }): Promise<unknown> {
-  const processHandle = spawnPluginAppServer(input.executable, input.codexHome, input.accessToken)
+  const processHandle = spawnPluginAppServer(input.executable, input.codexHome)
   const client = new CodexJsonlRpcClient(processHandle)
   try {
     await deadline(client.request('initialize', {
@@ -194,6 +185,10 @@ async function invokeAppServer(input: {
       capabilities: { experimentalApi: true, mcpServerOpenaiFormElicitation: false },
     }), input.timeoutMs, 'Codex plugin app-server initialize')
     await client.notify('initialized')
+    if (input.credential) {
+      await deadline(client.request('account/login/start', codexPluginLoginParams(input.credential)), input.timeoutMs, 'Codex plugin account login')
+      await deadline(waitForPluginLogin(client.incoming()), input.timeoutMs, 'Codex plugin account login completion')
+    }
     return await deadline(client.request(input.method, input.params), input.timeoutMs, `Codex ${input.method}`)
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error)
@@ -213,10 +208,27 @@ async function invokeAppServer(input: {
   }
 }
 
+async function waitForPluginLogin(messages: AsyncIterable<{
+  method?: string
+  params?: unknown
+}>): Promise<void> {
+  for await (const message of messages) {
+    if (message.method !== 'account/login/completed') continue
+    const params = object(message.params, 'account/login/completed params')
+    if (params.success === true) return
+    throw new CodexPluginControlPlaneError(
+      'authentication',
+      typeof params.error === 'string' && params.error.length > 0
+        ? `Codex plugin account login failed: ${params.error}`
+        : 'Codex plugin account login failed.',
+    )
+  }
+  throw new CodexPluginControlPlaneError('unavailable', 'Codex plugin account login ended without completion.')
+}
+
 function spawnPluginAppServer(
   executable: string,
   codexHome: string,
-  accessToken?: string,
 ): CodexAppServerProcess {
   const args = [
     '--config', 'features.plugins=true',
@@ -226,7 +238,6 @@ function spawnPluginAppServer(
   const invocation = resolveCodexInvocation(executable, args)
   const environment = codexPluginChildEnvironment()
   environment.CODEX_HOME = codexHome
-  if (accessToken) environment.CODEX_ACCESS_TOKEN = accessToken
   const child = spawn(invocation.executable, invocation.args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -250,6 +261,17 @@ function spawnPluginAppServer(
       if (child.exitCode !== null || child.signalCode !== null) return
       child.kill()
     },
+  }
+}
+
+export function codexPluginLoginParams(credential: CodexPluginCredential): Record<string, string> {
+  const accessToken = requiredText(credential.accessToken, 'accessToken')
+  const chatgptAccountId = requiredText(credential.chatgptAccountId, 'chatgptAccountId')
+  return {
+    type: 'chatgptAuthTokens',
+    accessToken,
+    chatgptAccountId,
+    ...(credential.plan ? { chatgptPlanType: credential.plan } : {}),
   }
 }
 

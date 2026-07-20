@@ -4,7 +4,8 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { Router } from 'express'
 import { parse as parseToml } from 'smol-toml'
-import { loadProxyConnection } from '../client-integration.ts'
+import { loadNativeCodexProxyConnection } from '../codex-native-runtime.ts'
+import { loadNativeClaudeProxyConnection } from '../claude-native-runtime.ts'
 import { AdapterRegistry } from './adapter-registry.ts'
 import { CanonicalContextRuntime } from './canonical-context-runtime.ts'
 import { CodexCanonicalAdapter } from './codex-adapter.ts'
@@ -45,27 +46,22 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
     cacheIdentitySecret: nativeNamespaceSecret,
     imageArtifacts,
     proxyConnection: async () => {
-      const connection = await loadProxyConnection(false)
+      const connection = await loadNativeCodexProxyConnection(false)
       return { baseUrl: connection.baseUrl, token: connection.token }
     },
   }))
-  const statelessProxyConnection = async () => {
-    const connection = await loadProxyConnection(false)
+  const claudeProxyConnection = async () => {
+    const connection = await loadNativeClaudeProxyConnection(false)
     return { baseUrl: connection.baseUrl, token: connection.token }
   }
   adapters.register(new StatelessHttpCanonicalAdapter({
     provider: 'claude',
-    proxyConnection: statelessProxyConnection,
+    proxyConnection: claudeProxyConnection,
     imageArtifacts,
     skillResources: discoverSkillResources([
       path.join(homedir(), '.claude', 'skills'),
       path.join(homedir(), '.agents', 'skills'),
     ]),
-  }))
-  adapters.register(new StatelessHttpCanonicalAdapter({
-    provider: 'gemini',
-    proxyConnection: statelessProxyConnection,
-    imageArtifacts,
   }))
   const events = new ConversationEventHub()
   const contextRuntime = new CanonicalContextRuntime(store)
@@ -80,10 +76,12 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
     nativeImport,
     imageArtifacts,
     listModels: async (provider) => {
-      const connection = await loadProxyConnection(true)
-      const configuredDefault = provider === 'codex'
-        ? await configuredDefaultModel(connection.models)
-        : null
+      const connection = provider === 'codex'
+        ? await loadNativeCodexProxyConnection(true)
+        : provider === 'claude'
+          ? await loadNativeClaudeProxyConnection(true)
+          : { models: [] }
+      const configuredDefault = provider === 'codex' ? await configuredDefaultModel(connection.models) : null
       const catalog = buildProviderModelCatalog(provider, connection.models, configuredDefault)
       return { models: catalog.models, defaultModel: catalog.defaultModel }
     },

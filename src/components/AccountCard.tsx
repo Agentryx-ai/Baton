@@ -21,16 +21,15 @@ import { QuotaBar } from '@/components/QuotaBar'
 
 /**
  * Honest account state — every value maps to a real backend fact, never an
- * inert "default" flag. CLIProxy round-robins non-paused credentials, while a
- * Baton Native backend may expose a real lowest-priority preferred account.
+ * inert "default" flag. Baton Native attempts enabled credentials by priority.
  *
  * - target        : engine's calculated first-ranked account (engine ON only;
- *                   CLIProxy request order is still determined by its strategy)
+ *                   retained only for imported historical policy state)
  * - reserve       : engine's calculated second-ranked account (engine ON only;
  *                   every non-manually-paused account remains in the pool)
  * - engine-paused : a legacy engine-owned pause pending restoration
  * - user-paused   : the user manually removed it from rotation (either mode)
- * - active        : in the CLIProxy pool, not a distinguished policy rank
+ * - active        : in the Baton Native routing pool
  */
 export type AccountStatus = 'target' | 'reserve' | 'engine-paused' | 'user-paused' | 'active'
 

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { CircleAlert, RefreshCw } from 'lucide-react'
+import { RefreshCw } from 'lucide-react'
 
 import { client } from '@/api/client'
 import type { BatonRuntimeStatus } from '@/api/types'
@@ -29,7 +29,7 @@ export function BatonStatusCard() {
       <div className="flex items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium">Baton 상태</p>
-          <p className="text-xs text-muted-foreground">모델 프록시 인증과 ChatGPT 플러그인 인증을 분리해 표시합니다.</p>
+          <p className="text-xs text-muted-foreground">Native 모델 라우팅과 플러그인 인증 상태를 표시합니다.</p>
         </div>
         <Button size="sm" variant="ghost" disabled={loading} onClick={() => void refresh()}>
           <RefreshCw className={loading ? 'animate-spin' : ''} />
@@ -52,12 +52,7 @@ export function BatonStatusCard() {
         </dl>
       ) : null}
 
-      {status?.codex.integrationMode === 'custom-provider' ? (
-        <div className="flex items-start gap-2 rounded-md border border-sky-500/30 bg-sky-500/10 p-2 text-xs leading-5">
-          <CircleAlert className="mt-0.5 size-4 shrink-0" />
-          <p>{status.codex.notice}</p>
-        </div>
-      ) : null}
+      {status ? <p className="text-xs leading-5 text-muted-foreground">{status.codex.notice}</p> : null}
       {error ? <p className="text-xs text-destructive">{error}</p> : null}
     </div>
   )

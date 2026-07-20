@@ -1,6 +1,6 @@
-import { Activity, RotateCw, TriangleAlert, Users } from 'lucide-react'
+import { Activity, TriangleAlert, Users } from 'lucide-react'
 
-import type { Account, AccountQuota, PolicyState, Provider, ProxyStatus } from '@/api/types'
+import type { Account, AccountQuota, Provider, ProxyStatus } from '@/api/types'
 
 const PROVIDERS: Provider[] = ['claude', 'codex']
 
@@ -30,12 +30,10 @@ function Metric({
 export function DashboardOverview({
   accounts,
   quotas,
-  policy,
   proxy,
 }: {
   accounts: Record<string, Account[]> | null
   quotas: Record<string, Record<string, AccountQuota | null>> | null
-  policy: PolicyState | null
   proxy: ProxyStatus | null
 }) {
   const allAccounts = PROVIDERS.flatMap((provider) => accounts?.[provider] ?? [])
@@ -43,10 +41,9 @@ export function DashboardOverview({
   const highUsageWindows = PROVIDERS.flatMap((provider) => (
     Object.values(quotas?.[provider] ?? {}).flatMap((quota) => quota?.windows ?? [])
   )).filter((window) => window.usedPercent >= 85).length
-  const targetedProviders = policy?.providers.filter((provider) => provider.target).length ?? 0
 
   return (
-    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+    <div className="grid gap-3 sm:grid-cols-3">
       <Metric
         icon={Activity}
         label="프록시"
@@ -58,12 +55,6 @@ export function DashboardOverview({
         label="활성 계정"
         value={`${activeAccounts} / ${allAccounts.length}`}
         detail={`${allAccounts.length - activeAccounts}개 일시정지`}
-      />
-      <Metric
-        icon={RotateCw}
-        label="스마트 로테이션"
-        value={policy?.enabled ? 'ON' : 'OFF'}
-        detail={policy?.enabled ? `${targetedProviders}개 provider 정책 순위 관측` : 'CLIProxy 기본 전략 사용'}
       />
       <Metric
         icon={TriangleAlert}

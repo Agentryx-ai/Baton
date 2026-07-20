@@ -53,13 +53,13 @@ test('paused Codex accounts remain eligible as plugin reference with preview, sw
     },
     getPluginCredential: async (accountId: string, forceRefresh = false) => {
       credentialRequests.push({ accountId, forceRefresh })
-      return { accessToken: `token-${accountId}` }
+      return { accessToken: `token-${accountId}`, chatgptAccountId: `chatgpt-${accountId}`, plan: 'pro' }
     },
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ method, accessToken }) => method === 'account/read'
+    invoke: async ({ method, credential }) => method === 'account/read'
       ? accountRead()
-      : rawCatalog(accessToken ? ['local', 'remote'] : ['local']),
+      : rawCatalog(credential ? ['local', 'remote'] : ['local']),
   })
   const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
   const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
@@ -104,15 +104,15 @@ test('failed post-switch catalog confirmation restores the previous plugin refer
       list: async () => accounts,
       readAccount: async () => ({ metadata: accounts[0], credential: {} }),
     },
-    getPluginCredential: async () => ({ accessToken: 'token' }),
+    getPluginCredential: async () => ({ accessToken: 'token', chatgptAccountId: 'chatgpt-account-1', plan: 'pro' }),
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ method, accessToken }) => {
+    invoke: async ({ method, credential }) => {
       if (method === 'account/read') return accountRead()
-      if (accessToken && failAuthenticatedList && ++authenticatedListsAfterArming >= 2) {
+      if (credential && failAuthenticatedList && ++authenticatedListsAfterArming >= 2) {
         throw new Error('catalog unavailable')
       }
-      return rawCatalog(accessToken ? ['remote'] : ['local'])
+      return rawCatalog(credential ? ['remote'] : ['local'])
     },
   })
   const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
@@ -186,13 +186,13 @@ test('account deletion and reference switching share one mutation boundary', asy
         accounts.splice(0, accounts.length)
       },
     },
-    getPluginCredential: async () => ({ accessToken: 'token' }),
+    getPluginCredential: async () => ({ accessToken: 'token', chatgptAccountId: 'chatgpt-account-1', plan: 'pro' }),
     forget: () => undefined,
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ method, accessToken }) => method === 'account/read'
+    invoke: async ({ method, credential }) => method === 'account/read'
       ? accountRead()
-      : rawCatalog(accessToken ? ['remote'] : ['local']),
+      : rawCatalog(credential ? ['remote'] : ['local']),
   })
   const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
   const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
@@ -222,14 +222,14 @@ test('target catalog marketplace load errors fail closed before reference mutati
       list: async () => accounts,
       readAccount: async () => ({ metadata: accounts[0], credential: {} }),
     },
-    getPluginCredential: async () => ({ accessToken: 'token' }),
+    getPluginCredential: async () => ({ accessToken: 'token', chatgptAccountId: 'chatgpt-account-1', plan: 'pro' }),
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ method, accessToken }) => method === 'account/read'
+    invoke: async ({ method, credential }) => method === 'account/read'
       ? accountRead()
       : ({
-        ...rawCatalog(accessToken ? ['remote'] : ['local']),
-        marketplaceLoadErrors: accessToken
+        ...rawCatalog(credential ? ['remote'] : ['local']),
+        marketplaceLoadErrors: credential
           ? [{ marketplacePath: 'remote', message: 'unauthorized' }]
           : [],
       }),

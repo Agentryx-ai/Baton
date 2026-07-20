@@ -1150,7 +1150,7 @@ function launchArgs(
 ): string[] {
   const providerOverrides = connection ? {
     model_provider: 'baton',
-    'model_providers.baton.name': 'Baton CLIProxy',
+    'model_providers.baton.name': 'Baton Native',
     'model_providers.baton.base_url': `${connection.baseUrl}/v1`,
     'model_providers.baton.env_key': 'BATON_PROXY_TOKEN',
     'model_providers.baton.wire_api': 'responses',

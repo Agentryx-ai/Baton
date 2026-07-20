@@ -10,13 +10,13 @@ test('Baton status uses the Baton-owned diagnostic endpoint', async () => {
     urls.push(String(input))
     return Response.json({
       checkedAt: '2026-07-20T00:00:00.000Z',
-      proxy: { running: true, port: 8317, version: 'test', strategy: 'fill-first', sessionAffinity: false },
+      proxy: { running: true, port: 4400, version: 'baton-native', strategy: 'priority-failover', sessionAffinity: false },
       codex: {
-        integrationMode: 'custom-provider',
+        integrationMode: 'native-openai',
         configuration: 'applied',
-        modelProvider: 'baton',
+        modelProvider: 'openai',
         providerAuth: 'available',
-        openAiLogin: { kind: 'none', label: 'OpenAI/ChatGPT 로그인 없음' },
+        openAiLogin: { kind: 'native-vault', label: 'Native OAuth 계정' },
         remotePluginCatalog: { state: 'unavailable', reason: 'test' },
         configuredHome: 'test',
         notice: 'test',
@@ -28,7 +28,7 @@ test('Baton status uses the Baton-owned diagnostic endpoint', async () => {
 
   try {
     const status = await client.getBatonStatus()
-    assert.equal(status.codex.modelProvider, 'baton')
+    assert.equal(status.codex.modelProvider, 'openai')
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -36,40 +36,7 @@ test('Baton status uses the Baton-owned diagnostic endpoint', async () => {
   assert.deepEqual(urls, ['/baton/status'])
 })
 
-test('routing settings use the installed CCS PUT contracts', async () => {
-  const originalFetch = globalThis.fetch
-  const calls: Array<{ url: string; method: string | undefined; body: unknown }> = []
-  globalThis.fetch = (async (input, init) => {
-    calls.push({
-      url: String(input),
-      method: init?.method,
-      body: init?.body ? JSON.parse(String(init.body)) : null,
-    })
-    return Response.json({ success: true })
-  }) as typeof fetch
-
-  try {
-    await client.setRoutingStrategy('fill-first')
-    await client.setSessionAffinity(true, '2h')
-  } finally {
-    globalThis.fetch = originalFetch
-  }
-
-  assert.deepEqual(calls, [
-    {
-      url: '/api/cliproxy/routing/strategy',
-      method: 'PUT',
-      body: { value: 'fill-first' },
-    },
-    {
-      url: '/api/cliproxy/routing/session-affinity',
-      method: 'PUT',
-      body: { enabled: true, ttl: '2h' },
-    },
-  ])
-})
-
-test('Claude account operations use Native routes while a custom-provider Codex stays on CLIProxy', async () => {
+test('Claude and Codex account operations always use Baton Native routes', async () => {
   const originalFetch = globalThis.fetch
   const calls: Array<{ url: string; method: string | undefined; body: unknown }> = []
   globalThis.fetch = (async (input, init) => {
@@ -100,7 +67,7 @@ test('Claude account operations use Native routes while a custom-provider Codex 
             certainlyStopped: true,
             running: [],
             configuration: 'applied',
-            codexMode: 'custom-provider',
+            codexMode: 'native-openai',
           },
         ],
       })
@@ -147,11 +114,11 @@ test('Claude account operations use Native routes while a custom-provider Codex 
   assert.ok(urls.includes('/baton/claude-native/auth/submit-callback'))
   assert.ok(urls.includes('/baton/claude-native/auth/cancel'))
 
-  assert.ok(urls.includes('/api/cliproxy/auth/accounts/codex'))
-  assert.ok(urls.includes('/api/cliproxy/quota/codex/codex%2Faccount'))
-  assert.ok(urls.includes('/api/cliproxy/auth/accounts/codex/codex%2Faccount/pause'))
-  assert.ok(urls.includes('/api/cliproxy/auth/codex/start-url'))
-  assert.equal(urls.some((url) => url.startsWith('/api/cliproxy/') && url.includes('claude')), false)
+  assert.ok(urls.includes('/baton/codex-native/accounts'))
+  assert.ok(urls.includes('/baton/codex-native/quota/codex%2Faccount'))
+  assert.ok(urls.includes('/baton/codex-native/accounts/codex%2Faccount/pause'))
+  assert.ok(urls.includes('/baton/codex-native/auth/start-url'))
+  assert.equal(urls.some((url) => url.startsWith('/api/')), false)
 })
 
 test('model fallback settings use the Baton-owned control plane', async () => {
@@ -243,7 +210,7 @@ test('Codex plugin reference candidates always use the Native vault endpoint', a
   ])
 })
 
-test('dedicated Codex plugin OAuth bypasses the model integration backend', async () => {
+test('Codex OAuth creates one unified Native account for model and plugin use', async () => {
   const originalFetch = globalThis.fetch
   const urls: string[] = []
   let startBody: unknown = null
@@ -271,10 +238,10 @@ test('dedicated Codex plugin OAuth bypasses the model integration backend', asyn
     '/baton/codex-native/auth/submit-callback',
     '/baton/codex-native/auth/cancel',
   ])
-  assert.deepEqual(startBody, { nickname: 'Plugin Account', enabledForModelRouting: false })
+  assert.deepEqual(startBody, { nickname: 'Plugin Account' })
 })
 
-test('native-openai Codex account operations never call CLIProxy', async () => {
+test('native-openai Codex account operations stay on Baton-owned routes', async () => {
   const originalFetch = globalThis.fetch
   const urls: string[] = []
   globalThis.fetch = (async (input) => {
@@ -318,5 +285,5 @@ test('native-openai Codex account operations never call CLIProxy', async () => {
   assert.ok(urls.includes('/baton/codex-native/accounts/codex%2Faccount/resume'))
   assert.ok(urls.includes('/baton/codex-native/accounts/codex%2Faccount'))
   assert.ok(urls.includes('/baton/codex-native/auth/start-url'))
-  assert.equal(urls.some((url) => url.startsWith('/api/cliproxy/') && url.includes('codex')), false)
+  assert.equal(urls.some((url) => url.startsWith('/api/')), false)
 })

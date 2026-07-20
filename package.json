@@ -17,7 +17,9 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "oxlint",
     "smoke:codex-adapter": "tsx scripts/codex-adapter-smoke.ts",
+    "smoke:claude-native": "tsx scripts/claude-native-canary.ts",
     "smoke:codex-plugins": "tsx scripts/codex-plugin-account-canary.ts",
+    "migrate:legacy-accounts": "tsx scripts/migrate-legacy-cliproxy-accounts.ts",
     "restore:native-goals": "tsx scripts/restore-native-goals.ts",
     "preview": "vite preview"
   },

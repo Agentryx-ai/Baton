@@ -11,8 +11,7 @@
 - 기존 Baton checkout과 현재 Git 변경 사항
 - 적용되는 `AGENTS.md`와 저장소 `README.md`
 - 기존 `.env`의 존재 여부. 값은 출력하지 않습니다.
-- gateway 관리 API와 CLIProxy의 실행 상태. 발견되지 않아도 임의의 외부 backend를 설치하지
-  않습니다.
+- 기존 Baton Native data directory와 legacy OAuth 원본의 존재 여부. 비밀값은 출력하지 않습니다.
 - 실행 중인 Claude Code, Codex CLI/Desktop. 현재 에이전트 자신의 프록시 설정은 설치 도중
   변경하지 않습니다.
 
@@ -38,10 +37,8 @@ cd Baton
 cp .env.example .env
 ```
 
-다음 값을 설정합니다.
+다음 값을 필요할 때만 설정합니다.
 
-- `GATEWAY_URL` — 기본값 `http://localhost:3000`
-- `GATEWAY_USER`, `GATEWAY_PASS` — gateway 관리 API 자격 증명
 - `BATON_PORT` — 선택 사항, 기본값 `4400`
 - `BATON_DATA_DIR` — 선택 사항. canonical SQLite, vault와 runtime state를 다른 위치에 저장할
   때만 지정
@@ -78,7 +75,7 @@ codex plugin add baton-codex-runtime-bridge@baton-local
 추가되면 loader를 우선합니다.
 
 검증이 실패하면 오류 원인을 확인하고 설치에 필요한 최소 변경만 적용한 뒤 실패한 검사와 관련
-전체 검사를 다시 실행합니다. Gateway 또는 CLIProxy가 없어서 외부 연동 검증만 실패한 경우에도
+전체 검사를 다시 실행합니다. Provider OAuth나 추가 계정이 없어 live 검증만 실패한 경우에도
 Baton 자체 build/test 결과와 외부 blocker를 구분해 보고합니다.
 
 ## 5. 실행 확인
@@ -99,11 +96,11 @@ npm start
 
 설치 작업을 실행 중인 Claude Code 또는 Codex 자신의 설정을 세션 도중 바꾸지 않습니다.
 설치와 검증이 끝난 뒤 사용자가 대상 CLI/Desktop을 완전히 종료하고 Baton 설정 UI에서 각
-클라이언트의 integration mode를 선택하도록 안내합니다.
+클라이언트의 Baton Native 연결을 적용하도록 안내합니다.
 
-- Baton Native는 Claude/Codex credential, refresh와 failover를 Baton이 직접 소유하는 경로입니다.
-- CLIProxy는 기존 설치와의 호환 경로입니다. 필요한 backend가 없으면 임의로 설치하지 않습니다.
-- Codex의 기존 OpenAI thread 목록을 유지하려면 `native-openai` 모드를 선택합니다.
+- Baton Native는 Claude/Codex credential, refresh, quota, plugin 인증과 failover를 직접 소유합니다.
+- Codex는 built-in `openai` provider identity를 유지해 기존 OpenAI thread 목록을 보존합니다.
+- legacy proxy OAuth가 발견되면 `npm run migrate:legacy-accounts`로 Native vault에 한 번 이전합니다.
 
 설정을 적용하거나 해제한 뒤에는 해당 클라이언트를 완전히 재시작합니다.
 
@@ -116,6 +113,6 @@ npm start
 - Codex를 사용하는 경우 runtime bridge plugin 설치/검증 결과
 - Baton 실행 상태와 대시보드 URL
 - 재실행 명령과 종료 방법
-- gateway/CLIProxy/OAuth/login처럼 사용자가 직접 처리해야 하는 남은 조건
+- OAuth/login이나 추가 계정처럼 사용자가 직접 처리해야 하는 남은 조건
 
 필수 검증 실패, health 실패 또는 unresolved 설정 충돌이 있으면 설치 완료로 표시하지 않습니다.

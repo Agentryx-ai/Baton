@@ -103,18 +103,18 @@ export class CodexPluginReferenceService {
     pluginName: string
   }): Promise<{ authPolicy: 'ON_INSTALL' | 'ON_USE'; appsNeedingAuth: Array<{ id: string; name: string }> }> {
     const state = await this.store.get()
-    const accessToken = state.mode === 'account'
-      ? (await this.runtime.getPluginCredential(state.accountId)).accessToken
+    const credential = state.mode === 'account'
+      ? await this.runtime.getPluginCredential(state.accountId)
       : undefined
-    return await this.controlPlane.install({ ...input, accessToken })
+    return await this.controlPlane.install({ ...input, credential })
   }
 
   async uninstall(pluginId: string): Promise<void> {
     const state = await this.store.get()
-    const accessToken = state.mode === 'account'
-      ? (await this.runtime.getPluginCredential(state.accountId)).accessToken
+    const credential = state.mode === 'account'
+      ? await this.runtime.getPluginCredential(state.accountId)
       : undefined
-    await this.controlPlane.uninstall(pluginId, accessToken)
+    await this.controlPlane.uninstall(pluginId, credential)
   }
 
   async preview(target: CodexPluginReference, cwds: string[] = []): Promise<CodexPluginReferencePreview> {
@@ -253,7 +253,7 @@ export class CodexPluginReferenceService {
     const credential = await this.runtime.getPluginCredential(reference.accountId, forceRefresh)
     return this.requireCompleteCatalog(await this.controlPlane.list({
       accountId: reference.accountId,
-      accessToken: credential.accessToken,
+      credential,
       cwds,
     }))
   }

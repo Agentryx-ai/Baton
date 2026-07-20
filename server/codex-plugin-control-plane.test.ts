@@ -4,8 +4,16 @@ import test from 'node:test'
 import {
   CodexPluginControlPlane,
   CodexPluginControlPlaneError,
+  type CodexPluginCredential,
   codexPluginChildEnvironment,
+  codexPluginLoginParams,
 } from './codex-plugin-control-plane.ts'
+
+const credential = {
+  accessToken: 'secret',
+  chatgptAccountId: 'chatgpt-account-1',
+  plan: 'pro',
+}
 
 function catalog(pluginId = 'plugin-a'): Record<string, unknown> {
   return {
@@ -31,46 +39,37 @@ function catalog(pluginId = 'plugin-a'): Record<string, unknown> {
 }
 
 test('Codex plugin catalog is normalized and account mode requests every supported marketplace kind', async () => {
-  const calls: Array<{ method: string; params: unknown; accessToken?: string }> = []
+  const calls: Array<{ method: string; params: unknown; credential?: CodexPluginCredential }> = []
   const control = new CodexPluginControlPlane({
     now: () => new Date('2026-07-20T00:00:00.000Z'),
     invoke: async (input) => {
       calls.push(input)
-      return input.method === 'account/read'
-        ? { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true }
-        : catalog()
+      return catalog()
     },
   })
 
-  const result = await control.list({ accountId: 'account-1', accessToken: 'secret', cwds: ['C:\\repo'] })
+  const result = await control.list({ accountId: 'account-1', credential, cwds: ['C:\\repo'] })
   assert.equal(result.accountId, 'account-1')
   assert.equal(result.marketplaces[0]?.plugins[0]?.displayName, 'Plugin A')
   assert.deepEqual(calls, [
-    {
-      method: 'account/read',
-      params: { refreshToken: false },
-      accessToken: 'secret',
-    },
     {
       method: 'plugin/list',
       params: {
         cwds: ['C:\\repo'],
         marketplaceKinds: ['local', 'vertical', 'workspace-directory', 'shared-with-me', 'created-by-me-remote'],
       },
-      accessToken: 'secret',
+      credential,
     },
   ])
 })
 
-test('Codex plugin account mode rejects credentials not recognized as ChatGPT auth', async () => {
+test('Codex plugin account mode rejects incomplete ChatGPT credentials', async () => {
   const control = new CodexPluginControlPlane({
-    invoke: async ({ method }) => method === 'account/read'
-      ? { account: { type: 'apiKey' }, requiresOpenaiAuth: true }
-      : catalog(),
+    invoke: async () => catalog(),
   })
   await assert.rejects(
-    control.list({ accountId: 'account-1', accessToken: 'wrong-kind' }),
-    (error: unknown) => error instanceof CodexPluginControlPlaneError && error.code === 'authentication',
+    control.list({ accountId: 'account-1', credential: { accessToken: 'token' } }),
+    (error: unknown) => error instanceof CodexPluginControlPlaneError && error.code === 'invalid',
   )
 })
 
@@ -84,6 +83,19 @@ test('Codex plugin child environment removes Baton, gateway, and inherited API c
     CODEX_ACCESS_TOKEN: 'old-token',
     CODEX_HOME: 'keep-home',
   }), { PATH: 'safe', CODEX_HOME: 'keep-home' })
+})
+
+test('Codex plugin account auth uses the app-server ChatGPT token contract', () => {
+  assert.deepEqual(codexPluginLoginParams(credential), {
+    type: 'chatgptAuthTokens',
+    accessToken: 'secret',
+    chatgptAccountId: 'chatgpt-account-1',
+    chatgptPlanType: 'pro',
+  })
+  assert.throws(
+    () => codexPluginLoginParams({ accessToken: 'secret' }),
+    (error: unknown) => error instanceof CodexPluginControlPlaneError && error.code === 'invalid',
+  )
 })
 
 test('Codex plugin install enforces the marketplace XOR and remote authentication contract', async () => {

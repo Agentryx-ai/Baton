@@ -1,4 +1,4 @@
-/** CLIProxy status, polled every 10s (lightweight; detects restarts). */
+/** Baton Native proxy status, polled every 10s. */
 import type { ProxyStatus } from '@/api/types'
 import { client } from '@/api/client'
 import { usePolling } from '@/hooks/usePolling'

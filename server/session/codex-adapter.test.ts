@@ -753,7 +753,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     assert.ok(args.includes('features.shell_tool=false'))
     assert.ok(args.includes('features.standalone_web_search=false'))
     assert.ok(args.includes('model_provider="baton"'))
-    assert.ok(args.includes('model_providers.baton.name="Baton CLIProxy"'))
+    assert.ok(args.includes('model_providers.baton.name="Baton Native"'))
     assert.ok(args.includes('model_providers.baton.base_url="http://127.0.0.1:8317/v1"'))
     assert.ok(args.includes('model_providers.baton.env_key="BATON_PROXY_TOKEN"'))
     assert.ok(args.includes('model_providers.baton.wire_api="responses"'))

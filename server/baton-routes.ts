@@ -1,9 +1,5 @@
 /**
- * HTTP routes for the policy engine, mounted by server/index.ts.
- *
- *   GET  /baton/policy       -> PolicyState
- *   POST /baton/policy       -> { enabled?: boolean, policy?: string } -> PolicyState
- *   GET  /baton/policy/log   -> { log: SteerLogEntry[] }
+ * Baton-owned client integration and status routes.
  *
  * The app installs `express.raw`, so `req.body` arrives as a Buffer (or empty).
  * We parse JSON ourselves, defensively, rather than assuming a JSON body parser.
@@ -12,8 +8,6 @@
 import { Router } from 'express'
 import type { Request, Response } from 'express'
 
-import { policyEngine } from './policy-engine.ts'
-import { POLICY_ID } from './policy-types.ts'
 import {
   applyClientIntegration,
   ClientIntegrationError,
@@ -50,39 +44,6 @@ function parseBody(body: unknown): Record<string, unknown> {
   if (typeof body === 'object') return body as Record<string, unknown>
   return {}
 }
-
-batonRouter.get('/baton/policy', (_req: Request, res: Response) => {
-  res.json(policyEngine.getState())
-})
-
-batonRouter.post('/baton/policy', async (req: Request, res: Response) => {
-  const body = parseBody(req.body)
-
-  // Validate before mutating so a bad request changes nothing.
-  const hasPolicy = 'policy' in body && body.policy !== undefined
-  if (hasPolicy && body.policy !== POLICY_ID) {
-    res.status(400).json({ error: `unknown policy '${String(body.policy)}'` })
-    return
-  }
-  const hasEnabled = 'enabled' in body && body.enabled !== undefined
-  if (hasEnabled && typeof body.enabled !== 'boolean') {
-    res.status(400).json({ error: 'enabled must be a boolean' })
-    return
-  }
-
-  try {
-    if (hasPolicy) await policyEngine.setPolicy(POLICY_ID)
-    if (hasEnabled) await policyEngine.setEnabled(body.enabled as boolean)
-    res.json(policyEngine.getState())
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err)
-    res.status(500).json({ error: message })
-  }
-})
-
-batonRouter.get('/baton/policy/log', (_req: Request, res: Response) => {
-  res.json({ log: policyEngine.getState().log })
-})
 
 batonRouter.get('/baton/client-integration', async (_req: Request, res: Response) => {
   res.json(await getClientIntegrationStatus())

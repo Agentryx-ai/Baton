@@ -93,6 +93,31 @@ test('canonical Responses bridge authenticates locally and deterministically rep
   }
 })
 
+test('canonical Responses bridge preserves an approved loopback proxy base path', async () => {
+  let upstreamUrl = ''
+  const bridge = await startCanonicalResponsesBridge({
+    upstreamBaseUrl: 'http://127.0.0.1:4400/baton/inference/openai',
+    upstreamToken: 'upstream-secret',
+    promptCacheKey: 'baton-th-v1-native-path',
+    allowedToolNames: [],
+    fetchImpl: async (url) => {
+      upstreamUrl = String(url)
+      return Response.json({ ok: true })
+    },
+  })
+  try {
+    const response = await fetch(`${bridge.baseUrl}/v1/responses`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${bridge.token}` },
+      body: '{}',
+    })
+    assert.equal(response.status, 200)
+    assert.equal(upstreamUrl, 'http://127.0.0.1:4400/baton/inference/openai/v1/responses')
+  } finally {
+    await bridge.close()
+  }
+})
+
 test('canonical Responses bridge has no alternate route or direct fallback', async () => {
   await assert.rejects(
     startCanonicalResponsesBridge({
