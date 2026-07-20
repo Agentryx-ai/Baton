@@ -3966,6 +3966,18 @@ export class SqliteSessionStore implements SessionStore {
         }
       }
 
+      const interruptedRows = this.#all(this.#db.prepare(`
+        SELECT turns.*,threads.session_id AS session_id
+        FROM turns JOIN threads ON threads.id=turns.thread_id
+        WHERE turns.status='interrupted'
+        ORDER BY turns.id
+      `))
+      for (const row of interruptedRows) {
+        if (this.#repairInterruptedReadOnlyToolCalls(row, now) > 0) {
+          recoveredTurnIds.add(text(row, 'id'))
+        }
+      }
+
       const unsettledGoalTurns = this.#all(this.#db.prepare(`
         SELECT turns.*,threads.session_id AS session_id,executions.budget_json AS execution_budget_json
         FROM turns JOIN threads ON threads.id=turns.thread_id
@@ -4028,6 +4040,69 @@ export class SqliteSessionStore implements SessionStore {
       }
       return recoveredTurnIds.size
     })
+  }
+
+  #repairInterruptedReadOnlyToolCalls(turn: SqlRow, now: string): number {
+    const turnId = text(turn, 'id')
+    const rows = this.#all(this.#db.prepare(`
+      SELECT kind,payload_json FROM items
+      WHERE turn_id=? AND kind IN ('tool_call','tool_result')
+      ORDER BY sequence
+    `), turnId)
+    const completed = new Set<string>()
+    const calls = new Map<string, { providerCallId: string; toolName: string }>()
+    for (const row of rows) {
+      const payload = parseObject(row.payload_json)
+      const callId = typeof payload.callId === 'string' ? payload.callId : null
+      if (!callId) continue
+      if (text(row, 'kind') === 'tool_result') {
+        completed.add(callId)
+        continue
+      }
+      if (payload.sideEffect !== 'read_only' || calls.has(callId)) continue
+      const providerCallId = typeof payload.providerCallId === 'string' ? payload.providerCallId : null
+      const toolName = typeof payload.name === 'string' ? payload.name : null
+      if (!providerCallId || !toolName) throw new Error('Corrupt database: read-only tool call identity is incomplete')
+      calls.set(callId, { providerCallId, toolName })
+    }
+    const unresolved = [...calls].filter(([callId]) => !completed.has(callId))
+    if (unresolved.length === 0) return 0
+
+    const items = this.#appendItems(
+      text(turn, 'session_id'),
+      text(turn, 'thread_id'),
+      turnId,
+      text(turn, 'provider') as CanonicalProvider,
+      unresolved.map(([callId, call]) => ({
+        kind: 'tool_result' as const,
+        visibility: 'portable' as const,
+        nativeId: call.providerCallId,
+        payload: {
+          callId,
+          providerCallId: call.providerCallId,
+          toolName: call.toolName,
+          result: {
+            success: false,
+            content: null,
+            error: {
+              code: 'runtime_interrupted',
+              message: 'Runtime interrupted before a durable tool result was recorded; the output is unavailable',
+              retryable: false,
+            },
+          },
+        },
+      })),
+      `baton:recover-interrupted-read-only:${turnId}`,
+      now,
+    )
+    this.#db.prepare('UPDATE threads SET revision=revision+1,updated_at=? WHERE id=?')
+      .run(now, text(turn, 'thread_id'))
+    this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, text(turn, 'session_id'))
+    this.#appendStreamEvent(text(turn, 'session_id'), text(turn, 'thread_id'), turnId, 'items_appended', {
+      itemIds: items.map((item) => item.id),
+      interruptedReadOnlyRecovery: true,
+    }, now)
+    return items.length
   }
 
   #hasUnresolvedMutatingToolCall(turnId: TurnId): boolean {
