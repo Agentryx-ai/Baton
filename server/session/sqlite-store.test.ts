@@ -13,7 +13,7 @@ import type {
   ProviderCapabilities,
 } from './domain.ts'
 import { ContextPersistenceError, SqliteSessionStore } from './sqlite-store.ts'
-import { sourceHashForItems } from './context-materializer.ts'
+import { hasSafeContextToolState, sourceHashForItems } from './context-materializer.ts'
 import { FollowUpStoreError, GoalStoreError, SessionStoreError } from './store.ts'
 import { goalEvidenceHash } from './goal-evidence.ts'
 import type { BeginSessionInput } from './store.ts'
@@ -3108,6 +3108,105 @@ test('startup recovery reports an unresolved mutating tool as an unknown outcome
   assert.equal(recovered.recoverInterruptedTurns(), 1)
   assert.equal(recovered.getTurn(started.turn.id)?.error?.code, 'unknown_mutation_outcome')
   assert.equal(recovered.getGoalById(goal.id)?.statusReason?.code, 'unknown_mutation_outcome')
+})
+
+test('startup recovery durably fails interrupted read-only tool calls exactly once', (t) => {
+  const path = databasePath(t)
+  const options = deterministicOptions()
+  const first = new SqliteSessionStore(path, options)
+  const session = first.createSession({})
+  const started = first.beginTurn(beginInput(session.activeThreadId))
+  first.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'unresolved-read-call',
+    items: [{
+      kind: 'tool_call',
+      payload: {
+        callId: 'read-1', providerCallId: 'provider-read-1', name: 'read_file',
+        input: { path: 'x' }, sideEffect: 'read_only',
+      },
+    }],
+  })
+  first.close()
+
+  const recovered = new SqliteSessionStore(path, options)
+  assert.equal(recovered.recoverInterruptedTurns(), 1)
+  const results = recovered.listItems(session.activeThreadId).filter((item) => item.kind === 'tool_result')
+  assert.equal(results.length, 1)
+  assert.equal(results[0]?.visibility, 'portable')
+  assert.equal(results[0]?.nativeId, 'provider-read-1')
+  assert.deepEqual(results[0]?.payload, {
+    callId: 'read-1',
+    providerCallId: 'provider-read-1',
+    toolName: 'read_file',
+    result: {
+      success: false,
+      content: null,
+      error: {
+        code: 'runtime_interrupted',
+        message: 'Runtime interrupted before a durable tool result was recorded; the output is unavailable',
+        retryable: false,
+      },
+    },
+  })
+  assert.equal(hasSafeContextToolState(recovered.getSnapshot(session.activeThreadId)?.items ?? []), true)
+  assert.equal(recovered.recoverInterruptedTurns(), 0)
+  const thread = recovered.getThread(session.activeThreadId)
+  assert.ok(thread)
+  const next = recovered.beginTurn({
+    ...beginInput(session.activeThreadId, 'request-after-recovery', 'hash-after-recovery'),
+    expectedRevision: thread.revision,
+  })
+  assert.equal(next.duplicate, false)
+  recovered.finishTurn({ turnId: next.turn.id, status: 'completed' })
+  recovered.close()
+
+  const reopened = new SqliteSessionStore(path, options)
+  t.after(() => reopened.close())
+  assert.equal(reopened.recoverInterruptedTurns(), 0)
+  assert.equal(reopened.listItems(session.activeThreadId).filter((item) => item.kind === 'tool_result').length, 1)
+})
+
+test('startup recovery repairs legacy terminal read-only calls but leaves mutations unresolved', (t) => {
+  const path = databasePath(t)
+  const options = deterministicOptions()
+  const first = new SqliteSessionStore(path, options)
+  const session = first.createSession({})
+  const started = first.beginTurn(beginInput(session.activeThreadId))
+  first.appendProviderEvent({
+    turnId: started.turn.id,
+    eventId: 'legacy-unresolved-calls',
+    items: [
+      {
+        kind: 'tool_call',
+        payload: {
+          callId: 'read-1', providerCallId: 'provider-read-1', name: 'read_file',
+          input: { path: 'x' }, sideEffect: 'read_only',
+        },
+      },
+      {
+        kind: 'tool_call',
+        payload: {
+          callId: 'mutation-1', providerCallId: 'provider-mutation-1', name: 'write_file',
+          input: { path: 'x' }, sideEffect: 'workspace_mutation',
+        },
+      },
+    ],
+  })
+  first.finishTurn({
+    turnId: started.turn.id,
+    status: 'interrupted',
+    error: { code: 'runtime_interrupted' },
+  })
+  first.close()
+
+  const recovered = new SqliteSessionStore(path, options)
+  t.after(() => recovered.close())
+  assert.equal(recovered.recoverInterruptedTurns(), 1)
+  const results = recovered.listItems(session.activeThreadId).filter((item) => item.kind === 'tool_result')
+  assert.deepEqual(results.map((item) => item.payload.callId), ['read-1'])
+  assert.equal(hasSafeContextToolState(recovered.getSnapshot(session.activeThreadId)?.items ?? []), false)
+  assert.equal(recovered.recoverInterruptedTurns(), 0)
 })
 
 test('unknown mutation reconciliation appends one durable result and preserves explicit Goal resume', (t) => {
