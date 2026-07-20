@@ -799,6 +799,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
             )
             if (eventScope === 'foreign') continue
             trackNativeChildThreads(params, nativeThreadId, nativeChildThreadIds)
+            trackNativeSubAgentActivity(message.method, params, nativeThreadId, nativeChildThreadIds)
             const forbiddenItemType = forbiddenNotificationItemType(message.method, params)
             if (forbiddenItemType !== null) {
               throw capabilityViolation(
@@ -1409,6 +1410,22 @@ function trackNativeChildThreads(
   }
   if (receivers.some((threadId) => threadId !== rootThreadId && !threadIds.has(threadId))) {
     throw capabilityViolation('Codex collaboration event referenced an unowned native receiver thread')
+  }
+}
+
+function trackNativeSubAgentActivity(
+  method: string,
+  params: JsonObject | null,
+  rootThreadId: string,
+  threadIds: Set<string>,
+): void {
+  if (method !== 'item/completed') return
+  const item = asOptionalObject(params?.item)
+  if (item?.type !== 'subAgentActivity' || item.kind !== 'started') return
+  if (typeof item.agentThreadId === 'string' && item.agentThreadId.trim().length > 0
+    && item.agentThreadId !== rootThreadId
+    && typeof item.agentPath === 'string' && item.agentPath.trim().length > 0) {
+    threadIds.add(item.agentThreadId)
   }
 }
 

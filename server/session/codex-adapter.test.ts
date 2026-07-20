@@ -33,6 +33,10 @@ type Scenario =
   | 'collab'
   | 'collabChildEvent'
   | 'collabChildTool'
+  | 'subAgentActivityChildTool'
+  | 'foreignSubAgentActivity'
+  | 'invalidSubAgentActivity'
+  | 'selfSubAgentActivity'
   | 'foreignCollabSender'
   | 'childStartsBeforeCollab'
   | 'subAgentActivity'
@@ -283,7 +287,8 @@ function scriptedFactory(
         && 'result' in message
       ) {
         emitScenario(self, 'normal')
-      } else if (scenario === 'collabChildTool' && message.id === 62 && 'result' in message) {
+      } else if ((scenario === 'collabChildTool' || scenario === 'subAgentActivityChildTool')
+        && message.id === 62 && 'result' in message) {
         self.emit({
           method: 'item/completed',
           params: {
@@ -426,6 +431,60 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
         item: { id: 'subagent-activity-1', type: 'subAgentActivity', kind: 'started' },
       },
     })
+  }
+  if (scenario === 'subAgentActivityChildTool') {
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'native-thread',
+        turnId: 'native-turn',
+        item: {
+          id: 'subagent-activity-1',
+          type: 'subAgentActivity',
+          kind: 'started',
+          agentThreadId: 'native-child-thread',
+          agentPath: '/root/child',
+        },
+      },
+    })
+    process.emit({
+      method: 'turn/started',
+      params: {
+        threadId: 'native-child-thread',
+        turn: { id: 'native-child-turn', status: 'inProgress', items: [] },
+      },
+    })
+    emitToolCall(process, {
+      rpcId: 62,
+      threadId: 'native-child-thread',
+      turnId: 'native-child-turn',
+      callId: 'child-provider-call',
+    })
+    return
+  }
+  if (scenario === 'foreignSubAgentActivity' || scenario === 'invalidSubAgentActivity'
+    || scenario === 'selfSubAgentActivity') {
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: scenario === 'foreignSubAgentActivity' ? 'foreign-thread' : 'native-thread',
+        turnId: scenario === 'foreignSubAgentActivity' ? 'foreign-turn' : 'native-turn',
+        item: {
+          id: 'subagent-activity-1',
+          type: 'subAgentActivity',
+          kind: 'started',
+          agentThreadId: scenario === 'selfSubAgentActivity' ? 'native-thread' : 'native-child-thread',
+          ...(scenario === 'invalidSubAgentActivity' ? {} : { agentPath: '/foreign/child' }),
+        },
+      },
+    })
+    emitToolCall(process, {
+      rpcId: 62,
+      threadId: scenario === 'selfSubAgentActivity' ? 'native-thread' : 'native-child-thread',
+      turnId: scenario === 'selfSubAgentActivity' ? 'foreign-turn' : 'native-child-turn',
+      callId: 'child-provider-call',
+    })
+    return
   }
   if (scenario === 'nonSpawnUnknownReceiver') {
     process.emit({
@@ -1188,6 +1247,47 @@ test('adapter executes Baton dynamic tools for a registered provider-native chil
     input: { path: 'README.md' },
   }])
 })
+
+test('adapter registers native child ownership from subagent activity before its dynamic tool call', async () => {
+  const invocations: AgentToolInvocation[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('subAgentActivityChildTool', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    executeTool: async (invocation) => {
+      invocations.push(invocation)
+      return { success: true, content: { text: 'child contents' }, error: null }
+    },
+  }))
+  assert.equal((await execution.terminal).status, 'completed')
+  assert.deepEqual(invocations, [{
+    callId: 'canonical-turn:native-child-thread:native-child-turn:child-provider-call',
+    providerCallId: 'child-provider-call',
+    name: 'read_file',
+    input: { path: 'README.md' },
+  }])
+})
+
+for (const scenario of [
+  'foreignSubAgentActivity',
+  'invalidSubAgentActivity',
+  'selfSubAgentActivity',
+] as const) {
+  test(`adapter does not widen child ownership from ${scenario}`, async () => {
+    const adapter = new CodexCanonicalAdapter({
+      processFactory: scriptedFactory(scenario, [], []),
+      shutdownTimeoutMs: 20,
+    })
+    const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+      tools: [readFileTool()],
+    }))
+    const terminal = await execution.terminal
+    assert.equal(terminal.status, 'failed')
+    assert.match(String(terminal.error?.message), /foreign(?: native)? (?:thread|turn)/)
+  })
+}
 
 test('adapter registers an owned child from thread/started before collaboration completes', async () => {
   const created: FakeProcess[] = []
