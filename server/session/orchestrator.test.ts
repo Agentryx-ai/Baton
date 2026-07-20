@@ -400,6 +400,61 @@ test('orchestrator runs compaction before beginTurn and records the execution co
   assert.equal(adapterSnapshots[0]?.items.length, 0, 'current input remains the explicit turn request')
 })
 
+test('Goal active-time abort releases a continuation blocked in context preparation', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-goal-context-abort-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  registry.register(safeAdapter([]))
+  const never = new Promise<null>(() => undefined)
+  const contextRuntime = {
+    assertUpcomingInputFits() {
+      return { additionalInputTokens: 0, inputBudgetTokens: 1 }
+    },
+    compactBeforeTurn() {
+      return never
+    },
+    async materializeForExecution({ snapshot }: { snapshot: ThreadSnapshot }) {
+      return snapshot
+    },
+  }
+  const orchestrator = new TurnOrchestrator(
+    store,
+    registry,
+    new ConversationEventHub(),
+    10_000,
+    contextRuntime,
+  )
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  const session = orchestrator.createSession({})
+  await orchestrator.startGoalRuntime()
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'release a blocked continuation at the active-time boundary',
+    provider: 'codex',
+    model: 'gpt-test',
+    maxActiveSeconds: 1,
+  })
+
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (store.getGoalById(goal.id)?.status === 'budget_limited') break
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  assert.equal(store.getGoalById(goal.id)?.status, 'budget_limited')
+  const resumed = await orchestrator.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: store.getGoalById(goal.id)?.revision ?? 0,
+    status: 'active',
+    resetLimitCounters: true,
+  })
+  assert.equal(resumed.status, 'applied')
+  assert.equal(resumed.goal?.status, 'active')
+})
+
 test('first send verifies workspace, creates the canonical graph once, and replays before rechecking cwd', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-initial-session-'))
   const workspace = join(directory, 'workspace')

@@ -1318,7 +1318,7 @@ export class TurnOrchestrator implements ConversationService {
       return { status: 'not_started' as const, reason: 'busy' as const }
     }
     try {
-      const started = await this.startTurnInternal({
+      const started = await resolveUnlessAborted(this.startTurnInternal({
         threadId: request.goal.threadId,
         provider: request.goal.provider,
         model: request.goal.model,
@@ -1330,7 +1330,8 @@ export class TurnOrchestrator implements ConversationService {
           visibility: 'baton_private',
           payload: { text: goalContinuationPrompt(request.goal), goalContinuation: true },
         }],
-      }, request.goalContext, true, request.signal)
+      }, request.goalContext, true, request.signal), request.signal)
+      if (started === null) return { status: 'not_started' as const, reason: 'cancelled' as const }
       return { status: 'started' as const, turnId: started.turn.id }
     } catch (error) {
       if (error instanceof GoalStoreError && error.code === 'goal_lease_lost') {
