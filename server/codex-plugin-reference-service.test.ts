@@ -33,6 +33,10 @@ function rawCatalog(ids: string[]): Record<string, unknown> {
   }
 }
 
+function accountRead(): Record<string, unknown> {
+  return { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true }
+}
+
 test('paused Codex accounts remain eligible as plugin reference with preview, switch, and deletion guard', async (t) => {
   const directory = await mkdtemp(path.join(tmpdir(), 'baton-plugin-service-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
@@ -53,7 +57,9 @@ test('paused Codex accounts remain eligible as plugin reference with preview, sw
     },
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ accessToken }) => rawCatalog(accessToken ? ['local', 'remote'] : ['local']),
+    invoke: async ({ method, accessToken }) => method === 'account/read'
+      ? accountRead()
+      : rawCatalog(accessToken ? ['local', 'remote'] : ['local']),
   })
   const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
   const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
@@ -101,7 +107,8 @@ test('failed post-switch catalog confirmation restores the previous plugin refer
     getPluginCredential: async () => ({ accessToken: 'token' }),
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ accessToken }) => {
+    invoke: async ({ method, accessToken }) => {
+      if (method === 'account/read') return accountRead()
       if (accessToken && failAuthenticatedList && ++authenticatedListsAfterArming >= 2) {
         throw new Error('catalog unavailable')
       }
@@ -183,7 +190,9 @@ test('account deletion and reference switching share one mutation boundary', asy
     forget: () => undefined,
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ accessToken }) => rawCatalog(accessToken ? ['remote'] : ['local']),
+    invoke: async ({ method, accessToken }) => method === 'account/read'
+      ? accountRead()
+      : rawCatalog(accessToken ? ['remote'] : ['local']),
   })
   const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
   const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })
@@ -216,12 +225,14 @@ test('target catalog marketplace load errors fail closed before reference mutati
     getPluginCredential: async () => ({ accessToken: 'token' }),
   } as unknown as CodexNativeRuntime
   const control = new CodexPluginControlPlane({
-    invoke: async ({ accessToken }) => ({
-      ...rawCatalog(accessToken ? ['remote'] : ['local']),
-      marketplaceLoadErrors: accessToken
-        ? [{ marketplacePath: 'remote', message: 'unauthorized' }]
-        : [],
-    }),
+    invoke: async ({ method, accessToken }) => method === 'account/read'
+      ? accountRead()
+      : ({
+        ...rawCatalog(accessToken ? ['remote'] : ['local']),
+        marketplaceLoadErrors: accessToken
+          ? [{ marketplacePath: 'remote', message: 'unauthorized' }]
+          : [],
+      }),
   })
   const store = new CodexPluginReferenceStore({ filePath: path.join(directory, 'reference.json') })
   const service = new CodexPluginReferenceService({ runtime, store, controlPlane: control })

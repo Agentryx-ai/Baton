@@ -13,6 +13,11 @@ Settings의 `플러그인 계정 추가`는 현재 모델 integration이 CLIProx
 라우트를 직접 사용하므로, 모델 경로를 바꾸지 않고 기준계정 후보를 등록할 수 있습니다. 전용
 경로로 추가한 계정은 모델 라우팅이 기본 중지된 상태로 저장됩니다.
 
+계정 모드의 catalog·remote install·uninstall 요청은 먼저 공식 `account/read`를 호출합니다.
+app-server가 주입된 token을 ChatGPT 계정으로 인정한 경우에만 plugin 요청을 진행하므로, 만료된
+token과 캐시된 catalog의 조합을 정상 접근으로 오판하지 않습니다. `account/login/start`의
+실험적 `chatgptAuthTokens` 방식은 upstream이 “OpenAI internal only”로 표시하므로 사용하지 않습니다.
+
 ## 공식 API 경계
 
 Baton은 Codex app-server가 공개하는 다음 메서드만 사용합니다.
@@ -67,5 +72,6 @@ Desktop의 비공개 프로토콜을 역공학하거나 별도 marketplace backe
   전환 성공, 확인 실패 rollback, 삭제 보호, 상태 fail-closed, install XOR 계약
 - 설치된 Codex app-server local-only canary: 공식 primary-runtime, bundled/curated cache,
   Baton repo-local marketplace 열거 및 load error 0건
+- 설치된 Codex app-server invalid-token canary: `account/read` 단계에서 authentication으로 거부
 - 남은 live gate: Baton Native Codex 계정을 등록한 환경에서 remote account catalog와 connector
   재인증을 실제 확인

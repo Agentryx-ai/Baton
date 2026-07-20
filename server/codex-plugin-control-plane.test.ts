@@ -36,21 +36,42 @@ test('Codex plugin catalog is normalized and account mode requests every support
     now: () => new Date('2026-07-20T00:00:00.000Z'),
     invoke: async (input) => {
       calls.push(input)
-      return catalog()
+      return input.method === 'account/read'
+        ? { account: { type: 'chatgpt', email: null, planType: 'pro' }, requiresOpenaiAuth: true }
+        : catalog()
     },
   })
 
   const result = await control.list({ accountId: 'account-1', accessToken: 'secret', cwds: ['C:\\repo'] })
   assert.equal(result.accountId, 'account-1')
   assert.equal(result.marketplaces[0]?.plugins[0]?.displayName, 'Plugin A')
-  assert.deepEqual(calls, [{
-    method: 'plugin/list',
-    params: {
-      cwds: ['C:\\repo'],
-      marketplaceKinds: ['local', 'vertical', 'workspace-directory', 'shared-with-me', 'created-by-me-remote'],
+  assert.deepEqual(calls, [
+    {
+      method: 'account/read',
+      params: { refreshToken: false },
+      accessToken: 'secret',
     },
-    accessToken: 'secret',
-  }])
+    {
+      method: 'plugin/list',
+      params: {
+        cwds: ['C:\\repo'],
+        marketplaceKinds: ['local', 'vertical', 'workspace-directory', 'shared-with-me', 'created-by-me-remote'],
+      },
+      accessToken: 'secret',
+    },
+  ])
+})
+
+test('Codex plugin account mode rejects credentials not recognized as ChatGPT auth', async () => {
+  const control = new CodexPluginControlPlane({
+    invoke: async ({ method }) => method === 'account/read'
+      ? { account: { type: 'apiKey' }, requiresOpenaiAuth: true }
+      : catalog(),
+  })
+  await assert.rejects(
+    control.list({ accountId: 'account-1', accessToken: 'wrong-kind' }),
+    (error: unknown) => error instanceof CodexPluginControlPlaneError && error.code === 'authentication',
+  )
 })
 
 test('Codex plugin child environment removes Baton, gateway, and inherited API credentials', () => {

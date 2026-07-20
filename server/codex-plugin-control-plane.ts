@@ -106,6 +106,7 @@ export class CodexPluginControlPlane {
     if (input.accountId !== null && !input.accessToken) {
       throw new CodexPluginControlPlaneError('authentication', '플러그인 기준계정 access token이 없습니다.')
     }
+    if (input.accessToken) await this.verifyAccessToken(input.accessToken)
     const marketplaceKinds = input.marketplaceKinds ?? (input.accountId === null
       ? ['local']
       : ['local', 'vertical', 'workspace-directory', 'shared-with-me', 'created-by-me-remote'])
@@ -125,6 +126,9 @@ export class CodexPluginControlPlane {
     }
     if (input.remoteMarketplaceName && !input.accessToken) {
       throw new CodexPluginControlPlaneError('authentication', '원격 plugin 설치에는 플러그인 기준계정이 필요합니다.')
+    }
+    if (input.remoteMarketplaceName && input.accessToken) {
+      await this.verifyAccessToken(input.accessToken)
     }
     const raw = object(await this.invoke('plugin/install', {
       marketplacePath: input.marketplacePath ?? null,
@@ -146,7 +150,19 @@ export class CodexPluginControlPlane {
   }
 
   async uninstall(pluginId: string, accessToken?: string): Promise<void> {
+    if (accessToken) await this.verifyAccessToken(accessToken)
     await this.invoke('plugin/uninstall', { pluginId: requiredText(pluginId, 'pluginId') }, accessToken)
+  }
+
+  private async verifyAccessToken(accessToken: string): Promise<void> {
+    const raw = object(await this.invoke('account/read', { refreshToken: false }, accessToken), 'account/read response')
+    const account = optionalObject(raw.account)
+    if (account?.type !== 'chatgpt') {
+      throw new CodexPluginControlPlaneError(
+        'authentication',
+        '선택한 credential을 Codex app-server의 ChatGPT 계정으로 확인하지 못했습니다.',
+      )
+    }
   }
 
   private async invoke(method: string, params: unknown, accessToken?: string): Promise<unknown> {

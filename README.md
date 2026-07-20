@@ -154,6 +154,7 @@ history에서 provider 요청을 재구성합니다.
   - 모델 라우팅 pause와 독립적으로 OAuth refresh
   - 전환 전 추가·제거 plugin diff와 connector 재인증 경고
   - revision/digest 확인, 전환 후 catalog 검증 실패 시 rollback, 기준계정 삭제 보호
+  - 공식 `account/read` 선검증으로 만료 token·cache 조합의 거짓 성공 차단
   - 설치된 Codex app-server의 공식 `plugin/list`·`plugin/install`·`plugin/uninstall`만 사용
 - Claude/Codex CLI와 Desktop별 프록시 적용/해제
   - 대상 프로세스 종료와 file lock 확인
