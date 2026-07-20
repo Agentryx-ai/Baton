@@ -287,3 +287,39 @@ test('native-openai Codex account operations stay on Baton-owned routes', async 
   assert.ok(urls.includes('/baton/codex-native/auth/start-url'))
   assert.equal(urls.some((url) => url.startsWith('/api/')), false)
 })
+
+test('client integration mutation refreshes a rejected capability exactly once', async () => {
+  const originalFetch = globalThis.fetch
+  const calls: Array<{ url: string; capability?: string }> = []
+  let capabilityCount = 0
+  let mutationCount = 0
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input)
+    const headers = new Headers(init?.headers)
+    calls.push({ url, capability: headers.get('X-Baton-Client-Capability') ?? undefined })
+    if (url.endsWith('/capability')) {
+      capabilityCount += 1
+      return Response.json({ capability: `cap-${capabilityCount}` })
+    }
+    mutationCount += 1
+    if (mutationCount === 1) return Response.json({ error: 'expired' }, { status: 403 })
+    return Response.json({
+      applied: true,
+      updated: ['Codex CLI/Desktop'],
+      restartRequired: true,
+      results: [{ target: 'codex', label: 'Codex CLI/Desktop', ok: true }],
+    })
+  }) as typeof fetch
+  try {
+    const result = await client.applyClientIntegration(['codex'])
+    assert.equal(result.applied, true)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+  assert.deepEqual(calls, [
+    { url: '/baton/client-integration/capability', capability: undefined },
+    { url: '/baton/client-integration/apply', capability: 'cap-1' },
+    { url: '/baton/client-integration/capability', capability: undefined },
+    { url: '/baton/client-integration/apply', capability: 'cap-2' },
+  ])
+})

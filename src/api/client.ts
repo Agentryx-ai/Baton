@@ -45,6 +45,39 @@ type GatewayAddStatus = {
   error?: string
 }
 
+let clientIntegrationCapability: Promise<string> | undefined
+
+async function integrationMutationHeaders(): Promise<Record<string, string>> {
+  clientIntegrationCapability ??= fetch('/baton/client-integration/capability', {
+    credentials: 'same-origin',
+    headers: { Accept: 'application/json' },
+  }).then(async (response) => {
+    const value = await response.json() as { capability?: unknown }
+    if (!response.ok || typeof value.capability !== 'string') throw new ApiError(response.status, 'Client integration capability unavailable')
+    return value.capability
+  }).catch((error) => {
+    clientIntegrationCapability = undefined
+    throw error
+  })
+  return { 'X-Baton-Client-Capability': await clientIntegrationCapability }
+}
+
+async function integrationMutationRequest<T>(path: string, json: unknown): Promise<T> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await request<T>(path, {
+        method: 'POST',
+        headers: await integrationMutationHeaders(),
+        json,
+      })
+    } catch (error) {
+      if (!(error instanceof ApiError) || (error.status !== 401 && error.status !== 403) || attempt > 0) throw error
+      clientIntegrationCapability = undefined
+    }
+  }
+  throw new ApiError(403, 'Client integration capability retry failed')
+}
+
 /** Normalize provider OAuth completion shapes. */
 export function normalizeAddStatus(result: GatewayAddStatus): AddStatus {
   if (result.success === true || result.status === 'success' || result.status === 'ok') {
@@ -255,13 +288,10 @@ export const client = {
     codexMode?: CodexIntegrationMode,
     claudeProxyMode?: ClaudeProxyMode,
   ): Promise<ClientIntegrationApplyResult> => {
-    const result = await request<ClientIntegrationApplyResult>('/baton/client-integration/apply', {
-      method: 'POST',
-      json: {
-        targets,
-        ...(codexMode ? { codexMode } : {}),
-        ...(claudeProxyMode ? { claudeProxyMode } : {}),
-      },
+    const result = await integrationMutationRequest<ClientIntegrationApplyResult>('/baton/client-integration/apply', {
+      targets,
+      ...(codexMode ? { codexMode } : {}),
+      ...(claudeProxyMode ? { claudeProxyMode } : {}),
     })
     return result
   },
@@ -269,10 +299,10 @@ export const client = {
   removeClientIntegration: async (
     targets: ClientIntegrationTarget[],
   ): Promise<ClientIntegrationRemoveResult> => {
-    const result = await request<ClientIntegrationRemoveResult>('/baton/client-integration/remove', {
-      method: 'POST',
-      json: { targets },
-    })
+    const result = await integrationMutationRequest<ClientIntegrationRemoveResult>(
+      '/baton/client-integration/remove',
+      { targets },
+    )
     return result
   },
 

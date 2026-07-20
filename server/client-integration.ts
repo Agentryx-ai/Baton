@@ -1,19 +1,21 @@
 import { spawn } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import {
-  mkdir,
   readFile,
   readdir,
-  rm,
-  writeFile,
 } from 'node:fs/promises'
 import { parse as parseToml, stringify as stringifyToml } from 'smol-toml'
 import {
   loadNativeClaudeProxyConnection,
   type NativeClaudeProxyConnection,
 } from './claude-native-runtime.ts'
+import {
+  applyRecoveryMutation,
+  removeRecoveryIntegration,
+  RecoveryError,
+  type RecoveryFormat,
+} from './client-integration-recovery.ts'
 
 export type ClientKind =
   | 'claude-cli'
@@ -61,15 +63,24 @@ export type ClientIntegrationConfigurationState =
   | 'unknown'
 
 export interface ClientIntegrationApplyResult {
-  applied: true
+  applied: boolean
   updated: string[]
-  restartRequired: true
+  restartRequired: boolean
+  results: ClientIntegrationTargetResult[]
 }
 
 export interface ClientIntegrationRemoveResult {
-  removed: true
+  removed: boolean
   updated: string[]
-  restartRequired: true
+  restartRequired: boolean
+  results: ClientIntegrationTargetResult[]
+}
+
+export interface ClientIntegrationTargetResult {
+  target: ClientIntegrationTarget
+  label: string
+  ok: boolean
+  error?: string
 }
 
 interface ProcessRecord {
@@ -84,8 +95,11 @@ interface PreparedFile {
   target: string
   content: string
   existed: boolean
-  temp?: string
-  backup?: string
+  integrationTarget: ClientIntegrationTarget
+  originalContent: string
+  format: RecoveryFormat
+  ownedFields: string[][]
+  endpoint: string
 }
 
 interface ClaudeDesktopModel {
@@ -281,59 +295,43 @@ export async function applyClientIntegration(
   const targets = parseIntegrationTargets(inputTargets)
   parseCodexIntegrationMode(inputCodexMode)
   parseClaudeProxyMode(inputClaudeProxyMode)
-  await requireTargetsStopped(targets)
-
-  const hasClaudeTarget = targets.includes('claude-cli') || targets.includes('claude-desktop')
   const needsClaudeModels = targets.includes('claude-desktop')
-  const claudeConnection = hasClaudeTarget
-    ? asProxyConnection(await loadNativeClaudeProxyConnection(needsClaudeModels))
-    : null
-  await requireConfigurationState(
-    targets,
-    claudeConnection,
-    'applyable',
-  )
-  const models = needsClaudeModels ? selectClaudeModels(claudeConnection?.models ?? []) : []
-  if (needsClaudeModels && models.length === 0) {
-    throw new ClientIntegrationError(502, '프록시 모델 목록에서 Claude 모델을 찾지 못했습니다.')
+  let claudeConnectionPromise: Promise<ProxyConnection> | undefined
+  const loadClaudeConnection = () => {
+    claudeConnectionPromise ??= loadNativeClaudeProxyConnection(needsClaudeModels).then(asProxyConnection)
+    return claudeConnectionPromise
   }
-
-  const files = await prepareFiles(
-    targets,
-    claudeConnection,
-    models,
-  )
-  await assertFilesUnlocked(files)
-
-  // Close the race window as much as possible: process state is checked again
-  // after all parsing/validation and immediately before the first replacement.
-  await requireTargetsStopped(targets)
-
-  const committed: PreparedFile[] = []
-  let preserveBackups = false
-  try {
-    for (const file of files) {
-      await commitFile(file)
-      committed.push(file)
+  const results = await runClientIntegrationTargetOperations(targets, async (target) => {
+    await requireTargetsStopped([target])
+    const claudeConnection = target === 'codex' ? null : await loadClaudeConnection()
+    await requireConfigurationState([target], claudeConnection, 'applyable')
+    const models = target === 'claude-desktop' ? selectClaudeModels(claudeConnection?.models ?? []) : []
+    if (target === 'claude-desktop' && models.length === 0) {
+      throw new ClientIntegrationError(502, '프록시 모델 목록에서 Claude 모델을 찾지 못했습니다.')
     }
-  } catch (error) {
-    const rollbackErrors = await rollbackFiles(committed)
-    preserveBackups = rollbackErrors.length > 0
-    const rollbackSuffix = rollbackErrors.length
-      ? ` 롤백 오류: ${rollbackErrors.join('; ')}`
-      : ''
-    const outcome = rollbackErrors.length
-      ? '설정 적용과 일부 파일 롤백에 실패했습니다. .baton-*.bak 파일을 보존했습니다.'
-      : '설정을 적용하지 못해 기존 파일로 되돌렸습니다.'
-    throw new ClientIntegrationError(500, `${outcome} ${errorMessage(error)}${rollbackSuffix}`)
-  } finally {
-    await Promise.all(files.map((file) => cleanupPreparedFile(file, !preserveBackups)))
-  }
-
+    const files = await prepareFiles([target], claudeConnection, models)
+    await assertFilesUnlocked(files)
+    await requireTargetsStopped([target])
+    for (const file of files) {
+      await applyRecoveryMutation({
+        target: file.integrationTarget,
+        label: file.label,
+        filePath: file.target,
+        format: file.format,
+        ownedFields: file.ownedFields,
+        endpoint: file.endpoint,
+        beforeExisted: file.existed,
+        beforeContent: file.originalContent,
+        appliedContent: file.content,
+      })
+    }
+  })
+  const updated = results.filter((item) => item.ok).map((item) => item.label)
   return {
-    applied: true,
-    updated: files.map((file) => file.label),
-    restartRequired: true,
+    applied: results.every((item) => item.ok),
+    updated,
+    restartRequired: updated.length > 0,
+    results,
   }
 }
 
@@ -341,47 +339,34 @@ export async function removeClientIntegration(
   inputTargets?: unknown,
 ): Promise<ClientIntegrationRemoveResult> {
   const targets = parseIntegrationTargets(inputTargets)
-  await requireTargetsStopped(targets)
-
-  const claudeConnection = asProxyConnection(await loadNativeClaudeProxyConnection(false))
-  await requireConfigurationState(
-    targets,
-    claudeConnection,
-    'applied',
-  )
-  const files = await prepareRemovalFiles(
-    targets,
-    claudeConnection,
-  )
-  await assertFilesUnlocked(files)
-  await requireTargetsStopped(targets)
-
-  const committed: PreparedFile[] = []
-  let preserveBackups = false
-  try {
-    for (const file of files) {
-      await commitFile(file)
-      committed.push(file)
-    }
-  } catch (error) {
-    const rollbackErrors = await rollbackFiles(committed)
-    preserveBackups = rollbackErrors.length > 0
-    const rollbackSuffix = rollbackErrors.length
-      ? ` 롤백 오류: ${rollbackErrors.join('; ')}`
-      : ''
-    const outcome = rollbackErrors.length
-      ? '설정 해제와 일부 파일 롤백에 실패했습니다. .baton-*.bak 파일을 보존했습니다.'
-      : '설정을 해제하지 못해 기존 파일로 되돌렸습니다.'
-    throw new ClientIntegrationError(500, `${outcome} ${errorMessage(error)}${rollbackSuffix}`)
-  } finally {
-    await Promise.all(files.map((file) => cleanupPreparedFile(file, !preserveBackups)))
-  }
-
+  const results = await runClientIntegrationTargetOperations(targets, async (target) => {
+    await requireTargetsStopped([target])
+    await removeRecoveryIntegration(target)
+  })
+  const updated = results.filter((item) => item.ok).map((item) => item.label)
   return {
-    removed: true,
-    updated: files.map((file) => file.label),
-    restartRequired: true,
+    removed: results.every((item) => item.ok),
+    updated,
+    restartRequired: updated.length > 0,
+    results,
   }
+}
+
+export async function runClientIntegrationTargetOperations(
+  targets: ClientIntegrationTarget[],
+  operation: (target: ClientIntegrationTarget) => Promise<void>,
+): Promise<ClientIntegrationTargetResult[]> {
+  const results: ClientIntegrationTargetResult[] = []
+  for (const target of targets) {
+    const label = targetLabel(target)
+    try {
+      await operation(target)
+      results.push({ target, label, ok: true })
+    } catch (error) {
+      results.push({ target, label, ok: false, error: safeOperationError(error) })
+    }
+  }
+  return results
 }
 
 export function parseIntegrationTargets(input: unknown): ClientIntegrationTarget[] {
@@ -460,11 +445,11 @@ type ConfigurationInspection = Pick<
   'configuration' | 'configurationDetail' | 'codexMode' | 'claudeProxyMode'
 >
 
-/** Applying is a deterministic repair for partial/stale Baton-owned fields. */
+/** Existing or ambiguous integration fields always fail closed. */
 export function canApplyConfiguration(
   state: ClientIntegrationConfigurationState,
 ): boolean {
-  return state === 'not-applied' || state === 'conflict'
+  return state === 'not-applied'
 }
 
 async function requireConfigurationState(
@@ -480,7 +465,7 @@ async function requireConfigurationState(
       : !canApplyConfiguration(inspection.configuration))
   if (invalid.length === 0) return
 
-  const expectedLabel = expected === 'applied' ? '적용된' : '미적용 또는 복구 가능한 충돌'
+  const expectedLabel = expected === 'applied' ? '적용된' : '미적용'
   const detail = invalid.map(({ target, inspection }) => {
     const label = TARGET_DEFINITIONS.find((item) => item.target === target)?.label ?? target
     return `${label}: ${inspection.configurationDetail ?? inspection.configuration}`
@@ -614,6 +599,10 @@ export function patchClaudeCliConfig(content: string, baseUrl: string, token: st
   if (existingEnv !== undefined && (!existingEnv || typeof existingEnv !== 'object' || Array.isArray(existingEnv))) {
     throw new ClientIntegrationError(422, 'Claude CLI 설정의 env 값이 객체가 아니어서 안전하게 병합할 수 없습니다.')
   }
+  const values = (existingEnv ?? {}) as Record<string, unknown>
+  if ('ANTHROPIC_BASE_URL' in values || 'ANTHROPIC_AUTH_TOKEN' in values) {
+    throw new ClientIntegrationError(409, 'Claude CLI의 기존 Anthropic 연결 항목을 덮어쓰지 않았습니다.')
+  }
   const nextEnv: Record<string, unknown> = {
     ...(existingEnv as Record<string, unknown> | undefined),
     ANTHROPIC_BASE_URL: baseUrl,
@@ -633,6 +622,13 @@ export function patchClaudeDesktopConfig(
   models: ClaudeDesktopModel[],
 ): string {
   const config = parseJsonObject(content, 'Claude Desktop 설정')
+  if (
+    config.inferenceProvider === 'gateway'
+    || 'inferenceGatewayBaseUrl' in config
+    || 'inferenceGatewayApiKey' in config
+  ) {
+    throw new ClientIntegrationError(409, 'Claude Desktop의 기존 gateway 연결 항목을 덮어쓰지 않았습니다.')
+  }
   config.inferenceProvider = 'gateway'
   config.inferenceCredentialKind = 'static'
   config.inferenceGatewayBaseUrl = baseUrl
@@ -650,8 +646,8 @@ export function inspectCodexNativeConfig(
   let parsed: Record<string, unknown>
   try {
     parsed = parseToml(content) as Record<string, unknown>
-  } catch (error) {
-    return { configuration: 'unknown', configurationDetail: `TOML 파싱 실패: ${errorMessage(error)}` }
+  } catch {
+    return { configuration: 'unknown', configurationDetail: 'Codex TOML 설정 문법이 올바르지 않습니다.' }
   }
 
   const configuredBaseUrl = parsed.openai_base_url
@@ -674,6 +670,13 @@ export function inspectCodexNativeConfig(
       configurationDetail: provider !== undefined && provider !== 'openai'
         ? 'Baton openai_base_url이 있으나 model_provider가 openai가 아닙니다.'
         : 'Baton openai_base_url이 있으나 기존 Baton 세션 resume 호환 provider가 없습니다.',
+      codexMode: 'native-openai',
+    }
+  }
+  if (configuredBaseUrl !== undefined || batonProvider !== undefined || provider === 'baton') {
+    return {
+      configuration: 'conflict',
+      configurationDetail: '기존 provider 또는 openai_base_url이 있어 기본 적용으로 덮어쓰지 않습니다.',
       codexMode: 'native-openai',
     }
   }
@@ -738,6 +741,11 @@ async function prepareFiles(
       target: claudeCli,
       content,
       existed: claudeSource.existed,
+      integrationTarget: 'claude-cli',
+      originalContent: claudeSource.content,
+      format: 'json',
+      ownedFields: [['env', 'ANTHROPIC_BASE_URL'], ['env', 'ANTHROPIC_AUTH_TOKEN']],
+      endpoint: claudeConnection.baseUrl,
     })
   }
 
@@ -759,6 +767,14 @@ async function prepareFiles(
       target: claudeDesktop,
       content,
       existed: true,
+      integrationTarget: 'claude-desktop',
+      originalContent: desktopSource.content,
+      format: 'json',
+      ownedFields: [
+        ['inferenceProvider'], ['inferenceCredentialKind'], ['inferenceGatewayBaseUrl'],
+        ['inferenceGatewayApiKey'], ['inferenceModels'],
+      ],
+      endpoint: claudeConnection.baseUrl,
     })
   }
 
@@ -771,58 +787,11 @@ async function prepareFiles(
       target: codex,
       content,
       existed: codexSource.existed,
-    })
-  }
-
-  return files
-}
-
-async function prepareRemovalFiles(
-  targets: ClientIntegrationTarget[],
-  claudeConnection: ProxyConnection | null,
-): Promise<PreparedFile[]> {
-  const home = homedir()
-  const claudeCli = path.join(home, '.claude', 'settings.json')
-  const codex = path.join(home, '.codex', 'config.toml')
-  const files: PreparedFile[] = []
-
-  if (targets.includes('claude-cli')) {
-    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
-    const source = await readOptional(claudeCli)
-    if (!source.existed) throw new ClientIntegrationError(409, 'Claude CLI 설정이 이미 없습니다.')
-    files.push({
-      label: 'Claude CLI',
-      target: claudeCli,
-      content: removeClaudeCliConfig(
-        source.content,
-        claudeConnection.baseUrl,
-        null,
-      ),
-      existed: true,
-    })
-  }
-
-  if (targets.includes('claude-desktop')) {
-    if (!claudeConnection) throw new ClientIntegrationError(502, 'Claude 프록시 연결이 없습니다.')
-    const file = await findClaudeDesktopConfig()
-    const source = await readOptional(file)
-    if (!source.existed) throw new ClientIntegrationError(409, 'Claude Desktop 설정이 이미 없습니다.')
-    files.push({
-      label: 'Claude Desktop',
-      target: file,
-      content: removeClaudeDesktopConfig(source.content, claudeConnection.baseUrl, claudeConnection.token),
-      existed: true,
-    })
-  }
-
-  if (targets.includes('codex')) {
-    const source = await readOptional(codex)
-    if (!source.existed) throw new ClientIntegrationError(409, 'Codex 설정이 이미 없습니다.')
-    files.push({
-      label: 'Codex CLI/Desktop',
-      target: codex,
-      content: unpatchCodexNativeConfig(source.content, codexNativeProxyBaseUrl()),
-      existed: true,
+      integrationTarget: 'codex',
+      originalContent: codexSource.content,
+      format: 'toml',
+      ownedFields: [['openai_base_url'], ['model_providers', 'baton']],
+      endpoint: codexNativeProxyBaseUrl(),
     })
   }
 
@@ -906,8 +875,8 @@ function parseJsonObject(content: string, label: string): Record<string, unknown
     const parsed = JSON.parse(content)
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('object expected')
     return parsed as Record<string, unknown>
-  } catch (error) {
-    throw new ClientIntegrationError(422, `${label} JSON을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
+  } catch {
+    throw new ClientIntegrationError(422, `${label} JSON 문법이 올바르지 않습니다.`)
   }
 }
 
@@ -920,8 +889,8 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
   let parsed: Record<string, unknown>
   try {
     parsed = parseToml(content) as Record<string, unknown>
-  } catch (error) {
-    throw new ClientIntegrationError(422, `Codex 설정 TOML을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
+  } catch {
+    throw new ClientIntegrationError(422, 'Codex 설정 TOML 문법이 올바르지 않습니다.')
   }
 
   const batonProvider = codexProvider(parsed, 'baton')
@@ -1001,8 +970,8 @@ export function unpatchCodexNativeConfig(content: string, baseUrl: string): stri
   let parsed: Record<string, unknown>
   try {
     parsed = parseToml(content) as Record<string, unknown>
-  } catch (error) {
-    throw new ClientIntegrationError(422, `Codex 설정 TOML을 안전하게 파싱하지 못했습니다: ${errorMessage(error)}`)
+  } catch {
+    throw new ClientIntegrationError(422, 'Codex 설정 TOML 문법이 올바르지 않습니다.')
   }
   if (
     parsed.openai_base_url !== baseUrl
@@ -1122,54 +1091,6 @@ $results = @($inputObject.paths | ForEach-Object {
   }
 }
 
-async function commitFile(file: PreparedFile): Promise<void> {
-  await mkdir(path.dirname(file.target), { recursive: true })
-  const suffix = `.baton-${randomUUID()}`
-  file.temp = `${file.target}${suffix}.tmp`
-  file.backup = file.existed ? `${file.target}${suffix}.bak` : undefined
-  await writeFile(file.temp, file.content, 'utf8')
-  await runPowerShell(
-    String.raw`$item = [Console]::In.ReadToEnd() | ConvertFrom-Json
-if ($item.existed) {
-  [System.IO.File]::Replace([string]$item.temp, [string]$item.target, [string]$item.backup, $true)
-} else {
-  [System.IO.File]::Move([string]$item.temp, [string]$item.target)
-}
-[Console]::Out.Write('{}')`,
-    { target: file.target, temp: file.temp, backup: file.backup, existed: file.existed },
-  )
-}
-
-async function rollbackFiles(files: PreparedFile[]): Promise<string[]> {
-  const errors: string[] = []
-  for (const file of [...files].reverse()) {
-    try {
-      if (file.existed && file.backup) {
-        await runPowerShell(
-          String.raw`$item = [Console]::In.ReadToEnd() | ConvertFrom-Json
-[System.IO.File]::Replace([string]$item.backup, [string]$item.target, $null, $true)
-[Console]::Out.Write('{}')`,
-          { target: file.target, backup: file.backup },
-        )
-      } else {
-        await rm(file.target, { force: true })
-      }
-    } catch (error) {
-      errors.push(`${file.label}: ${errorMessage(error)}`)
-    }
-  }
-  return errors
-}
-
-async function cleanupPreparedFile(file: PreparedFile, removeBackup: boolean): Promise<void> {
-  await Promise.all([
-    file.temp ? rm(file.temp, { force: true }).catch(() => {}) : Promise.resolve(),
-    removeBackup && file.backup
-      ? rm(file.backup, { force: true }).catch(() => {})
-      : Promise.resolve(),
-  ])
-}
-
 async function readOptional(file: string): Promise<{ existed: boolean; content: string }> {
   try {
     return { existed: true, content: await readFile(file, 'utf8') }
@@ -1221,4 +1142,13 @@ function compareText(a: string, b: string): number {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function targetLabel(target: ClientIntegrationTarget): string {
+  return TARGET_DEFINITIONS.find((item) => item.target === target)?.label ?? target
+}
+
+function safeOperationError(error: unknown): string {
+  if (error instanceof ClientIntegrationError || error instanceof RecoveryError) return error.message
+  return '예상하지 못한 로컬 설정 오류가 발생했습니다.'
 }

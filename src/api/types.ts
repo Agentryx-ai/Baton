@@ -154,15 +154,24 @@ export type ClientIntegrationConfigurationState =
   | 'unknown'
 
 export interface ClientIntegrationApplyResult {
-  applied: true
+  applied: boolean
   updated: string[]
-  restartRequired: true
+  restartRequired: boolean
+  results: ClientIntegrationTargetResult[]
 }
 
 export interface ClientIntegrationRemoveResult {
-  removed: true
+  removed: boolean
   updated: string[]
-  restartRequired: true
+  restartRequired: boolean
+  results: ClientIntegrationTargetResult[]
+}
+
+export interface ClientIntegrationTargetResult {
+  target: ClientIntegrationTarget
+  label: string
+  ok: boolean
+  error?: string
 }
 
 /** OAuth add-account progress. */
