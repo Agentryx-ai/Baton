@@ -124,6 +124,36 @@ test('metadata-only inventory materializes and commits selected sessions one at 
   store.close()
 })
 
+test('materialization accepts provider-private records without counting them as portable items', async () => {
+  const store = await newStore()
+  const value = candidate(['visible'])
+  const records = finalizeRecords([
+    ...value.records.map(({ prefixDigest: _prefixDigest, ...record }) => record),
+    {
+      key: 'native-checkpoint', ordinal: 2, digest: sha256('native-checkpoint'), createdAt: null,
+      item: {
+        kind: 'provider_event', provider: 'codex', visibility: 'provider_private',
+        payload: { nativeContextCheckpoint: { version: 1, provider: 'codex' } },
+      },
+    },
+  ])
+  Object.assign(value, {
+    records,
+    contentDigest: contentDigest(records),
+    prefixDigest: contentDigest(records),
+    portableItemCount: 1,
+  })
+  const service = new NativeSessionImportService(store, [new MutableReader(value)])
+
+  const preview = await service.preview({ sources: ['codex_local'] })
+  const receipt = await service.commit({ token: preview.token, candidateIds: [preview.candidates[0]!.candidateId] })
+
+  assert.equal(receipt.results[0]?.status, 'imported')
+  const snapshot = store.getSnapshot(store.listSessions()[0]!.activeThreadId)
+  assert.deepEqual(snapshot?.items.map((item) => item.visibility), ['portable', 'provider_private'])
+  store.close()
+})
+
 test('preview rejects an inventory above the supported cap before tokenization', async () => {
   const store = await newStore()
   const base = candidate(['one'])
