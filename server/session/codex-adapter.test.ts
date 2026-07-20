@@ -31,6 +31,7 @@ type Scenario =
   | 'usageFallback'
   | 'reroute'
   | 'collab'
+  | 'forbiddenExecution'
   | 'cancel'
   | 'hangInterrupt'
   | 'steerMalformed'
@@ -133,8 +134,8 @@ function configResult(): Record<string, unknown> {
       web_search: 'disabled',
       project_doc_max_bytes: 0,
       features: {
-        multi_agent: false,
-        multi_agent_v2: false,
+        multi_agent: true,
+        multi_agent_v2: true,
         enable_fanout: false,
         shell_tool: false,
         standalone_web_search: false,
@@ -179,7 +180,7 @@ function scriptedFactory(
         self.emit({
           id: idOf(message),
           result: {
-            thread: { id: 'native-thread', ephemeral: true, path: null },
+            thread: { id: 'native-thread', ephemeral: false, path: 'C:/tmp/native-thread.jsonl' },
             model: 'gpt-resolved',
             modelProvider: scenario === 'foreignProvider' ? 'openai' : 'baton',
             runtimeWorkspaceRoots: [],
@@ -188,6 +189,8 @@ function scriptedFactory(
       } else if (method === 'experimentalFeature/list') {
         self.emit({ id: idOf(message), result: featureResult() })
       } else if (method === 'thread/inject_items') {
+        self.emit({ id: idOf(message), result: {} })
+      } else if (method === 'thread/archive') {
         self.emit({ id: idOf(message), result: {} })
       } else if (method === 'turn/start') {
         self.emit({ id: idOf(message), result: { turn: { id: 'native-turn', status: 'inProgress', items: [] } } })
@@ -330,7 +333,24 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
       params: {
         threadId: 'native-thread',
         turnId: 'native-turn',
-        item: { id: 'collab-1', type: 'collabAgentToolCall' },
+        item: {
+          id: 'collab-1',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'completed',
+          senderThreadId: 'native-thread',
+          receiverThreadIds: ['native-child-thread'],
+        },
+      },
+    })
+  }
+  if (scenario === 'forbiddenExecution') {
+    process.emit({
+      method: 'item/completed',
+      params: {
+        threadId: 'native-thread',
+        turnId: 'native-turn',
+        item: { id: 'command-1', type: 'commandExecution' },
       },
     })
     return
@@ -593,7 +613,7 @@ test('JSONL client parses fragmented frames and correlates out-of-order response
   await process.closeInput()
 })
 
-test('Codex model catalog hardening disables model-selected native agents without changing models', () => {
+test('Codex model catalog validation preserves provider-native agent support', () => {
   const hardened = hardenCodexModelCatalog(JSON.stringify({
     models: [
       { slug: 'gpt-5.6-sol', display_name: 'Sol', multi_agent_version: 'v2' },
@@ -604,8 +624,8 @@ test('Codex model catalog hardening disables model-selected native agents withou
   assert.equal(hardened.modelCount, 2)
   assert.deepEqual(JSON.parse(hardened.json), {
     models: [
-      { slug: 'gpt-5.6-sol', display_name: 'Sol', multi_agent_version: 'disabled' },
-      { slug: 'gpt-5.6-luna', display_name: 'Luna', multi_agent_version: 'disabled' },
+      { slug: 'gpt-5.6-sol', display_name: 'Sol', multi_agent_version: 'v2' },
+      { slug: 'gpt-5.6-luna', display_name: 'Luna', multi_agent_version: 'v1' },
     ],
     etag: 'keep-me',
   })
@@ -697,7 +717,10 @@ test('adapter applies process and thread hardening and normalizes durable text, 
     shutdownTimeoutMs: 20,
   })
   const handshake = await adapter.initialize()
-  assert.equal(handshake.capabilities.nativeChildExecution, 'disabled')
+  assert.equal(handshake.capabilities.nativeChildExecution, 'exposed')
+  assert.deepEqual(handshake.exposedNativeAgentTools, [
+    'spawn_agent', 'send_input', 'resume_agent', 'wait', 'close_agent',
+  ])
   assert.equal(handshake.capabilities.toolCalling, true)
   assert.equal(handshake.enforcementEvidence.source, 'config/read')
   assert.deepEqual(handshake.enforcementEvidence.providerLocalMetadataTools, ['update_plan'])
@@ -724,8 +747,8 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   for (const args of argsSeen) {
     assert.ok(args.includes('web_search="disabled"'))
     assert.ok(args.includes('project_doc_max_bytes=0'))
-    assert.ok(args.includes('features.multi_agent=false'))
-    assert.ok(args.includes('features.multi_agent_v2=false'))
+    assert.ok(args.includes('features.multi_agent=true'))
+    assert.ok(args.includes('features.multi_agent_v2=true'))
     assert.ok(args.includes('features.enable_fanout=false'))
     assert.ok(args.includes('features.shell_tool=false'))
     assert.ok(args.includes('features.standalone_web_search=false'))
@@ -753,20 +776,20 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   const threadStart = turnProcess.writes.find((message) => message.method === 'thread/start')
   assert.ok(threadStart)
   const params = threadStart.params as Record<string, unknown>
-  assert.equal(params.ephemeral, true)
+  assert.equal(params.ephemeral, false)
   assert.deepEqual(params.environments, [])
   assert.deepEqual(params.runtimeWorkspaceRoots, [])
   assert.equal(params.approvalsReviewer, 'user')
   assert.equal(params.approvalPolicy, 'never')
   assert.match(String(params.developerInstructions), /Baton is the canonical execution owner/)
-  assert.match(String(params.developerInstructions), /Use only the dynamic tools exposed by Baton/)
+  assert.match(String(params.developerInstructions), /Codex-native collaboration\/subagent tools/)
   assert.match(String(params.developerInstructions), /Verify before finishing\.$/)
   assert.deepEqual(params.dynamicTools, [])
   assert.deepEqual(params.config, {
     web_search: 'disabled',
     project_doc_max_bytes: 0,
-    'features.multi_agent': false,
-    'features.multi_agent_v2': false,
+    'features.multi_agent': true,
+    'features.multi_agent_v2': true,
     'features.enable_fanout': false,
     'features.shell_tool': false,
     'features.standalone_web_search': false,
@@ -918,16 +941,48 @@ test('adapter exposes only Baton dynamic tools and returns their result through 
   await adapter.shutdown()
 })
 
-test('adapter treats native collaboration events as a fatal capability violation', async () => {
+test('adapter audits provider-native collaboration and archives parent and child threads', async () => {
+  const created: FakeProcess[] = []
   const adapter = new CodexCanonicalAdapter({
-    processFactory: scriptedFactory('collab', [], []),
+    processFactory: scriptedFactory('collab', created, []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const events = await collect(execution.events)
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'completed')
+  assert.deepEqual(events.flatMap((event) => adapter.normalize(event)).find((item) =>
+    item.kind === 'provider_event' && item.payload.event === 'provider_native_collaboration'), {
+    kind: 'provider_event',
+    visibility: 'baton_private',
+    payload: {
+      event: 'provider_native_collaboration',
+      tool: 'spawnAgent',
+      status: 'completed',
+      senderThreadId: 'native-thread',
+      receiverThreadIds: ['native-child-thread'],
+    },
+    provider: 'codex',
+    nativeId: 'collab-1',
+  })
+  await execution.dispose()
+  assert.deepEqual(created[1].writes.filter((message) => message.method === 'thread/archive')
+    .map((message) => message.params), [
+    { threadId: 'native-child-thread' },
+    { threadId: 'native-thread' },
+  ])
+})
+
+test('adapter still rejects unrelated native execution items', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('forbiddenExecution', [], []),
     shutdownTimeoutMs: 20,
   })
   const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
   const events = await collect(execution.events)
   const terminal = await execution.terminal
   assert.equal(terminal.status, 'failed')
-  assert.match(String(terminal.error?.message), /capability violation/)
+  assert.match(String(terminal.error?.message), /capability violation.*commandExecution/)
   assert.ok(events.some((event) => event.type === 'adapter/error'))
 })
 

@@ -47,8 +47,8 @@ At the current Preview boundary:
 
 - the canonical domain, SQLite/WAL store, fork/replay/idempotency, REST/SSE surface, cancellation, and startup
   interruption recovery are implemented;
-- a hardened Codex app-server adapter executes text-oriented turns by injecting portable Baton history into an
-  ephemeral native thread;
+- a hardened Codex app-server adapter executes turns by injecting portable Baton history into a transient persisted
+  native thread, allowing provider-native collaboration and archiving its parent/child threads at disposal;
 - the minimal session UI is mounted, but only Codex has a registered adapter;
 - Claude/Gemini adapters, cross-provider continuation, general tool execution, native import/bridges, and
   Baton-managed child execution remain incomplete;
@@ -68,7 +68,8 @@ Therefore:
 3. The adapter normalizes the native stream back into Baton events.
 4. Provider-specific continuation data is stored as opaque binding data and is never interpreted by the common core.
 5. Native session import/export and proxy capture are compatibility bridges, not the source of truth.
-6. Provider-native child agents cannot create conversations outside Baton's ownership boundary.
+6. Provider-native child agents may run only when declared by the adapter; their lifecycle is private audit data,
+   not Baton-owned canonical child lineage.
 
 This follows the useful boundaries in Codex: conversation `Thread`, user operation `Turn`, structured `Item`, a storage-neutral `ThreadStore`, and explicit start/resume/fork operations. Codex's app-server is also designed as a product-integration boundary rather than a terminal-only protocol.
 
@@ -212,15 +213,16 @@ The core never switches on native JSON field names. Provider-specific parsing li
 
 ### Codex adapter
 
-- Use Codex app-server as the native execution boundary. The current Preview creates an ephemeral `thread/start`,
+- Use Codex app-server as the native execution boundary. The current Preview creates a transient persisted `thread/start`,
   replays portable Baton history with `thread/inject_items`, starts the turn with `turn/start`, and uses
-  `turn/interrupt` for cancellation. Baton, not the ephemeral native thread, implements durable resume and fork.
+  `turn/interrupt` for cancellation, and archives provider parent/child threads after completion. Baton, not the
+  native thread, implements durable resume and fork.
 - Map Codex Thread/Turn/Item into the canonical domain, retaining raw rollout/native IDs only in provenance or opaque binding state.
 - The latest Codex source separates storage behind `ThreadStore`, loads replay history for resume/fork, and keeps a fresh `ModelClientSession` per turn. Baton should copy these boundaries, not Codex's exact Rust schema.
 - `model_provider` and remote response IDs are execution details; Baton history remains reconstructable without them.
-- The Preview deliberately disables approval, shell, MCP, plugin, and native multi-agent surfaces and currently
-  normalizes text, plan, reasoning summary, usage, and error events only. This is a safe Phase 1 subset, not the
-  final ordinary-tool execution contract described below.
+- The Preview deliberately disables approval, shell, MCP, and plugin surfaces. Native multi-agent collaboration is
+  exposed as provider-managed execution and normalized into Baton-private audit events; it is not canonical child lineage.
+  The adapter also normalizes text, plan, reasoning summary, usage, and error events.
 
 ### Claude adapter
 
@@ -241,7 +243,9 @@ Gemini is included in the interface, schema enum, fixtures, and contract tests f
 
 ## 6. Child execution ownership
 
-Canonical ownership is broken if an adapter can silently create a provider-native subagent, team, or cloud task whose messages and tool activity are stored outside Baton. Baton-managed turns therefore start in **single-agent mode**: the selected provider executes one turn and cannot directly create another model session.
+Canonical ownership is broken if an adapter silently treats provider-native children as Baton-owned work. An adapter may
+instead declare **provider-native mode**: Codex manages the child sessions, Baton audits collaboration lifecycle events,
+and no canonical lineage, budget, replay, or join guarantee is claimed.
 
 ### 6.1 Task taxonomy
 
@@ -251,20 +255,22 @@ The word "task" is overloaded and must not drive policy by name alone.
 |---|---|---|
 | Plan/progress metadata | Claude `TaskCreate`/`TaskUpdate`, Gemini tracker/todo tools | Allowed; normalize as canonical plan/task items |
 | Ordinary tool execution | Shell command, file edit, MCP read | Allowed by the turn's tool and approval policy; record as items |
-| Child model execution | Codex subagent, Claude `Agent`, Gemini agent, agent team, remote agent task | Denied natively; only Baton may create it |
+| Child model execution | Codex subagent, Claude `Agent`, Gemini agent, agent team, remote agent task | Codex may declare provider-native audit mode; otherwise denied until Baton-managed execution exists |
 | Background process | Compiler/server launched by a shell tool | Track as a leased tool process; it is not a conversation, but it may not launch an AI agent CLI |
 
 ### 6.2 Provider enforcement
 
-Prompt instructions are not an enforcement boundary. Each managed adapter must remove the native capability before the turn starts.
+Prompt instructions are not an enforcement boundary. Each adapter must either remove native child capability or explicitly
+declare and audit provider-native delegation before the turn starts.
 
 | Adapter | Required managed-mode configuration | Evidence/notes |
 |---|---|---|
-| Codex | Set `features.multi_agent = false` in the Baton-owned Codex configuration and verify collaboration tools are absent before accepting the turn | Current Codex enables `multi_agent` by default; source gates `spawn_agent`/collaboration tool registration on this feature. Deprecated `turn/start.multiAgentMode` is not a disable switch. |
+| Codex | Enable supported multi-agent features, declare exposed collaboration tools in the handshake, use a non-ephemeral parent thread, audit collaboration items, and archive parent/child threads at disposal | Native children remain provider-managed and must not be represented as Baton child executions. |
 | Claude | With Agent SDK, exclude or disallow `Agent`; with managed CLI, deny the `Agent` tool. Do not enable experimental agent teams. Disable background tasks when the adapter does not support their lifecycle. | `Agent` (formerly `Task`) creates a separate subagent; `TaskCreate` and related task-list tools do not. |
 | Gemini | Set `experimental.enableAgents = false`; optionally add policy-engine denies for agent virtual tools as defense in depth | Gemini CLI agents are enabled by default in preview and run with separate context. |
 
-The adapter startup handshake records a capability snapshot. If a native agent tool is still exposed, canonical mode fails closed before user input is sent.
+The adapter startup handshake records a capability snapshot. Disabled adapters must expose no native agent tools;
+provider-native adapters must declare a non-empty tool set. Inconsistent declarations fail closed before user input is sent.
 
 Native-tool removal alone is insufficient because a model with shell access could run `codex`, `claude`, `gemini`, or an equivalent script. Baton therefore owns a **Child Execution Gate**:
 
@@ -288,7 +294,8 @@ baton.list_children
 
 `baton.spawn_child` creates a child thread/execution through the same `SessionStore` and adapter contracts as a root turn. The request declares purpose, history cut, provider/model preference, allowed tools, token/time budget, and maximum depth. Baton may reject it because of policy, quota, concurrency, or unsupported capabilities. Providers never receive credentials or native IDs with which to resume the child outside Baton.
 
-The initial implementation uses `delegation_mode: 'disabled'`. A future `baton-managed` mode may enable these tools. Provider-native execution can be imported for diagnostics, but is never the default canonical path.
+The Codex implementation uses `delegation_mode: 'provider-native'`; other adapters remain `disabled`. A future
+`baton-managed` mode may enable canonical child tools. Provider-native execution is deliberately opaque beyond its audit trail.
 
 ### 6.4 Durable child execution records
 
@@ -429,8 +436,8 @@ Exit: create/read/resume/fork/replay produces deterministic canonical history af
 ### Phase 1 — Codex vertical slice — **Preview implemented; live exit test pending**
 
 - Implement the Codex adapter through app-server.
-- Launch it with `multi_agent` disabled and verify collaboration tools are absent.
-- Add shell/MCP Child Execution Gate tests with delegation disabled.
+- Launch it with provider-native multi-agent enabled and declare collaboration tools.
+- Audit collaboration events and retain shell/MCP execution-gate tests.
 - Persist streamed items and reconnect by cursor.
 - Add one minimal Baton session UI flow.
 
@@ -476,7 +483,7 @@ manual-package evidence separation, stale-approval rejection, and uncertain/dive
 
 - Implement provider-neutral child tools and bounded execution trees.
 - Add budget, depth, concurrency, approval, lease, join, and cancellation policies.
-- Keep provider-native agent tools disabled; child turns use ordinary Baton adapters.
+- Keep provider-native execution distinct; Baton-managed child turns use ordinary Baton adapters.
 
 Exit: every child action replays from Baton storage, no provider-native child session is required, and killing Baton cannot leave an unowned agent running.
 
@@ -500,7 +507,7 @@ The full target matrix below contains both covered and pending cases; per-item s
 8. compaction covers an exact immutable range and can be regenerated;
 9. cancellation, stream disconnect, crash recovery, and concurrent turn conflicts are deterministic;
 10. account rotation changes do not change Baton session identity;
-11. managed adapters expose no native child-agent/team tool;
+11. provider-native adapters declare and audit child-agent tools while disabled adapters expose none;
 12. shell and MCP escape attempts fail without a Baton capability;
 13. plan/task metadata remains usable without spawning a child model;
 14. child cancellation, budget exhaustion, crash recovery, and parent join replay deterministically.
@@ -532,8 +539,8 @@ The design fixes these implementation choices:
 3. Provider selection: per turn; switching only at terminal turn boundaries.
 4. First vertical slice: Codex app-server, then Claude, with Gemini contracts present from phase 0.
 5. Native Desktop support: import/bridge on a best-effort basis, not promised as transparent session sharing.
-6. Initial delegation: disabled; native provider subagents and teams are unavailable.
-7. Future delegation: Baton-managed child executions only, with canonical lineage and policy.
+6. Codex delegation: provider-native with private audit/archive and no canonical child guarantees.
+7. Future delegation: Baton-managed child executions with canonical lineage and policy.
 
 ## References
 

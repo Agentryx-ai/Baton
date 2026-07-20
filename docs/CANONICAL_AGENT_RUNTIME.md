@@ -51,7 +51,8 @@ preflight process; shutdown never waits on an unresolved initialization promise.
 
 ### A provider adapter must not
 
-- create an untracked native child task or subagent;
+- create a native child task or subagent unless its handshake declares `provider-native` delegation and
+  its collaboration lifecycle is captured as Baton-private provider audit events;
 - execute an unregistered native shell, plugin, app, MCP server, or tool;
 - silently continue after a Baton limit, cancellation, or policy denial;
 - claim completion for truncation, refusal, malformed output, or a pending tool exchange.
@@ -59,8 +60,9 @@ preflight process; shutdown never waits on an unresolved initialization promise.
 Codex currently exposes `update_plan` unconditionally and provides no supported switch to remove it.
 Baton permits this one provider-local metadata tool because it has no external side effect or child
 execution and normalizes its output into canonical `plan` items. It is recorded in adapter
-enforcement evidence. This exception does not permit native shell, web search, MCP, plugin, app, or
-subagent tools; those remain disabled and fail-closed.
+enforcement evidence. Codex collaboration/subagent tools are separately declared as provider-native;
+they do not become Baton-owned child executions. Native shell, web search, MCP, plugin, and app tools
+remain disabled and fail-closed.
 
 ## 3. Tool contract
 
@@ -254,4 +256,5 @@ expiry or process restart does not busy-loop or silently approve it.
 Conformance requires tests for single and parallel tool batches, provider-ID round trips, tool denial
 and failure, write-before-execute ordering, crash before/after mutation, cancellation races, approval
 and user-input waits, server continuation, truncation, compaction, refusal, malformed results, every
-limit, restart recovery, and the absence of native unregistered tools or child execution.
+limit, restart recovery, provider-native collaboration audit/archive, and the absence of other native
+unregistered tools or execution.
