@@ -31,6 +31,9 @@ type Scenario =
   | 'usageFallback'
   | 'reroute'
   | 'collab'
+  | 'collabChildEvent'
+  | 'collabChildTool'
+  | 'foreignCollabSender'
   | 'forbiddenExecution'
   | 'cancel'
   | 'hangInterrupt'
@@ -276,6 +279,16 @@ function scriptedFactory(
         && 'result' in message
       ) {
         emitScenario(self, 'normal')
+      } else if (scenario === 'collabChildTool' && message.id === 62 && 'result' in message) {
+        self.emit({
+          method: 'item/completed',
+          params: {
+            threadId: 'native-child-thread',
+            turnId: 'native-child-turn',
+            item: { id: 'child-dynamic-1', type: 'dynamicToolCall', status: 'completed' },
+          },
+        })
+        emitScenario(self, 'normal')
       }
     })
     created.push(process)
@@ -327,22 +340,42 @@ function emitScenario(process: FakeProcess, scenario: Scenario): void {
     process.exit({ code: 7, signal: null, stderr: 'invalid test configuration' })
     return
   }
-  if (scenario === 'collab') {
+  if (scenario === 'collab' || scenario === 'collabChildEvent'
+    || scenario === 'collabChildTool' || scenario === 'foreignCollabSender') {
     process.emit({
       method: 'item/completed',
       params: {
-        threadId: 'native-thread',
-        turnId: 'native-turn',
+        threadId: scenario === 'collabChildEvent' ? 'native-child-thread' : 'native-thread',
+        turnId: scenario === 'collabChildEvent' ? 'native-child-turn' : 'native-turn',
         item: {
           id: 'collab-1',
           type: 'collabAgentToolCall',
           tool: 'spawnAgent',
           status: 'completed',
-          senderThreadId: 'native-thread',
+          senderThreadId: scenario === 'foreignCollabSender' ? 'foreign-thread' : 'native-thread',
           receiverThreadIds: ['native-child-thread'],
         },
       },
     })
+    if (scenario === 'collabChildEvent') {
+      process.emit({
+        method: 'item/completed',
+        params: {
+          threadId: 'native-child-thread',
+          turnId: 'native-child-turn',
+          item: { id: 'child-reasoning-1', type: 'reasoning', summary: ['checked by child'] },
+        },
+      })
+    }
+    if (scenario === 'collabChildTool') {
+      emitToolCall(process, {
+        rpcId: 62,
+        threadId: 'native-child-thread',
+        turnId: 'native-child-turn',
+        callId: 'child-provider-call',
+      })
+      return
+    }
   }
   if (scenario === 'forbiddenExecution') {
     process.emit({
@@ -971,6 +1004,49 @@ test('adapter audits provider-native collaboration and archives parent and child
     { threadId: 'native-child-thread' },
     { threadId: 'native-thread' },
   ])
+})
+
+test('adapter accepts follow-up events from a registered provider-native child thread', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('collabChildEvent', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  const events = await collect(execution.events)
+  assert.equal((await execution.terminal).status, 'completed')
+  assert.ok(events.some((event) => event.type === 'item/completed'
+    && (event.payload as Record<string, unknown> | null)?.threadId === 'native-child-thread'))
+})
+
+test('adapter rejects collaboration events from an unowned sender thread', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('foreignCollabSender', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context())
+  assert.equal((await execution.terminal).status, 'failed')
+})
+
+test('adapter executes Baton dynamic tools for a registered provider-native child thread', async () => {
+  const invocations: AgentToolInvocation[] = []
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('collabChildTool', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot()), context({
+    tools: [readFileTool()],
+    executeTool: async (invocation) => {
+      invocations.push(invocation)
+      return { success: true, content: { text: 'child contents' }, error: null }
+    },
+  }))
+  assert.equal((await execution.terminal).status, 'completed')
+  assert.deepEqual(invocations, [{
+    callId: 'canonical-turn:native-child-thread:native-child-turn:child-provider-call',
+    providerCallId: 'child-provider-call',
+    name: 'read_file',
+    input: { path: 'README.md' },
+  }])
 })
 
 test('adapter still rejects unrelated native execution items', async () => {
