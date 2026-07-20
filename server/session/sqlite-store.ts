@@ -3701,11 +3701,14 @@ export class SqliteSessionStore implements SessionStore {
     })
   }
 
-  #createNativeImport(input: CommitNativeImportInput): NativeImportCommitResult {
+  #createNativeImport(
+    input: CommitNativeImportInput,
+    preservedIds?: { sessionId: string; threadId: string; sourceId: string },
+  ): NativeImportCommitResult {
     const candidate = input.candidate
-    const sessionId = this.#idFactory()
-    const threadId = this.#idFactory()
-    const sourceId = this.#idFactory()
+    const sessionId = preservedIds?.sessionId ?? this.#idFactory()
+    const threadId = preservedIds?.threadId ?? this.#idFactory()
+    const sourceId = preservedIds?.sourceId ?? this.#idFactory()
     const revisionId = this.#idFactory()
     const now = this.#now()
     this.#db.prepare(`
@@ -3770,7 +3773,11 @@ export class SqliteSessionStore implements SessionStore {
         throw new Error('source_rewritten_conflict: imported session has Baton turns, items, or forks')
       }
       this.#deleteUntouchedNativeImport(current.sourceId, current.sessionId)
-      const replacement = this.#createNativeImport({ ...input, previewedState: null })
+      const replacement = this.#createNativeImport({ ...input, previewedState: null }, {
+        sessionId: current.sessionId,
+        threadId: text(sessionRow, 'root_thread_id'),
+        sourceId: current.sourceId,
+      })
       return { ...replacement, status: 'updated' }
     }
     if (!untouchedRoot) {
