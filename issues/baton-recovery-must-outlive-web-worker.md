@@ -1,6 +1,6 @@
 # Baton 복구 경로는 Web Worker와 함께 죽으면 안 된다
 
-상태: **P0 구현·독립 적대적 검수 승인 · P1 구현 전**
+상태: **P0·P1 구현 및 독립 적대적 검수 승인 · P2 구현 전**
 우선순위: **P0 → P2 순차 구현**
 
 ## 문제
@@ -85,7 +85,8 @@ P1은 일시적 Worker 종료를 줄이되 복구 기능 자체는 P0 CLI에 둔
 ### 구현
 
 - 사용자 동의를 받은 경우에만 Windows 사용자 단위 로그인 시작을 등록한다.
-- Task Scheduler의 제한된 실패 재시작 정책을 사용하고 반복 실패 시 무한 재시작하지 않는다.
+- Task Scheduler의 제한된 실패 재시작 정책은 best-effort 안전망으로 설정하되 정상 Worker 복구는
+  여기에 의존하지 않으며, 반복 실패 시 무한 재시작하지 않는다.
 - 등록·해제·상태 확인·repair와 최근 Worker 종료/로그 진단을 CLI로 제공한다.
 - CurrentUser DPAPI와 사용자 프로필 설정을 사용하므로 LocalSystem 서비스로 실행하지 않는다.
 - 다른 프로세스가 `:4400`을 점유하면 종료하거나 포트를 탈취하지 않고 진단한다.
@@ -98,6 +99,68 @@ P1은 일시적 Worker 종료를 줄이되 복구 기능 자체는 P0 CLI에 둔
 - 자동 시작은 사용자 승인 없이 등록되지 않으며 해제 시 integration 설정을 바꾸지 않는다.
 - 자동 시작이 실패하거나 등록이 손상돼도 P0 오프라인 CLI가 동작한다.
 - 설치 경로에 공백이 있고 사용자 권한만 있는 환경에서 동작한다.
+
+### P1 구현 및 검증 기록
+
+2026-07-21에 P1을 별도 Supervisor가 아닌 **Task Scheduler action의 bounded lifecycle
+wrapper**로 구현했다. 이 wrapper는 `:4400` front-door, recovery web 또는 별도 상주 control plane이
+아니다.
+
+- `baton autostart install --confirm|status|repair|uninstall`과
+  `baton start|stop|restart|status|doctor|logs`를 추가했다. 등록은 명시적 opt-in만 허용하고
+  CurrentUser의 `Interactive`/`Limited` 로그인 trigger만 사용한다. LocalSystem·LocalService·
+  NetworkService SID와 실행 사용자가 계획된 CurrentUser와 다른 경우 mutation을 거부한다.
+- Task 정의는 고정 TaskPath와 installation별 이름·Description, 정확히 하나의 action과 사용자
+  AtLogOn trigger, principal, working directory, `IgnoreNew`, `StartWhenAvailable`, 무제한 execution
+  time, 배터리 정책, restart 횟수·간격을 모두 검사한다. start를 포함한 정상 lifecycle mutation은
+  ownership과 전체 definition이 모두 일치해야 한다. repair는 손상된 definition을 고치는 명령이므로
+  고정 path·description·CurrentUser 소유권을 두 번 확인한 뒤에만 교체한다.
+- install은 단일 PowerShell 호출 안에서 기존 Task를 검사하고 `-Force` 없는 register를 사용한다.
+  따라서 검사 뒤 같은 이름의 foreign Task가 먼저 등록되면 덮어쓰지 않고 실패한다. stop,
+  uninstall, repair도 같은 호출 안에서 mutation 직전 재검사한다.
+- Task Scheduler API에는 파일 CAS와 같은 조건부 update/delete가 없다. 따라서 재검사 직후와
+  `Disable/Unregister/Start` 사이에 동일 TaskPath·TaskName을 비협조 프로세스가 바꾸는 극단적
+  경합까지 원자적으로 배제할 수는 없다. repair는 unregister 직전 재검사 후 no-force register를
+  사용해 창을 최소화하며, foreign Task가 register를 선점하면 덮어쓰지 않는다. 이보다 강한 보장은
+  Windows가 조건부 Task mutation primitive를 제공해야 한다.
+- `:4400` listener의 PID뿐 아니라 `ExecutablePath`와 `CommandLine`을 계획된 Node executable,
+  checkout 및 `server/index.ts`와 대조한다. foreign owner는 진단만 하고 시작·종료하지 않는다.
+  이미 Running인 Task도 definition과 port owner 검사를 마친 뒤에만 no-op 처리한다.
+- runner는 Worker stdout/stderr를 CurrentUser 전용 ACL과 mode의 1 MiB bounded rotating log에
+  redaction하여 기록한다. signal을 소유 child에 전달하고 child settlement를 기다리며, 로그 쓰기
+  실패 시 자신이 만든 child tree만 종료한다. 임의 port owner는 종료하지 않는다.
+- `baton doctor`는 Scheduler 조회 실패를 lifecycle `unavailable`로 포함하되 P0 진단 결과와 exit
+  의미를 보존한다. `baton status`는 Worker가 없을 때 lifecycle을 출력하면서도 기존처럼 nonzero로
+  종료한다. Worker/Task 장애는 integration 설정을 변경하지 않는다.
+
+#### 실제 Windows 관측
+
+실제 Windows에서 Task Scheduler의 `RestartCount=3`, `RestartInterval=PT1M` 정의는 확인됐지만,
+수동 시작한 Exec action이 exit code 9로 끝난 경우 235초 동안 Scheduler가 action을 다시 실행하지
+않았다. 따라서 이 설정만으로 **Worker** 재기동을 보장한다고 주장하지 않는다.
+
+Worker 종료는 lifecycle runner가 60초 간격으로 초기 실행과 최대 3회의 재시도를 직접 수행한다.
+네 번째 실패 후 `worker-restart-exhausted`를 남기고 runner는 정상 종료하여 Scheduler 정책과의
+곱연산 재시도를 막는다. Scheduler restart 설정은 runner 자체가 비정상 crash하거나 action 시작에
+실패하는 경우를 위한 **best-effort 설정**일 뿐이며, Baton의 정상 복구 계약이나 수용 판정은 이에
+의존하지 않는다.
+
+UUID 격리 Task와 harmless fixture로 다음을 실제 관측했다.
+
+- 공백 경로, CurrentUser/Interactive/Limited, 전체 definition match와 등록 후 cleanup
+- Worker 실패 시 정확히 4회 실행 후 exhaustion, 다섯 번째 실행 없음
+- 명시적 stop 후 Task disabled, 현재 child 종료, 여러 test retry interval 이후 재실행 없음
+- 모든 `Baton-P1-Isolated-*` Task와 fixture 정리 후 잔존 0
+
+단위 검증은 service account 거부, opt-in, idempotency, name collision, repair, mutation 내부 재검사,
+foreign port, doctor fail-soft, runtime unavailable exit, 로그 rotation/redaction, logging failure cleanup과
+bounded retry를 포함한다. P2 standalone packaging은 이 단계에서 구현하지 않았다.
+
+독립 검수는 네 차례 진행됐다. 변조 Task 실행과 foreign Task mutation, 정의 검증 누락, P0 doctor
+결합, Worker 로그 폐기, secret redaction 우회와 로그 상한 해제를 차례로 반례화해 수정을 요구했다.
+최종 검수는 ownership/full-definition/no-force mutation, SID guard, port no-kill, bounded retry와
+explicit stop, child settlement, 1 MiB rotation, 64 KiB CLI tail, JSON·query·chunk-boundary redaction,
+unavailable exit 의미와 P0 독립성을 다시 확인한 뒤 새 승인 차단 finding 없이 P1을 승인했다.
 
 ## P2 — 복구 도구의 배포 독립성
 
