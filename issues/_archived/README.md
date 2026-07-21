@@ -8,6 +8,7 @@
 
 ## 보관된 이슈
 
+- [Web Worker와 독립적인 Baton 복구 경로](baton-recovery-must-outlive-web-worker.md)
 - [Codex 대용량 압축 요청의 event-loop starvation](codex-native-proxy-must-not-block-event-loop-on-large-compressed-requests.md)
 - [Codex built-in skill의 Native proxy 회귀](resolved-codex-built-in-skills-failed-through-native-proxy.md)
 - [Native import의 명시적 Goal 복원](native-import-must-restore-explicit-goals.md)

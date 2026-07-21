@@ -13,7 +13,6 @@
 
 | 이슈 | 상태 |
 |---|---|
-| [Web Worker와 독립적인 Baton 복구 경로](baton-recovery-must-outlive-web-worker.md) | 설계 승인 · 구현 전 |
 | [기존 Codex config의 resume alias 자동 복구](already-migrated-codex-config-missing-baton-compat-alias.md) | 부분 해결 |
 | [Canonical 대화의 plugin skill과 MCP](canonical-conversations-must-expose-plugin-skills-and-mcp.md) | 미해결 |
 | [Claude actual-429 계정 전환](claude-rotation-must-switch-on-actual-429.md) | 부분 해결 |
