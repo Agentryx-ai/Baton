@@ -6,6 +6,7 @@ import {
   activitySummary,
   conversationEntries,
   isLongConversationText,
+  itemTaskNotification,
   latestUsageSummary,
   payloadText,
   tailConversationEntries,
@@ -32,6 +33,31 @@ function item(payload: CanonicalItemDto['payload']): CanonicalItemDto {
 
 test('reasoning summaries are rendered as readable text instead of raw JSON', () => {
   assert.equal(payloadText(item({ summary: ['첫 판단', '검증 완료'] })), '첫 판단\n\n검증 완료')
+})
+
+test('legacy native task notifications render their result instead of provider envelopes', () => {
+  const raw = [
+    '<task-notification>',
+    '<task-id>a6bcbb3346afee066</task-id>',
+    '<tool-use-id>toolu_01ABC</tool-use-id>',
+    '<output-file>C:\\temp\\task.output</output-file>',
+    '<status>completed</status>',
+    '<summary>Agent "audit" finished</summary>',
+    '<note>A task-notification fires each time this agent stops.</note>',
+    '<result>Useful audit result.</result>',
+    '</task-notification>',
+  ].join('\n')
+  const legacy = {
+    ...item({ text: raw, nativeSourceClient: 'claude_desktop' }),
+    kind: 'user_message' as const,
+    provider: 'claude' as const,
+  }
+  assert.equal(payloadText(legacy), 'Useful audit result.')
+  assert.equal(itemTaskNotification(legacy)?.summary, 'Agent "audit" finished')
+
+  const userAuthored = { ...legacy, payload: { text: raw } }
+  assert.equal(itemTaskNotification(userAuthored), null)
+  assert.equal(payloadText(userAuthored), raw)
 })
 
 test('usage summary mirrors Codex token grouping and accepts app-server camelCase', () => {

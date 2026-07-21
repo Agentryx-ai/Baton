@@ -22,6 +22,10 @@ import type {
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 import { hasPortableUserContent, imageAttachments, parseImageArtifactRef, type ImageArtifactResolver } from './image-artifacts.ts'
 import { latestNativeContextCheckpoint } from './native-context-checkpoint.ts'
+import {
+  taskNotificationContextText,
+  taskNotificationFromPayload,
+} from '../../src/lib/native-task-notification.ts'
 
 type SupportedProvider = Extract<CanonicalProvider, 'claude' | 'gemini'>
 type JsonObject = Record<string, unknown>
@@ -1507,6 +1511,8 @@ function portableHistoryText(kind: string, payload: JsonObject): string | null {
 }
 
 function portableText(payload: JsonObject): string | null {
+  const taskNotification = taskNotificationFromPayload(payload)
+  if (taskNotification) return taskNotificationContextText(taskNotification)
   if (typeof payload.text === 'string' && payload.text.trim()) return payload.text
   if (typeof payload.content === 'string' && payload.content.trim()) return payload.content
   if (Array.isArray(payload.summary)) {
