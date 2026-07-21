@@ -505,8 +505,6 @@ test('first-turn route parses the immutable draft payload and reports idempotent
         kind: 'user_message',
         visibility: 'portable',
         payload: { text: 'hello' },
-        provider: undefined,
-        nativeId: undefined,
       }],
     })
 
@@ -923,8 +921,6 @@ test('fork, turn, item cursor, and cancellation routes pass validated contracts'
           kind: 'user_message',
           visibility: 'portable',
           payload: { text: 'hello' },
-          provider: undefined,
-          nativeId: undefined,
         },
       ],
     })
@@ -938,7 +934,13 @@ test('fork, turn, item cursor, and cancellation routes pass validated contracts'
     })
     assert.equal(followed.status, 202)
     assert.equal(((await json(followed)).followUp as { id: string }).id, 'follow-up-1')
-    assert.equal(service.followUpInput?.expectedTurnId, turn.id)
+    assert.deepEqual(service.followUpInput, {
+      threadId: thread.id,
+      clientRequestId: 'follow-1',
+      expectedTurnId: turn.id,
+      delivery: 'steer_or_queue',
+      input: [{ kind: 'user_message', payload: { text: 'more' } }],
+    })
     const followCancelled = await fetch(`${baseUrl}/follow-ups/follow-up-1`, {
       method: 'DELETE', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ expectedRevision: 1 }),
