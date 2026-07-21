@@ -118,7 +118,11 @@ export async function installBootstrap(options: InstallOptions): Promise<Bootstr
 
       const previous = await tryVerify(readActiveBootstrapManifest)
       const existingLkg = await tryVerify(readLastKnownGoodManifest)
-      const nextLkg = previous ?? existingLkg
+      // First install must be recoverable too. The already published candidate
+      // is verified through the same manifest contract before it may seed both
+      // the active and last-known-good fixed entries.
+      const candidate = await verifyBootstrapManifest(manifest, { allowUnsignedDevelopment: true })
+      const nextLkg = previous ?? existingLkg ?? candidate
       // Replace the active stable entry first. On Windows a running image locks
       // its executable, so an upgrade then fails before any manifest/LKG byte
       // is changed rather than entering rollback with a still-locked target.

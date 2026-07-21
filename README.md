@@ -192,8 +192,9 @@ npm start
 
 `install:bootstrap:dev`는 checkout, `node_modules`, 시스템 Node와 별개로 실행되는 unsigned
 offline recovery artifact를 명시적으로 개발용 설치합니다. unsigned build는 Windows
-SmartScreen/AppLocker 정책에 따라 실행이 차단될 수 있으며, 전역 Claude/Codex 연결 적용에도
-`BATON_ALLOW_UNSIGNED_BOOTSTRAP=1` 개발 override가 별도로 필요합니다. production apply는
+SmartScreen/AppLocker 정책에 따라 실행이 차단될 수 있으며, 전역 Claude/Codex 연결 적용과
+checkout/standalone lifecycle 명령에도 `BATON_ALLOW_UNSIGNED_BOOTSTRAP=1` 개발 override가 별도로
+필요합니다. production apply와 lifecycle은
 Authenticode 서명과 배포 시 고정한 signer thumbprint를 모두 검증한 release artifact만 허용하며,
 승인 thumbprint는 mutable manifest가 아니라 별도 `BATON_APPROVED_SIGNER_THUMBPRINT` 배포 정책에서
 공급해야 합니다. 같은 사용자가 이 환경과 manifest를 모두 바꿀 수 있다면 외부 trust anchor가

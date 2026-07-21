@@ -87,10 +87,22 @@ export async function verifyActiveBootstrapForLifecycle(): Promise<VerifiedBoots
     throw new Error('Production bootstrap lifecycle requires an independently approved signer policy')
   }
   const verified = await verifyBootstrapManifest(manifest, {
-    allowUnsignedDevelopment: true,
+    allowUnsignedDevelopment: process.env.BATON_ALLOW_UNSIGNED_BOOTSTRAP === '1',
     approvedSignerThumbprint,
   })
   return verifyStableEntry(verified)
+}
+
+export async function hasBootstrapLifecycleMetadata(): Promise<boolean> {
+  for (const file of [activeManifestPath(), lastKnownGoodManifestPath(), stableBootstrapPath(), stableLastKnownGoodPath()]) {
+    try {
+      await stat(file)
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+  return false
 }
 
 async function verifyStableEntry(verified: VerifiedBootstrap): Promise<VerifiedBootstrap> {

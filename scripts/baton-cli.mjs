@@ -46,9 +46,22 @@ if (command === 'autostart' || ['start', 'stop', 'restart', 'logs'].includes(com
 if (command === 'doctor') {
   try {
     const offline = await loadOffline()
-    const lifecycle = await loadLifecycle()
     const recovery = await offline.offlineDoctor()
-    const worker = await lifecycle.lifecycleStatus()
+    let worker
+    try {
+      const lifecycle = await loadLifecycle()
+      const plan = await lifecycle.resolveLifecyclePlan()
+      worker = await lifecycle.lifecycleStatus(plan)
+    } catch (error) {
+      worker = {
+        supported: process.platform === 'win32',
+        task: {
+          exists: false,
+          unavailable: true,
+          error: terminalText(error instanceof Error ? error.message : String(error)).slice(0, 300),
+        },
+      }
+    }
     const result = { ...recovery, lifecycle: worker }
     output(result, process.argv.includes('--json'))
     if (!recovery.ok || worker.task?.unavailable) process.exitCode = 1
@@ -73,7 +86,14 @@ try {
 }
 
 const lifecycle = await loadLifecycle()
-const worker = await lifecycle.lifecycleStatus()
+let worker
+try {
+  const plan = await lifecycle.resolveLifecyclePlan()
+  worker = await lifecycle.lifecycleStatus(plan)
+} catch (error) {
+  console.error(`Baton lifecycle failed: ${terminalText(error instanceof Error ? error.message : String(error))}`)
+  process.exit(1)
+}
 
 if (process.argv.includes('--json')) {
   console.log(JSON.stringify({ runtime: body, lifecycle: worker }, null, 2))
@@ -150,27 +170,28 @@ async function loadLifecycle() {
 
 async function runLifecycleCommand(topLevel) {
   const lifecycle = await loadLifecycle()
+  const plan = await lifecycle.resolveLifecyclePlan()
   const json = process.argv.includes('--json')
   if (topLevel === 'autostart') {
     const subcommand = process.argv[3] ?? 'status'
-    if (subcommand === 'status') return outputLifecycle(await lifecycle.lifecycleStatus(), json)
+    if (subcommand === 'status') return outputLifecycle(await lifecycle.lifecycleStatus(plan), json)
     if (subcommand === 'install') {
-      const result = await lifecycle.installScheduledTask(process.argv.includes('--confirm'))
-      return outputLifecycle(await lifecycle.lifecycleStatus(), json, result)
+      const result = await lifecycle.installScheduledTask(process.argv.includes('--confirm'), plan)
+      return outputLifecycle(await lifecycle.lifecycleStatus(plan), json, result)
     }
     if (subcommand === 'repair') {
-      const result = await lifecycle.repairScheduledTask()
-      return outputLifecycle(await lifecycle.lifecycleStatus(), json, result)
+      const result = await lifecycle.repairScheduledTask(plan)
+      return outputLifecycle(await lifecycle.lifecycleStatus(plan), json, result)
     }
     if (subcommand === 'uninstall') {
-      await lifecycle.uninstallScheduledTask()
-      return outputLifecycle(await lifecycle.lifecycleStatus(), json)
+      await lifecycle.uninstallScheduledTask(plan)
+      return outputLifecycle(await lifecycle.lifecycleStatus(plan), json)
     }
     throw new Error(`Unknown autostart command: ${subcommand}`)
   }
-  if (topLevel === 'start') await lifecycle.startWorker()
-  else if (topLevel === 'stop') await lifecycle.stopWorker()
-  else if (topLevel === 'restart') await lifecycle.restartWorker()
+  if (topLevel === 'start') await lifecycle.startWorker(plan)
+  else if (topLevel === 'stop') await lifecycle.stopWorker(plan)
+  else if (topLevel === 'restart') await lifecycle.restartWorker(plan)
   else if (topLevel === 'logs') {
     const logs = await lifecycle.lifecycleLogs()
     if (json) console.log(JSON.stringify(logs, null, 2))
@@ -181,7 +202,7 @@ async function runLifecycleCommand(topLevel) {
     }
     return
   } else throw new Error(`Unknown lifecycle command: ${topLevel}`)
-  outputLifecycle(await lifecycle.lifecycleStatus(), json)
+  outputLifecycle(await lifecycle.lifecycleStatus(plan), json)
 }
 
 function outputLifecycle(value, jsonOutput, registration) {

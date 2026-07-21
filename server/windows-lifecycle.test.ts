@@ -36,15 +36,20 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
 
 test('standalone bootstrap becomes the task action without changing the Worker checkout identity', () => {
   const previousBootstrap = process.env.BATON_BOOTSTRAP_EXECUTABLE
-  process.env.BATON_BOOTSTRAP_EXECUTABLE = 'C:\\Local App Data\\Baton\\bootstrap\\versions\\v1\\baton-bootstrap.exe'
+  const previousWorker = process.env.BATON_WORKER_EXECUTABLE
+  process.env.BATON_BOOTSTRAP_EXECUTABLE = 'C:\\Local App Data\\Baton\\bootstrap\\baton-bootstrap.exe'
+  process.env.BATON_WORKER_EXECUTABLE = 'C:\\Program Files\\nodejs\\node.exe'
   try {
     const plan = createLifecyclePlan({ root: 'C:\\Path With Spaces\\Baton', taskName: 'Baton-Test-Bootstrap' })
     assert.equal(plan.executable, process.env.BATON_BOOTSTRAP_EXECUTABLE)
+    assert.equal(plan.workerExecutable, process.env.BATON_WORKER_EXECUTABLE)
     assert.equal(plan.arguments, 'worker-runner --root "C:\\Path With Spaces\\Baton"')
     assert.equal(plan.root, 'C:\\Path With Spaces\\Baton')
   } finally {
     if (previousBootstrap === undefined) delete process.env.BATON_BOOTSTRAP_EXECUTABLE
     else process.env.BATON_BOOTSTRAP_EXECUTABLE = previousBootstrap
+    if (previousWorker === undefined) delete process.env.BATON_WORKER_EXECUTABLE
+    else process.env.BATON_WORKER_EXECUTABLE = previousWorker
   }
 })
 
@@ -124,7 +129,14 @@ test('explicit stop disables before stopping; restart enables only afterwards', 
 })
 
 test('start validates a running task and classifies the port owner before any no-op or launch', async () => {
-  const plan = createLifecyclePlan({ root: 'C:\\Baton', userId: 'alice', taskName: 'test' })
+  const plan = createLifecyclePlan({
+    root: 'C:\\Baton',
+    executable: 'C:\\Baton\\bootstrap\\baton-bootstrap.exe',
+    workerExecutable: 'C:\\Program Files\\nodejs\\node.exe',
+    useBootstrap: true,
+    userId: 'alice',
+    taskName: 'test',
+  })
   const calls: string[] = []
   const run = async (script: string) => { calls.push(script); return '' }
   const { startWorker } = await import('./windows-lifecycle.ts')
@@ -136,7 +148,37 @@ test('start validates a running task and classifies the port owner before any no
   assert.match(script, /ExecutablePath/)
   assert.match(script, /CommandLine/)
   assert.match(script, /expected-baton-worker/)
+  assert.match(script, /ExecutablePath -eq 'C:\\Program Files\\nodejs\\node\.exe'/)
+  assert.match(script, /\$action\.Execute -eq 'C:\\Baton\\bootstrap\\baton-bootstrap\.exe'/)
   assert.doesNotMatch(script, /Stop-Process|taskkill/)
+})
+
+test('public lifecycle CLI fails closed when any installed bootstrap metadata is invalid', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-bootstrap-invalid-cli-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  await writeFile(path.join(directory, 'active.json'), '{"schemaVersion":999}\n')
+  const result = await spawnResult(process.execPath, ['scripts/baton-cli.mjs', 'autostart', 'status', '--json'], {
+    ...process.env,
+    BATON_BOOTSTRAP_ROOT: directory,
+    BATON_ALLOW_UNSIGNED_BOOTSTRAP: '1',
+  })
+  assert.equal(result.code, 1)
+  assert.match(result.stderr, /manifest is incompatible/)
+  assert.doesNotMatch(result.stdout, /configured runner arguments/)
+
+  const doctor = await spawnResult(process.execPath, ['scripts/baton-cli.mjs', 'doctor', '--json'], {
+    ...process.env,
+    BATON_BOOTSTRAP_ROOT: directory,
+    BATON_ALLOW_UNSIGNED_BOOTSTRAP: '1',
+    BATON_RECOVERY_ROOT: path.join(directory, 'recovery'),
+    BATON_OFFLINE_HOME: path.join(directory, 'home'),
+    BATON_OFFLINE_LOCAL_APP_DATA: path.join(directory, 'local'),
+  })
+  const diagnosis = JSON.parse(doctor.stdout)
+  assert.equal(diagnosis.statuses.length, 3)
+  assert.equal(diagnosis.lifecycle.task.unavailable, true)
+  assert.equal(doctor.code, 1)
+  assert.equal('plan' in diagnosis.lifecycle, false)
 })
 
 test('uninstall is idempotent and never changes integration files or kills a port owner', async () => {
@@ -175,6 +217,7 @@ test('CLI doctor preserves P0 output when lifecycle tooling is unavailable', asy
     ...process.env,
     BATON_LIFECYCLE_POWERSHELL: path.join(directory, 'missing-powershell.exe'),
     BATON_RECOVERY_ROOT: path.join(directory, 'state'),
+    BATON_BOOTSTRAP_ROOT: path.join(directory, 'bootstrap'),
     BATON_OFFLINE_HOME: path.join(directory, 'home'),
     BATON_OFFLINE_LOCAL_APP_DATA: path.join(directory, 'local'),
   })
@@ -192,6 +235,7 @@ test('autostart status prints unavailable lifecycle state and exits nonzero', as
     ...process.env,
     BATON_LIFECYCLE_POWERSHELL: path.join(directory, 'missing-powershell.exe'),
     BATON_RECOVERY_ROOT: directory,
+    BATON_BOOTSTRAP_ROOT: path.join(directory, 'bootstrap'),
   })
   const value = JSON.parse(result.stdout)
   assert.equal(value.task.unavailable, true)
@@ -205,6 +249,7 @@ test('CLI status reports lifecycle state but exits nonzero when runtime is unava
     ...process.env,
     BATON_URL: 'http://127.0.0.1:1',
     BATON_RECOVERY_ROOT: directory,
+    BATON_BOOTSTRAP_ROOT: path.join(directory, 'bootstrap'),
     BATON_TASK_NAME: `Baton-P1-Isolated-${Date.now()}`,
   })
   const value = JSON.parse(result.stdout)

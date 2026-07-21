@@ -6,6 +6,12 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
+import {
+  hasBootstrapLifecycleMetadata,
+  verifyActiveBootstrapForLifecycle,
+  withBootstrapLock,
+} from './bootstrap-contract.ts'
+
 const execFileAsync = promisify(execFile)
 
 export const RESTART_COUNT = 3
@@ -15,7 +21,10 @@ export interface LifecyclePlan {
   taskName: string
   taskPath: string
   root: string
+  /** Scheduled Task action executable (bootstrap after P2). */
   executable: string
+  /** Expected executable for the process that owns the Worker listener. */
+  workerExecutable: string
   arguments: string
   workingDirectory: string
   userId: string
@@ -63,6 +72,8 @@ function lifecycleRoot(): string {
 export function createLifecyclePlan(options: {
   root?: string
   executable?: string
+  workerExecutable?: string
+  useBootstrap?: boolean
   userId?: string
   taskName?: string
 } = {}): LifecyclePlan {
@@ -72,8 +83,9 @@ export function createLifecyclePlan(options: {
   const hash = createHash('sha256').update(root.toLowerCase()).digest('hex').slice(0, 12)
   const runner = path.join(root, 'scripts', 'baton-worker-runner.mjs')
   const bootstrapExecutable = process.env.BATON_BOOTSTRAP_EXECUTABLE
-  const useBootstrap = !options.executable && Boolean(bootstrapExecutable)
+  const useBootstrap = options.useBootstrap ?? (!options.executable && Boolean(bootstrapExecutable))
   const executable = options.executable ?? bootstrapExecutable ?? process.execPath
+  const workerExecutable = options.workerExecutable ?? process.env.BATON_WORKER_EXECUTABLE ?? process.execPath
   const argumentsValue = useBootstrap
     ? `worker-runner --root ${quoteArgument(root)}`
     : `${quoteArgument(runner)} --root ${quoteArgument(root)}`
@@ -82,6 +94,7 @@ export function createLifecyclePlan(options: {
     taskPath: '\\',
     root,
     executable,
+    workerExecutable,
     arguments: argumentsValue,
     workingDirectory: root,
     userId: options.userId ?? (process.env.USERDOMAIN
@@ -91,6 +104,34 @@ export function createLifecyclePlan(options: {
     restartIntervalMinutes: RESTART_INTERVAL_MINUTES,
     ownershipMarker: `Baton CurrentUser worker lifecycle (${root})`,
   }
+}
+
+export async function resolveLifecyclePlan(options: {
+  userId?: string
+  taskName?: string
+} = {}): Promise<LifecyclePlan> {
+  return withBootstrapLock(async () => {
+    if (!(await hasBootstrapLifecycleMetadata())) {
+      return createLifecyclePlan({
+        ...options,
+        executable: process.execPath,
+        workerExecutable: process.execPath,
+        useBootstrap: false,
+      })
+    }
+    // Metadata presence is a one-way trust boundary: once P2 has written any
+    // fixed entry/manifest, corruption or policy failure must not silently
+    // downgrade lifecycle mutations to the checkout's Node runner.
+    const verified = await verifyActiveBootstrapForLifecycle()
+    if (!verified.stableEntry) throw new Error('Verified bootstrap has no stable lifecycle entry')
+    return createLifecyclePlan({
+      ...options,
+      root: verified.manifest.workerRoot,
+      executable: verified.stableEntry,
+      workerExecutable: verified.manifest.workerNode,
+      useBootstrap: true,
+    })
+  })
 }
 
 async function defaultPowerShell(script: string): Promise<string> {
@@ -265,7 +306,7 @@ function portInspectionScript(plan: LifecyclePlan): string[] {
     `$portOccupied = $null -ne $connection`,
     `$portProcess = if ($portOccupied) { Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess) -ErrorAction SilentlyContinue } else { $null }`,
     `$expectedCommand = ($null -ne $portProcess) -and ($null -ne $portProcess.CommandLine) -and ($portProcess.CommandLine.IndexOf(${psLiteral(plan.root)}, [StringComparison]::OrdinalIgnoreCase) -ge 0) -and ($portProcess.CommandLine.IndexOf('server/index.ts', [StringComparison]::OrdinalIgnoreCase) -ge 0)`,
-    `$expectedExecutable = ($null -ne $portProcess) -and ($null -ne $portProcess.ExecutablePath) -and ($portProcess.ExecutablePath -eq ${psLiteral(plan.executable)})`,
+    `$expectedExecutable = ($null -ne $portProcess) -and ($null -ne $portProcess.ExecutablePath) -and ($portProcess.ExecutablePath -eq ${psLiteral(plan.workerExecutable)})`,
     `$portOwnerKind = if ($portOccupied -and $expectedCommand -and $expectedExecutable) { 'expected-baton-worker' } elseif ($portOccupied) { 'foreign' } else { $null }`,
   ]
 }

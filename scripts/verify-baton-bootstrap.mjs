@@ -15,6 +15,7 @@ const localAppData = path.join(fixture, 'Local App Data')
 const home = path.join(fixture, 'User Profile')
 const bootstrapRoot = path.join(localAppData, 'Baton', 'bootstrap')
 const recoveryRoot = path.join(localAppData, 'Baton', 'integration-recovery')
+const fakeWorker = path.join(fixture, 'baton-test-worker.exe')
 const tsx = path.join('node_modules', 'tsx', 'dist', 'cli.mjs')
 const taskName = `Baton-P2-Isolated-${randomUUID()}`
 const baseEnv = {
@@ -27,16 +28,62 @@ const baseEnv = {
   BATON_RECOVERY_ROOT: recoveryRoot,
   BATON_BOOTSTRAP_ROOT: bootstrapRoot,
   BATON_TASK_NAME: taskName,
+  BATON_WORKER_NODE: fakeWorker,
+  BATON_ALLOW_UNSIGNED_BOOTSTRAP: '1',
 }
+delete baseEnv.BATON_BOOTSTRAP_EXECUTABLE
 let taskInstalled = false
 let taskExecutable = null
 let holdingStable = null
 
 try {
   await mkdir(fixture, { recursive: true })
+  await compileExitZeroExecutable(fakeWorker)
   await run(process.execPath, ['scripts/build-baton-bootstrap.mjs', '--install', '--allow-unsigned-development'], baseEnv, root)
   let manifest = JSON.parse(await readFile(path.join(bootstrapRoot, 'active.json'), 'utf8'))
   const stable = path.join(bootstrapRoot, 'baton-bootstrap.exe')
+  const lkg = path.join(bootstrapRoot, 'baton-bootstrap-lkg.exe')
+  const assertUnavailableDoctor = async (env, expectedError) => {
+    const result = await captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', 'doctor', '--json'], env, root)
+    assert.notEqual(result.code, 0)
+    const value = JSON.parse(result.stdout.toString('utf8'))
+    assert.equal(value.statuses.length, 3)
+    assert.equal(value.lifecycle.task.unavailable, true)
+    assert.equal('plan' in value.lifecycle, false)
+    assert.match(value.lifecycle.task.error, expectedError)
+    assert.doesNotMatch(result.stdout.toString('utf8'), /configured runner arguments/)
+  }
+  assert.equal(JSON.parse(await readFile(path.join(bootstrapRoot, 'last-known-good.json'), 'utf8')).artifactSha256, manifest.artifactSha256)
+  assert.deepEqual(await readFile(lkg), await readFile(stable))
+  await writeFile(path.join(bootstrapRoot, 'active.json'), '{"schemaVersion":999}\n')
+  await assertUnavailableDoctor(baseEnv, /manifest is incompatible/)
+  await run(lkg, ['recover-active', '--from-lkg', '--json'], baseEnv, fixture)
+  manifest = JSON.parse(await readFile(path.join(bootstrapRoot, 'active.json'), 'utf8'))
+  assert.equal(manifest.artifactSha256, JSON.parse(await readFile(path.join(bootstrapRoot, 'last-known-good.json'), 'utf8')).artifactSha256)
+  const stableBytes = await readFile(stable)
+  await rm(stable)
+  await assertUnavailableDoctor(baseEnv, /ENOENT|no such file/i)
+  await writeFile(stable, Buffer.from('corrupt stable entry'))
+  await assertUnavailableDoctor(baseEnv, /does not match the active artifact/)
+  await writeFile(stable, stableBytes)
+  const productionLifecycleEnv = { ...baseEnv }
+  delete productionLifecycleEnv.BATON_ALLOW_UNSIGNED_BOOTSTRAP
+  const rejectedUnsignedLifecycle = await captureFailureAllowed(process.execPath, [
+    'scripts/baton-cli.mjs', 'autostart', 'status', '--json',
+  ], productionLifecycleEnv, root)
+  assert.notEqual(rejectedUnsignedLifecycle.code, 0)
+  assert.match(rejectedUnsignedLifecycle.stderr.toString('utf8'), /Unsigned development bootstrap/)
+  await assertUnavailableDoctor(productionLifecycleEnv, /Unsigned development bootstrap/)
+  const activeManifestFile = path.join(bootstrapRoot, 'active.json')
+  const unsignedManifestBytes = await readFile(activeManifestFile)
+  const signedPolicyFixture = JSON.parse(unsignedManifestBytes.toString('utf8'))
+  signedPolicyFixture.trust = { kind: 'signed-release', signerThumbprint: 'A'.repeat(40) }
+  await writeFile(activeManifestFile, `${JSON.stringify(signedPolicyFixture, null, 2)}\n`)
+  const missingSignerPolicyEnv = { ...baseEnv }
+  delete missingSignerPolicyEnv.BATON_APPROVED_SIGNER_THUMBPRINT
+  await assertUnavailableDoctor(missingSignerPolicyEnv, /independently approved signer policy/)
+  await assertUnavailableDoctor({ ...baseEnv, BATON_APPROVED_SIGNER_THUMBPRINT: 'B'.repeat(40) }, /does not match the independently approved deployment policy/)
+  await writeFile(activeManifestFile, unsignedManifestBytes)
   taskExecutable = stable
   await run(process.execPath, [tsx, 'scripts/prepare-bootstrap-fixture.ts'], baseEnv, root)
 
@@ -56,7 +103,14 @@ try {
   const repaired = JSON.parse((await capture(stable, ['autostart', 'repair', '--json'], baseEnv, fixture)).toString('utf8'))
   assert.equal(repaired.task.definitionMatches, true)
   assert.equal((await realpath(repaired.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
+  assert.equal((await realpath(repaired.plan.workerExecutable)).toLowerCase(), (await realpath(fakeWorker)).toLowerCase())
   taskExecutable = repaired.plan.executable
+  const validPublicDoctor = await captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', 'doctor', '--json'], baseEnv, root)
+  assert.equal(validPublicDoctor.code, 0, validPublicDoctor.stderr.toString('utf8'))
+  const validDiagnosis = JSON.parse(validPublicDoctor.stdout.toString('utf8'))
+  assert.equal(validDiagnosis.statuses.length, 3)
+  assert.notEqual(validDiagnosis.lifecycle.task.unavailable, true)
+  assert.equal((await realpath(validDiagnosis.lifecycle.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
 
   const originalDigest = manifest.artifactSha256
   const seaBytes = await readFile(path.join(root, '.tmp', 'bootstrap-build', 'baton-bootstrap.exe'))
@@ -79,9 +133,37 @@ try {
   assert.equal(afterPrune.task.definitionMatches, true)
   assert.equal((await realpath(afterPrune.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
 
-  await run(process.execPath, [tsx, 'scripts/bootstrap-task-fixture.ts', 'uninstall'], {
-    ...baseEnv, BATON_RELEASE_ROOT: root, BATON_BOOTSTRAP_EXECUTABLE: taskExecutable,
+  const publicCli = (args) => captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', ...args], baseEnv, root)
+  const publicStatus = await publicCli(['autostart', 'status', '--json'])
+  assert.equal(publicStatus.code, 0)
+  const publicStatusValue = JSON.parse(publicStatus.stdout.toString('utf8'))
+  assert.equal((await realpath(publicStatusValue.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
+  assert.equal((await realpath(publicStatusValue.plan.workerExecutable)).toLowerCase(), (await realpath(fakeWorker)).toLowerCase())
+  const offlineRuntimeStatus = await captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', 'status', '--json'], {
+    ...baseEnv, BATON_URL: 'http://127.0.0.1:1',
   }, root)
+  assert.equal(offlineRuntimeStatus.code, 1)
+  const offlineRuntimeValue = JSON.parse(offlineRuntimeStatus.stdout.toString('utf8'))
+  assert.equal((await realpath(offlineRuntimeValue.lifecycle.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
+  for (const args of [
+    ['autostart', 'install', '--confirm', '--json'],
+    ['autostart', 'repair', '--json'],
+    ['logs', '--json'],
+  ]) {
+    const result = await publicCli(args)
+    assert.equal(result.code, 0, `public CLI ${args.join(' ')} failed: ${result.stderr}`)
+  }
+  // A real Baton/foreign listener may already own :4400 on the developer
+  // machine. Public start/restart must then fail before mutating the isolated
+  // Task; when the port is free the harmless exit-zero worker is exercised.
+  for (const command of ['start', 'restart']) {
+    const result = await publicCli([command, '--json'])
+    if (result.code !== 0) assert.match(result.stderr.toString('utf8'), /Port 4400 is (?:already occupied|owned by a foreign process)/)
+  }
+  for (const args of [['stop', '--json'], ['autostart', 'uninstall', '--json']]) {
+    const result = await publicCli(args)
+    assert.equal(result.code, 0, `public CLI ${args.join(' ')} failed: ${result.stderr}`)
+  }
   taskInstalled = false
 
   const isolatedEnv = {
@@ -112,7 +194,6 @@ try {
   assert.ok(!`${remove.stdout}\n${remove.stderr}`.includes('fixture-secret'), 'secret leaked from standalone output')
 
   // B is the directly executable LKG after A→B→C pruning.
-  const lkg = path.join(bootstrapRoot, 'baton-bootstrap-lkg.exe')
 
   // Missing/corrupt active metadata cannot disable either fixed P0 entry.
   await writeFile(path.join(bootstrapRoot, 'active.json'), '{"schemaVersion":999}\n')
@@ -238,4 +319,20 @@ function spawnUntilLine(file, args, env, cwd, expected) {
 function onceClosed(child) {
   if (child.exitCode !== null) return Promise.resolve()
   return new Promise((resolve) => child.once('close', resolve))
+}
+
+function compileExitZeroExecutable(output) {
+  const script = Buffer.from(String.raw`$ErrorActionPreference = 'Stop'
+$output = [Console]::In.ReadToEnd()
+Add-Type -TypeDefinition 'public static class Program { public static int Main(string[] args) { return 0; } }' -Language CSharp -OutputType ConsoleApplication -OutputAssembly $output`, 'utf16le').toString('base64')
+  return new Promise((resolve, reject) => {
+    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', script], {
+      windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stderr = ''
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk })
+    child.once('error', reject)
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error(`fixture compiler exited ${code}: ${stderr}`)))
+    child.stdin.end(output)
+  })
 }

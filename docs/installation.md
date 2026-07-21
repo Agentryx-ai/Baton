@@ -92,12 +92,15 @@ npm start
 
 첫 명령은 Worker와 별개로 동작하는 offline recovery 실행 파일을
 `%LOCALAPPDATA%\Baton\bootstrap`에 staging→hash/self-test→atomic activation 순서로 설치합니다.
+최초 설치부터 검증된 동일 candidate로 active와 LKG manifest 및 두 고정 exe를 모두 채우므로, 첫
+활성화 직후 `active.json`이 손상돼도 고정 LKG entry로 복구할 수 있습니다.
 P1 Task가 `worker-runner`로 stable exe를 실행 중이면 Windows가 그 exe 교체를 잠글 수 있으므로
 bootstrap upgrade 전에 `baton stop`으로 owned Worker Task를 명시적으로 중지합니다. installer는 잠긴
 entry를 우회하거나 Task를 자동 변경하지 않고 전체 전환을 rollback합니다.
 이 명령은 이름과 flag에서 드러나듯 unsigned local-development 설치에 대한 명시적 opt-in입니다.
-unsigned SEA는 SmartScreen/AppLocker 정책에 따라 실행되지 않을 수 있고, 전역 integration apply는
-`BATON_ALLOW_UNSIGNED_BOOTSTRAP=1`을 별도로 지정한 개발 실행에서만 허용됩니다. production에서는
+unsigned SEA는 SmartScreen/AppLocker 정책에 따라 실행되지 않을 수 있고, 전역 integration apply와
+checkout/standalone lifecycle 명령은 `BATON_ALLOW_UNSIGNED_BOOTSTRAP=1`을 별도로 지정한 개발
+실행에서만 허용됩니다. production에서는
 SEA 생성 후 조직의 release signing 단계로 Authenticode 서명하고 다음처럼 실제 signer thumbprint를
 검증해 설치해야 합니다.
 
@@ -125,6 +128,13 @@ anchor가 아닙니다. 위 환경값도 같은 사용자가 자유롭게 바꿀
 key/서명 파이프라인이 없으므로 unsigned local
 artifact를 production-ready라고 주장하지 않습니다. 생성 exe는 build 산출물이며 저장소에 commit하지
 않습니다.
+
+설치 이후 checkout의 `baton autostart ...`, `baton start|stop|restart`, `baton status`, `baton logs`도
+Node fallback plan을 새로 만들지 않습니다. OS bootstrap lock 안에서 active content artifact와 고정
+stable entry를 hash/self-test/서명 정책으로 검증한 뒤, manifest의 `workerRoot`·`workerNode`와 고정
+stable Task action에서 하나의 lifecycle plan을 만듭니다. 네 lifecycle metadata 중 하나라도 존재하는데
+검증이 실패하면 명령은 fail closed합니다. P2 metadata가 전혀 없는 기존 설치만 checkout Node runner를
+사용합니다.
 
 Worker와 `active.json`이 모두 손상돼도 다음 고정 경로는 manifest 없이 P0 status/remove를 실행합니다.
 
