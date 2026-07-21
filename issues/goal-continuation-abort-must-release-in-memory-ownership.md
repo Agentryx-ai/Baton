@@ -49,4 +49,3 @@ stale turn을 생성하지 않는다.
 - DaeumKkini Goal을 재개해 새 scheduler lease와 running turn이 생성되는지 확인한다.
 - 다음 turn에 복구 컨텍스트가 소비되고 pause/resume API가 timeout 없이 응답하는지 확인한다.
 - live 검증 뒤 이 문서를 `_archived`로 이동한다.
-

@@ -66,4 +66,3 @@ retryable: false
 - 중단된 읽기 전용 호출은 재시작 시 실패 result로 정확히 한 번 닫힌다.
 - mutation 결과는 추측하거나 자동 재실행하지 않는다.
 - 복구 뒤 provider snapshot과 다음 turn이 unresolved tool 오류 없이 진행된다.
-
