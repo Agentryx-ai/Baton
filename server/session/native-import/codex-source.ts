@@ -18,6 +18,10 @@ import {
   type CodexGoalToolAction,
 } from './goal-reconstruction.ts'
 import { nativeContextCheckpointPayload } from '../native-context-checkpoint.ts'
+import {
+  parseCodexTaskNotification,
+  taskNotificationPayload,
+} from '../../../src/lib/native-task-notification.ts'
 
 export interface CodexSourceReaderOptions {
   codexHome?: string
@@ -41,7 +45,7 @@ const CODEX_TOP_LEVEL_TYPES = new Set([
   // provider-private execution checkpoint; other private bookkeeping remains loss.
   'world_state', 'compacted', 'inter_agent_communication_metadata',
 ])
-const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v4`
+const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v5`
 
 export class CodexLocalSourceReader implements NativeSourceReader {
   readonly sourceClient = 'codex_local' as const
@@ -297,6 +301,18 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
     const timestamp = string(event.timestamp)
     const baseId = string(payload.id) ?? `${sessionId}:${lineIndex + 1}`
 
+    if (payloadType === 'agent_message') {
+      const textValue = messageText(payload.content)
+      const taskNotification = textValue ? parseCodexTaskNotification(textValue) : null
+      if (!taskNotification) { skipped += 1; continue }
+      addRecord(records, `${baseId}:task-notification`, 'user_message', {
+        ...taskNotificationPayload(taskNotification),
+        nativeSourceClient: 'codex_local',
+        nativeRecordType: 'agent_message',
+        nativeTimestamp: timestamp,
+      }, timestamp)
+      continue
+    }
     if (payloadType === 'message') {
       const role = string(payload.role)
       if (role !== 'user' && role !== 'assistant') { skipped += 1; continue }

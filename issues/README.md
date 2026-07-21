@@ -13,6 +13,7 @@
 
 | 이슈 | 상태 |
 |---|---|
+| [Follow-up API의 생략 선택 필드 저장 실패](follow-up-api-must-omit-absent-optional-item-fields.md) | 부분 해결 |
 | [기존 Codex config의 resume alias 자동 복구](already-migrated-codex-config-missing-baton-compat-alias.md) | 부분 해결 |
 | [Canonical 대화의 plugin skill과 MCP](canonical-conversations-must-expose-plugin-skills-and-mcp.md) | 미해결 |
 | [Claude actual-429 계정 전환](claude-rotation-must-switch-on-actual-429.md) | 부분 해결 |

@@ -11,7 +11,13 @@ import {
   type CodexProcessFactory,
 } from './codex-adapter.ts'
 import { DEFAULT_AGENT_LOOP_LIMITS } from './domain.ts'
-import type { AgentToolDefinition, AgentToolInvocation, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import type {
+  AgentToolDefinition,
+  AgentToolInvocation,
+  NewCanonicalItem,
+  PermissionProfile,
+  ThreadSnapshot,
+} from './domain.ts'
 import type { ImageArtifactRef } from './image-artifacts.ts'
 
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null; stderr?: string }
@@ -26,6 +32,7 @@ type Scenario =
   | 'foreignTool'
   | 'foreignStatus'
   | 'foreignProvider'
+  | 'sandboxMismatch'
   | 'twoRounds'
   | 'nextRoundTool'
   | 'usageFallback'
@@ -188,6 +195,14 @@ function scriptedFactory(
       } else if (method === 'config/read') {
         self.emit({ id: idOf(message), result: configResult() }, true)
       } else if (method === 'thread/start') {
+        const sandboxMode = (message.params as Record<string, unknown>).sandbox
+        const sandboxType = scenario === 'sandboxMismatch'
+          ? 'readOnly'
+          : sandboxMode === 'read-only'
+            ? 'readOnly'
+            : sandboxMode === 'workspace-write'
+              ? 'workspaceWrite'
+              : 'dangerFullAccess'
         self.emit({
           id: idOf(message),
           result: {
@@ -195,6 +210,7 @@ function scriptedFactory(
             model: 'gpt-resolved',
             modelProvider: scenario === 'foreignProvider' ? 'openai' : 'baton',
             runtimeWorkspaceRoots: [],
+            sandbox: { type: sandboxType },
           },
         })
       } else if (method === 'experimentalFeature/list') {
@@ -711,12 +727,14 @@ function context(options: {
   }
 }
 
-function snapshot(): ThreadSnapshot {
+function snapshot(permissionProfile: PermissionProfile = 'workspace'): ThreadSnapshot {
   const now = new Date(0).toISOString()
   return {
     session: {
       id: 'session', title: null, preview: null, activeThreadId: 'thread', projectKey: null,
-      cwd: 'C:/workspace', permissions: { defaultProfile: 'workspace', override: null, effectiveProfile: 'workspace', source: 'global' },
+      cwd: 'C:/workspace', permissions: {
+        defaultProfile: permissionProfile, override: null, effectiveProfile: permissionProfile, source: 'global',
+      },
       schemaVersion: 1, createdAt: now, updatedAt: now, archivedAt: null,
       workStatus: 'idle',
     },
@@ -778,6 +796,31 @@ test('materializes canonical image references as Codex localImage input and data
       { type: 'input_text', text: 'prior image' },
       { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
     ],
+  }])
+})
+
+test('replays legacy Claude task notifications to Codex without the provider envelope', () => {
+  const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
+  const raw = [
+    '<task-notification>', '<task-id>a6bcbb3346afee066</task-id>', '<tool-use-id>toolu_01ABC</tool-use-id>',
+    '<output-file>C:\\temp\\task.output</output-file>',
+    '<status>completed</status>', '<summary>Agent "audit" finished</summary>',
+    '<note>A task-notification fires each time this agent stops.</note>',
+    '<result>Audit passed.</result>', '</task-notification>',
+  ].join('\n')
+  const base = snapshot()
+  const projected = adapter.materialize(request(), {
+    ...base,
+    items: [{
+      ...base.items[0]!, kind: 'user_message', provider: 'claude',
+      payload: { text: raw, nativeSourceClient: 'claude_desktop' },
+    }],
+  }).body as Record<string, unknown>
+  assert.deepEqual(projected.history, [{
+    type: 'message', role: 'user', content: [{
+      type: 'input_text',
+      text: '[Background agent completed: Agent "audit" finished]\nAudit passed.',
+    }],
   }])
 })
 
@@ -1013,6 +1056,7 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.deepEqual(params.runtimeWorkspaceRoots, [])
   assert.equal(params.approvalsReviewer, 'user')
   assert.equal(params.approvalPolicy, 'never')
+  assert.equal(params.sandbox, 'workspace-write')
   assert.match(String(params.developerInstructions), /Baton is the canonical execution owner/)
   assert.match(String(params.developerInstructions), /Codex-native collaboration\/subagent tools/)
   assert.match(String(params.developerInstructions), /Verify before finishing\.$/)
@@ -1032,10 +1076,36 @@ test('adapter applies process and thread hardening and normalizes durable text, 
   assert.ok(turnStart)
   assert.deepEqual((turnStart.params as Record<string, unknown>).environments, [])
   assert.deepEqual((turnStart.params as Record<string, unknown>).runtimeWorkspaceRoots, [])
+  assert.equal((turnStart.params as Record<string, unknown>).sandboxPolicy, undefined)
   assert.equal((turnStart.params as Record<string, unknown>).webSearch, undefined)
   assert.equal((threadStart.params as Record<string, unknown>).allowProviderModelFallback, false)
   assert.ok(turnProcess.writes.some((message) => message.method === 'thread/inject_items'))
   await adapter.shutdown()
+})
+
+test('adapter maps every Baton permission profile to the Codex thread sandbox contract', async () => {
+  const cases = [
+    ['read_only', 'read-only'],
+    ['workspace', 'workspace-write'],
+    ['full_access', 'danger-full-access'],
+  ] as const
+
+  for (const [permissionProfile, expectedSandbox] of cases) {
+    const created: FakeProcess[] = []
+    const adapter = new CodexCanonicalAdapter({
+      processFactory: scriptedFactory('normal', created, []),
+      shutdownTimeoutMs: 20,
+    })
+    const execution = await adapter.execute(adapter.materialize(request(), snapshot(permissionProfile)), context())
+    assert.equal((await execution.terminal).status, 'completed')
+    const threadStart = created[1]?.writes.find((message) => message.method === 'thread/start')
+    assert.ok(threadStart)
+    assert.equal((threadStart.params as Record<string, unknown>).sandbox, expectedSandbox)
+    const turnStart = created[1]?.writes.find((message) => message.method === 'turn/start')
+    assert.ok(turnStart)
+    assert.equal((turnStart.params as Record<string, unknown>).sandboxPolicy, undefined)
+    await adapter.shutdown()
+  }
 })
 
 test('canonical Codex execution uses an authenticated per-turn cache bridge without exposing the upstream credential', async () => {
@@ -1520,6 +1590,17 @@ test('adapter rejects a resolved provider that bypasses the configured Baton pro
   const terminal = await execution.terminal
   assert.equal(terminal.status, 'failed')
   assert.match(String(terminal.error?.message), /resolved model provider openai did not match baton/)
+})
+
+test('adapter rejects an effective Codex sandbox that downgrades the Baton permission profile', async () => {
+  const adapter = new CodexCanonicalAdapter({
+    processFactory: scriptedFactory('sandboxMismatch', [], []),
+    shutdownTimeoutMs: 20,
+  })
+  const execution = await adapter.execute(adapter.materialize(request(), snapshot('full_access')), context())
+  const terminal = await execution.terminal
+  assert.equal(terminal.status, 'failed')
+  assert.match(String(terminal.error?.message), /effective Codex sandbox readOnly did not match dangerFullAccess/)
 })
 
 test('adapter rejects duplicate JSON-RPC tool request ids', async () => {

@@ -170,6 +170,34 @@ test('Claude uses its native compact summary plus suffix and never consumes a Co
   ])
 })
 
+test('replays legacy Claude task notifications without exposing the internal envelope', () => {
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+  })
+  const raw = [
+    '<task-notification>', '<task-id>a6bcbb3346afee066</task-id>', '<tool-use-id>toolu_01ABC</tool-use-id>',
+    '<output-file>C:\\temp\\task.output</output-file>',
+    '<status>completed</status>', '<summary>Agent "audit" finished</summary>',
+    '<note>A task-notification fires each time this agent stops.</note>',
+    '<result>Audit passed.</result>', '</task-notification>',
+  ].join('\n')
+  const body = adapter.materialize({
+    turnId: 'legacy-task-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  }, {
+    ...snapshot,
+    items: [{
+      ...snapshot.items[0]!, kind: 'user_message', provider: 'claude',
+      payload: { text: raw, nativeSourceClient: 'claude_desktop' },
+    }],
+  }).body as Record<string, unknown>
+  assert.deepEqual(body.messages, [
+    { role: 'user', content: '[Background agent completed: Agent "audit" finished]\nAudit passed.' },
+    { role: 'user', content: 'continue' },
+  ])
+})
+
 test('Claude adapter sends stateless history and records a provider-reported model fallback', async () => {
   const sentBodies: Record<string, unknown>[] = []
   const adapter = new StatelessHttpCanonicalAdapter({

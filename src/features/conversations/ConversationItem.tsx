@@ -8,6 +8,7 @@ import {
   activityFailed,
   activitySummary,
   ITEM_LABEL,
+  itemTaskNotification,
   isLongConversationText,
   PROVIDER_LABEL,
   payloadDetail,
@@ -48,6 +49,7 @@ export function ConversationItem({
   const isError = item.kind === 'error'
   const isReasoning = item.kind === 'reasoning_summary'
   const isUsage = item.kind === 'usage'
+  const taskNotification = itemTaskNotification(item)
   const body = isUsage ? usageSummary(item.payload) : payloadText(item)
   const showRawDetail = isError || isReasoning || isUsage || item.kind === 'provider_event'
   const metadata = assistantExecutionMetadata(item, turn)
@@ -72,6 +74,21 @@ export function ConversationItem({
     || item.kind === 'file_change'
     || item.kind === 'provider_event'
   const images = itemImages(item, toolResult)
+
+  if (taskNotification) {
+    return (
+      <article className="rounded-xl border bg-muted/20 px-4 py-3">
+        <header className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+          <Bot className="size-3.5" aria-hidden />
+          <span className="font-medium text-foreground">백그라운드 에이전트</span>
+          <span>{taskNotification.status === 'completed' ? '완료' : '업데이트'}</span>
+          <span>{PROVIDER_LABEL[taskNotification.source]}</span>
+        </header>
+        <p className="mb-2 text-sm font-medium text-foreground">{taskNotification.summary}</p>
+        <LongContent text={body} className="text-[0.9375rem] leading-7 text-foreground" />
+      </article>
+    )
+  }
 
   if (isToolActivity) {
     const failed = activityFailed(item) || (toolResult ? activityFailed(toolResult) : false)
