@@ -25,6 +25,10 @@ import {
 import { canonicalDeveloperInstructions } from './instruction-snapshot.ts'
 import { hasPortableUserContent, imageAttachments, type ImageArtifactResolver } from './image-artifacts.ts'
 import { latestNativeContextCheckpoint } from './native-context-checkpoint.ts'
+import {
+  taskNotificationContextText,
+  taskNotificationFromPayload,
+} from '../../src/lib/native-task-notification.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
@@ -1573,6 +1577,8 @@ function portableHistoryText(kind: string, payload: JsonObject): string | null {
 }
 
 function portableText(payload: JsonObject): string | null {
+  const taskNotification = taskNotificationFromPayload(payload)
+  if (taskNotification) return taskNotificationContextText(taskNotification)
   if (typeof payload.text === 'string' && payload.text.length > 0) return payload.text
   if (typeof payload.content === 'string' && payload.content.length > 0) return payload.content
   if (Array.isArray(payload.summary)) {

@@ -33,6 +33,9 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
     JSON.stringify({ timestamp: '2026-07-18T00:00:03Z', type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'call-1', output: 'x'.repeat(20_000) } }),
     JSON.stringify({ timestamp: '2026-07-18T00:00:04Z', type: 'response_item', payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: 'Checked constraints access_token=reasoning-secret' }], encrypted_content: 'never-import' } }),
     JSON.stringify({ timestamp: '2026-07-18T00:00:04Z', type: 'turn_context', payload: { model: 'gpt-5.6-sol', effort: 'high', cwd: 'C:\\work\\alpha', secret: 'never-copy' } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:04Z', type: 'response_item', payload: { type: 'agent_message', content: [{ type: 'input_text', text: [
+      'Message Type: FINAL_ANSWER', 'Task name: /root/audit', 'Sender: /root/audit', 'Payload:', 'Audit passed.',
+    ].join('\n') }] } }),
     JSON.stringify({ timestamp: '2026-07-18T00:00:05Z', type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Answer' }] } }),
   ].join('\n'))
   const corrupt = path.join(sessions, 'corrupt.jsonl')
@@ -50,7 +53,7 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   assert.equal(candidates[0]?.titleSource, 'threads.title')
   assert.deepEqual(candidates[0]?.records.map((record) => record.item.kind), [
     'user_message', 'provider_event', 'user_message', 'tool_call', 'file_change', 'tool_result',
-    'reasoning_summary', 'assistant_message',
+    'reasoning_summary', 'user_message', 'assistant_message',
   ])
   const checkpoint = candidates[0]?.records.find((record) => record.item.kind === 'provider_event')
   assert.ok(checkpoint)
@@ -83,10 +86,15 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
     },
   })))
   assert.equal(JSON.stringify(assistant?.item.payload).includes('never-copy'), false)
+  const taskNotification = candidates[0]?.records.find((record) =>
+    record.item.payload.nativeRecordType === 'agent_message')
+  assert.ok(taskNotification)
+  assert.equal((taskNotification.item.payload.nativeTaskNotification as Record<string, unknown>).source, 'codex')
+  assert.equal(taskNotification.item.payload.text, 'Audit passed.')
   // 4 metadata + 3 denied tool-input fields + 1 omitted output + 1 summary DLP + 1 encrypted reasoning.
   assert.equal(candidates[0]?.skippedItemCount, 10)
-  assert.equal(candidates[0]?.portableItemCount, 6)
-  assert.match(String(candidates[0]?.parserVersion), /codex-native-compact-v4$/)
+  assert.equal(candidates[0]?.portableItemCount, 7)
+  assert.match(String(candidates[0]?.parserVersion), /codex-native-compact-v5$/)
   assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'codex_json_corrupt'), true)
   assert.deepEqual(await fileHead(rollout), before)
 
@@ -96,7 +104,7 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   assert.equal(metadataOnly?.materialized, false)
   assert.ok(metadataOnly?.sourceLocator)
   const materialized = await reader.materialize(metadataOnly!)
-  assert.equal(materialized.records.length, 8)
+  assert.equal(materialized.records.length, 9)
   assert.equal(materialized.materialized, true)
 })
 
@@ -167,6 +175,12 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
     JSON.stringify({ type: 'user', uuid: 'u2', sessionId: 'cli-1', timestamp: '2026-07-18T00:00:02Z', message: { content: [
       { type: 'tool_result', tool_use_id: 'tool-1', content: [{ type: 'text', text: 'z'.repeat(20_000) }, { type: 'image', source: 'not-portable' }] },
     ] } }),
+    JSON.stringify({ type: 'user', uuid: 'task-result', sessionId: 'cli-1', timestamp: '2026-07-18T00:00:02Z',
+      origin: { kind: 'task-notification' }, promptSource: 'sdk', message: { content: [
+        '<task-notification>', '<task-id>task-1</task-id>', '<tool-use-id>tool-1</tool-use-id>',
+        '<output-file>C:\\temp\\task.output</output-file>', '<status>completed</status>',
+        '<summary>Agent "audit" finished</summary>', '<result>Audit passed.</result>', '</task-notification>',
+      ].join('\n') } }),
     JSON.stringify({ type: 'file-history-delta', messageId: 'f1', timestamp: '2026-07-18T00:00:03Z', trackingPath: 'C:\\work\\beta\\b.ts' }),
   ].join('\n'))
   await writeFile(path.join(projects, 'corrupt.jsonl'), '{not-json')
@@ -185,7 +199,8 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
   assert.equal(candidate?.sourceAlias, 'User custom title')
   assert.equal(candidate?.titleSource, 'custom-title')
   assert.deepEqual(candidate?.records.map((record) => record.item.kind), [
-    'user_message', 'provider_event', 'assistant_message', 'tool_call', 'file_change', 'tool_result', 'file_change',
+    'user_message', 'provider_event', 'assistant_message', 'tool_call', 'file_change', 'tool_result',
+    'user_message', 'file_change',
   ])
   const claudeCheckpoint = candidate?.records.find((record) => record.item.kind === 'provider_event')
   assert.ok(claudeCheckpoint)
@@ -202,6 +217,11 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
   assert.equal(serializedClaude.includes('claude-password'), false)
   assert.equal(serializedClaude.includes('zzzzzzzzzzzz'), false)
   assert.ok(JSON.stringify(candidate?.records.find((record) => record.item.kind === 'tool_result')?.item.payload).length < 1_000)
+  const taskNotification = candidate?.records.find((record) =>
+    record.item.payload.nativeRecordType === 'task-notification')
+  assert.ok(taskNotification)
+  assert.equal((taskNotification.item.payload.nativeTaskNotification as Record<string, unknown>).source, 'claude')
+  assert.equal(taskNotification.item.payload.text, 'Audit passed.')
   const [nativeKey, cliKey] = candidate?.identityKeys ?? []
   assert.equal(nativeKey?.scopeNamespaceKey, candidate?.namespaceKey)
   assert.notEqual(cliKey?.scopeNamespaceKey, candidate?.namespaceKey)
@@ -214,7 +234,7 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
   assert.equal(metadataOnly?.materialized, false)
   assert.ok(metadataOnly?.sourceLocator)
   const materialized = await reader.materialize(metadataOnly!)
-  assert.equal(materialized.records.length, 7)
+  assert.equal(materialized.records.length, 8)
   assert.equal(materialized.materialized, true)
 
   const otherProfile = await new ClaudeLocalSourceReader({

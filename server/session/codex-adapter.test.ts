@@ -799,6 +799,31 @@ test('materializes canonical image references as Codex localImage input and data
   }])
 })
 
+test('replays legacy Claude task notifications to Codex without the provider envelope', () => {
+  const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
+  const raw = [
+    '<task-notification>', '<task-id>a6bcbb3346afee066</task-id>', '<tool-use-id>toolu_01ABC</tool-use-id>',
+    '<output-file>C:\\temp\\task.output</output-file>',
+    '<status>completed</status>', '<summary>Agent "audit" finished</summary>',
+    '<note>A task-notification fires each time this agent stops.</note>',
+    '<result>Audit passed.</result>', '</task-notification>',
+  ].join('\n')
+  const base = snapshot()
+  const projected = adapter.materialize(request(), {
+    ...base,
+    items: [{
+      ...base.items[0]!, kind: 'user_message', provider: 'claude',
+      payload: { text: raw, nativeSourceClient: 'claude_desktop' },
+    }],
+  }).body as Record<string, unknown>
+  assert.deepEqual(projected.history, [{
+    type: 'message', role: 'user', content: [{
+      type: 'input_text',
+      text: '[Background agent completed: Agent "audit" finished]\nAudit passed.',
+    }],
+  }])
+})
+
 test('injects exact Codex native replacement history and only the uncovered suffix', () => {
   const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
   const base = snapshot()

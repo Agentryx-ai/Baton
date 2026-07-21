@@ -1,4 +1,8 @@
 import type { CanonicalItemDto, CanonicalTurnDto, JsonObject, JsonValue } from './types.ts'
+import {
+  taskNotificationFromPayload,
+  type NativeTaskNotification,
+} from '../../lib/native-task-notification.ts'
 
 export const PROVIDER_LABEL = {
   claude: 'Claude',
@@ -36,6 +40,8 @@ function textParts(value: JsonValue | undefined): string[] {
 }
 
 export function payloadText(item: CanonicalItemDto): string {
+  const taskNotification = itemTaskNotification(item)
+  if (taskNotification) return taskNotification.result
   if (typeof item.payload.text === 'string') return item.payload.text
   if (typeof item.payload.content === 'string') return item.payload.content
   const content = textParts(item.payload.content)
@@ -45,6 +51,10 @@ export function payloadText(item: CanonicalItemDto): string {
   const summary = textParts(item.payload.summary)
   if (summary.length > 0) return summary.join('\n\n')
   return JSON.stringify(item.payload, null, 2)
+}
+
+export function itemTaskNotification(item: CanonicalItemDto): NativeTaskNotification | null {
+  return item.kind === 'user_message' ? taskNotificationFromPayload(item.payload) : null
 }
 
 function numberValue(object: JsonObject, camel: string, snake: string): number {

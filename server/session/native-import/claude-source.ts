@@ -17,6 +17,10 @@ import {
   parseClaudeGoalConfirmation, parseExplicitGoalCommand,
 } from './goal-reconstruction.ts'
 import { nativeContextCheckpointPayload } from '../native-context-checkpoint.ts'
+import {
+  parseClaudeTaskNotification,
+  taskNotificationPayload,
+} from '../../../src/lib/native-task-notification.ts'
 
 interface ClaudeDesktopMetadata {
   sessionId?: unknown
@@ -54,7 +58,7 @@ const CLAUDE_BLOCK_TYPES = new Set([
   'text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'fallback', 'image', 'document',
   'server_tool_use', 'web_search_tool_result',
 ])
-const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v3`
+const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v4`
 
 export interface ClaudeSourceReaderOptions {
   desktopRoot?: string
@@ -461,6 +465,17 @@ function parseClaudeRecords(
     const blocks = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : null
     if (!blocks) throw new Error('claude_message_content_framing_invalid')
     const baseId = string(event.uuid) ?? `${sessionId}:${lineIndex + 1}`
+    const origin = object(event.origin)
+    const taskNotification = eventType === 'user' && string(origin?.kind) === 'task-notification'
+      ? parseClaudeTaskNotification(fullText)
+      : null
+    if (taskNotification) {
+      addClaudeRecord(records, `${baseId}:task-notification`, 'user_message', {
+        ...taskNotificationPayload(taskNotification),
+        nativeRecordType: 'task-notification',
+      }, timestamp, sourceClient)
+      continue
+    }
     const recordCountBeforeMessage = records.count
     const skippedBeforeMessage = skipped
     const textParts: string[] = []
