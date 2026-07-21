@@ -30,6 +30,10 @@ import {
   claudeControlMessageContextText,
   claudeControlMessageFromPayload,
 } from '../../src/lib/native-claude-control-message.ts'
+import {
+  codexEnvelopeContextText,
+  codexEnvelopeFromPayload,
+} from '../../src/lib/native-codex-envelope.ts'
 
 type SupportedProvider = Extract<CanonicalProvider, 'claude' | 'gemini'>
 type JsonObject = Record<string, unknown>
@@ -1519,6 +1523,8 @@ function portableText(payload: JsonObject): string | null {
   if (taskNotification) return taskNotificationContextText(taskNotification)
   const controlMessage = claudeControlMessageFromPayload(payload)
   if (controlMessage) return claudeControlMessageContextText(controlMessage)
+  const codexEnvelope = codexEnvelopeFromPayload(payload)
+  if (codexEnvelope) return codexEnvelopeContextText(codexEnvelope)
   if (typeof payload.text === 'string' && payload.text.trim()) return payload.text
   if (typeof payload.content === 'string' && payload.content.trim()) return payload.content
   if (Array.isArray(payload.summary)) {

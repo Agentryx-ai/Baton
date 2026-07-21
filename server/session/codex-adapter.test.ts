@@ -849,6 +849,27 @@ test('replays legacy Claude control messages to Codex without XML or Stop-hook d
   ])
 })
 
+test('replays legacy Codex envelopes semantically and drops internal context', () => {
+  const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
+  const base = snapshot()
+  const native = (id: string, sequence: number, text: string) => ({
+    ...base.items[0]!, id, sequence, kind: 'user_message' as const, provider: 'codex' as const,
+    payload: { text, nativeSourceClient: 'codex_local' },
+  })
+  const projected = adapter.materialize(request(), {
+    ...base,
+    items: [
+      native('context', 1, '<environment_context><cwd>C:\\private</cwd></environment_context>'),
+      native('delegation', 2, '<codex_delegation><source_thread_id>parent</source_thread_id><input>Review it.</input></codex_delegation>'),
+      native('request', 3, '<in-app-browser-context source="ambient-ui-state">tabs</in-app-browser-context>\n\n## My request for Codex:\nSearch it.'),
+    ],
+  }).body as Record<string, unknown>
+  assert.deepEqual(projected.history, [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[하위 작업 배정 from parent]\nReview it.' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Search it.' }] },
+  ])
+})
+
 test('injects exact Codex native replacement history and only the uncovered suffix', () => {
   const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
   const base = snapshot()

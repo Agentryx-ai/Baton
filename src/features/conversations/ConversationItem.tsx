@@ -9,6 +9,7 @@ import {
   activitySummary,
   ITEM_LABEL,
   itemClaudeControlMessage,
+  itemCodexEnvelope,
   itemTaskNotification,
   isLongConversationText,
   PROVIDER_LABEL,
@@ -52,6 +53,7 @@ export function ConversationItem({
   const isUsage = item.kind === 'usage'
   const taskNotification = itemTaskNotification(item)
   const controlMessage = itemClaudeControlMessage(item)
+  const codexEnvelope = itemCodexEnvelope(item)
   const body = isUsage ? usageSummary(item.payload) : payloadText(item)
   const showRawDetail = isError || isReasoning || isUsage || item.kind === 'provider_event'
   const metadata = assistantExecutionMetadata(item, turn)
@@ -83,7 +85,7 @@ export function ConversationItem({
         <header className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
           <Bot className="size-3.5" aria-hidden />
           <span className="font-medium text-foreground">백그라운드 에이전트</span>
-          <span>{taskNotification.status === 'completed' ? '완료' : '업데이트'}</span>
+          <span>{taskNotification.status === 'completed' ? '완료' : taskNotification.status === 'failed' ? '실패' : '업데이트'}</span>
           <span>{PROVIDER_LABEL[taskNotification.source]}</span>
         </header>
         <p className="mb-2 text-sm font-medium text-foreground">{taskNotification.summary}</p>
@@ -106,6 +108,26 @@ export function ConversationItem({
         {controlMessage.content ? (
           <div className="mt-3 border-l-2 pl-4 text-[0.875rem] leading-6 text-foreground">
             <LongContent text={controlMessage.content} />
+          </div>
+        ) : null}
+      </details>
+    )
+  }
+
+  if (codexEnvelope?.presentation === 'card') {
+    return (
+      <details className="group/envelope rounded-xl border bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+        <summary className="flex cursor-pointer list-none items-center gap-2 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+          <Wrench className="size-3.5 shrink-0" aria-hidden />
+          <span className="font-medium text-foreground">{codexEnvelope.summary}</span>
+          <span>Codex</span>
+          {codexEnvelope.content ? (
+            <ChevronRight className="ml-auto size-3.5 shrink-0 opacity-50 transition-transform group-open/envelope:rotate-90" aria-hidden />
+          ) : null}
+        </summary>
+        {codexEnvelope.content ? (
+          <div className="mt-3 border-l-2 pl-4 text-[0.875rem] leading-6 text-foreground">
+            <LongContent text={codexEnvelope.content} />
           </div>
         ) : null}
       </details>

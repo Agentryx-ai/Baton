@@ -23,13 +23,13 @@ export function parseClaudeTaskNotification(text: string): NativeTaskNotificatio
   const status = singleLineTag(body, 'status')
   const summary = singleLineTag(body, 'summary')
   const result = multilineTag(body, 'result')
-  if (!taskId || !toolUseId || !status || !summary || result === null) return null
+  if (!taskId || !toolUseId || !status || !summary) return null
   return {
     version: 1,
     source: 'claude',
     status,
     summary,
-    result: result.trim(),
+    result: result?.trim() ?? '',
     taskId,
     toolUseId,
     messageType: null,
@@ -38,7 +38,7 @@ export function parseClaudeTaskNotification(text: string): NativeTaskNotificatio
 
 export function parseCodexTaskNotification(text: string): NativeTaskNotification | null {
   const match = /^Message Type: (MESSAGE|FINAL_ANSWER)\r?\nTask name: ([^\r\n]+)\r?\nSender: ([^\r\n]+)\r?\nPayload:\r?\n([\s\S]+)$/.exec(text.trim())
-  if (!match) return null
+  if (!match) return parseLegacyCodexSubagentNotification(text)
   const [, messageType, taskName, sender, result] = match
   if (!messageType || !taskName || !sender || !result?.trim()) return null
   return {
@@ -55,6 +55,32 @@ export function parseCodexTaskNotification(text: string): NativeTaskNotification
   }
 }
 
+function parseLegacyCodexSubagentNotification(text: string): NativeTaskNotification | null {
+  const match = /^<subagent_notification>\s*([\s\S]*?)\s*<\/subagent_notification>$/.exec(text.trim())
+  if (!match?.[1]) return null
+  let parsed: unknown
+  try { parsed = JSON.parse(match[1]) } catch { return null }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return null
+  const value = parsed as Record<string, unknown>
+  const taskId = nullableString(value.agent_id) ?? nullableString(value.agent_path)
+  const status = value.status
+  if (!taskId || !status || Array.isArray(status) || typeof status !== 'object') return null
+  const result = status as Record<string, unknown>
+  const completed = nullableString(result.completed)
+  const errored = nullableString(result.errored)
+  if (!completed && !errored) return null
+  return {
+    version: 1,
+    source: 'codex',
+    status: completed ? 'completed' : 'failed',
+    summary: completed ? `Agent ${taskId} finished` : `Agent ${taskId} failed`,
+    result: completed ?? errored as string,
+    taskId,
+    toolUseId: null,
+    messageType: 'SUBAGENT_NOTIFICATION',
+  }
+}
+
 export function taskNotificationFromPayload(payload: Record<string, unknown>): NativeTaskNotification | null {
   const payloadText = typeof payload.text === 'string' ? payload.text : null
   const structured = notificationObject(payload.nativeTaskNotification, payloadText)
@@ -68,16 +94,21 @@ export function taskNotificationFromPayload(payload: Record<string, unknown>): N
   }
   if (sourceClient === 'codex_local') {
     const notification = parseCodexTaskNotification(text)
-    return notification?.taskId?.startsWith('/root') ? notification : null
+    return notification && (notification.messageType === 'SUBAGENT_NOTIFICATION'
+      || notification.taskId?.startsWith('/root')) ? notification : null
   }
   return null
 }
 
 function isLegacyClaudeTaskNotification(text: string, notification: NativeTaskNotification): boolean {
-  return /^[A-Za-z0-9_-]{8,64}$/.test(notification.taskId ?? '')
+  const commonEnvelope = /^[A-Za-z0-9_-]{8,64}$/.test(notification.taskId ?? '')
     && /^toolu_[A-Za-z0-9]+$/.test(notification.toolUseId ?? '')
     && /(?:^|\r?\n)<output-file>[^\r\n<]+<\/output-file>(?:\r?\n|$)/.test(text)
-    && /<note>A task-notification fires each time this agent stops/.test(text)
+  if (!commonEnvelope) return false
+  if (notification.result) {
+    return /<note>A task-notification fires each time this agent stops/.test(text)
+  }
+  return /^Background command [\s\S]+ (?:completed \(exit code \d+\)|failed with exit code \d+)$/.test(notification.summary)
 }
 
 export function taskNotificationPayload(notification: NativeTaskNotification): Record<string, unknown> {

@@ -33,6 +33,10 @@ import {
   claudeControlMessageContextText,
   claudeControlMessageFromPayload,
 } from '../../src/lib/native-claude-control-message.ts'
+import {
+  codexEnvelopeContextText,
+  codexEnvelopeFromPayload,
+} from '../../src/lib/native-codex-envelope.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
@@ -1585,6 +1589,8 @@ function portableText(payload: JsonObject): string | null {
   if (taskNotification) return taskNotificationContextText(taskNotification)
   const controlMessage = claudeControlMessageFromPayload(payload)
   if (controlMessage) return claudeControlMessageContextText(controlMessage)
+  const codexEnvelope = codexEnvelopeFromPayload(payload)
+  if (codexEnvelope) return codexEnvelopeContextText(codexEnvelope)
   if (typeof payload.text === 'string' && payload.text.length > 0) return payload.text
   if (typeof payload.content === 'string' && payload.content.length > 0) return payload.content
   if (Array.isArray(payload.summary)) {

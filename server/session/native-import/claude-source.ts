@@ -62,7 +62,7 @@ const CLAUDE_BLOCK_TYPES = new Set([
   'text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'fallback', 'image', 'document',
   'server_tool_use', 'web_search_tool_result',
 ])
-const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v5`
+const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v6`
 
 export interface ClaudeSourceReaderOptions {
   desktopRoot?: string

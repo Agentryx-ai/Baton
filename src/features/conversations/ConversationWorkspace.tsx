@@ -1051,6 +1051,25 @@ export function ConversationWorkspace({
     }
   }
 
+  const connectImportedWorkspace = async () => {
+    const sourceCwd = snapshot?.session.source?.cwd?.trim()
+    if (!snapshot || !sourceCwd) {
+      openWorkspaceDialog()
+      return
+    }
+    setWorkspaceBusy(true)
+    setError(null)
+    try {
+      await conversationApi.connectWorkspace(snapshot.session.id, sourceCwd, snapshot.thread.revision)
+      await Promise.all([refreshThread(), refreshSessions(true)])
+    } catch (cause) {
+      setError(errorMessage(cause))
+      openWorkspaceDialog()
+    } finally {
+      setWorkspaceBusy(false)
+    }
+  }
+
   const disconnectWorkspace = async () => {
     if (!snapshot) return
     setWorkspaceBusy(true)
@@ -1908,12 +1927,20 @@ export function ConversationWorkspace({
               <section className="mb-6 flex items-center gap-3 rounded-xl border bg-muted/30 px-4 py-3">
                 <FolderOpen className="size-4 shrink-0 text-muted-foreground" aria-hidden />
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium">가져온 대화에는 연결된 프로젝트 폴더가 없습니다.</p>
+                  <p className="text-sm font-medium">원본 프로젝트 폴더가 아직 Baton 파일 권한에 연결되지 않았습니다.</p>
                   <p className="truncate text-xs text-muted-foreground">
                     {snapshot.session.source.cwd ?? '원본 폴더를 확인할 수 없습니다.'}
                   </p>
                 </div>
-                <Button type="button" size="sm" variant="outline" onClick={openWorkspaceDialog}>폴더 연결</Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={workspaceBusy || snapshot.thread.status !== 'idle'}
+                  onClick={() => void connectImportedWorkspace()}
+                >
+                  {workspaceBusy ? '연결 중…' : snapshot.session.source.cwd ? '원본 폴더 연결' : '폴더 선택'}
+                </Button>
               </section>
             ) : null}
 

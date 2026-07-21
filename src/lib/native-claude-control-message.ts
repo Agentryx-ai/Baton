@@ -1,4 +1,9 @@
-export type NativeClaudeControlMessageKind = 'command' | 'command_output' | 'stop_hook'
+export type NativeClaudeControlMessageKind =
+  | 'command'
+  | 'command_output'
+  | 'stop_hook'
+  | 'stop_hook_feedback'
+  | 'local_command_caveat'
 
 export interface NativeClaudeControlMessage {
   version: 1
@@ -57,6 +62,26 @@ export function parseClaudeControlMessage(text: string): NativeClaudeControlMess
       commandName: '/goal',
     }
   }
+  if (trimmed.startsWith('Stop hook feedback:')) {
+    return {
+      version: 1,
+      source: 'claude',
+      kind: 'stop_hook_feedback',
+      summary: '목표 Stop hook 피드백',
+      content: trimmed.slice('Stop hook feedback:'.length).trim(),
+      commandName: '/goal',
+    }
+  }
+  if (wholeTag(trimmed, 'local-command-caveat') !== null) {
+    return {
+      version: 1,
+      source: 'claude',
+      kind: 'local_command_caveat',
+      summary: 'Claude 로컬 명령 안내',
+      content: '',
+      commandName: null,
+    }
+  }
   return null
 }
 
@@ -74,12 +99,16 @@ export function claudeControlMessagePayload(message: NativeClaudeControlMessage)
   return { text: content, nativeClaudeControlMessage: metadata }
 }
 
-export function claudeControlMessageContextText(message: NativeClaudeControlMessage): string {
+export function claudeControlMessageContextText(message: NativeClaudeControlMessage): string | null {
+  if (message.kind === 'local_command_caveat') return null
   if (message.kind === 'command') {
     return message.content ? `[Claude command ${message.commandName ?? ''}]\n${message.content}` : `[${message.summary}]`
   }
   if (message.kind === 'command_output') {
     return message.content ? `[${message.summary}]\n${message.content}` : `[${message.summary}]`
+  }
+  if (message.kind === 'stop_hook_feedback') {
+    return message.content ? `[Claude Goal Stop hook feedback]\n${message.content}` : '[Claude Goal Stop hook feedback]'
   }
   return '[Claude Goal Stop hook active]'
 }
@@ -88,7 +117,8 @@ function controlObject(value: unknown, payloadText: string | null): NativeClaude
   if (!value || Array.isArray(value) || typeof value !== 'object') return null
   const item = value as Record<string, unknown>
   if (item.version !== 1 || item.source !== 'claude'
-    || (item.kind !== 'command' && item.kind !== 'command_output' && item.kind !== 'stop_hook')
+    || (item.kind !== 'command' && item.kind !== 'command_output' && item.kind !== 'stop_hook'
+      && item.kind !== 'stop_hook_feedback' && item.kind !== 'local_command_caveat')
     || typeof item.summary !== 'string') return null
   return {
     version: 1,
