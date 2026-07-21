@@ -319,10 +319,16 @@ function parseNewItem(value: unknown, index: number): NewCanonicalItem {
   }
   return {
     kind: value.kind as CanonicalItemKind,
-    visibility: value.visibility as NewCanonicalItem['visibility'],
     payload: value.payload,
-    provider: value.provider as CanonicalProvider | null | undefined,
-    nativeId: value.nativeId as string | null | undefined,
+    ...(value.visibility === undefined ? {} : {
+      visibility: value.visibility as NewCanonicalItem['visibility'],
+    }),
+    ...(value.provider === undefined ? {} : {
+      provider: value.provider as CanonicalProvider | null,
+    }),
+    ...(value.nativeId === undefined ? {} : {
+      nativeId: value.nativeId as string | null,
+    }),
   }
 }
 
