@@ -83,7 +83,8 @@ export class RecoveryError extends Error {
   }
 }
 
-const RECEIPT_SCHEMA = 1 as const
+export const RECOVERY_RECEIPT_SCHEMA_VERSION = 1 as const
+const RECEIPT_SCHEMA = RECOVERY_RECEIPT_SCHEMA_VERSION
 const TARGETS: RecoveryTarget[] = ['claude-cli', 'claude-desktop', 'codex']
 
 export function defaultRecoveryRoot(): string {

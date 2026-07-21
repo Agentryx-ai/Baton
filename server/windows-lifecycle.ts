@@ -66,16 +66,23 @@ export function createLifecyclePlan(options: {
   userId?: string
   taskName?: string
 } = {}): LifecyclePlan {
-  const moduleRoot = fileURLToPath(new URL('..', import.meta.url))
+  const moduleRoot = process.env.BATON_RELEASE_ROOT
+    ?? fileURLToPath(new URL('..', import.meta.url))
   const root = path.resolve(options.root ?? moduleRoot)
   const hash = createHash('sha256').update(root.toLowerCase()).digest('hex').slice(0, 12)
   const runner = path.join(root, 'scripts', 'baton-worker-runner.mjs')
+  const bootstrapExecutable = process.env.BATON_BOOTSTRAP_EXECUTABLE
+  const useBootstrap = !options.executable && Boolean(bootstrapExecutable)
+  const executable = options.executable ?? bootstrapExecutable ?? process.execPath
+  const argumentsValue = useBootstrap
+    ? `worker-runner --root ${quoteArgument(root)}`
+    : `${quoteArgument(runner)} --root ${quoteArgument(root)}`
   return {
     taskName: options.taskName ?? process.env.BATON_TASK_NAME ?? `Baton-Worker-${hash}`,
     taskPath: '\\',
     root,
-    executable: options.executable ?? process.execPath,
-    arguments: `${quoteArgument(runner)} --root ${quoteArgument(root)}`,
+    executable,
+    arguments: argumentsValue,
     workingDirectory: root,
     userId: options.userId ?? (process.env.USERDOMAIN
       ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`

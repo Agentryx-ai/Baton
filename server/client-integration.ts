@@ -16,6 +16,11 @@ import {
   RecoveryError,
   type RecoveryFormat,
 } from './client-integration-recovery.ts'
+import {
+  assertBootstrapReady,
+  assertBootstrapUnchanged,
+  withBootstrapLock,
+} from './bootstrap-contract.ts'
 
 export type ClientKind =
   | 'claude-cli'
@@ -295,6 +300,29 @@ export async function applyClientIntegration(
   const targets = parseIntegrationTargets(inputTargets)
   parseCodexIntegrationMode(inputCodexMode)
   parseClaudeProxyMode(inputClaudeProxyMode)
+  return withBootstrapLock(async () => {
+    // Hold the same OS lock used by installer activation from validation until
+    // every global mutation and its post-integrity check have settled.
+    const verified = await assertBootstrapReady({
+      allowUnsignedDevelopment: process.env.BATON_ALLOW_UNSIGNED_BOOTSTRAP === '1',
+      approvedSignerThumbprint: process.env.BATON_APPROVED_SIGNER_THUMBPRINT,
+    })
+    const result = await applyClientIntegrationLocked(targets)
+    try {
+      await assertBootstrapUnchanged(verified)
+    } catch (error) {
+      for (const item of result.results.filter((candidate) => candidate.ok)) {
+        await removeRecoveryIntegration(item.target).catch(() => {})
+      }
+      throw error
+    }
+    return result
+  })
+}
+
+async function applyClientIntegrationLocked(
+  targets: ClientIntegrationTarget[],
+): Promise<ClientIntegrationApplyResult> {
   const needsClaudeModels = targets.includes('claude-desktop')
   let claudeConnectionPromise: Promise<ProxyConnection> | undefined
   const loadClaudeConnection = () => {

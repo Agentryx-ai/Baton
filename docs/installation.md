@@ -86,7 +86,59 @@ Baton 자체 build/test 결과와 외부 blocker를 구분해 보고합니다.
 ## 5. 실행 확인
 
 ```bash
+npm run install:bootstrap:dev
 npm start
+```
+
+첫 명령은 Worker와 별개로 동작하는 offline recovery 실행 파일을
+`%LOCALAPPDATA%\Baton\bootstrap`에 staging→hash/self-test→atomic activation 순서로 설치합니다.
+P1 Task가 `worker-runner`로 stable exe를 실행 중이면 Windows가 그 exe 교체를 잠글 수 있으므로
+bootstrap upgrade 전에 `baton stop`으로 owned Worker Task를 명시적으로 중지합니다. installer는 잠긴
+entry를 우회하거나 Task를 자동 변경하지 않고 전체 전환을 rollback합니다.
+이 명령은 이름과 flag에서 드러나듯 unsigned local-development 설치에 대한 명시적 opt-in입니다.
+unsigned SEA는 SmartScreen/AppLocker 정책에 따라 실행되지 않을 수 있고, 전역 integration apply는
+`BATON_ALLOW_UNSIGNED_BOOTSTRAP=1`을 별도로 지정한 개발 실행에서만 허용됩니다. production에서는
+SEA 생성 후 조직의 release signing 단계로 Authenticode 서명하고 다음처럼 실제 signer thumbprint를
+검증해 설치해야 합니다.
+
+```powershell
+npm run build:bootstrap
+# .tmp\bootstrap-build\baton-bootstrap.exe를 승인된 release key로 서명
+node node_modules\tsx\dist\cli.mjs scripts\install-baton-bootstrap.ts `
+  --artifact .tmp\bootstrap-build\baton-bootstrap.exe `
+  --signed-release-thumbprint <APPROVED_CERT_THUMBPRINT>
+```
+
+Baton은 production apply 직전에도 artifact hash, schema, self-test와 Authenticode signer identity를
+다시 검증합니다. 이때 Worker를 시작하는 배포 정책에서 active manifest와 별도로 다음 값을
+주입해야 하며, manifest가 자기 signer를 임의로 승인할 수 없습니다.
+
+```powershell
+$env:BATON_APPROVED_SIGNER_THUMBPRINT='<APPROVED_CERT_THUMBPRINT>'
+```
+
+`active.json`은 같은 사용자에게 쓰기 가능한 lifecycle/deployment metadata이지 외부 signer trust
+anchor가 아닙니다. 위 환경값도 같은 사용자가 자유롭게 바꿀 수 있는 실행이라면 강한 적대자 경계를
+제공하지 않으므로, production 배포기는 승인 thumbprint와 Worker launch policy를 별도 ACL/관리
+정책으로 보호해야 합니다. Baton의 이 검증은 손상·잘못된 release와 정책 불일치를 fail closed하는
+계약이며 동일 사용자 관리자에 대한 완전한 방어 주장은 아닙니다. 현재 저장소 자체에는 signing
+key/서명 파이프라인이 없으므로 unsigned local
+artifact를 production-ready라고 주장하지 않습니다. 생성 exe는 build 산출물이며 저장소에 commit하지
+않습니다.
+
+Worker와 `active.json`이 모두 손상돼도 다음 고정 경로는 manifest 없이 P0 status/remove를 실행합니다.
+
+```powershell
+& "$env:LOCALAPPDATA\Baton\bootstrap\baton-bootstrap.exe" integration status
+& "$env:LOCALAPPDATA\Baton\bootstrap\baton-bootstrap.exe" integration remove --target codex
+& "$env:LOCALAPPDATA\Baton\bootstrap\baton-bootstrap-lkg.exe" integration status
+```
+
+`active.json` lifecycle metadata가 손상됐으면 실행 중인 active exe가 자신을 교체하지 않도록 반드시
+고정 LKG entry에서 다음 명령을 실행합니다.
+
+```powershell
+& "$env:LOCALAPPDATA\Baton\bootstrap\baton-bootstrap-lkg.exe" recover-active --from-lkg
 ```
 
 다음을 확인합니다.
@@ -94,6 +146,7 @@ npm start
 - `http://127.0.0.1:4400/baton/health`가 JSON health 응답을 반환함
 - `http://127.0.0.1:4400`에서 대시보드가 열림
 - `node scripts/baton-cli.mjs status`가 Baton과 integration 상태를 출력함
+- `npm run verify:bootstrap`이 격리 프로필에서 standalone 복구, 동시 설치 배제와 rollback을 검증함
 
 운영체제 부팅 자동 시작은 사용자의 명시적 승인 없이 등록하지 않습니다.
 

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import {
   createLifecyclePlan,
@@ -31,6 +32,35 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
   assert.match(script, /-RestartInterval \(New-TimeSpan -Minutes 1\)/)
   assert.match(script, /-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries/)
   assert.doesNotMatch(script, /SYSTEM|LocalSystem/)
+})
+
+test('standalone bootstrap becomes the task action without changing the Worker checkout identity', () => {
+  const previousBootstrap = process.env.BATON_BOOTSTRAP_EXECUTABLE
+  process.env.BATON_BOOTSTRAP_EXECUTABLE = 'C:\\Local App Data\\Baton\\bootstrap\\versions\\v1\\baton-bootstrap.exe'
+  try {
+    const plan = createLifecyclePlan({ root: 'C:\\Path With Spaces\\Baton', taskName: 'Baton-Test-Bootstrap' })
+    assert.equal(plan.executable, process.env.BATON_BOOTSTRAP_EXECUTABLE)
+    assert.equal(plan.arguments, 'worker-runner --root "C:\\Path With Spaces\\Baton"')
+    assert.equal(plan.root, 'C:\\Path With Spaces\\Baton')
+  } finally {
+    if (previousBootstrap === undefined) delete process.env.BATON_BOOTSTRAP_EXECUTABLE
+    else process.env.BATON_BOOTSTRAP_EXECUTABLE = previousBootstrap
+  }
+})
+
+test('normal lifecycle imports derive the checkout root independently of cwd', () => {
+  const previousReleaseRoot = process.env.BATON_RELEASE_ROOT
+  const previousCwd = process.cwd()
+  delete process.env.BATON_RELEASE_ROOT
+  try {
+    process.chdir(tmpdir())
+    const plan = createLifecyclePlan({ taskName: 'Baton-Test-Module-Root' })
+    assert.equal(plan.root, path.resolve(fileURLToPath(new URL('..', import.meta.url))))
+  } finally {
+    process.chdir(previousCwd)
+    if (previousReleaseRoot === undefined) delete process.env.BATON_RELEASE_ROOT
+    else process.env.BATON_RELEASE_ROOT = previousReleaseRoot
+  }
 })
 
 test('registration requires explicit opt-in and is idempotent', async () => {

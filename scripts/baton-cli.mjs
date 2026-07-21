@@ -1,5 +1,9 @@
 #!/usr/bin/env node
 
+import { fileURLToPath } from 'node:url'
+
+process.env.BATON_RELEASE_ROOT ??= fileURLToPath(new URL('..', import.meta.url))
+
 const command = process.argv[2] ?? 'help'
 const baseUrl = process.env.BATON_URL ?? 'http://127.0.0.1:4400'
 
