@@ -58,6 +58,7 @@ import { uuidV7 } from './domain.ts'
 import { hasSafeContextToolState } from './context-materializer.js'
 import { LEGACY_CONTEXT_VIEW_KEY } from './context-view-contract.js'
 import { goalEvidenceHash } from './goal-evidence.ts'
+import { latestNativeContextCheckpoint } from './native-context-checkpoint.js'
 import type {
   ClaimGoalLeaseInput,
   ClaimGoalVerifierLeaseInput,
@@ -129,6 +130,19 @@ export interface SqliteSessionStoreOptions {
 interface LineageSegment {
   thread: CanonicalThread
   maximumItemSequence: number | null
+}
+
+function nativeCheckpointRepresentedIds(
+  lineage: readonly CanonicalItem[],
+  canonicalIds: readonly string[],
+  provider: CanonicalProvider,
+): Set<string> {
+  const firstCanonicalId = canonicalIds[0]
+  if (!firstCanonicalId) return new Set()
+  const checkpoint = latestNativeContextCheckpoint(lineage, provider)
+  if (checkpoint?.item.id !== firstCanonicalId) return new Set()
+  const checkpointIndex = lineage.findIndex((item) => item.id === firstCanonicalId)
+  return new Set(lineage.slice(0, checkpointIndex).map((item) => item.id))
 }
 
 function canonicalJson(value: unknown): string {
@@ -3112,7 +3126,11 @@ export class SqliteSessionStore implements SessionStore {
       if (text(execution, 'thread_id') !== input.threadId) {
         throw new ContextPersistenceError('invalid_input', 'Execution belongs to a different canonical thread')
       }
-      const entries = this.#resolveExecutionContextSources(input.threadId, input.sources)
+      const entries = this.#resolveExecutionContextSources(
+        input.threadId,
+        text(execution, 'provider') as CanonicalProvider,
+        input.sources,
+      )
       const manifestHash = sha256Canonical({
         schema: 'baton.execution-context-manifest.v1',
         executionId: input.executionId,
@@ -5023,6 +5041,7 @@ export class SqliteSessionStore implements SessionStore {
 
   #resolveExecutionContextSources(
     threadId: ThreadId,
+    provider: CanonicalProvider,
     sources: CreateExecutionContextManifestInput['sources'],
   ): ExecutionContextManifestEntry[] {
     if (!Array.isArray(sources) || sources.length === 0) {
@@ -5055,6 +5074,9 @@ export class SqliteSessionStore implements SessionStore {
       canonicalIds.push(source.itemId)
       return { ordinal, kind: 'canonical_item', itemId: source.itemId, digest: this.#itemDigest(row) }
     })
+    if (representedIds.size === 0) {
+      representedIds = nativeCheckpointRepresentedIds(lineage, canonicalIds, provider)
+    }
     const expectedCanonicalIds = lineage.filter((item) => !representedIds.has(item.id)).map((item) => item.id)
     if (canonicalIds.length !== expectedCanonicalIds.length
       || canonicalIds.some((id, index) => expectedCanonicalIds[index] !== id)) {
@@ -5107,6 +5129,18 @@ export class SqliteSessionStore implements SessionStore {
     const thread = this.getThread(text(row, 'thread_id'))
     if (!thread) throw new ContextPersistenceError('integrity_violation', 'Execution context thread is missing')
     const lineage = this.#itemsForSegments(this.#lineage(thread), 0)
+    if (representedIds.size === 0) {
+      const execution = this.#optional(this.#db.prepare('SELECT provider FROM executions WHERE id=?'), text(row, 'execution_id'))
+      if (!execution) throw new ContextPersistenceError('integrity_violation', 'Execution context execution is missing')
+      const lastCanonicalIndex = canonicalIds.length === 0
+        ? -1
+        : lineage.findIndex((item) => item.id === canonicalIds.at(-1))
+      representedIds = nativeCheckpointRepresentedIds(
+        lastCanonicalIndex < 0 ? lineage : lineage.slice(0, lastCanonicalIndex + 1),
+        canonicalIds,
+        text(execution, 'provider') as CanonicalProvider,
+      )
+    }
     const capturedIds = new Set([...representedIds, ...canonicalIds])
     const lastCapturedIndex = lineage.findLastIndex((item) => capturedIds.has(item.id))
     const capturedLineage = lineage.slice(0, lastCapturedIndex + 1)

@@ -25,6 +25,100 @@ import {
 } from './sqlite-context-compaction.js'
 import { SqliteSessionStore } from './sqlite-store.js'
 
+test('execution manifest treats a matching native compact checkpoint as exact prefix provenance', (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), 'baton-native-checkpoint-manifest-'))
+  const store = new SqliteSessionStore(path.join(directory, 'session.sqlite'))
+  t.after(() => {
+    store.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const session = store.createSession({})
+  const imported = store.beginTurn({
+    threadId: session.activeThreadId,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'imported',
+    requestHash: 'imported',
+    expectedRevision: 0,
+    input: [{ kind: 'user_message', payload: { text: 'canonical prefix' } }],
+    adapterVersion: 'test/1',
+    policySnapshot: {
+      delegationMode: 'disabled', allowedTools: [], approvalPolicy: 'never',
+      cwd: null, maxDepth: 0, capabilityGrant: null,
+    },
+  })
+  store.appendProviderEvent({
+    turnId: imported.turn.id,
+    eventId: 'native-checkpoint',
+    items: [{
+      kind: 'provider_event',
+      visibility: 'provider_private',
+      provider: 'codex',
+      payload: {
+        nativeContextCheckpoint: {
+          version: 1,
+          provider: 'codex',
+          format: 'codex_replacement_history',
+          history: [{ type: 'compaction', encrypted_content: 'opaque' }],
+          sourceModel: 'gpt-test',
+        },
+      },
+    }, { kind: 'assistant_message', payload: { text: 'canonical suffix' } }],
+  })
+  store.finishTurn({ turnId: imported.turn.id, status: 'completed' })
+
+  const resumed = store.beginTurn({
+    threadId: session.activeThreadId,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'resumed',
+    requestHash: 'resumed',
+    expectedRevision: store.getThread(session.activeThreadId)!.revision,
+    input: [{ kind: 'user_message', payload: { text: 'resume' } }],
+    adapterVersion: 'test/1',
+    policySnapshot: {
+      delegationMode: 'disabled', allowedTools: [], approvalPolicy: 'never',
+      cwd: null, maxDepth: 0, capabilityGrant: null,
+    },
+  })
+  const current = store.getSnapshot(session.activeThreadId)!
+  const selected = materializeContext(current, [], 'codex')
+  assert.deepEqual(selected.entries.map((entry) =>
+    entry.type === 'canonical_item' ? entry.item.sequence : -1), [2, 3, 4])
+  persistExecutionContextManifest(store, resumed.execution, selected)
+  assert.deepEqual(store.getExecutionContextManifest(resumed.execution.id)?.entries.map((entry) =>
+    entry.kind === 'canonical_item' ? entry.itemId : entry.compactionId),
+  selected.entries.map((entry) => entry.type === 'canonical_item' ? entry.item.id : entry.artifact.id))
+
+  store.appendProviderEvent({
+    turnId: resumed.turn.id,
+    eventId: 'later-answer',
+    items: [{ kind: 'assistant_message', payload: { text: 'later canonical item' } }],
+  })
+  store.finishTurn({ turnId: resumed.turn.id, status: 'completed' })
+  assert.doesNotThrow(() => store.getExecutionContextManifest(resumed.execution.id),
+    'a later canonical suffix must not change the checkpoint frontier of an immutable manifest')
+
+  const switched = store.beginTurn({
+    threadId: session.activeThreadId,
+    provider: 'claude',
+    model: 'claude-test',
+    clientRequestId: 'switched',
+    requestHash: 'switched',
+    expectedRevision: store.getThread(session.activeThreadId)!.revision,
+    input: [{ kind: 'user_message', payload: { text: 'switch provider' } }],
+    adapterVersion: 'test/1',
+    policySnapshot: {
+      delegationMode: 'disabled', allowedTools: [], approvalPolicy: 'never',
+      cwd: null, maxDepth: 0, capabilityGrant: null,
+    },
+  })
+  const foreignSelection = materializeContext(store.getSnapshot(session.activeThreadId)!, [], 'codex')
+  assert.throws(() => persistExecutionContextManifest(store, switched.execution, foreignSelection),
+    /retain every canonical item/,
+    'a native checkpoint cannot cover canonical history for a different execution provider')
+})
+
 test('schema-v14 store round-trips a derived summary and exact execution manifest', async (t) => {
   const directory = mkdtempSync(path.join(tmpdir(), 'baton-context-store-'))
   const store = new SqliteSessionStore(path.join(directory, 'session.sqlite'))
