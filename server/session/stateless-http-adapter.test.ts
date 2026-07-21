@@ -222,6 +222,31 @@ test('replays legacy Claude control messages without exposing provider wrappers'
   ])
 })
 
+test('replays legacy Codex envelopes without provider wrappers or hidden context', () => {
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+  })
+  const native = (id: string, sequence: number, text: string) => ({
+    ...snapshot.items[0]!, id, sequence, kind: 'user_message' as const, provider: 'codex' as const,
+    payload: { text, nativeSourceClient: 'codex_local' },
+  })
+  const body = adapter.materialize({
+    turnId: 'legacy-envelope-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  }, {
+    ...snapshot,
+    items: [
+      native('context', 1, '<codex_internal_context source="goal"><objective>hidden</objective></codex_internal_context>'),
+      native('aborted', 2, '<turn_aborted>User interrupted.</turn_aborted>'),
+    ],
+  }).body as Record<string, unknown>
+  assert.deepEqual(body.messages, [
+    { role: 'user', content: '[이전 턴 중단됨]\nUser interrupted.' },
+    { role: 'user', content: 'continue' },
+  ])
+})
+
 test('Claude adapter sends stateless history and records a provider-reported model fallback', async () => {
   const sentBodies: Record<string, unknown>[] = []
   const adapter = new StatelessHttpCanonicalAdapter({

@@ -7,6 +7,7 @@ import {
   conversationEntries,
   isLongConversationText,
   itemClaudeControlMessage,
+  itemCodexEnvelope,
   itemTaskNotification,
   latestUsageSummary,
   payloadText,
@@ -74,6 +75,24 @@ test('legacy Claude command envelopes render as compact control messages without
   const userAuthored = { ...legacy, payload: { text: raw } }
   assert.equal(itemClaudeControlMessage(userAuthored), null)
   assert.equal(payloadText(userAuthored), raw)
+})
+
+test('legacy Codex envelopes hide internal context and retain semantic cards or user requests', () => {
+  const internal = {
+    ...item({ text: '<environment_context><cwd>C:\\work</cwd></environment_context>', nativeSourceClient: 'codex_local' }),
+    id: 'internal-context', kind: 'user_message' as const,
+  }
+  const delegation = {
+    ...item({
+      text: '<codex_delegation><source_thread_id>parent</source_thread_id><input>Review it.</input></codex_delegation>',
+      nativeSourceClient: 'codex_local',
+    }),
+    id: 'delegation', kind: 'user_message' as const,
+  }
+  assert.equal(itemCodexEnvelope(internal)?.presentation, 'hidden')
+  assert.deepEqual(transcriptItems([internal, delegation]), [delegation])
+  assert.equal(itemCodexEnvelope(delegation)?.summary, '하위 작업 배정')
+  assert.equal(payloadText(delegation), 'Review it.')
 })
 
 test('usage summary mirrors Codex token grouping and accepts app-server camelCase', () => {

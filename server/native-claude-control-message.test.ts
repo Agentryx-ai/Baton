@@ -49,6 +49,17 @@ test('Claude local command output and Goal Stop hooks lose their provider prose'
   assert.equal(hook?.kind, 'stop_hook')
   assert.equal(hook?.content, '')
   assert.equal(claudeControlMessageContextText(hook!), '[Claude Goal Stop hook active]')
+
+  const feedback = parseClaudeControlMessage('Stop hook feedback:\n[goal]\nStill incomplete.')
+  assert.equal(feedback?.kind, 'stop_hook_feedback')
+  assert.equal(feedback?.summary, '목표 Stop hook 피드백')
+  assert.doesNotMatch(claudeControlMessageContextText(feedback!) ?? '', /Stop hook feedback:/)
+
+  const caveat = parseClaudeControlMessage(
+    '<local-command-caveat>Internal local command warning.</local-command-caveat>',
+  )
+  assert.equal(caveat?.kind, 'local_command_caveat')
+  assert.equal(claudeControlMessageContextText(caveat!), null)
 })
 
 test('legacy control-message recognition requires Claude native provenance', () => {

@@ -22,6 +22,10 @@ import {
   parseCodexTaskNotification,
   taskNotificationPayload,
 } from '../../../src/lib/native-task-notification.ts'
+import {
+  codexEnvelopePayload,
+  parseCodexEnvelope,
+} from '../../../src/lib/native-codex-envelope.ts'
 
 export interface CodexSourceReaderOptions {
   codexHome?: string
@@ -45,7 +49,7 @@ const CODEX_TOP_LEVEL_TYPES = new Set([
   // provider-private execution checkpoint; other private bookkeeping remains loss.
   'world_state', 'compacted', 'inter_agent_communication_metadata',
 ])
-const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v5`
+const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v6`
 
 export class CodexLocalSourceReader implements NativeSourceReader {
   readonly sourceClient = 'codex_local' as const
@@ -327,6 +331,28 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       }
       const textValue = messageText(portableContent)
       if (!textValue?.trim()) { skipped += 1; continue }
+      if (role === 'user') {
+        const taskNotification = parseCodexTaskNotification(textValue)
+        if (taskNotification) {
+          addRecord(records, `${baseId}:task-notification`, 'user_message', {
+            ...taskNotificationPayload(taskNotification),
+            nativeSourceClient: 'codex_local',
+            nativeRecordType: 'subagent-notification',
+            nativeTimestamp: timestamp,
+          }, timestamp)
+          continue
+        }
+        const envelope = parseCodexEnvelope(textValue)
+        if (envelope) {
+          addRecord(records, `${baseId}:envelope`, envelope.presentation === 'hidden' ? 'provider_event' : 'user_message', {
+            ...codexEnvelopePayload(envelope),
+            nativeSourceClient: 'codex_local',
+            nativeRecordType: 'codex-envelope',
+            nativeTimestamp: timestamp,
+          }, timestamp, envelope.presentation === 'hidden' ? 'provider_private' : 'portable')
+          continue
+        }
+      }
       if (role === 'user') {
         applyGoalCommand(goal, parseExplicitGoalCommand(textValue), timestamp, 'slash_command')
       }

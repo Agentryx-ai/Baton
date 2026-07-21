@@ -94,7 +94,7 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   // 4 metadata + 3 denied tool-input fields + 1 omitted output + 1 summary DLP + 1 encrypted reasoning.
   assert.equal(candidates[0]?.skippedItemCount, 10)
   assert.equal(candidates[0]?.portableItemCount, 7)
-  assert.match(String(candidates[0]?.parserVersion), /codex-native-compact-v5$/)
+  assert.match(String(candidates[0]?.parserVersion), /codex-native-compact-v6$/)
   assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'codex_json_corrupt'), true)
   assert.deepEqual(await fileHead(rollout), before)
 
@@ -106,6 +106,48 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   const materialized = await reader.materialize(metadataOnly!)
   assert.equal(materialized.records.length, 9)
   assert.equal(materialized.materialized, true)
+})
+
+test('Codex adapter normalizes every known native transcript envelope class', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-envelopes-'))
+  const sessions = path.join(home, 'sessions')
+  await mkdir(sessions)
+  const rollout = path.join(sessions, 'envelopes.jsonl')
+  const message = (text: string) => JSON.stringify({
+    timestamp: '2026-07-18T00:00:00Z', type: 'response_item',
+    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+  })
+  await writeFile(rollout, [
+    JSON.stringify({ type: 'session_meta', payload: { id: 'envelopes' } }),
+    message('<codex_internal_context source="goal"><objective>hidden</objective></codex_internal_context>'),
+    message('<environment_context><cwd>C:\\work</cwd></environment_context>'),
+    message('<user_instructions>hidden instructions</user_instructions>'),
+    message('<recommended_plugins>hidden plugins</recommended_plugins>'),
+    message('<codex_delegation><source_thread_id>parent</source_thread_id><input>Review it.</input></codex_delegation>'),
+    message('<turn_aborted>User interrupted.</turn_aborted>'),
+    message('<user_shell_command><command>npm test</command><result>Exit code: 0</result></user_shell_command>'),
+    message('<in-app-browser-context source="ambient-ui-state">hidden tabs</in-app-browser-context>\n\n## My request for Codex:\nSearch it.'),
+    message('<subagent_notification>\n{"agent_id":"child","status":{"completed":"Audit passed."}}\n</subagent_notification>'),
+    message('<subagent_notification>\n{"agent_path":"child","status":"shutdown"}\n</subagent_notification>'),
+  ].join('\n'))
+  const db = createCodexDatabase(home)
+  db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('envelopes', rollout, 1, 2, 'C:\\work', null, null)
+  db.close()
+
+  const [candidate] = await new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET }).scan()
+  assert.ok(candidate)
+  assert.equal(candidate.records.filter((record) => record.item.visibility === 'provider_private').length, 5)
+  assert.equal(candidate.records.filter((record) =>
+    record.item.payload.nativeRecordType === 'codex-envelope').length, 9)
+  assert.equal(candidate.records.find((record) =>
+    (record.item.payload.nativeCodexEnvelope as Record<string, unknown> | undefined)?.kind === 'ambient_request')?.item.payload.text,
+  'Search it.')
+  assert.equal(candidate.records.find((record) =>
+    record.item.payload.nativeRecordType === 'subagent-notification')?.item.payload.text, 'Audit passed.')
+  const serialized = JSON.stringify(candidate.records)
+  assert.equal(serialized.includes('<codex_internal_context'), false)
+  assert.equal(serialized.includes('<codex_delegation>'), false)
+  assert.equal(serialized.includes('<subagent_notification>'), false)
 })
 
 test('Codex adapter never derives an alias from first_user_message', async () => {

@@ -7,6 +7,10 @@ import {
   claudeControlMessageFromPayload,
   type NativeClaudeControlMessage,
 } from '../../lib/native-claude-control-message.ts'
+import {
+  codexEnvelopeFromPayload,
+  type NativeCodexEnvelope,
+} from '../../lib/native-codex-envelope.ts'
 
 export const PROVIDER_LABEL = {
   claude: 'Claude',
@@ -48,6 +52,8 @@ export function payloadText(item: CanonicalItemDto): string {
   if (taskNotification) return taskNotification.result
   const controlMessage = itemClaudeControlMessage(item)
   if (controlMessage) return controlMessage.content
+  const codexEnvelope = itemCodexEnvelope(item)
+  if (codexEnvelope) return codexEnvelope.content
   if (typeof item.payload.text === 'string') return item.payload.text
   if (typeof item.payload.content === 'string') return item.payload.content
   const content = textParts(item.payload.content)
@@ -65,6 +71,12 @@ export function itemTaskNotification(item: CanonicalItemDto): NativeTaskNotifica
 
 export function itemClaudeControlMessage(item: CanonicalItemDto): NativeClaudeControlMessage | null {
   return item.kind === 'user_message' ? claudeControlMessageFromPayload(item.payload) : null
+}
+
+export function itemCodexEnvelope(item: CanonicalItemDto): NativeCodexEnvelope | null {
+  return item.kind === 'user_message' || item.kind === 'provider_event'
+    ? codexEnvelopeFromPayload(item.payload)
+    : null
 }
 
 function numberValue(object: JsonObject, camel: string, snake: string): number {
@@ -97,7 +109,10 @@ export function usageSummary(payload: JsonObject): string {
 }
 
 export function transcriptItems(items: CanonicalItemDto[]): CanonicalItemDto[] {
-  return items.filter((item) => item.kind !== 'usage' && !isInternalGoalContinuation(item))
+  return items.filter((item) => item.kind !== 'usage'
+    && !isInternalGoalContinuation(item)
+    && itemClaudeControlMessage(item)?.kind !== 'local_command_caveat'
+    && itemCodexEnvelope(item)?.presentation !== 'hidden')
 }
 
 function isInternalGoalContinuation(item: CanonicalItemDto): boolean {
