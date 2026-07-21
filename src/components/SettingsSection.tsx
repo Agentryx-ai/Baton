@@ -323,7 +323,12 @@ export function SettingsSection({
         target === 'codex' ? codexMode : undefined,
         target !== 'codex' ? claudeProxyMode : undefined,
       )
-      toast.success(`${result.updated.join(', ')} 설정을 적용했습니다. 이제 앱을 다시 실행하세요.`)
+      const failures = result.results.filter((item) => !item.ok)
+      if (failures.length > 0) {
+        toast.warning(`일부 설정만 적용되었습니다: ${failures.map((item) => `${item.label} (${item.error ?? '실패'})`).join(', ')}`)
+      } else {
+        toast.success(`${result.updated.join(', ')} 설정을 적용했습니다. 이제 앱을 다시 실행하세요.`)
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error))
     } finally {
@@ -336,7 +341,12 @@ export function SettingsSection({
     setChangingIntegrationTarget(target)
     try {
       const result = await onRemoveClientIntegration([target])
-      toast.success(`${result.updated.join(', ')} 설정을 해제했습니다. 이제 앱을 다시 실행하세요.`)
+      const failures = result.results.filter((item) => !item.ok)
+      if (failures.length > 0) {
+        toast.warning(`일부 설정만 해제되었습니다: ${failures.map((item) => `${item.label} (${item.error ?? '실패'})`).join(', ')}`)
+      } else {
+        toast.success(`${result.updated.join(', ')} 설정을 해제했습니다. 이제 앱을 다시 실행하세요.`)
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error))
     } finally {

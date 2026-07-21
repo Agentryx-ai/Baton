@@ -17,12 +17,16 @@ while ([DateTime]::UtcNow -lt $deadline) {
 
   if ($running.Count -eq 0) {
     try {
-      Invoke-RestMethod `
+      $capability = Invoke-RestMethod `
+        -Method Get `
+        -Uri "$BatonBaseUrl/baton/client-integration/capability"
+      $result = Invoke-RestMethod `
         -Method Post `
         -Uri "$BatonBaseUrl/baton/client-integration/apply" `
+        -Headers @{ 'X-Baton-Client-Capability' = [string]$capability.capability } `
         -ContentType 'application/json' `
-        -Body '{"targets":["codex"]}' |
-        Out-Null
+        -Body '{"targets":["codex"]}'
+      if (-not $result.applied) { throw 'Codex integration apply failed.' }
       exit 0
     } catch {
       Start-Sleep -Seconds 2

@@ -181,6 +181,7 @@ history에서 provider 요청을 재구성합니다.
 cp .env.example .env
 npm ci
 npm run build
+npm run install:bootstrap:dev
 npm start
 ```
 
@@ -188,6 +189,18 @@ npm start
 필요하지 않습니다. 정본 데이터의 기본 위치는 Windows `%LOCALAPPDATA%\Baton`, 그 외
 환경에서는 사용자 홈의 `Baton` 디렉터리입니다. 자세한 설치와 검증 순서는
 [설치 가이드](docs/installation.md)에 있습니다.
+
+`install:bootstrap:dev`는 checkout, `node_modules`, 시스템 Node와 별개로 실행되는 unsigned
+offline recovery artifact를 명시적으로 개발용 설치합니다. unsigned build는 Windows
+SmartScreen/AppLocker 정책에 따라 실행이 차단될 수 있으며, 전역 Claude/Codex 연결 적용과
+checkout/standalone lifecycle 명령에도 `BATON_ALLOW_UNSIGNED_BOOTSTRAP=1` 개발 override가 별도로
+필요합니다. production apply와 lifecycle은
+Authenticode 서명과 배포 시 고정한 signer thumbprint를 모두 검증한 release artifact만 허용하며,
+승인 thumbprint는 mutable manifest가 아니라 별도 `BATON_APPROVED_SIGNER_THUMBPRINT` 배포 정책에서
+공급해야 합니다. 같은 사용자가 이 환경과 manifest를 모두 바꿀 수 있다면 외부 trust anchor가
+아니므로 production launcher/ACL에서 별도로 보호해야 합니다.
+현재 저장소는 release signing key나 서명 파이프라인을 제공하지 않으므로 local SEA build를
+production-ready signed binary라고 간주하지 않습니다.
 
 ## 알려진 한계와 핵심 TODO
 

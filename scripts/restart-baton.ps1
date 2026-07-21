@@ -12,8 +12,9 @@ $ErrorActionPreference = 'Stop'
 $workspace = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $tsx = Join-Path $workspace 'node_modules\tsx\dist\cli.mjs'
 $serverEntry = Join-Path $workspace 'server\index.ts'
-$stdoutLog = Join-Path $workspace '.baton-server.out.log'
-$stderrLog = Join-Path $workspace '.baton-server.err.log'
+$logStamp = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmssfff')
+$stdoutLog = Join-Path $workspace ".baton-server-$logStamp.out.log"
+$stderrLog = Join-Path $workspace ".baton-server-$logStamp.err.log"
 
 if (-not (Test-Path -LiteralPath $tsx -PathType Leaf)) {
   throw "tsx entry point was not found: $tsx"

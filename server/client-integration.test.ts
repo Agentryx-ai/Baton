@@ -6,6 +6,7 @@ import {
   blockedProcessesForTargets,
   canApplyConfiguration,
   classifyProcessRecords,
+  ClientIntegrationError,
   inspectClaudeCliConfig,
   inspectClaudeDesktopConfig,
   inspectCodexNativeConfig,
@@ -17,13 +18,14 @@ import {
   parseIntegrationTargets,
   removeClaudeCliConfig,
   removeClaudeDesktopConfig,
+  runClientIntegrationTargetOperations,
   selectClaudeModels,
   unpatchCodexNativeConfig,
 } from './client-integration.ts'
 
-test('configuration conflicts are repairable but applied and unknown states are not', () => {
+test('configuration conflicts fail closed and only absent settings are applyable', () => {
   assert.equal(canApplyConfiguration('not-applied'), true)
-  assert.equal(canApplyConfiguration('conflict'), true)
+  assert.equal(canApplyConfiguration('conflict'), false)
   assert.equal(canApplyConfiguration('applied'), false)
   assert.equal(canApplyConfiguration('unknown'), false)
 })
@@ -88,6 +90,7 @@ test('native Codex mode migrates the exact Baton-owned legacy provider to an una
     '',
   ].join('\n')
   const migrated = patchCodexNativeConfig(source, baseUrl)
+  assert.equal(inspectCodexNativeConfig(source, baseUrl).configuration, 'conflict')
   const parsed = parseToml(migrated) as Record<string, unknown>
   assert.equal(parsed.model_provider, undefined)
   assert.equal(parsed.openai_base_url, baseUrl)
@@ -163,7 +166,7 @@ test('JSON removers preserve unrelated user settings', () => {
 })
 
 test('Claude CLI Native settings apply, inspect, and remove without touching user values', () => {
-  const original = JSON.stringify({ env: { KEEP: 'yes', ANTHROPIC_AUTH_TOKEN: 'stale' }, user: 1 })
+  const original = JSON.stringify({ env: { KEEP: 'yes' }, user: 1 })
   const nativeBaseUrl = 'http://127.0.0.1:4400/baton/inference/anthropic'
 
   const native = patchClaudeCliConfig(original, nativeBaseUrl, null)
@@ -176,6 +179,29 @@ test('Claude CLI Native settings apply, inspect, and remove without touching use
     env: { KEEP: 'yes' },
     user: 1,
   })
+})
+
+test('malformed client config errors never echo source lines or secrets', () => {
+  const secret = 'DO_NOT_ECHO_SECRET'
+  for (const operation of [
+    () => patchClaudeCliConfig(`{"env":{"TOKEN":"${secret}"}`, 'http://127.0.0.1:4400', null),
+    () => patchClaudeDesktopConfig(`{"secret":"${secret}"`, 'http://127.0.0.1:4400', 'token', []),
+    () => patchCodexNativeConfig(`bad = "${secret}\n`, 'http://127.0.0.1:4400/v1'),
+  ]) {
+    assert.throws(operation, (error: unknown) => error instanceof Error && !error.message.includes(secret))
+  }
+})
+
+test('Claude patchers fail closed when related fields appear in the inspected snapshot', () => {
+  const endpoint = 'http://127.0.0.1:4400/baton/inference/anthropic'
+  assert.throws(
+    () => patchClaudeCliConfig(JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'inserted-secret' } }), endpoint, null),
+    /덮어쓰지 않았습니다/,
+  )
+  assert.throws(
+    () => patchClaudeDesktopConfig(JSON.stringify({ inferenceGatewayApiKey: 'inserted-secret' }), endpoint, 'token', []),
+    /덮어쓰지 않았습니다/,
+  )
 })
 
 test('Claude Desktop uses the Baton Native static client token and round-trips user values', () => {
@@ -294,4 +320,17 @@ test('blockedProcessesForTargets ignores running unselected clients', () => {
     blockedProcessesForTargets(running, ['codex']).map((item) => item.pid),
     [30, 40],
   )
+})
+
+test('per-target web operation reports partial success and continues after failure', async () => {
+  const visited: string[] = []
+  const results = await runClientIntegrationTargetOperations(['claude-cli', 'codex'], async (target) => {
+    visited.push(target)
+    if (target === 'codex') throw new ClientIntegrationError(409, 'second failed')
+  })
+  assert.deepEqual(visited, ['claude-cli', 'codex'])
+  assert.deepEqual(results.map((item) => ({ target: item.target, ok: item.ok })), [
+    { target: 'claude-cli', ok: true },
+    { target: 'codex', ok: false },
+  ])
 })

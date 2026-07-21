@@ -20,6 +20,9 @@
     "smoke:claude-native": "tsx scripts/claude-native-canary.ts",
     "smoke:codex-plugins": "tsx scripts/codex-plugin-account-canary.ts",
     "migrate:legacy-accounts": "tsx scripts/migrate-legacy-cliproxy-accounts.ts",
+    "build:bootstrap": "node scripts/build-baton-bootstrap.mjs",
+    "install:bootstrap:dev": "node scripts/build-baton-bootstrap.mjs --install --allow-unsigned-development",
+    "verify:bootstrap": "node scripts/verify-baton-bootstrap.mjs",
     "restore:native-goals": "tsx scripts/restore-native-goals.ts",
     "preview": "vite preview"
   },
@@ -47,6 +50,7 @@
     "@vitejs/plugin-react": "^6.0.3",
     "concurrently": "^10.0.3",
     "oxlint": "^1.71.0",
+    "postject": "^1.0.0-alpha.6",
     "tsx": "^4.23.1",
     "typescript": "~6.0.2",
     "vite": "^8.1.1"
