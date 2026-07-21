@@ -8,6 +8,7 @@ import {
   activityFailed,
   activitySummary,
   ITEM_LABEL,
+  itemClaudeControlMessage,
   itemTaskNotification,
   isLongConversationText,
   PROVIDER_LABEL,
@@ -50,6 +51,7 @@ export function ConversationItem({
   const isReasoning = item.kind === 'reasoning_summary'
   const isUsage = item.kind === 'usage'
   const taskNotification = itemTaskNotification(item)
+  const controlMessage = itemClaudeControlMessage(item)
   const body = isUsage ? usageSummary(item.payload) : payloadText(item)
   const showRawDetail = isError || isReasoning || isUsage || item.kind === 'provider_event'
   const metadata = assistantExecutionMetadata(item, turn)
@@ -87,6 +89,26 @@ export function ConversationItem({
         <p className="mb-2 text-sm font-medium text-foreground">{taskNotification.summary}</p>
         <LongContent text={body} className="text-[0.9375rem] leading-7 text-foreground" />
       </article>
+    )
+  }
+
+  if (controlMessage) {
+    return (
+      <details className="group/control rounded-xl border bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+        <summary className="flex cursor-pointer list-none items-center gap-2 outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+          <Wrench className="size-3.5 shrink-0" aria-hidden />
+          <span className="font-medium text-foreground">{controlMessage.summary}</span>
+          <span>Claude</span>
+          {controlMessage.content ? (
+            <ChevronRight className="ml-auto size-3.5 shrink-0 opacity-50 transition-transform group-open/control:rotate-90" aria-hidden />
+          ) : null}
+        </summary>
+        {controlMessage.content ? (
+          <div className="mt-3 border-l-2 pl-4 text-[0.875rem] leading-6 text-foreground">
+            <LongContent text={controlMessage.content} />
+          </div>
+        ) : null}
+      </details>
     )
   }
 

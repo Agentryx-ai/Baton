@@ -6,6 +6,7 @@ import {
   activitySummary,
   conversationEntries,
   isLongConversationText,
+  itemClaudeControlMessage,
   itemTaskNotification,
   latestUsageSummary,
   payloadText,
@@ -57,6 +58,21 @@ test('legacy native task notifications render their result instead of provider e
 
   const userAuthored = { ...legacy, payload: { text: raw } }
   assert.equal(itemTaskNotification(userAuthored), null)
+  assert.equal(payloadText(userAuthored), raw)
+})
+
+test('legacy Claude command envelopes render as compact control messages without raw tags', () => {
+  const raw = '<local-command-stdout>Goal set: finish the report</local-command-stdout>'
+  const legacy = {
+    ...item({ text: raw, nativeSourceClient: 'claude_desktop' }),
+    kind: 'user_message' as const,
+    provider: 'claude' as const,
+  }
+  assert.equal(itemClaudeControlMessage(legacy)?.summary, '목표 설정 완료')
+  assert.equal(payloadText(legacy), 'Goal set: finish the report')
+
+  const userAuthored = { ...legacy, payload: { text: raw } }
+  assert.equal(itemClaudeControlMessage(userAuthored), null)
   assert.equal(payloadText(userAuthored), raw)
 })
 

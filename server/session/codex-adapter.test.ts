@@ -824,6 +824,31 @@ test('replays legacy Claude task notifications to Codex without the provider env
   }])
 })
 
+test('replays legacy Claude control messages to Codex without XML or Stop-hook directives', () => {
+  const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
+  const base = snapshot()
+  const projected = adapter.materialize(request(), {
+    ...base,
+    items: [{
+      ...base.items[0]!, kind: 'user_message', provider: 'claude',
+      payload: {
+        text: '<local-command-stdout>Login successful</local-command-stdout>',
+        nativeSourceClient: 'claude_desktop',
+      },
+    }, {
+      ...base.items[0]!, id: 'hook', sequence: 2, kind: 'user_message', provider: 'claude',
+      payload: {
+        text: 'A session-scoped Stop hook is now active with condition: "finish". The hook will block stopping until the condition holds. It auto-clears once the condition is met.',
+        nativeSourceClient: 'claude_desktop',
+      },
+    }],
+  }).body as Record<string, unknown>
+  assert.deepEqual(projected.history, [
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Claude 명령 결과]\nLogin successful' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Claude Goal Stop hook active]' }] },
+  ])
+})
+
 test('injects exact Codex native replacement history and only the uncovered suffix', () => {
   const adapter = new CodexCanonicalAdapter({ processFactory: () => new FakeProcess() })
   const base = snapshot()

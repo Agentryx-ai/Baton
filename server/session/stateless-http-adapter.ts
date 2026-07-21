@@ -26,6 +26,10 @@ import {
   taskNotificationContextText,
   taskNotificationFromPayload,
 } from '../../src/lib/native-task-notification.ts'
+import {
+  claudeControlMessageContextText,
+  claudeControlMessageFromPayload,
+} from '../../src/lib/native-claude-control-message.ts'
 
 type SupportedProvider = Extract<CanonicalProvider, 'claude' | 'gemini'>
 type JsonObject = Record<string, unknown>
@@ -1513,6 +1517,8 @@ function portableHistoryText(kind: string, payload: JsonObject): string | null {
 function portableText(payload: JsonObject): string | null {
   const taskNotification = taskNotificationFromPayload(payload)
   if (taskNotification) return taskNotificationContextText(taskNotification)
+  const controlMessage = claudeControlMessageFromPayload(payload)
+  if (controlMessage) return claudeControlMessageContextText(controlMessage)
   if (typeof payload.text === 'string' && payload.text.trim()) return payload.text
   if (typeof payload.content === 'string' && payload.content.trim()) return payload.content
   if (Array.isArray(payload.summary)) {

@@ -198,6 +198,30 @@ test('replays legacy Claude task notifications without exposing the internal env
   ])
 })
 
+test('replays legacy Claude control messages without exposing provider wrappers', () => {
+  const adapter = new StatelessHttpCanonicalAdapter({
+    provider: 'claude',
+    proxyConnection: async () => ({ baseUrl: 'http://proxy', token: 'secret' }),
+  })
+  const body = adapter.materialize({
+    turnId: 'legacy-control-turn', model: 'claude-opus-4-8',
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  }, {
+    ...snapshot,
+    items: [{
+      ...snapshot.items[0]!, kind: 'user_message', provider: 'claude',
+      payload: {
+        text: '<command-name>/goal</command-name>\n<command-args>finish the report</command-args>',
+        nativeSourceClient: 'claude_desktop',
+      },
+    }],
+  }).body as Record<string, unknown>
+  assert.deepEqual(body.messages, [
+    { role: 'user', content: '[Claude command /goal]\nfinish the report' },
+    { role: 'user', content: 'continue' },
+  ])
+})
+
 test('Claude adapter sends stateless history and records a provider-reported model fallback', async () => {
   const sentBodies: Record<string, unknown>[] = []
   const adapter = new StatelessHttpCanonicalAdapter({
