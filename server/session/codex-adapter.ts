@@ -29,6 +29,10 @@ import {
   taskNotificationContextText,
   taskNotificationFromPayload,
 } from '../../src/lib/native-task-notification.ts'
+import {
+  claudeControlMessageContextText,
+  claudeControlMessageFromPayload,
+} from '../../src/lib/native-claude-control-message.ts'
 
 const HARDENING_OVERRIDES = Object.freeze({
   web_search: 'disabled',
@@ -1579,6 +1583,8 @@ function portableHistoryText(kind: string, payload: JsonObject): string | null {
 function portableText(payload: JsonObject): string | null {
   const taskNotification = taskNotificationFromPayload(payload)
   if (taskNotification) return taskNotificationContextText(taskNotification)
+  const controlMessage = claudeControlMessageFromPayload(payload)
+  if (controlMessage) return claudeControlMessageContextText(controlMessage)
   if (typeof payload.text === 'string' && payload.text.length > 0) return payload.text
   if (typeof payload.content === 'string' && payload.content.length > 0) return payload.content
   if (Array.isArray(payload.summary)) {

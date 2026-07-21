@@ -21,6 +21,10 @@ import {
   parseClaudeTaskNotification,
   taskNotificationPayload,
 } from '../../../src/lib/native-task-notification.ts'
+import {
+  claudeControlMessagePayload,
+  parseClaudeControlMessage,
+} from '../../../src/lib/native-claude-control-message.ts'
 
 interface ClaudeDesktopMetadata {
   sessionId?: unknown
@@ -58,7 +62,7 @@ const CLAUDE_BLOCK_TYPES = new Set([
   'text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'fallback', 'image', 'document',
   'server_tool_use', 'web_search_tool_result',
 ])
-const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v4`
+const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v5`
 
 export interface ClaudeSourceReaderOptions {
   desktopRoot?: string
@@ -473,6 +477,14 @@ function parseClaudeRecords(
       addClaudeRecord(records, `${baseId}:task-notification`, 'user_message', {
         ...taskNotificationPayload(taskNotification),
         nativeRecordType: 'task-notification',
+      }, timestamp, sourceClient)
+      continue
+    }
+    const controlMessage = eventType === 'user' ? parseClaudeControlMessage(fullText) : null
+    if (controlMessage) {
+      addClaudeRecord(records, `${baseId}:control-message`, 'user_message', {
+        ...claudeControlMessagePayload(controlMessage),
+        nativeRecordType: 'control-message',
       }, timestamp, sourceClient)
       continue
     }

@@ -271,6 +271,13 @@ test('Claude adapter reconstructs a confirmed Goal and ignores ordinary Stop-hoo
     objective: 'complete the EagleEye evidence path', model: 'claude-fable-5', effort: null,
     detectedAt: '2026-07-18T00:00:01Z', evidence: 'claude_goal_status',
   })
+  const controlMessages = candidate?.records.filter((record) =>
+    record.item.payload.nativeRecordType === 'control-message') ?? []
+  assert.equal(controlMessages.length, 2)
+  assert.equal(JSON.stringify(controlMessages).includes('<command-name>'), false)
+  assert.equal(JSON.stringify(controlMessages).includes('<local-command-stdout>'), false)
+  assert.equal(controlMessages[0]?.item.payload.text, 'complete the EagleEye evidence path')
+  assert.equal(controlMessages[1]?.item.payload.text, 'Goal set: complete the EagleEye evidence path')
 })
 
 test('Codex local inventory defaults to active user surfaces and opts into internal or archived tasks', async () => {
