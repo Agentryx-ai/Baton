@@ -22,4 +22,5 @@
 | [Goal continuation 중단의 in-memory 소유권 해제](goal-continuation-abort-must-release-in-memory-ownership.md) | 부분 해결 |
 | [마이그레이션된 Claude 계정 quota·중복·placeholder](migrated-claude-accounts-fail-quota-and-canary-placeholder-duplicate.md) | 부분 해결 |
 | [범용 모델 fallback 후보 순회와 override 정리](model-fallback-must-exhaust-candidates-and-clear-failed-overrides.md) | 미해결 |
+| [전체 테스트의 live Baton lifecycle 격리](test-suite-must-not-restart-live-baton.md) | 미해결 |
 
