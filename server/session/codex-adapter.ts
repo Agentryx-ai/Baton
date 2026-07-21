@@ -16,7 +16,7 @@ import type {
   ProviderSkillResource,
   SessionProviderAdapter,
 } from './adapter.ts'
-import type { AgentToolResult, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import type { AgentToolResult, NewCanonicalItem, PermissionProfile, ThreadSnapshot } from './domain.ts'
 import {
   canonicalConversationCacheKey,
   startCanonicalResponsesBridge,
@@ -37,6 +37,15 @@ const HARDENING_OVERRIDES = Object.freeze({
   'features.apps': false,
   'features.plugins': false,
 })
+
+const CODEX_SANDBOX_BY_PERMISSION = Object.freeze({
+  read_only: { mode: 'read-only', type: 'readOnly' },
+  workspace: { mode: 'workspace-write', type: 'workspaceWrite' },
+  full_access: { mode: 'danger-full-access', type: 'dangerFullAccess' },
+} satisfies Record<PermissionProfile, {
+  mode: 'read-only' | 'workspace-write' | 'danger-full-access'
+  type: 'readOnly' | 'workspaceWrite' | 'dangerFullAccess'
+}>)
 
 const VERIFIED_FEATURES = [
   'enable_fanout',
@@ -123,6 +132,7 @@ interface MaterializedCodexTurn {
   model: string
   effort: string | null
   cwd: string | null
+  permissionProfile: PermissionProfile
   developerInstructions: string | null
   history: JsonObject[]
   input: Array<{ type: 'text'; text: string } | { type: 'localImage'; path: string }>
@@ -385,6 +395,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       model: request.model,
       effort: request.effort ?? null,
       cwd: snapshot.session.cwd,
+      permissionProfile: snapshot.session.permissions.effectiveProfile,
       developerInstructions: canonicalToolBoundaryInstructions(
         canonicalDeveloperInstructions(snapshot.thread.instructionSnapshot),
       ),
@@ -671,6 +682,7 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
           ephemeral: false,
           approvalPolicy: 'never',
           approvalsReviewer: 'user',
+          sandbox: CODEX_SANDBOX_BY_PERMISSION[body.permissionProfile].mode,
           dynamicTools: context.toolDefinitions.map(dynamicToolSpec),
           config: { ...HARDENING_OVERRIDES, ...this.mcpDisableOverrides },
         }),
@@ -690,6 +702,13 @@ export class CodexCanonicalAdapter implements SessionProviderAdapter {
       }
       if (!Array.isArray(start.runtimeWorkspaceRoots) || start.runtimeWorkspaceRoots.length !== 0) {
         throw new Error('Codex canonical mode requires zero execution environment roots')
+      }
+      const effectiveSandbox = asObject(start.sandbox, 'Codex effective sandbox')
+      const expectedSandboxType = CODEX_SANDBOX_BY_PERMISSION[body.permissionProfile].type
+      if (effectiveSandbox.type !== expectedSandboxType) {
+        throw capabilityViolation(
+          `effective Codex sandbox ${String(effectiveSandbox.type)} did not match ${expectedSandboxType}`,
+        )
       }
       nativeThreadId = requiredString(thread.id, 'Codex thread id')
       assertFeatureList(
@@ -1285,6 +1304,7 @@ function parseMaterializedRequest(value: unknown): MaterializedCodexTurn {
     model: requiredString(body.model, 'Codex model'),
     effort: typeof body.effort === 'string' ? body.effort : null,
     cwd: typeof body.cwd === 'string' ? body.cwd : null,
+    permissionProfile: parsePermissionProfile(body.permissionProfile),
     developerInstructions: typeof body.developerInstructions === 'string' ? body.developerInstructions : null,
     history: body.history.map((item) => asObject(item, 'Codex history item')),
     input: body.input.map((item) => {
@@ -1296,6 +1316,11 @@ function parseMaterializedRequest(value: unknown): MaterializedCodexTurn {
       throw new Error('Invalid Codex input type')
     }),
   }
+}
+
+function parsePermissionProfile(value: unknown): PermissionProfile {
+  if (value === 'read_only' || value === 'workspace' || value === 'full_access') return value
+  throw new Error('Invalid Codex permission profile')
 }
 
 function nativeEvent(method: string, params: JsonObject | null): NativeProviderEvent {
