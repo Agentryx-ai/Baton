@@ -49,7 +49,7 @@ const CODEX_TOP_LEVEL_TYPES = new Set([
   // provider-private execution checkpoint; other private bookkeeping remains loss.
   'world_state', 'compacted', 'inter_agent_communication', 'inter_agent_communication_metadata',
 ])
-const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v6`
+const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v7`
 
 export class CodexLocalSourceReader implements NativeSourceReader {
   readonly sourceClient = 'codex_local' as const

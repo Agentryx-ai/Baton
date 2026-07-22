@@ -153,6 +153,7 @@ export function finalizeRecords(records: Omit<NativePortableRecord, 'prefixDiges
 export class NativeRecordAccumulator {
   readonly #includeRecords: boolean
   readonly #records: NativePortableRecord[] = []
+  readonly #recordDigests = new Map<string, string>()
   #prefixDigest = sha256('')
   #count = 0
   #portableCount = 0
@@ -165,7 +166,13 @@ export class NativeRecordAccumulator {
   get records(): NativePortableRecord[] { return this.#records }
 
   add(record: Omit<NativePortableRecord, 'prefixDigest'>): void {
+    const existingDigest = this.#recordDigests.get(record.key)
+    if (existingDigest !== undefined) {
+      if (existingDigest === record.digest) return
+      throw new Error('native_source_record_key_collision')
+    }
     if (this.#count >= MAX_NATIVE_PORTABLE_RECORDS) throw new Error('native_source_portable_record_limit')
+    this.#recordDigests.set(record.key, record.digest)
     this.#prefixDigest = sha256(`${this.#prefixDigest}\0${record.digest}`)
     this.#count += 1
     if (record.item.visibility === 'portable') this.#portableCount += 1

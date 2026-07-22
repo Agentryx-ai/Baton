@@ -94,7 +94,7 @@ test('Codex adapter preserves portable messages, tool/file summaries and loss co
   // 4 metadata + 3 denied tool-input fields + 1 omitted output + 1 summary DLP + 1 encrypted reasoning.
   assert.equal(candidates[0]?.skippedItemCount, 10)
   assert.equal(candidates[0]?.portableItemCount, 7)
-  assert.match(String(candidates[0]?.parserVersion), /codex-native-compact-v6$/)
+  assert.match(String(candidates[0]?.parserVersion), /codex-native-compact-v7$/)
   assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'codex_json_corrupt'), true)
   assert.deepEqual(await fileHead(rollout), before)
 
@@ -307,6 +307,38 @@ test('Claude adapter excludes nested subagent transcripts from the root session 
   const candidates = await reader.scan({ sources: ['claude_code'] })
 
   assert.deepEqual(candidates.map((candidate) => candidate.nativeSessionId), ['main-session'])
+})
+
+test('Claude adapter collapses exact native record replays and rejects conflicting key reuse', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'baton-claude-record-replay-'))
+  const project = path.join(root, 'projects', 'project')
+  await mkdir(project, { recursive: true })
+  const replayed = JSON.stringify({
+    type: 'user', uuid: 'replayed-user', cwd: 'C:\\work\\main', timestamp: '2026-07-18T00:00:00Z',
+    message: { content: 'Visible once' },
+  })
+  await writeFile(path.join(project, 'replayed.jsonl'), [replayed, replayed].join('\n'))
+  await writeFile(path.join(project, 'conflicting.jsonl'), [
+    JSON.stringify({
+      type: 'user', uuid: 'conflicting-user', cwd: 'C:\\work\\main', timestamp: '2026-07-18T00:00:00Z',
+      message: { content: 'First value' },
+    }),
+    JSON.stringify({
+      type: 'user', uuid: 'conflicting-user', cwd: 'C:\\work\\main', timestamp: '2026-07-18T00:00:01Z',
+      message: { content: 'Different value' },
+    }),
+  ].join('\n'))
+
+  const reader = new ClaudeLocalSourceReader({
+    desktopRoot: path.join(root, 'missing-desktop'), projectsRoot: path.join(root, 'projects'),
+    namespaceSecret: NAMESPACE_SECRET,
+  })
+  const candidates = await reader.scan({ sources: ['claude_code'] })
+
+  assert.deepEqual(candidates.map((candidate) => candidate.nativeSessionId), ['replayed'])
+  assert.deepEqual(candidates[0]?.records.map((record) => record.item.payload.text), ['Visible once'])
+  assert.equal(candidates[0]?.portableItemCount, 1)
+  assert.equal(reader.lastScanWarnings.some((warning) => warning.code === 'native_source_record_key_collision'), true)
 })
 
 test('Claude adapter excludes meta and sidechain messages and preserves MCP attribution privately', async () => {
