@@ -4,10 +4,12 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 
 // Node 20.12+ loads .env natively; ignore if absent (env may be set externally).
-try {
-  process.loadEnvFile()
-} catch {
-  /* .env not found — rely on process env */
+if (process.env.BATON_DISABLE_ENV_FILE !== '1') {
+  try {
+    process.loadEnvFile()
+  } catch {
+    /* .env not found — rely on process env */
+  }
 }
 
 export const config = {

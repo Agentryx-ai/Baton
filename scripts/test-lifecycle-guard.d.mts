@@ -10,3 +10,5 @@ export function assertLiveBatonUnchanged(
 ): void
 
 export function snapshotLiveBaton(): Promise<LiveBatonSnapshot>
+
+export function liveSnapshotScript(): string

@@ -88,9 +88,10 @@ export function createLifecyclePlan(options: {
   const useBootstrap = options.useBootstrap ?? (!options.executable && Boolean(bootstrapExecutable))
   const executable = options.executable ?? bootstrapExecutable ?? process.execPath
   const workerExecutable = options.workerExecutable ?? process.env.BATON_WORKER_EXECUTABLE ?? process.execPath
+  const port = lifecyclePort(options.port)
   const argumentsValue = useBootstrap
-    ? `worker-runner --root ${quoteArgument(root)}`
-    : `${quoteArgument(runner)} --root ${quoteArgument(root)}`
+    ? `worker-runner --root ${quoteArgument(root)} --port ${port}`
+    : `${quoteArgument(runner)} --root ${quoteArgument(root)} --port ${port}`
   return {
     taskName: options.taskName ?? process.env.BATON_TASK_NAME ?? `Baton-Worker-${hash}`,
     taskPath: '\\',
@@ -102,7 +103,7 @@ export function createLifecyclePlan(options: {
     userId: options.userId ?? (process.env.USERDOMAIN
       ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
       : userInfo().username),
-    port: lifecyclePort(options.port),
+    port,
     restartCount: RESTART_COUNT,
     restartIntervalMinutes: RESTART_INTERVAL_MINUTES,
     ownershipMarker: `Baton CurrentUser worker lifecycle (${root})`,

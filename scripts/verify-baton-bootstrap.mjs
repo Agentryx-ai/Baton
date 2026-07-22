@@ -4,11 +4,12 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
-import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
+
+import { reserveTemporaryPort } from './temporary-port-reservation.mjs'
 
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
 const fixture = path.join(tmpdir(), `Baton P2 verify ${randomUUID()}`)
@@ -19,7 +20,8 @@ const recoveryRoot = path.join(localAppData, 'Baton', 'integration-recovery')
 const fakeWorker = path.join(fixture, 'baton-test-worker.exe')
 const tsx = path.join('node_modules', 'tsx', 'dist', 'cli.mjs')
 const taskName = `Baton-P2-Isolated-${randomUUID()}`
-const port = await reserveTemporaryPort()
+const portReservation = await reserveTemporaryPort('bootstrap verification port')
+const port = portReservation.port
 const baseEnv = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('BATON_'))),
   LOCALAPPDATA: localAppData,
@@ -31,6 +33,8 @@ const baseEnv = {
   BATON_RECOVERY_ROOT: recoveryRoot,
   BATON_BOOTSTRAP_ROOT: bootstrapRoot,
   BATON_TASK_NAME: taskName,
+  BATON_DISABLE_ENV_FILE: '1',
+  BATON_DATA_DIR: path.join(fixture, 'data'),
   BATON_PORT: String(port),
   BATON_URL: `http://127.0.0.1:${port}`,
   BATON_WORKER_NODE: fakeWorker,
@@ -109,6 +113,7 @@ try {
   assert.equal(repaired.task.definitionMatches, true)
   assert.equal((await realpath(repaired.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
   assert.equal((await realpath(repaired.plan.workerExecutable)).toLowerCase(), (await realpath(fakeWorker)).toLowerCase())
+  assert.match(repaired.plan.arguments, new RegExp(`--port ${port}$`))
   taskExecutable = repaired.plan.executable
   const validPublicDoctor = await captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', 'doctor', '--json'], baseEnv, root)
   assert.equal(validPublicDoctor.code, 0, validPublicDoctor.stderr.toString('utf8'))
@@ -144,6 +149,7 @@ try {
   const publicStatusValue = JSON.parse(publicStatus.stdout.toString('utf8'))
   assert.equal((await realpath(publicStatusValue.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
   assert.equal((await realpath(publicStatusValue.plan.workerExecutable)).toLowerCase(), (await realpath(fakeWorker)).toLowerCase())
+  assert.match(publicStatusValue.plan.arguments, new RegExp(`--port ${port}$`))
   const offlineRuntimeStatus = await captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', 'status', '--json'], {
     ...baseEnv, BATON_URL: 'http://127.0.0.1:1',
   }, root)
@@ -160,6 +166,7 @@ try {
   }
   // Start/restart may inspect and exercise only this run's temporary port and
   // UUID Task. The harmless exit-zero worker cannot touch the live listener.
+  await portReservation.release()
   for (const command of ['start', 'restart']) {
     const result = await publicCli([command, '--json'])
     assert.equal(result.code, 0, `${command} failed: ${result.stderr}`)
@@ -260,6 +267,7 @@ try {
 
   console.log('Standalone bootstrap adversarial verification passed.')
 } finally {
+  await portReservation.release()
   if (holdingStable) {
     holdingStable.kill()
     await onceClosed(holdingStable)
@@ -338,21 +346,5 @@ Add-Type -TypeDefinition 'public static class Program { public static int Main(s
     child.once('error', reject)
     child.once('close', (code) => code === 0 ? resolve() : reject(new Error(`fixture compiler exited ${code}: ${stderr}`)))
     child.stdin.end(output)
-  })
-}
-
-function reserveTemporaryPort() {
-  return new Promise((resolve, reject) => {
-    const server = createServer()
-    server.unref()
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address()
-      if (!address || typeof address === 'string') {
-        server.close(() => reject(new Error('Could not reserve a bootstrap verification port')))
-        return
-      }
-      server.close((error) => error ? reject(error) : resolve(address.port))
-    })
   })
 }

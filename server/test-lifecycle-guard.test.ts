@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { assertLiveBatonUnchanged } from '../scripts/test-lifecycle-guard.mjs'
+import { assertLiveBatonUnchanged, liveSnapshotScript } from '../scripts/test-lifecycle-guard.mjs'
 
 const baseline = {
   listenerPid: 123,
@@ -26,4 +26,12 @@ test('live Baton guard fails closed for each protected invariant', () => {
     () => assertLiveBatonUnchanged(baseline, { ...baseline, tasks: [] }),
     /Scheduled Task definitions changed/,
   )
+})
+
+test('live listener discovery distinguishes an empty result from a failed query', () => {
+  const script = liveSnapshotScript()
+  assert.match(script, /Get-NetTCPConnection -ErrorAction Stop/)
+  assert.match(script, /\$connections = @\(Get-NetTCPConnection/)
+  assert.match(script, /Where-Object/)
+  assert.doesNotMatch(script, /Get-NetTCPConnection[^\n]*-ErrorAction SilentlyContinue/)
 })

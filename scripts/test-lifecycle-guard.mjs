@@ -18,12 +18,7 @@ export function assertLiveBatonUnchanged(before, after) {
 
 export async function snapshotLiveBaton() {
   if (process.platform !== 'win32') return { listenerPid: null, health: null, tasks: [] }
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    `$connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort ${LIVE_PORT} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1`,
-    `$tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -like 'Baton-*' -or $_.Description -like 'Baton CurrentUser worker lifecycle*' } | Sort-Object TaskPath, TaskName | ForEach-Object { [pscustomobject]@{ path=$_.TaskPath; name=$_.TaskName; xml=(Export-ScheduledTask -TaskPath $_.TaskPath -TaskName $_.TaskName) } })`,
-    `[pscustomobject]@{ listenerPid=if ($null -eq $connection) { $null } else { $connection.OwningProcess }; tasks=$tasks } | ConvertTo-Json -Compress -Depth 5`,
-  ].join('\n')
+  const script = liveSnapshotScript()
   const encoded = Buffer.from(script, 'utf16le').toString('base64')
   const { stdout } = await execFileAsync('powershell.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded,
@@ -42,4 +37,15 @@ export async function snapshotLiveBaton() {
     health = { status: response.status, ok: body?.ok === true }
   }
   return { listenerPid: snapshot.listenerPid ?? null, health, tasks }
+}
+
+export function liveSnapshotScript() {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$connections = @(Get-NetTCPConnection -ErrorAction Stop)`,
+    `$connection = $connections | Where-Object { $_.State -eq 'Listen' -and $_.LocalAddress -eq '127.0.0.1' -and $_.LocalPort -eq ${LIVE_PORT} } | Select-Object -First 1`,
+    `$tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -like 'Baton-*' -or $_.Description -like 'Baton CurrentUser worker lifecycle*' } | Sort-Object TaskPath, TaskName | ForEach-Object { [pscustomobject]@{ path=$_.TaskPath; name=$_.TaskName; xml=(Export-ScheduledTask -TaskPath $_.TaskPath -TaskName $_.TaskName) } })`,
+    `[pscustomobject]@{ listenerPid=if ($null -eq $connection) { $null } else { $connection.OwningProcess }; tasks=$tasks } | ConvertTo-Json -Compress -Depth 5`,
+  ].join('\n')
+  return script
 }

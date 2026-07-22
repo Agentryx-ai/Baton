@@ -60,6 +60,7 @@ async function main(): Promise<void> {
 
   if (command === 'autostart' || command === 'worker-runner') {
     if (command === 'worker-runner') {
+      process.env.BATON_PORT = String(taskActionPort(process.argv))
       const verified = await withLifecycleBootstrap(async (value) => {
         if (!value.stableEntry || !samePath(await realpath(process.execPath), await realpath(value.stableEntry))) {
           throw new Error('Worker launcher is not the active verified bootstrap artifact')
@@ -79,6 +80,15 @@ async function main(): Promise<void> {
   }
 
   console.log('Usage: baton-bootstrap integration status|remove [--target NAME] [--json]\n  baton-bootstrap doctor [--json]\n  baton-bootstrap autostart status|repair [--json]\n  baton-bootstrap recover-active --from-lkg [--json]')
+}
+
+function taskActionPort(argv: string[]): number {
+  const index = argv.indexOf('--port')
+  const value = index >= 0 ? Number(argv[index + 1]) : Number.NaN
+  if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+    throw new Error('Task action --port must be an integer between 1 and 65535')
+  }
+  return value
 }
 
 async function lifecycleDiagnostic() {

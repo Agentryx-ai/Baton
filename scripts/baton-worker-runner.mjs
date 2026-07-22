@@ -8,6 +8,14 @@ import {
 import { homedir } from 'node:os'
 import path from 'node:path'
 
+const portIndex = process.argv.indexOf('--port')
+if (portIndex >= 0) {
+  const port = Number(process.argv[portIndex + 1])
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error('Task action --port must be an integer between 1 and 65535')
+  }
+  process.env.BATON_PORT = String(port)
+}
 const rootIndex = process.argv.indexOf('--root')
 const root = path.resolve(rootIndex >= 0 ? process.argv[rootIndex + 1] : process.cwd())
 const stateRoot = process.env.BATON_RECOVERY_ROOT ?? path.join(process.env.LOCALAPPDATA ?? homedir(), 'Baton')
