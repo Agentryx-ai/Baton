@@ -455,6 +455,129 @@ test('Goal active-time abort releases a continuation blocked in context preparat
   assert.equal(resumed.goal?.status, 'active')
 })
 
+test('pausing preparation cannot create a stale Goal turn and the Goal can resume repeatedly', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-goal-pause-preparation-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const adapter = safeAdapter([])
+  const completeFirstExecution = adapter.execute.bind(adapter)
+  let executionCount = 0
+  adapter.execute = async (request, context): Promise<ProviderTurnExecution> => {
+    executionCount += 1
+    if (executionCount === 1) return completeFirstExecution(request, context)
+    const stopped = deferred<void>()
+    const stop = () => stopped.resolve()
+    context.signal.addEventListener('abort', stop, { once: true })
+    return {
+      events: emptyEvents(stopped.promise),
+      terminal: stopped.promise.then(() => ({ status: 'interrupted' as const })),
+      async cancel() { stop() },
+      async dispose() { context.signal.removeEventListener('abort', stop) },
+    }
+  }
+  registry.register(adapter)
+  const stalePreparation = deferred<null>()
+  let preparationCount = 0
+  const contextRuntime = {
+    assertUpcomingInputFits() {
+      return { additionalInputTokens: 0, inputBudgetTokens: 1 }
+    },
+    compactBeforeTurn() {
+      preparationCount += 1
+      return preparationCount === 2 ? stalePreparation.promise : Promise.resolve(null)
+    },
+    async materializeForExecution({ snapshot }: { snapshot: ThreadSnapshot }) {
+      return snapshot
+    },
+  }
+  const orchestrator = new TurnOrchestrator(
+    store,
+    registry,
+    new ConversationEventHub(),
+    100,
+    contextRuntime,
+  )
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  const session = orchestrator.createSession({})
+  await orchestrator.startGoalRuntime()
+  const goal = await orchestrator.createGoal({
+    threadId: session.activeThreadId,
+    expected: { kind: 'none' },
+    objective: 'resume after cancelling stale preparation',
+    provider: 'codex',
+    model: 'gpt-test',
+  })
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (store.getSnapshot(session.activeThreadId)?.turns[0]?.status === 'completed' && preparationCount >= 2) break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  assert.equal(store.getSnapshot(session.activeThreadId)?.turns[0]?.status, 'completed')
+  assert.equal(preparationCount, 2)
+
+  const firstPause = await Promise.race([
+    orchestrator.updateGoalStatus({
+      goalId: goal.id,
+      expectedRevision: store.getGoalById(goal.id)?.revision ?? 0,
+      status: 'paused',
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Goal pause timed out')), 250)),
+  ])
+  assert.equal(firstPause.status, 'applied')
+  assert.equal(store.getSnapshot(session.activeThreadId)?.turns.length, 1)
+
+  const firstResume = await orchestrator.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: firstPause.goal?.revision ?? 0,
+    status: 'active',
+  })
+  assert.equal(firstResume.status, 'applied')
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (store.getSnapshot(session.activeThreadId)?.turns[1]?.status === 'running') break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  const firstTurn = store.getSnapshot(session.activeThreadId)?.turns[1]
+  assert.equal(firstTurn?.status, 'running')
+  assert.equal(
+    firstTurn?.clientRequestId,
+    `goal-continuation:${goal.id}:r${firstResume.goal?.revision}:a${(firstResume.goal?.automaticTurnsUsed ?? -1) + 1}`,
+  )
+
+  const secondPause = await Promise.race([
+    orchestrator.updateGoalStatus({
+      goalId: goal.id,
+      expectedRevision: firstResume.goal?.revision ?? 0,
+      status: 'paused',
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Running Goal pause timed out')), 250)),
+  ])
+  assert.equal(secondPause.status, 'applied')
+  stalePreparation.resolve(null)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(store.getSnapshot(session.activeThreadId)?.turns.length, 2, 'aborted preparation must not create a stale turn')
+
+  const secondResume = await orchestrator.updateGoalStatus({
+    goalId: goal.id,
+    expectedRevision: secondPause.goal?.revision ?? 0,
+    status: 'active',
+  })
+  assert.equal(secondResume.status, 'applied')
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (store.getSnapshot(session.activeThreadId)?.turns[2]?.status === 'running') break
+    await new Promise((resolve) => setTimeout(resolve, 1))
+  }
+  const secondTurn = store.getSnapshot(session.activeThreadId)?.turns[2]
+  assert.equal(secondTurn?.status, 'running')
+  assert.equal(
+    secondTurn?.clientRequestId,
+    `goal-continuation:${goal.id}:r${secondResume.goal?.revision}:a${(secondResume.goal?.automaticTurnsUsed ?? -1) + 1}`,
+  )
+  assert.notEqual(secondTurn?.clientRequestId, firstTurn?.clientRequestId)
+})
+
 test('first send verifies workspace, creates the canonical graph once, and replays before rechecking cwd', async (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'baton-initial-session-'))
   const workspace = join(directory, 'workspace')
