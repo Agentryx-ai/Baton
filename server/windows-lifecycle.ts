@@ -94,12 +94,20 @@ export function createLifecyclePlan(options: {
   const runner = path.join(root, 'scripts', 'baton-worker-runner.mjs')
   const bootstrapExecutable = process.env.BATON_BOOTSTRAP_EXECUTABLE
   const useBootstrap = options.useBootstrap ?? (!options.executable && Boolean(bootstrapExecutable))
-  const executable = options.executable ?? bootstrapExecutable ?? process.execPath
+  const launchTarget = options.executable ?? bootstrapExecutable ?? process.execPath
   const workerExecutable = options.workerExecutable ?? process.env.BATON_WORKER_EXECUTABLE ?? process.execPath
   const port = lifecyclePort(options.port)
-  const argumentsValue = useBootstrap
+  const launchArguments = useBootstrap
     ? `worker-runner --root ${quoteArgument(root)} --port ${port}`
     : `${quoteArgument(runner)} --root ${quoteArgument(root)} --port ${port}`
+  // Task Scheduler shows a console window for interactively-launched console
+  // executables. Routing the launch through wscript (window style 0) keeps the
+  // supervisor invisible; the real target and its arguments ride behind the
+  // shuttle script and validation stays coherent because it derives from this
+  // same plan.
+  const hiddenLauncher = path.join(root, 'scripts', 'baton-hidden-launch.vbs')
+  const executable = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'wscript.exe')
+  const argumentsValue = `${quoteArgument(hiddenLauncher)} ${quoteArgument(launchTarget)} ${launchArguments}`
   return {
     taskName: options.taskName ?? process.env.BATON_TASK_NAME ?? `Baton-Worker-${hash}`,
     taskPath: '\\',

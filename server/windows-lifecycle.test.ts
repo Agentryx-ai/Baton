@@ -26,7 +26,10 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
     taskName: 'Baton-Test-Plan',
   })
   const script = registrationScript(plan)
-  assert.match(plan.arguments, /^"C:\\Path With Spaces\\Baton\\scripts\\baton-worker-runner\.mjs" --root "C:\\Path With Spaces\\Baton" --port 45123$/)
+  // The action launches through the hidden-window shuttle; the real runner and
+  // its arguments ride behind it.
+  assert.match(plan.executable, /\\wscript\.exe$/)
+  assert.match(plan.arguments, /^"C:\\Path With Spaces\\Baton\\scripts\\baton-hidden-launch\.vbs" "C:\\Program Files\\nodejs\\node\.exe" "C:\\Path With Spaces\\Baton\\scripts\\baton-worker-runner\.mjs" --root "C:\\Path With Spaces\\Baton" --port 45123$/)
   assert.match(script, /-LogonType Interactive -RunLevel Limited/)
   assert.match(script, /-AtLogOn -User 'DOMAIN\\alice'/)
   assert.match(script, /-RepetitionInterval \(New-TimeSpan -Minutes 1\)/)
@@ -76,9 +79,14 @@ test('standalone bootstrap becomes the task action without changing the Worker c
   process.env.BATON_WORKER_EXECUTABLE = 'C:\\Program Files\\nodejs\\node.exe'
   try {
     const plan = createLifecyclePlan({ root: 'C:\\Path With Spaces\\Baton', taskName: 'Baton-Test-Bootstrap', port: 45125 })
-    assert.equal(plan.executable, process.env.BATON_BOOTSTRAP_EXECUTABLE)
+    assert.match(plan.executable, /\\wscript\.exe$/)
     assert.equal(plan.workerExecutable, process.env.BATON_WORKER_EXECUTABLE)
-    assert.equal(plan.arguments, 'worker-runner --root "C:\\Path With Spaces\\Baton" --port 45125')
+    assert.equal(
+      plan.arguments,
+      '"C:\\Path With Spaces\\Baton\\scripts\\baton-hidden-launch.vbs" '
+      + `"${process.env.BATON_BOOTSTRAP_EXECUTABLE}" `
+      + 'worker-runner --root "C:\\Path With Spaces\\Baton" --port 45125',
+    )
     assert.equal(plan.root, 'C:\\Path With Spaces\\Baton')
   } finally {
     if (previousBootstrap === undefined) delete process.env.BATON_BOOTSTRAP_EXECUTABLE
@@ -184,7 +192,10 @@ test('start validates a running task and classifies the port owner before any no
   assert.match(script, /CommandLine/)
   assert.match(script, /expected-baton-worker/)
   assert.match(script, /ExecutablePath -eq 'C:\\Program Files\\nodejs\\node\.exe'/)
-  assert.match(script, /\$action\.Execute -eq 'C:\\Baton\\bootstrap\\baton-bootstrap\.exe'/)
+  // The action itself is the hidden-window shuttle; the bootstrap target rides
+  // inside the validated argument string.
+  assert.match(script, /\$action\.Execute -eq '[^']*\\wscript\.exe'/)
+  assert.match(script, /baton-bootstrap\.exe/)
   assert.doesNotMatch(script, /Stop-Process|taskkill/)
 })
 
