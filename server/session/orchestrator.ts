@@ -581,6 +581,10 @@ export class TurnOrchestrator implements ConversationService {
         })
       : null
     if (startSignal?.aborted) throw startSignal.reason ?? new Error('Goal continuation start was cancelled')
+    // Close imported (turnless) orphan tool calls before this turn's items are
+    // appended, so on a freshly imported session the synthetic results stay
+    // inside the leading turnless block and the transcript remains compactable.
+    this.store.repairOrphanImportedToolCalls(input.threadId)
     const result = this.store.beginTurn({
       threadId: input.threadId,
       provider: input.provider,
@@ -850,11 +854,6 @@ export class TurnOrchestrator implements ConversationService {
     }, remainingGoalMs)
     const executionSignal = executionController.signal
     try {
-      // Imported transcripts can carry tool calls whose results were never
-      // recorded; persist synthetic error results so the transcript closes
-      // durably (execution, compaction, and provider views stay consistent).
-      // Live-turn orphans are untouched: mutating ones must be reconciled.
-      this.store.repairOrphanImportedToolCalls(input.threadId)
       const persisted = this.store.getSnapshot(input.threadId)
       if (!persisted) throw new Error(`Thread disappeared after turn start: ${input.threadId}`)
       const materialized = this.contextRuntime
@@ -1780,21 +1779,25 @@ function adapterSnapshot(
 }
 
 /**
- * Turnless (imported) orphans are durably repaired before the snapshot is
- * taken, so anything still unresolved here belongs to a live turn whose
+ * Only unresolved calls belonging to a live turn block execution: their
  * outcome is unknown — most importantly a mutating tool call that must go
- * through user reconciliation rather than being silently re-run.
+ * through user reconciliation rather than being silently re-run. Turnless
+ * (imported) orphans are tolerated: their results can never arrive, they are
+ * durably repaired on the leaf thread, and appends can never reach into a
+ * fork's inherited parent slice — while providers drop tool items from
+ * portable history entirely, so nothing malformed is ever sent.
  */
 function assertNoUnresolvedToolCalls(snapshot: ThreadSnapshot): void {
-  const open = new Set<string>()
+  const open = new Map<string, ThreadSnapshot['items'][number]>()
   for (const item of snapshot.items) {
     const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
     if (!callId) continue
-    if (item.kind === 'tool_call') open.add(callId)
+    if (item.kind === 'tool_call') open.set(callId, item)
     if (item.kind === 'tool_result') open.delete(callId)
   }
-  if (open.size > 0) {
-    throw new Error(`Unresolved tool calls require reconciliation before continuing: ${[...open].join(', ')}`)
+  const liveOrphans = [...open.entries()].filter(([, item]) => item.turnId !== null)
+  if (liveOrphans.length > 0) {
+    throw new Error(`Unresolved tool calls require reconciliation before continuing: ${liveOrphans.map(([callId]) => callId).join(', ')}`)
   }
 }
 

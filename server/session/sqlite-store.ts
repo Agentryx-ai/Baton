@@ -4120,13 +4120,20 @@ export class SqliteSessionStore implements SessionStore {
    * recovery, and mutating ones must go through user reconciliation.
    */
   repairOrphanImportedToolCalls(threadId: ThreadId): number {
-    return this.#transaction('IMMEDIATE', () => {
+    return this.#transaction('IMMEDIATE', () => this.#repairOrphanImportedToolCallsInTxn(threadId))
+  }
+
+  #repairOrphanImportedToolCallsInTxn(threadId: ThreadId): number {
+    {
       const rows = this.#all(this.#db.prepare(`
         SELECT kind,payload_json,provider FROM items
         WHERE thread_id=? AND turn_id IS NULL AND kind IN ('tool_call','tool_result')
         ORDER BY sequence
       `), threadId)
-      const completed = new Set<string>()
+      // Order-aware, matching the executor's consistency scan exactly: a
+      // result closes a call only when it appears after it, and a repeated
+      // call record reopens the id. Anything this scan leaves open is what
+      // the executor would flag.
       const calls = new Map<string, {
         provider: CanonicalProvider | null
         toolName: string | null
@@ -4137,7 +4144,7 @@ export class SqliteSessionStore implements SessionStore {
         const callId = typeof payload.callId === 'string' ? payload.callId : null
         if (!callId) continue
         if (text(row, 'kind') === 'tool_result') {
-          completed.add(callId)
+          calls.delete(callId)
           continue
         }
         calls.set(callId, {
@@ -4146,7 +4153,7 @@ export class SqliteSessionStore implements SessionStore {
           providerCallId: typeof payload.providerCallId === 'string' ? payload.providerCallId : null,
         })
       }
-      const unresolved = [...calls].filter(([callId]) => !completed.has(callId))
+      const unresolved = [...calls]
       if (unresolved.length === 0) return 0
 
       const threadRow = this.#optional(this.#db.prepare('SELECT session_id FROM threads WHERE id=?'), threadId)
@@ -4191,7 +4198,7 @@ export class SqliteSessionStore implements SessionStore {
         orphanImportRecovery: true,
       }, now)
       return appended.length
-    })
+    }
   }
 
   #repairInterruptedReadOnlyToolCalls(turn: SqlRow, now: string): number {
@@ -4372,14 +4379,28 @@ export class SqliteSessionStore implements SessionStore {
       }
       if (existing) {
         const result = this.#appendNativeImport(existing, input)
+        this.#repairOrphanToolCallsForSession(result.sessionId)
         if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
         return result
       }
       if (input.previewedState) throw new Error('native source identity disappeared after preview')
       const result = this.#createNativeImport(input)
+      this.#repairOrphanToolCallsForSession(result.sessionId)
       if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
       return result
     })
+  }
+
+  /**
+   * Close imported orphans at import time: on a fresh import every item is
+   * still turnless, so the synthetic results land inside the leading turnless
+   * block and the transcript stays compactable from the start.
+   */
+  #repairOrphanToolCallsForSession(sessionId: string | undefined): void {
+    if (!sessionId) return
+    const row = this.#optional(this.#db.prepare('SELECT active_thread_id FROM sessions WHERE id=?'), sessionId)
+    if (!row) return
+    this.#repairOrphanImportedToolCallsInTxn(text(row, 'active_thread_id') as ThreadId)
   }
 
   #createNativeImport(

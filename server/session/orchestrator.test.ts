@@ -2066,6 +2066,18 @@ test('an imported orphan tool call is durably repaired and the conversation resu
   assert.ok(imported.sessionId)
   const threadId = store.getSession(imported.sessionId as string)!.activeThreadId
 
+  // Import-time repair: the synthetic result is persisted while every item is
+  // still turnless, so it lands inside the leading turnless block and the
+  // transcript stays compactable from the start.
+  const items = store.listItems(threadId)
+  const synthetic = items.find((item) => item.kind === 'tool_result'
+    && item.payload.callId === 'toolu_import_orphan')
+  assert.ok(synthetic, 'synthetic tool_result must be persisted at import time')
+  assert.equal(synthetic?.payload.synthetic, true)
+  assert.equal(synthetic?.turnId, null)
+  assert.match(JSON.stringify(synthetic?.payload.result ?? {}), /tool_result_missing/)
+  assert.ok(items.every((item) => item.turnId === null), 'repair happened before any turn')
+
   // Previously this threw "Provider switch blocked by unresolved tool calls".
   const turn = await orchestrator.startTurn({
     threadId,
@@ -2077,15 +2089,92 @@ test('an imported orphan tool call is durably repaired and the conversation resu
   })
   await waitForTerminal(store, turn.turn.id)
   assert.equal(store.getTurn(turn.turn.id)?.status, 'completed')
-
-  // The repair is durable: a persisted synthetic result closes the orphan.
-  const items = store.listItems(threadId)
-  const synthetic = items.find((item) => item.kind === 'tool_result'
-    && item.payload.callId === 'toolu_import_orphan')
-  assert.ok(synthetic, 'synthetic tool_result must be persisted')
-  assert.equal(synthetic?.payload.synthetic, true)
-  assert.equal(synthetic?.turnId, null)
-  assert.match(JSON.stringify(synthetic?.payload.result ?? {}), /tool_result_missing/)
   // Idempotent: a second repair pass appends nothing.
   assert.equal(store.repairOrphanImportedToolCalls(threadId), 0)
+
+  // A fork anchored before the synthetic result inherits the orphan call
+  // without its repair — appends can never reach the parent slice, so the
+  // executor tolerates turnless orphans instead of bricking the fork.
+  const orphanCall = items.find((item) => item.kind === 'tool_call')!
+  const fork = store.forkThread({ threadId, forkItemId: orphanCall.id })
+  const forkTurn = await orchestrator.startTurn({
+    threadId: fork.id,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'request-fork',
+    expectedRevision: store.getThread(fork.id)!.revision,
+    input: [{ kind: 'user_message', payload: { text: 'continue the fork' } }],
+  })
+  await waitForTerminal(store, forkTurn.turn.id)
+  assert.equal(store.getTurn(forkTurn.turn.id)?.status, 'completed')
+})
+
+test('duplicated imported call records are closed by the order-aware repair', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-dup-orphan-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  registry.register(safeAdapter([]))
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+  const record = (ordinal: number, item: { kind: string; payload: Record<string, unknown> }) => ({
+    key: `record-${ordinal}`,
+    ordinal,
+    digest: `digest-${ordinal}`,
+    prefixDigest: `prefix-${ordinal}`,
+    item,
+    createdAt: '2026-07-18T00:00:00.000Z',
+  })
+  const imported = store.commitNativeImport({
+    candidate: {
+      candidateId: 'candidate-dup',
+      sourceClient: 'claude_desktop',
+      provider: 'claude',
+      namespaceKey: 'native-test',
+      nativeSessionId: 'native-dup-1',
+      identityKeys: [],
+      sourceAlias: 'Duplicated call records',
+      aliasSource: 'native',
+      titleSource: 'metadata:user',
+      projectAlias: null,
+      projectGroupKey: null,
+      cwd: null,
+      createdAt: '2026-07-18T00:00:00.000Z',
+      updatedAt: '2026-07-18T00:00:00.000Z',
+      nativeOrigin: 'ide_app',
+      nativeArchived: false,
+      sourceHead: { size: 3, mtimeMs: 3, finalRecordDigest: 'digest-3' },
+      contentDigest: 'content-dup',
+      prefixDigest: 'prefix-3',
+      portableItemCount: 3,
+      records: [
+        record(1, { kind: 'tool_call', payload: { callId: 'toolu_dup', name: 'Read', input: {} } }),
+        record(2, { kind: 'tool_result', payload: { callId: 'toolu_dup', isError: false } }),
+        // A crash-resume replay repeats the call: order-aware scan reopens it.
+        record(3, { kind: 'tool_call', payload: { callId: 'toolu_dup', name: 'Read', input: {} } }),
+      ],
+      skippedItemCount: 0,
+      parserVersion: 'test/1',
+      warnings: [],
+      materialized: true,
+    } as NativeSessionCandidate,
+    previewedState: null,
+  })
+  assert.equal(imported.status, 'imported')
+  const threadId = store.getSession(imported.sessionId as string)!.activeThreadId
+  const results = store.listItems(threadId).filter((item) => item.kind === 'tool_result')
+  assert.equal(results.length, 2, 'the reopened call gets its own synthetic result')
+
+  const turn = await orchestrator.startTurn({
+    threadId,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'request-dup',
+    expectedRevision: store.getThread(threadId)!.revision,
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  })
+  await waitForTerminal(store, turn.turn.id)
+  assert.equal(store.getTurn(turn.turn.id)?.status, 'completed')
 })
