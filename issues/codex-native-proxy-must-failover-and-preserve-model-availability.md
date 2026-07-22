@@ -4,6 +4,7 @@
 
 - 상태: **부분 해결**
 - 발견일: 2026-07-20
+- 우선순위: P1
 - 현재 조치: (1) 소진 계정 수동 pause(임시 fail-safe)로 서비스 복구, (2) merozemory **재로그인**으로 Pro 토큰 재발급 → `gpt-5.6-sol` 카탈로그 복귀·200 서빙 확인
 - 미해결 핵심: 구현·합성 회귀는 완료했으며, **실제 OAuth 계정에서 재로그인 없는 free→pro canary**가 남음
 - 근본 해결: Baton Codex Native Proxy, OAuth/vault, live claim/catalog, model-aware same-request router 구현 완료. 실제 계정 gate 진행 전

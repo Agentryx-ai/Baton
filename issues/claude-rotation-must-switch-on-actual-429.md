@@ -7,6 +7,7 @@
 - live 검증 대기: 실제 429 same-request failover와 reset 복귀
 - 403 durable 상태 계약 대기
 - 발견일: 2026-07-19
+- 우선순위: P1
 
 ## 요약
 

@@ -4,6 +4,7 @@
 
 - 상태: **부분 해결**
 - 발견일: 2026-07-21
+- 우선순위: P0
 - 신규 OAuth의 profile email/stable account ID 저장과 기존 계정 backfill 도구는 `ef68dd5`에서 구현
 - refresh 실패 원인 확증, vault 중복 병합과 live quota 검증은 미완료
 
