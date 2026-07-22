@@ -307,14 +307,22 @@ export class SqliteSessionStore implements SessionStore {
     })
     this.#db.exec(`
       PRAGMA journal_mode = WAL;
-      PRAGMA synchronous = FULL;
+      PRAGMA synchronous = NORMAL;
       PRAGMA foreign_keys = ON;
       PRAGMA trusted_schema = OFF;
       PRAGMA busy_timeout = 5000;
     `)
+    // WAL + NORMAL keeps the database consistent across crashes and power loss
+    // (at most the last commits roll back). FULL forced an fsync per commit,
+    // which on a gigabyte-scale store held write locks long enough to starve
+    // every reader for the full busy_timeout.
     try {
       this.#migrate()
       this.#nativeIdentityKey = this.#loadNativeIdentityKey()
+      // Collapse any WAL accumulated by earlier runs (observed at 178 MB after
+      // checkpoint starvation): a huge WAL slows every read and makes later
+      // checkpoints stall for seconds.
+      this.checkpointWal()
     } catch (error) {
       try {
         this.#db.close()
@@ -4545,6 +4553,20 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   #nativeHmac(value: string): string { return createHmac('sha256', this.#nativeIdentityKey).update(value).digest('hex') }
+
+  /**
+   * Checkpoint and truncate the WAL so it cannot grow without bound (long
+   * external readers previously starved auto-checkpointing until the WAL hit
+   * hundreds of megabytes). Best-effort: with concurrent readers SQLite
+   * checkpoints as far as it can and reports busy instead of throwing.
+   */
+  checkpointWal(): void {
+    try {
+      this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE);')
+    } catch {
+      // A locked database is not fatal here; the next interval retries.
+    }
+  }
 
   close(): void {
     this.#db.close()

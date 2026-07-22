@@ -87,6 +87,7 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
     },
   })
   let retentionTimer: ReturnType<typeof setInterval> | null = null
+  let checkpointTimer: ReturnType<typeof setInterval> | null = null
 
   const sweepTrash = (): void => {
     try {
@@ -110,12 +111,19 @@ export function createConversationRuntime(options: ConversationRuntimeOptions): 
         retentionTimer = setInterval(sweepTrash, SESSION_RETENTION_INTERVAL_MS)
         retentionTimer.unref()
       }
+      if (!checkpointTimer) {
+        // Keep the WAL small so reads stay fast and checkpoints stay cheap.
+        checkpointTimer = setInterval(() => store.checkpointWal(), 5 * 60_000)
+        checkpointTimer.unref()
+      }
       return recovered
     },
     closeStreams: () => router.closeStreams(),
     close: () => {
       if (retentionTimer) clearInterval(retentionTimer)
       retentionTimer = null
+      if (checkpointTimer) clearInterval(checkpointTimer)
+      checkpointTimer = null
       return service.close()
     },
   }
