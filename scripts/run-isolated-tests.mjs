@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-import { isolatedEnvironment } from './isolated-test-environment.mjs'
+import { DEFAULT_ISOLATED_TEST_PATTERNS, isolatedEnvironment } from './isolated-test-environment.mjs'
 import { assertLiveBatonUnchanged, snapshotLiveBaton } from './test-lifecycle-guard.mjs'
 import { reserveTemporaryPort } from './temporary-port-reservation.mjs'
 
@@ -22,7 +22,7 @@ try {
   const port = portReservation.port
   const env = isolatedEnvironment(fixture, port)
   const patterns = process.argv.slice(2)
-  const tests = patterns.length > 0 ? patterns : ['server/**/*.test.ts']
+  const tests = patterns.length > 0 ? patterns : DEFAULT_ISOLATED_TEST_PATTERNS
   console.log(`Isolated tests: port ${port}, task ${env.BATON_TASK_NAME}`)
   exitCode = await run(process.execPath, [
     path.join(root, 'node_modules', 'tsx', 'dist', 'cli.mjs'),

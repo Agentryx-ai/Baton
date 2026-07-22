@@ -1,9 +1,17 @@
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 
+export const DEFAULT_ISOLATED_TEST_PATTERNS = [
+  'server/**/*.test.ts',
+  'scripts/**/*.test.mjs',
+]
+
 export function isolatedEnvironment(directory, port, source = process.env) {
   const env = Object.fromEntries(
-    Object.entries(source).filter(([key]) => !key.toUpperCase().startsWith('BATON_')),
+    Object.entries(source).filter(([key]) => {
+      const name = key.toUpperCase()
+      return !name.startsWith('BATON_') && name !== 'CODEX_HOME'
+    }),
   )
   const home = path.join(directory, 'home')
   const localAppData = path.join(directory, 'local-app-data')
@@ -16,6 +24,7 @@ export function isolatedEnvironment(directory, port, source = process.env) {
     LOCALAPPDATA: localAppData,
     APPDATA: path.join(directory, 'app-data'),
     XDG_CONFIG_HOME: path.join(directory, 'xdg-config'),
+    CODEX_HOME: path.join(home, '.codex'),
     BATON_DISABLE_ENV_FILE: '1',
     BATON_DATA_DIR: path.join(directory, 'data'),
     BATON_PORT: String(port),
