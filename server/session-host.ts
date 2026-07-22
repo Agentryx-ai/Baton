@@ -215,7 +215,9 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
     })
     spawned.on('error', (error) => {
       lastError = error.message
-      console.error(`[baton] session host worker error: ${error.message}`)
+      // Full stack: a supervisor that logs only the message turns every worker
+      // failure into an unattributable one-liner.
+      console.error(`[baton] session host worker error: ${error.stack ?? error.message}`)
     })
     spawned.once('exit', (code) => {
       if (worker === spawned) worker = null
