@@ -32,8 +32,13 @@ export async function classifyPortConflict(
       signal: controller.signal,
     })
     if (!response.ok) return 'foreign'
-    const body = await response.json() as { ok?: unknown }
-    return body?.ok === true ? 'yield' : 'foreign'
+    const body = await response.json() as { ok?: unknown; sessionHost?: unknown }
+    // Require a Baton-specific field, not merely ok:true: an unrelated local
+    // server answering /baton/health with {ok:true} would otherwise make the
+    // real Baton stand down and never start.
+    return body?.ok === true && typeof body?.sessionHost === 'object' && body.sessionHost !== null
+      ? 'yield'
+      : 'foreign'
   } catch {
     return 'foreign'
   } finally {

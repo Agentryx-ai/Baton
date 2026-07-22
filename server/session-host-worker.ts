@@ -55,10 +55,14 @@ server.listen(0, '127.0.0.1', () => {
   if (!address || typeof address !== 'object') {
     port.postMessage({ type: 'fatal', message: 'session-host worker bound no address' })
     process.exit(1)
+    return
   }
-  port.postMessage({ type: 'listening', port: address.port, token })
   try {
     const recovered = runtime.start()
+    // Announce readiness only AFTER recovery succeeds. The parent flips to
+    // 'ready' and flushes parked requests on 'listening', so posting it before
+    // start() could funnel requests into a worker that then throws and exits.
+    port.postMessage({ type: 'listening', port: address.port, token })
     port.postMessage({ type: 'started', recovered })
   } catch (error) {
     port.postMessage({

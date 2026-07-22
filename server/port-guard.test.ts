@@ -23,9 +23,18 @@ test('yields to a healthy Baton incumbent on /baton/health', async () => {
   await withServer((url, res) => {
     assert.equal(url, '/baton/health')
     res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({ ok: true }))
+    res.end(JSON.stringify({ ok: true, sessionHost: { state: 'ready' } }))
   }, async (port) => {
     assert.equal(await classifyPortConflict(port), 'yield')
+  })
+})
+
+test('treats an impostor returning bare {ok:true} without a Baton marker as foreign', async () => {
+  await withServer((_url, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true }))
+  }, async (port) => {
+    assert.equal(await classifyPortConflict(port), 'foreign')
   })
 })
 

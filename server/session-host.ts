@@ -19,11 +19,13 @@ const RESTART_DELAYS_MS = [250, 1_000, 5_000, 15_000, 30_000]
 const HEALTHY_RESET_MS = 60_000
 /**
  * How long a request may wait for the worker to become ready before failing.
- * Covers the boot window and the restart-backoff ladder; browsers treat an SSE
- * HTTP error as a permanent connection failure (no automatic retry), so
- * holding the request until the worker is back preserves live streams.
+ * Must exceed the top restart-backoff rung (RESTART_DELAYS_MS max, 30s) plus a
+ * boot margin, or a request parked at the start of an elevated-backoff window
+ * 503s before the worker is even respawned; browsers treat an SSE HTTP error as
+ * a permanent connection failure (no automatic retry), so holding the request
+ * until the worker is back preserves live streams.
  */
-const READY_WAIT_MS = 20_000
+const READY_WAIT_MS = 40_000
 // A fresh connection per hop: reusing pooled keep-alive sockets races the
 // worker server's idle timeout and surfaces spurious ECONNRESET 502s.
 const hopAgent = new Agent({ keepAlive: false })
@@ -147,6 +149,11 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
   // back to ready — that would flush requests into a dying worker and make the
   // exit handler respawn a zombie nothing will ever stop.
   let closed = false
+  // Worker mode spawns lazily on start() (called from the server.listen success
+  // callback), not at construction: a duplicate process that loses the :4400
+  // race and stands down must never open the shared SQLite DB or run
+  // destructive interrupted-turn recovery against the healthy incumbent.
+  let started = false
   let respawnTimer: ReturnType<typeof setTimeout> | null = null
   const closeResolvers: (() => void)[] = []
 
@@ -187,10 +194,30 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
     if (closed) return
     state = 'starting'
     target = null
-    const spawned = new Worker(workerUrl, {
-      workerData: { dataDir: options.dataDir },
-      env: { ...process.env, BATON_DATA_DIR: options.dataDir },
-    })
+    let spawned: Worker
+    try {
+      spawned = new Worker(workerUrl, {
+        workerData: { dataDir: options.dataDir },
+        env: { ...process.env, BATON_DATA_DIR: options.dataDir },
+      })
+    } catch (error) {
+      // `new Worker()` throws synchronously (ERR_WORKER_INIT_FAILED) when a
+      // thread/isolate cannot be allocated under memory/handle pressure. This
+      // runs from the respawn setTimeout, so an uncaught throw would escape the
+      // timer and crash the main :4400 process (inference proxies included).
+      // Treat it as a failed attempt and back off, exactly like an early exit —
+      // no exit event fires here, so self-reschedule.
+      worker = null
+      state = 'down'
+      lastError = error instanceof Error ? error.message : String(error)
+      const delay = RESTART_DELAYS_MS[Math.min(attempt, RESTART_DELAYS_MS.length - 1)]
+      attempt += 1
+      restarts += 1
+      console.error(`[baton] session host worker failed to spawn: ${lastError}; retrying in ${delay}ms`)
+      respawnTimer = setTimeout(spawn, delay)
+      respawnTimer.unref()
+      return
+    }
     worker = spawned
     startedAt = Date.now()
     spawned.on('message', (message: unknown) => {
@@ -240,8 +267,6 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
     })
   }
 
-  spawn()
-
   return {
     middleware: (req, res) => {
       if (state === 'ready' && target) {
@@ -276,7 +301,16 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
       ...(state === 'ready' && target ? { port: target.port } : {}),
       ...(lastError ? { lastError } : {}),
     }),
-    start: () => null,
+    start: () => {
+      // Spawn the worker only now that this process has won :4400 (start() is
+      // called from the server.listen success callback). A yielding/foreign
+      // duplicate never reaches this, so it never opens the shared DB.
+      if (!started && !closed) {
+        started = true
+        spawn()
+      }
+      return null
+    },
     closeStreams: () => {
       // Mirror the old inline semantics: end worker-held SSE streams now so
       // the main server's connection drain is not stuck behind them — and

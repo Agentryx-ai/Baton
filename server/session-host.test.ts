@@ -140,6 +140,7 @@ test('worker session host serves the real runtime and refuses tokenless direct a
   const front = createServer()
   try {
     host = createWorkerSessionHost({ dataDir })
+    host.start()
     const app = express()
     app.use('/baton/v1', host.middleware)
     front.on('request', app)
@@ -189,6 +190,7 @@ test('close during the worker boot window resolves and never respawns', async ()
   const dataDir = await mkdtemp(path.join(tmpdir(), 'baton-session-host-close-'))
   try {
     const host = createWorkerSessionHost({ dataDir })
+    host.start()
     // The worker is still booting (tsx register + runtime import + DB open):
     // close() must settle, not wait on a listening message that will be
     // ignored, and the graceful worker exit must not take the restart branch.
@@ -227,6 +229,7 @@ parentPort.on('message', (m) => { if (m?.type === 'shutdown') process.exit(0) })
 `, 'utf8')
 
   const host = createWorkerSessionHost({ dataDir, workerUrl: pathToFileURL(fixture) })
+  host.start()
   const app = express()
   app.use('/baton/v1', host.middleware)
   const front = createServer(app)

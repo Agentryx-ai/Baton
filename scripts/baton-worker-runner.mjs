@@ -41,10 +41,17 @@ if (process.platform === 'win32') {
   // access — including the owner — so the log open fails with EPERM and the whole
   // worker crashes. Grant the directory inheritable full control (new logs then
   // inherit access), then heal any existing files with a concrete, flag-free ACE.
-  execFileSync('icacls.exe', [lifecycleDir, '/inheritance:r', '/grant:r', `${account}:(OI)(CI)F`], {
-    windowsHide: true,
-    stdio: 'ignore',
-  })
+  // Best-effort, like the per-file loop below: an icacls hiccup (AV/EDR handle,
+  // redirected/network path, transient sharing violation) must not throw out of
+  // module load and crash the supervisor before it can open its logs or spawn a
+  // worker — that would be an invisible 1/min crash-respawn loop. A freshly
+  // mkdir'd %LOCALAPPDATA% dir already grants the owner access via inheritance.
+  try {
+    execFileSync('icacls.exe', [lifecycleDir, '/inheritance:r', '/grant:r', `${account}:(OI)(CI)F`], {
+      windowsHide: true,
+      stdio: 'ignore',
+    })
+  } catch { /* fall back to the inherited owner ACL */ }
   for (const entry of readdirSync(lifecycleDir)) {
     // Best-effort: a single icacls hiccup on one file must not crash the
     // supervisor and block startup.
@@ -157,6 +164,15 @@ const restartCount = Math.max(0, Math.min(3, Number(process.env.BATON_WORKER_RES
 const restartIntervalMs = process.env.NODE_ENV === 'test'
   ? Math.max(0, Number(process.env.BATON_WORKER_RESTART_INTERVAL_MS ?? 60_000))
   : 60_000
+// Liveness watchdog thresholds: a worker that binds the port then wedges its
+// event loop never emits exit/error, so nothing would free the port. After a
+// boot grace, poll its health endpoint; only a total non-response (event loop
+// wedged) counts — an ok:false body still proves the loop is alive.
+const workerPort = Number(process.env.BATON_PORT) || 4400
+const HEALTH_PROBE_GRACE_MS = 15_000
+const HEALTH_PROBE_INTERVAL_MS = 15_000
+const HEALTH_PROBE_TIMEOUT_MS = 2_000
+const HEALTH_PROBE_FAILURES_BEFORE_KILL = 3
 let activeChild
 let stopRequested = false
 let wakeDelay
@@ -202,13 +218,49 @@ async function runWorker(attempt) {
   const flushStdout = lineSink(child.stdout, onLogFailure)
   const flushStderr = lineSink(child.stderr, onLogFailure)
   try { record({ event: 'worker-started', attempt, pid: child.pid ?? null }) } catch (error) { onLogFailure(error) }
-  const outcome = await Promise.race([childOutcome, logFailure])
-  if (outcome.event === 'runner-log-failed') {
-    terminateOwnedChild()
+
+  // A wedged-but-alive worker (bound the port, then its event loop hung — the
+  // incident's "zombie") emits neither exit nor error, so childOutcome would
+  // hang forever and the port would never be released. Poll the worker's health
+  // endpoint; count ONLY total non-responses (connection refused / timeout =
+  // event loop wedged), never an ok:false body (that proves the loop is alive
+  // and is the session host's own concern). After N consecutive misses, kill
+  // the child so the normal restart loop rebinds the port.
+  let healthFailures = 0
+  let probeInFlight = false
+  const bootAt = Date.now()
+  const watchdog = process.env.NODE_ENV === 'test' ? null : setInterval(() => {
+    if (stopRequested || probeInFlight || child.exitCode !== null) return
+    if (Date.now() - bootAt < HEALTH_PROBE_GRACE_MS) return
+    probeInFlight = true
+    const controller = new AbortController()
+    const abortTimer = setTimeout(() => controller.abort(), HEALTH_PROBE_TIMEOUT_MS)
+    fetch(`http://127.0.0.1:${workerPort}/baton/health`, { signal: controller.signal })
+      .then(() => { healthFailures = 0 })
+      .catch(() => {
+        healthFailures += 1
+        if (healthFailures >= HEALTH_PROBE_FAILURES_BEFORE_KILL && child.exitCode === null && !stopRequested) {
+          healthFailures = 0
+          try { record({ event: 'worker-health-timeout', attempt, pid: child.pid ?? null }) } catch { /* diagnostic only */ }
+          terminateOwnedChild()
+        }
+      })
+      .finally(() => { clearTimeout(abortTimer); probeInFlight = false })
+  }, HEALTH_PROBE_INTERVAL_MS)
+  watchdog?.unref()
+
+  let outcome
+  try {
+    outcome = await Promise.race([childOutcome, logFailure])
+    if (outcome.event === 'runner-log-failed') {
+      terminateOwnedChild()
+      await childClosed
+      throw outcome.error
+    }
     await childClosed
-    throw outcome.error
+  } finally {
+    if (watchdog) clearInterval(watchdog)
   }
-  await childClosed
   flushStdout()
   flushStderr()
   record({ event: outcome.event, attempt, code: outcome.code, signal: outcome.signal ?? null, reason: outcome.reason })
