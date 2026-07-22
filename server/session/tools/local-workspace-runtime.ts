@@ -951,20 +951,27 @@ function resolveCodexRuntime(): CodexRuntime {
   const appDataNpm = process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : null
   const roots = [...new Set([...pathDirectories, ...(appDataNpm ? [appDataNpm] : [])])]
   for (const root of roots) {
-    const direct = path.join(root, 'codex.exe')
-    if (existsSync(direct)) {
-      return { executable: direct, pathEntries: codexRuntimePathEntries(direct) }
-    }
     const packageRoot = path.join(
       root, 'node_modules', '@openai', 'codex', 'node_modules', '@openai', architecture.packageName,
       'vendor', architecture.triple,
     )
     const packaged = path.join(packageRoot, 'bin', 'codex.exe')
+    const pathDirectory = path.join(packageRoot, 'codex-path')
+    const packagedPathEntries = existsSync(packaged) && existsSync(path.join(pathDirectory, 'rg.exe'))
+      ? [pathDirectory]
+      : []
+    const direct = path.join(root, 'codex.exe')
+    if (existsSync(direct)) {
+      const directPathEntries = codexRuntimePathEntries(direct)
+      return {
+        executable: direct,
+        pathEntries: directPathEntries.length > 0 ? directPathEntries : packagedPathEntries,
+      }
+    }
     if (existsSync(packaged)) {
-      const pathDirectory = path.join(packageRoot, 'codex-path')
       return {
         executable: packaged,
-        pathEntries: existsSync(path.join(pathDirectory, 'rg.exe')) ? [pathDirectory] : [],
+        pathEntries: packagedPathEntries,
       }
     }
   }

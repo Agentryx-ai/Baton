@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { copyFile, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test, { type TestContext } from 'node:test'
@@ -331,6 +331,65 @@ test('full-access runner injects runtime PATH and strips Baton-owned secrets', a
   }
 })
 
+test('default full-access runner resolves packaged codex-path for bare rg on Windows', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('Windows Codex package layout regression')
+    return
+  }
+  const cwd = await workspace(t)
+  const npmRoot = await packagedCodexRuntime(t, cwd)
+  const previousPath = process.env.PATH
+  const previousAppData = process.env.APPDATA
+  process.env.PATH = npmRoot
+  delete process.env.APPDATA
+  t.after(() => {
+    if (previousPath === undefined) delete process.env.PATH
+    else process.env.PATH = previousPath
+    if (previousAppData === undefined) delete process.env.APPDATA
+    else process.env.APPDATA = previousAppData
+  })
+
+  const stdout: Buffer[] = []
+  const result = await new FullAccessCommandRunner().run({
+    argv: ['rg', '--version'],
+    cwd,
+    signal: new AbortController().signal,
+    onStdout: (chunk) => stdout.push(Buffer.from(chunk)),
+    onStderr: () => undefined,
+  })
+  assert.equal(result.exitCode, 0)
+  assert.match(Buffer.concat(stdout).toString('utf8'), /^v\d+/u)
+})
+
+test('direct codex.exe does not mask packaged codex-path for full-access commands on Windows', async (t) => {
+  if (process.platform !== 'win32') {
+    t.skip('Windows Codex package layout regression')
+    return
+  }
+  const cwd = await workspace(t)
+  const npmRoot = await packagedCodexRuntime(t, cwd)
+  await writeFile(path.join(npmRoot, 'codex.exe'), 'direct executable fixture')
+  const previousPath = process.env.PATH
+  const previousAppData = process.env.APPDATA
+  process.env.PATH = npmRoot
+  delete process.env.APPDATA
+  t.after(() => {
+    if (previousPath === undefined) delete process.env.PATH
+    else process.env.PATH = previousPath
+    if (previousAppData === undefined) delete process.env.APPDATA
+    else process.env.APPDATA = previousAppData
+  })
+
+  const result = await new FullAccessCommandRunner().run({
+    argv: ['rg', '--version'],
+    cwd,
+    signal: new AbortController().signal,
+    onStdout: () => undefined,
+    onStderr: () => undefined,
+  })
+  assert.equal(result.exitCode, 0)
+})
+
 test('run_command reports a missing executable as command_not_found', async (t) => {
   const cwd = await workspace(t)
   const runtime = new HostCommandToolRuntime({ cwd, commandRunner: new FullAccessCommandRunner([]) })
@@ -341,6 +400,23 @@ test('run_command reports a missing executable as command_not_found', async (t) 
   assert.equal(result.error?.message, `Command executable was not found: ${missing}`)
   assert.equal(result.error?.retryable, false)
 })
+
+async function packagedCodexRuntime(t: TestContext, cwd: string): Promise<string> {
+  const npmRoot = path.join(cwd, 'npm')
+  const architecture = process.arch === 'arm64'
+    ? { packageName: 'codex-win32-arm64', triple: 'aarch64-pc-windows-msvc' }
+    : { packageName: 'codex-win32-x64', triple: 'x86_64-pc-windows-msvc' }
+  const packageRoot = path.join(
+    npmRoot, 'node_modules', '@openai', 'codex', 'node_modules', '@openai', architecture.packageName,
+    'vendor', architecture.triple,
+  )
+  await mkdir(path.join(packageRoot, 'bin'), { recursive: true })
+  await mkdir(path.join(packageRoot, 'codex-path'))
+  await writeFile(path.join(packageRoot, 'bin', 'codex.exe'), 'packaged executable fixture')
+  await copyFile(process.execPath, path.join(packageRoot, 'codex-path', 'rg.exe'))
+  t.after(() => rm(npmRoot, { recursive: true, force: true }))
+  return npmRoot
+}
 
 test('list_files and search_text return deterministic workspace-relative results', async (t) => {
   const cwd = await workspace(t)
