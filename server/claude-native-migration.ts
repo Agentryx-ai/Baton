@@ -28,6 +28,7 @@ export async function migrateLegacyClaudeAccount(input: {
   legacy: LegacyClaudeCredential
   priority: number
 }): Promise<LegacyClaudeMigrationResult> {
+  return input.vault.withExclusiveMutation(async () => {
   const alias = required(input.legacy.email, 'email').trim().toLowerCase()
   const enabled = !input.sourcePath.includes('/auth-paused/') && input.legacy.disabled !== true
   const refreshToken = required(input.legacy.refresh_token, 'refresh_token')
@@ -93,6 +94,7 @@ export async function migrateLegacyClaudeAccount(input: {
     },
   })
   return { alias, status: 'imported', enabled }
+  })
 }
 
 export function legacyClaudeStableIdentity(legacy: LegacyClaudeCredential): string | undefined {

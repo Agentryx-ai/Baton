@@ -1,7 +1,8 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { constants } from 'node:fs'
-import { chmod, copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, readFile, rename, rmdir, writeFile } from 'node:fs/promises'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import path from 'node:path'
 
 export interface ClaudeNativeAccountSecret {
@@ -62,9 +63,16 @@ export interface ClaudeStableIdentityDuplicate {
   accountIds: string[]
 }
 
+export interface ClaudeRefreshCredentialDuplicate {
+  refreshFingerprint: string
+  accountIds: string[]
+  identitylessAccountIds: string[]
+}
+
 export interface ClaudeStableIdentityRepairResult {
   applied: boolean
   duplicates: ClaudeStableIdentityDuplicate[]
+  refreshCredentialDuplicates: ClaudeRefreshCredentialDuplicate[]
   removedAccountIds: string[]
   backupPath: string | null
 }
@@ -87,6 +95,7 @@ export class ClaudeNativeAccountVault {
   private readonly protector: ClaudeNativeSecretProtector
   private readonly now: () => number
   private readonly createId: () => string
+  private readonly mutationContext = new AsyncLocalStorage<boolean>()
   private pendingMutation: Promise<void> = Promise.resolve()
 
   constructor(options: ClaudeNativeAccountVaultOptions) {
@@ -166,12 +175,9 @@ export class ClaudeNativeAccountVault {
   async repairStableIdentityDuplicates(input: {
     apply?: boolean
     keepByAccountId?: Record<string, string>
+    keepByRefreshFingerprint?: Record<string, string>
   } = {}): Promise<ClaudeStableIdentityRepairResult> {
-    const previous = this.pendingMutation
-    let release!: () => void
-    this.pendingMutation = new Promise<void>((resolve) => { release = resolve })
-    await previous
-    try {
+    return this.withExclusiveMutation(async () => {
       const file = await this.read()
       const grouped = new Map<string, StoredAccount[]>()
       for (const account of file.accounts) {
@@ -184,29 +190,60 @@ export class ClaudeNativeAccountVault {
         .filter(([, accounts]) => accounts.length > 1)
         .map(([accountId, accounts]) => ({ accountId, accountIds: accounts.map((account) => account.id) }))
         .sort((left, right) => left.accountId.localeCompare(right.accountId))
+      const refreshGrouped = new Map<string, StoredAccount[]>()
+      for (const account of file.accounts) {
+        const fingerprint = credentialFingerprint((await this.openSecret(account)).refreshToken)
+        const group = refreshGrouped.get(fingerprint) ?? []
+        group.push(account)
+        refreshGrouped.set(fingerprint, group)
+      }
+      const refreshCredentialDuplicates = [...refreshGrouped.entries()]
+        .filter(([, accounts]) => accounts.length > 1 && accounts.some((account) => !account.accountId))
+        .map(([refreshFingerprint, accounts]) => ({
+          refreshFingerprint,
+          accountIds: accounts.map((account) => account.id),
+          identitylessAccountIds: accounts.filter((account) => !account.accountId).map((account) => account.id),
+        }))
+        .sort((left, right) => left.refreshFingerprint.localeCompare(right.refreshFingerprint))
       if (input.apply !== true) {
-        return { applied: false, duplicates, removedAccountIds: [], backupPath: null }
+        return { applied: false, duplicates, refreshCredentialDuplicates, removedAccountIds: [], backupPath: null }
       }
 
       const keepByAccountId = input.keepByAccountId ?? {}
-      const keepIds = new Set<string>()
-      for (const duplicate of duplicates) {
-        const keepId = keepByAccountId[duplicate.accountId]
-        if (!keepId || !duplicate.accountIds.includes(keepId)) {
+      const keepByRefreshFingerprint = input.keepByRefreshFingerprint ?? {}
+      const decisions = new Map<string, 'keep' | 'remove'>()
+      const selectKeeper = (accountIds: string[], keepId: string | undefined, description: string): void => {
+        if (!keepId || !accountIds.includes(keepId)) {
           throw new ClaudeNativeAccountVaultError(
             'invalid',
-            `중복 stable identity ${duplicate.accountId}에서 유지할 계정 id를 명시하세요 (explicit keep id required).`,
+            `${description}에서 유지할 계정 id를 명시하세요 (explicit keep id required).`,
           )
         }
-        keepIds.add(keepId)
+        for (const accountId of accountIds) {
+          const decision = accountId === keepId ? 'keep' : 'remove'
+          const previous = decisions.get(accountId)
+          if (previous && previous !== decision) {
+            throw new ClaudeNativeAccountVaultError('invalid', '중복 그룹의 keeper 선택이 서로 충돌합니다.')
+          }
+          decisions.set(accountId, decision)
+        }
       }
-      if (duplicates.length === 0) {
-        return { applied: true, duplicates, removedAccountIds: [], backupPath: null }
+      for (const duplicate of duplicates) {
+        selectKeeper(duplicate.accountIds, keepByAccountId[duplicate.accountId], `중복 stable identity ${duplicate.accountId}`)
+      }
+      for (const duplicate of refreshCredentialDuplicates) {
+        selectKeeper(
+          duplicate.accountIds,
+          keepByRefreshFingerprint[duplicate.refreshFingerprint],
+          `중복 refresh credential ${duplicate.refreshFingerprint}`,
+        )
+      }
+      if (duplicates.length === 0 && refreshCredentialDuplicates.length === 0) {
+        return { applied: true, duplicates, refreshCredentialDuplicates, removedAccountIds: [], backupPath: null }
       }
 
-      const duplicateIds = new Set(duplicates.flatMap((duplicate) => duplicate.accountIds))
       const removedAccountIds = file.accounts
-        .filter((account) => duplicateIds.has(account.id) && !keepIds.has(account.id))
+        .filter((account) => decisions.get(account.id) === 'remove')
         .map((account) => account.id)
       const backupPath = `${this.filePath}.backup-${this.now()}`
       try {
@@ -216,10 +253,50 @@ export class ClaudeNativeAccountVault {
       }
       file.accounts = file.accounts.filter((account) => !removedAccountIds.includes(account.id))
       await this.write(file)
-      return { applied: true, duplicates, removedAccountIds, backupPath }
-    } finally {
-      release()
-    }
+      return { applied: true, duplicates, refreshCredentialDuplicates, removedAccountIds, backupPath }
+    })
+  }
+
+  async claimClaudeCodePlaceholder(input: Omit<ClaudeNativeAccountInput, 'id' | 'accountId'> & {
+    accountId: string
+    placeholderId: string
+    expectedRefreshToken: string
+  }): Promise<ClaudeNativeAccount> {
+    validateInput(input)
+    return this.mutate(async (file) => {
+      const placeholder = file.accounts.find((account) => account.id === input.placeholderId)
+      if (!placeholder || placeholder.source !== 'claude-code' || placeholder.accountId) {
+        throw new ClaudeNativeAccountVaultError('invalid', 'Claude Code placeholder ownership changed before it could be claimed.')
+      }
+      if (file.accounts.some((account) => account.accountId === input.accountId)) {
+        throw new ClaudeNativeAccountVaultError(
+          'invalid',
+          `Claude stable identity ${input.accountId} is already owned by another vault account.`,
+        )
+      }
+      const currentSecret = await this.openSecret(placeholder)
+      if (currentSecret.refreshToken !== input.expectedRefreshToken) {
+        throw new ClaudeNativeAccountVaultError(
+          'invalid',
+          'Claude Code placeholder credential ownership changed before it could be claimed.',
+        )
+      }
+      const account: StoredAccount = {
+        id: placeholder.id,
+        nickname: input.nickname.trim(),
+        accountId: input.accountId.trim(),
+        ...(input.email?.trim() ? { email: input.email.trim() } : {}),
+        priority: input.priority ?? placeholder.priority,
+        enabled: input.enabled ?? placeholder.enabled,
+        createdAt: placeholder.createdAt,
+        updatedAt: new Date(this.now()).toISOString(),
+        source: input.source ?? 'oauth',
+        protectedSecret: await this.protector.protect(JSON.stringify(input.secret)),
+      }
+      file.accounts[file.accounts.indexOf(placeholder)] = account
+      const { protectedSecret: _protectedSecret, ...publicAccount } = account
+      return publicAccount
+    })
   }
 
   async setEnabled(id: string, enabled: boolean): Promise<ClaudeNativeAccount> {
@@ -307,18 +384,35 @@ export class ClaudeNativeAccountVault {
   }
 
   private async mutate<T>(operation: (file: VaultFile) => Promise<T>): Promise<T> {
+    return this.withExclusiveMutation(async () => {
+      const file = await this.read()
+      const result = await operation(file)
+      await this.write(file)
+      return result
+    })
+  }
+
+  async withExclusiveMutation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.mutationContext.getStore()) return operation()
     const previous = this.pendingMutation
     let release!: () => void
     this.pendingMutation = new Promise<void>((resolve) => { release = resolve })
     await previous
     try {
-      const file = await this.read()
-      const result = await operation(file)
-      await this.write(file)
-      return result
+      return await withVaultFileLock(this.filePath, () => this.mutationContext.run(true, operation))
     } finally {
       release()
     }
+  }
+
+  private async openSecret(account: StoredAccount): Promise<ClaudeNativeAccountSecret> {
+    let plaintext: string
+    try {
+      plaintext = await this.protector.unprotect(account.protectedSecret)
+    } catch {
+      throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 자격증명을 복호화하지 못했습니다.')
+    }
+    return parseSecret(plaintext)
   }
 
   private async read(): Promise<VaultFile> {
@@ -346,6 +440,31 @@ export class ClaudeNativeAccountVault {
     await writeFile(temporary, `${JSON.stringify(file, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
     await rename(temporary, this.filePath)
     await chmod(this.filePath, 0o600).catch(() => undefined)
+  }
+}
+
+async function withVaultFileLock<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+  const lockPath = `${filePath}.lock`
+  await mkdir(path.dirname(filePath), { recursive: true })
+  const deadline = Date.now() + 10_000
+  while (true) {
+    try {
+      await mkdir(lockPath)
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock을 획득하지 못했습니다.')
+      }
+      if (Date.now() >= deadline) {
+        throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault가 다른 프로세스에서 변경 중입니다.')
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  try {
+    return await operation()
+  } finally {
+    await rmdir(lockPath).catch(() => undefined)
   }
 }
 
@@ -412,6 +531,10 @@ function validateStoredAccount(value: unknown): asserts value is StoredAccount {
 
 function nextPriority(accounts: StoredAccount[]): number {
   return accounts.reduce((highest, account) => Math.max(highest, account.priority), -1) + 1
+}
+
+function credentialFingerprint(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
 }
 
 const DPAPI_SCRIPT = {

@@ -167,21 +167,29 @@ export class ClaudeNativeOAuthManager {
     } catch (error) {
       return this.fail(flow, error instanceof Error ? error.message : 'Claude OAuth token 응답이 올바르지 않습니다.')
     }
-    // Best-effort identity enrichment: fill the account email and a stable
-    // account id so the UI shows the real account instead of a placeholder.
-    // A profile failure must not fail the connection.
     const profile = await this.fetchProfile(secret.accessToken)
+    if (!profile.accountUuid) {
+      return this.fail(flow, 'Claude OAuth profile에서 검증된 계정 식별자를 확인하지 못했습니다.')
+    }
     const nickname = flow.explicitNickname
       ? flow.nickname
       : profile.email?.split('@')[0] || profile.displayName || flow.nickname
     try {
-      flow.account = await this.vault.put({
+      const accountInput = {
         nickname,
         ...(profile.email ? { email: profile.email } : {}),
-        ...(profile.accountUuid ? { accountId: profile.accountUuid } : {}),
+        accountId: profile.accountUuid,
         source: 'oauth',
         secret,
-      })
+      } as const
+      const placeholder = await this.findOwnedClaudeCodePlaceholder(profile.accountUuid)
+      flow.account = placeholder
+        ? await this.vault.claimClaudeCodePlaceholder({
+            ...accountInput,
+            placeholderId: placeholder.id,
+            expectedRefreshToken: placeholder.refreshToken,
+          })
+        : await this.vault.put(accountInput)
     } catch {
       return this.fail(flow, 'Claude OAuth 자격증명을 보안 vault에 저장하지 못했습니다.')
     }
@@ -225,6 +233,34 @@ export class ClaudeNativeOAuthManager {
     } catch {
       return {}
     }
+  }
+
+  private async findOwnedClaudeCodePlaceholder(accountUuid: string): Promise<{
+    id: string
+    refreshToken: string
+  } | null> {
+    const placeholders = (await this.vault.list()).filter((account) => (
+      account.source === 'claude-code' && !account.accountId
+    ))
+    const matches: Array<{ id: string; refreshToken: string }> = []
+    for (const placeholder of placeholders) {
+      const secret = await this.vault.getSecret(placeholder.id)
+      const profile = await this.fetchProfile(secret.accessToken)
+      if (!profile.accountUuid) {
+        throw new ClaudeNativeOAuthError(
+          'unavailable',
+          'Claude Code placeholder identity could not be verified; refusing to guess account ownership.',
+        )
+      }
+      if (profile.accountUuid === accountUuid) matches.push({ id: placeholder.id, refreshToken: secret.refreshToken })
+    }
+    if (matches.length > 1) {
+      throw new ClaudeNativeOAuthError(
+        'invalid',
+        'Multiple Claude Code placeholders resolve to the same account; repair the vault before connecting.',
+      )
+    }
+    return matches[0] ?? null
   }
 
   cancel(state?: string): void {

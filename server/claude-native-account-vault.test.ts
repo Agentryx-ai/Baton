@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -114,6 +115,59 @@ test('native Claude preferred account priority is atomic and survives restart', 
   ])
 })
 
+test('separate Claude vault instances preserve an account add racing a token refresh', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-process-race-'))
+  const filePath = path.join(directory, 'accounts.json')
+  let nextId = 0
+  let releaseRefresh!: () => void
+  let refreshProtectStarted!: () => void
+  const refreshStarted = new Promise<void>((resolve) => { refreshProtectStarted = resolve })
+  let addProtectStarted!: () => void
+  const addStarted = new Promise<void>((resolve) => { addProtectStarted = resolve })
+  let blockRefresh = false
+  let watchAdd = false
+  let addFinished: Promise<unknown> = Promise.resolve()
+  class RefreshBlockingProtector extends TestProtector {
+    override async protect(value: string): Promise<string> {
+      if (blockRefresh) {
+        blockRefresh = false
+        refreshProtectStarted()
+        await new Promise<void>((resolve) => { releaseRefresh = resolve })
+      } else if (watchAdd) {
+        watchAdd = false
+        addProtectStarted()
+      }
+      return super.protect(value)
+    }
+  }
+  const protector = new RefreshBlockingProtector()
+  const createVault = () => new ClaudeNativeAccountVault({
+    filePath,
+    protector,
+    createId: () => `account-${++nextId}`,
+  })
+  const refreshVault = createVault()
+  const addVault = createVault()
+  const existing = await refreshVault.put({ nickname: 'Existing', secret })
+  blockRefresh = true
+  const refresh = refreshVault.updateSecret(existing.id, { ...secret, accessToken: 'rotated-access' })
+  await refreshStarted
+  watchAdd = true
+  addFinished = addVault.put({ nickname: 'Added concurrently', secret: { ...secret, refreshToken: 'other-refresh' } })
+  const addEnteredBeforeRelease = await Promise.race([
+    addStarted.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 30)),
+  ])
+  if (addEnteredBeforeRelease) await addFinished
+  releaseRefresh()
+  await Promise.all([refresh, addFinished])
+
+  assert.deepEqual((await createVault().list()).map((account) => account.nickname).sort(), [
+    'Added concurrently', 'Existing',
+  ])
+  assert.equal((await createVault().getSecret(existing.id)).accessToken, 'rotated-access')
+})
+
 test('vault put preserves omitted identity metadata and upserts one stable account identity', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'baton-vault-stable-identity-'))
   let nextId = 0
@@ -178,6 +232,32 @@ test('vault fails closed when assigning a stable identity owned by another recor
   ])
 })
 
+test('Claude Code placeholder claim fails closed if credential ownership changed', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-vault-placeholder-ownership-'))
+  const vault = new ClaudeNativeAccountVault({
+    filePath: path.join(directory, 'accounts.json'),
+    protector: new TestProtector(),
+    createId: () => 'placeholder',
+  })
+  const placeholder = await vault.importClaudeCodeOnce(async () => ({ nickname: 'Claude Code', secret }))
+
+  await assert.rejects(
+    vault.claimClaudeCodePlaceholder({
+      placeholderId: placeholder!.id,
+      expectedRefreshToken: 'stale-refresh-credential',
+      accountId: 'verified-account',
+      nickname: 'Verified',
+      source: 'oauth',
+      secret: { ...secret, accessToken: 'new-access', refreshToken: 'new-refresh' },
+    }),
+    /credential ownership changed/i,
+  )
+  assert.deepEqual((await vault.list()).map(({ id, accountId, source }) => ({ id, accountId, source })), [{
+    id: placeholder!.id, accountId: undefined, source: 'claude-code',
+  }])
+  assert.equal((await vault.getSecret(placeholder!.id)).refreshToken, secret.refreshToken)
+})
+
 test('duplicate identity repair is dry-run by default and requires an explicit keep id plus backup to apply', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'baton-vault-duplicate-repair-'))
   const filePath = path.join(directory, 'accounts.json')
@@ -226,6 +306,42 @@ test('duplicate identity repair is dry-run by default and requires an explicit k
   assert.equal(await readFile(applied.backupPath!, 'utf8'), before)
   assert.deepEqual((await repairVault.list()).map((account) => account.id), [second.id])
   assert.equal((await repairVault.getSecret(second.id)).refreshToken, 'current-refresh')
+})
+
+test('repair surfaces identity-less refresh credential duplicates and requires an explicit keeper', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-vault-refresh-duplicate-repair-'))
+  const filePath = path.join(directory, 'accounts.json')
+  let nextId = 0
+  const vault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    createId: () => `account-${++nextId}`,
+    now: () => 8_000,
+  })
+  const placeholder = await vault.importClaudeCodeOnce(async () => ({ nickname: 'Claude Code', secret }))
+  const identified = await vault.put({
+    nickname: 'Identified',
+    accountId: 'stable-account',
+    secret: { ...secret, accessToken: 'other-access' },
+  })
+  const fingerprint = createHash('sha256').update(secret.refreshToken).digest('hex')
+
+  const preview = await vault.repairStableIdentityDuplicates()
+  assert.deepEqual(preview.refreshCredentialDuplicates, [{
+    refreshFingerprint: fingerprint,
+    accountIds: [placeholder!.id, identified.id],
+    identitylessAccountIds: [placeholder!.id],
+  }])
+  await assert.rejects(
+    vault.repairStableIdentityDuplicates({ apply: true }),
+    /refresh credential|explicit keep id/i,
+  )
+  const applied = await vault.repairStableIdentityDuplicates({
+    apply: true,
+    keepByRefreshFingerprint: { [fingerprint]: identified.id },
+  })
+  assert.deepEqual(applied.removedAccountIds, [placeholder!.id])
+  assert.deepEqual((await vault.list()).map((account) => account.id), [identified.id])
 })
 
 test('Windows DPAPI protector round-trips without exposing plaintext as ciphertext', {

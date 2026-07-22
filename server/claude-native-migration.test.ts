@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -80,4 +80,90 @@ test('legacy Claude migration can match stable id_token subject after refresh-to
   assert.equal(result.status, 'matched')
   assert.equal((await vault.list()).length, 1)
   assert.equal((await vault.getSecret('native-account')).refreshToken, 'current-refresh')
+})
+
+test('migration and repair from separate vault instances cannot stale-overwrite each other', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-migration-repair-race-'))
+  const filePath = path.join(directory, 'accounts.json')
+  let nextId = 0
+  let blockNextProtect = false
+  let releaseProtect!: () => void
+  let protectStarted!: () => void
+  const started = new Promise<void>((resolve) => { protectStarted = resolve })
+  let repairReadStarted!: () => void
+  const repairStarted = new Promise<void>((resolve) => { repairReadStarted = resolve })
+  let watchRepairRead = false
+  class BlockingProtector extends TestProtector {
+    override async protect(value: string): Promise<string> {
+      if (blockNextProtect) {
+        blockNextProtect = false
+        protectStarted()
+        await new Promise<void>((resolve) => { releaseProtect = resolve })
+      }
+      return super.protect(value)
+    }
+
+    override async unprotect(value: string): Promise<string> {
+      if (watchRepairRead) {
+        watchRepairRead = false
+        repairReadStarted()
+      }
+      return super.unprotect(value)
+    }
+  }
+  const protector = new BlockingProtector()
+  const createVault = () => new ClaudeNativeAccountVault({
+    filePath,
+    protector,
+    createId: () => `account-${++nextId}`,
+    now: () => 9_000,
+  })
+  const migrationVault = createVault()
+  const repairVault = createVault()
+  const target = await migrationVault.put({
+    nickname: 'Migration target',
+    secret: { accessToken: 'target-access', refreshToken: 'target-refresh', scopes: [] },
+  })
+  const remove = await migrationVault.put({
+    nickname: 'Remove duplicate',
+    secret: { accessToken: 'remove-access', refreshToken: 'remove-refresh', scopes: [] },
+  })
+  const keep = await migrationVault.put({
+    nickname: 'Keep duplicate',
+    secret: { accessToken: 'keep-access', refreshToken: 'keep-refresh', scopes: [] },
+  })
+  const seeded = JSON.parse(await readFile(filePath, 'utf8')) as { accounts: Array<Record<string, unknown>> }
+  for (const account of seeded.accounts) {
+    if (account.id === remove.id || account.id === keep.id) account.accountId = 'duplicate-stable'
+  }
+  await writeFile(filePath, `${JSON.stringify(seeded, null, 2)}\n`)
+
+  blockNextProtect = true
+  const migration = migrateLegacyClaudeAccount({
+    vault: migrationVault,
+    sourcePath: '/tmp/legacy/user.json',
+    priority: 4,
+    legacy: {
+      email: 'updated@example.com',
+      access_token: 'stale-access',
+      refresh_token: 'target-refresh',
+    },
+  })
+  await started
+  watchRepairRead = true
+  const repair = repairVault.repairStableIdentityDuplicates({
+    apply: true,
+    keepByAccountId: { 'duplicate-stable': keep.id },
+  })
+  const repairReadBeforeRelease = await Promise.race([
+    repairStarted.then(() => true),
+    new Promise<false>((resolve) => setTimeout(() => resolve(false), 30)),
+  ])
+  if (repairReadBeforeRelease) await repair
+  releaseProtect()
+  await Promise.all([migration, repair])
+
+  const accounts = await createVault().list()
+  assert.equal(accounts.some((account) => account.id === remove.id), false)
+  assert.equal(accounts.find((account) => account.id === target.id)?.email, 'updated@example.com')
 })
