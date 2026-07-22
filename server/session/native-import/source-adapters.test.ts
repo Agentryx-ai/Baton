@@ -516,6 +516,51 @@ test('Codex local inventory defaults to active user surfaces and opts into inter
   ])
 })
 
+test('Codex adapter recovers stale state paths from archived_sessions only for archived scans', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-stale-archive-'))
+  const sessions = path.join(home, 'sessions', '2026', '07', '22')
+  const archived = path.join(home, 'archived_sessions')
+  await mkdir(sessions, { recursive: true })
+  await mkdir(archived)
+  const id = 'stale-archive-id'
+  const filename = `rollout-2026-07-22T00-00-00-${id}.jsonl`
+  const stalePath = path.join(sessions, filename)
+  const archivedPath = path.join(archived, filename)
+  await writeFile(archivedPath, JSON.stringify({ type: 'session_meta', payload: { id } }))
+  const db = createCodexDatabase(home)
+  db.exec("ALTER TABLE threads ADD COLUMN source TEXT NOT NULL DEFAULT 'cli'; ALTER TABLE threads ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+  db.prepare(`
+    INSERT INTO threads(id,rollout_path,created_at,updated_at,cwd,title,first_user_message,source,archived)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `).run(id, stalePath, 1, 2, null, id, null, 'cli', 0)
+  db.close()
+
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
+  assert.deepEqual(await reader.scan({ includeRecords: false }), [])
+  assert.deepEqual(reader.lastScanWarnings, [])
+
+  const recovered = await reader.scan({ includeRecords: false, codex: { includeArchived: true } })
+  assert.equal(recovered.length, 1)
+  assert.equal(recovered[0]?.nativeSessionId, id)
+  assert.equal(recovered[0]?.nativeArchived, true)
+  assert.equal(path.basename(recovered[0]?.sourceLocator?.path ?? ''), filename)
+})
+
+test('Codex archived fallback requires the rollout filename to match the state session identity', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-stale-identity-'))
+  const archived = path.join(home, 'archived_sessions')
+  await mkdir(archived)
+  const stalePath = path.join(home, 'sessions', 'rollout-2026-07-22T00-00-00-other-id.jsonl')
+  await writeFile(path.join(archived, path.basename(stalePath)), JSON.stringify({ type: 'session_meta', payload: {} }))
+  const db = createCodexDatabase(home)
+  db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('expected-id', stalePath, 1, 2, null, null, null)
+  db.close()
+
+  const reader = new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET })
+  assert.deepEqual(await reader.scan({ includeRecords: false, codex: { includeArchived: true } }), [])
+  assert.equal(reader.lastScanWarnings[0]?.code, 'codex_archived_rollout_identity_mismatch')
+})
+
 test('Codex adapter strips Windows verbatim prefixes from recorded cwd values', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-verbatim-'))
   const sessions = path.join(home, 'sessions')

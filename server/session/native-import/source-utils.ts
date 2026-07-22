@@ -5,8 +5,8 @@ import path from 'node:path'
 import type { NativePortableRecord, NativeSourceHead } from './contracts.ts'
 
 export const PARSER_VERSION = 'native-session-v1'
-/** Above the largest observed live transcript (~248 MiB), while still bounding a single read. */
-export const MAX_NATIVE_FILE_BYTES = 256 * 1024 * 1024
+/** Above the largest observed live transcript (~298 MiB), while still bounding a single read. */
+export const MAX_NATIVE_FILE_BYTES = 384 * 1024 * 1024
 /** Observed live maxima are 14,169 Codex and 78,101 Claude lines. */
 export const MAX_NATIVE_PHYSICAL_LINES = 250_000
 export const MAX_NATIVE_PORTABLE_RECORDS = 250_000
