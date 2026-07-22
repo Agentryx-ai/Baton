@@ -178,12 +178,12 @@ function interruptedAdapter(): SessionProviderAdapter {
   return adapter
 }
 
-function transientThenCompletingAdapter(): SessionProviderAdapter {
+function transientThenCompletingAdapter(transientFailures = 1): SessionProviderAdapter {
   const adapter = safeAdapter([])
   let executions = 0
   adapter.execute = async (_request, context): Promise<ProviderTurnExecution> => {
     executions += 1
-    const terminal = executions === 1
+    const terminal = executions <= transientFailures
       ? Promise.resolve({
           status: 'failed' as const,
           error: { code: 'provider_retry_exhausted', message: 'temporary upstream 503' },
@@ -1694,7 +1694,7 @@ test('an automatic Goal retries an exhausted transient provider failure within i
   const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-transient-retry-'))
   const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
   const registry = new AdapterRegistry()
-  registry.register(transientThenCompletingAdapter())
+  registry.register(transientThenCompletingAdapter(3))
   const orchestrator = new TurnOrchestrator(
     store, registry, new ConversationEventHub(), 10_000, null, null, acceptingGoalVerifier,
   )
@@ -1707,21 +1707,24 @@ test('an automatic Goal retries an exhausted transient provider failure within i
   const goal = await orchestrator.createGoal({
     threadId: session.activeThreadId,
     expected: { kind: 'none' },
-    objective: 'recover from one transient provider failure',
+    objective: 'recover from repeated transient provider failures',
     provider: 'codex',
     model: 'gpt-test',
   })
 
-  for (let attempt = 0; attempt < 300; attempt += 1) {
+  for (let attempt = 0; attempt < 1_200; attempt += 1) {
     if (store.getGoalById(goal.id)?.status === 'complete') break
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
   const turns = store.getSnapshot(session.activeThreadId)?.turns ?? []
-  assert.equal(turns.length, 2)
-  assert.equal(turns[0]?.error?.code, 'provider_retry_exhausted')
-  assert.equal(turns[1]?.status, 'completed')
+  assert.equal(turns.length, 4)
+  assert.deepEqual(turns.slice(0, 3).map((turn) => turn.error?.code), [
+    'provider_retry_exhausted', 'provider_retry_exhausted', 'provider_retry_exhausted',
+  ])
+  assert.equal(turns[3]?.status, 'completed')
   assert.equal(store.getGoalById(goal.id)?.status, 'complete')
-  assert.equal(store.getGoalById(goal.id)?.automaticTurnsUsed, 2)
+  assert.equal(store.getGoalById(goal.id)?.automaticTurnsUsed, 4)
+  assert.equal(store.getGoalById(goal.id)?.noProgressCount, 1)
 })
 
 test('replacing an active Goal flushes and interrupts the old revision before the new Goal waits', async (t) => {

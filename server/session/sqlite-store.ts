@@ -110,7 +110,7 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 21
+const SCHEMA_VERSION = 22
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace'
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
@@ -1461,6 +1461,26 @@ export class SqliteSessionStore implements SessionStore {
           .run(21, 'native-imported-records-item-index-heal', this.#now())
         this.#db.exec('PRAGMA user_version = 21')
         appliedVersion = 21
+      }
+      if (appliedVersion < 22) {
+        const hasGoalTurnAccounting = this.#optional(this.#db.prepare(
+          "SELECT name AS name FROM sqlite_master WHERE type='table' AND name='goal_turn_accounting'",
+        )) !== null
+        if (hasGoalTurnAccounting) {
+          const hasNoProgressFlag = this.#all(this.#db.prepare(
+            "SELECT name AS name FROM pragma_table_info('goal_turn_accounting')",
+          )).some((row) => text(row, 'name') === 'counts_toward_no_progress')
+          if (!hasNoProgressFlag) {
+            this.#db.exec(`
+              ALTER TABLE goal_turn_accounting ADD COLUMN counts_toward_no_progress
+                INTEGER NOT NULL DEFAULT 1 CHECK(counts_toward_no_progress IN (0,1));
+            `)
+          }
+        }
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(22, 'goal-turn-no-progress-accounting', this.#now())
+        this.#db.exec('PRAGMA user_version = 22')
+        appliedVersion = 22
       }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
@@ -3873,6 +3893,7 @@ export class SqliteSessionStore implements SessionStore {
           && integer(duplicate, 'time_used_seconds') === input.timeUsedSeconds
           && integer(duplicate, 'automatic') === (input.automatic ? 1 : 0)
           && nullableText(duplicate, 'progress_digest') === input.progressDigest
+          && integer(duplicate, 'counts_toward_no_progress') === (input.countsTowardNoProgress === false ? 0 : 1)
         if (!same) throw new GoalStoreError('invalid_goal_input', 'Goal turn was already accounted differently')
         const current = this.#goalById(input.goalId)
         return current?.revision === input.goalRevision
@@ -3886,21 +3907,27 @@ export class SqliteSessionStore implements SessionStore {
         throw new GoalStoreError('invalid_goal_input', 'Goal accounting would exceed safe integer storage')
       }
       const now = this.#now()
+      const countsTowardNoProgress = input.countsTowardNoProgress !== false
       const sameProgress = input.progressDigest !== null && current.lastProgressDigest === input.progressDigest
-      const noProgressCount = input.progressDigest === null
-        ? current.noProgressCount + 1
-        : sameProgress ? current.noProgressCount + 1 : 0
+      const noProgressCount = countsTowardNoProgress
+        ? input.progressDigest === null
+          ? current.noProgressCount + 1
+          : sameProgress ? current.noProgressCount + 1 : 0
+        : current.noProgressCount
+      const lastProgressDigest = countsTowardNoProgress
+        ? input.progressDigest ?? current.lastProgressDigest
+        : current.lastProgressDigest
       this.#db.prepare(`
         UPDATE goal_turn_accounting
-        SET automatic=?,terminal=1,progress_digest=?,updated_at=?
+        SET automatic=?,terminal=1,progress_digest=?,counts_toward_no_progress=?,updated_at=?
         WHERE turn_id=? AND terminal=0
-      `).run(input.automatic ? 1 : 0, input.progressDigest, now, input.turnId)
+      `).run(input.automatic ? 1 : 0, input.progressDigest, countsTowardNoProgress ? 1 : 0, now, input.turnId)
       this.#db.prepare(`
         UPDATE goals SET automatic_turns_used=automatic_turns_used+?,
           no_progress_count=?,last_progress_digest=?,updated_at=?
         WHERE id=? AND revision=?
       `).run(input.automatic ? 1 : 0, noProgressCount,
-        input.progressDigest ?? current.lastProgressDigest, now, current.id, current.revision)
+        lastProgressDigest, now, current.id, current.revision)
       const goal = this.#goal(this.#one(this.#db.prepare('SELECT * FROM goals WHERE id=?'), current.id))
       const thread = this.getThread(goal.threadId)
       if (!thread) throw new Error('Corrupt database: Goal thread is missing')
@@ -3910,6 +3937,7 @@ export class SqliteSessionStore implements SessionStore {
         timeUsedSeconds: input.timeUsedSeconds,
         automatic: input.automatic,
         progressDigest: input.progressDigest,
+        countsTowardNoProgress,
       }, now)
       this.#appendGoalChanged(goal, thread.sessionId, input.turnId, now)
       return { status: 'applied', goal }

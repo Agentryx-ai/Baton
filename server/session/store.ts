@@ -141,6 +141,7 @@ export interface RecordGoalTurnInput {
   timeUsedSeconds: number
   automatic: boolean
   progressDigest: string | null
+  countsTowardNoProgress?: boolean
 }
 
 export interface CheckpointGoalTurnInput {

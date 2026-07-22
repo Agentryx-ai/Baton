@@ -203,7 +203,7 @@ test('initial session materialization is atomic, idempotent, and keeps schema v1
     const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
     assert.equal(row.count, expected, table)
   }
-  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 22)
   store.close()
 
   const reopened = new SqliteSessionStore(path, deterministicOptions())
@@ -342,10 +342,10 @@ test('schema v1 migrates through v19 with Goal verification storage', (t) => {
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 22)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -465,11 +465,11 @@ test('schema v6 migrates to v19 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 22)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -515,7 +515,7 @@ test('schema v10 rebuilds follow-up constraints through v19 with foreign keys an
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 22)
   assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
   assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
 })
@@ -552,11 +552,11 @@ test('schema v12 migrates once to immutable derived context tables and preserves
 
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 22)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations WHERE version>=13 ORDER BY version')
       .all() as Array<{ version: number }>).map((row) => row.version),
-    [13, 14, 15, 16, 17, 18, 19, 20, 21],
+    [13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
   )
   const tables = (inspected.prepare(`
     SELECT name FROM sqlite_schema WHERE type='table'
@@ -616,7 +616,7 @@ test('an empty released v13 database migrates through v19 and gains the authorit
   migrated.close()
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 22)
   assert.ok((inspected.prepare(`
     SELECT 1 FROM pragma_table_info('context_compaction_jobs')
     WHERE name='expected_previous_artifact_id'
@@ -2486,15 +2486,59 @@ test('stale Goal turn completion cannot mutate a newer revision and accounting i
     goalContext: { goalId: goal.id, goalRevision: edited.revision, leaseId: thirdLease.leaseId },
   } as BeginTurnInput & { goalContext: { goalId: string; goalRevision: number; leaseId: string } })
   store.finishTurn({ turnId: third.turn.id, status: 'completed' })
-  const repeated = store.recordGoalTurn({
+  const excluded = store.recordGoalTurn({
     ...accounting,
     turnId: third.turn.id,
     tokensUsed: 4,
     timeUsedSeconds: 1,
+    progressDigest: null,
+    countsTowardNoProgress: false,
   })
-  assert.equal(repeated.goal?.tokensUsed, 21)
-  assert.equal(repeated.goal?.automaticTurnsUsed, 2)
-  assert.equal(repeated.goal?.noProgressCount, 1)
+  assert.equal(excluded.goal?.tokensUsed, 21)
+  assert.equal(excluded.goal?.timeUsedSeconds, 5)
+  assert.equal(excluded.goal?.automaticTurnsUsed, 2)
+  assert.equal(excluded.goal?.noProgressCount, 0)
+  assert.equal(excluded.goal?.lastProgressDigest, 'digest-a')
+  assert.deepEqual(store.recordGoalTurn({
+    ...accounting,
+    turnId: third.turn.id,
+    tokensUsed: 4,
+    timeUsedSeconds: 1,
+    progressDigest: null,
+    countsTowardNoProgress: false,
+  }), excluded)
+  assert.throws(() => store.recordGoalTurn({
+    ...accounting,
+    turnId: third.turn.id,
+    tokensUsed: 4,
+    timeUsedSeconds: 1,
+    progressDigest: null,
+  }), /already accounted differently/)
+  const excludedEvent = store.listGoalEvents(session.activeThreadId)
+    .filter((event) => event.type === 'goal_turn_accounted').at(-1)
+  assert.equal(excludedEvent?.payload.countsTowardNoProgress, false)
+
+  now = '2026-07-18T00:03:00.000Z'
+  const fourthLease = store.claimGoalLease({ goalId: goal.id, goalRevision: edited.revision, ownerId: 'scheduler' })
+  assert.ok(fourthLease)
+  const fourth = store.beginTurn({
+    ...beginInput(session.activeThreadId, 'request-4', 'hash-4'),
+    expectedRevision: store.getThread(session.activeThreadId)?.revision ?? -1,
+    goalContext: { goalId: goal.id, goalRevision: edited.revision, leaseId: fourthLease.leaseId },
+  } as BeginTurnInput & { goalContext: { goalId: string; goalRevision: number; leaseId: string } })
+  store.finishTurn({ turnId: fourth.turn.id, status: 'completed' })
+  const counted = store.recordGoalTurn({
+    ...accounting,
+    turnId: fourth.turn.id,
+    tokensUsed: 3,
+    timeUsedSeconds: 1,
+    progressDigest: null,
+  })
+  assert.equal(counted.goal?.tokensUsed, 24)
+  assert.equal(counted.goal?.timeUsedSeconds, 6)
+  assert.equal(counted.goal?.automaticTurnsUsed, 3)
+  assert.equal(counted.goal?.noProgressCount, 1)
+  assert.equal(counted.goal?.lastProgressDigest, 'digest-a')
 })
 
 test('clearing a Goal revokes its lease and retains an append-only clear event', (t) => {

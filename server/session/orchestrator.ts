@@ -1083,6 +1083,9 @@ export class TurnOrchestrator implements ConversationService {
     adapter?: import('./adapter.ts').SessionProviderAdapter,
   ): Promise<void> {
     if (turn.goalId === null || turn.goalRevision === null) return
+    const retryableProviderFailure = automatic
+      && terminal.status !== 'completed'
+      && terminal.error?.code === 'provider_retry_exhausted'
     const progressDigest = goalProgressDigest(this.store.getSnapshot(turn.threadId), turn.goalRevision, turn.id)
     const accounted = this.store.recordGoalTurn({
       turnId: turn.id,
@@ -1092,6 +1095,7 @@ export class TurnOrchestrator implements ConversationService {
       timeUsedSeconds: elapsedTurnSeconds(turn, new Date().toISOString()),
       automatic,
       progressDigest,
+      countsTowardNoProgress: !retryableProviderFailure,
     })
     if (accounted.status === 'stale' || !accounted.goal) return
     if (preserveGoalForUser) return
@@ -1099,7 +1103,7 @@ export class TurnOrchestrator implements ConversationService {
       const stoppingError = terminal.status === 'cancelled' || terminal.status === 'interrupted'
         ? { ...(terminal.error ?? {}), code: terminal.error?.code ?? 'runtime_interrupted' }
         : terminal.error
-      if (automatic && stoppingError?.code === 'provider_retry_exhausted') {
+      if (retryableProviderFailure) {
         await delay(transientGoalRetryDelay(accounted.goal.automaticTurnsUsed))
         await this.goalRuntime.notifyThreadIdle(turn.threadId)
         this.events.publish(turn.threadId)
