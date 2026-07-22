@@ -28,6 +28,7 @@ import type { NativeProxyRequestHealth } from './native-proxy-health.ts'
 export const CODEX_RESPONSES_WEBSOCKET_VERSION = 'responses_websockets=2026-02-06'
 
 const MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
+const MAX_UPSTREAM_QUEUED_MESSAGES = 4_096
 const DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60_000
 const DEFAULT_RETRY_DEADLINE_MS = 30_000
 const TERMINAL_EVENT_TYPES = new Set([
@@ -101,9 +102,19 @@ export interface CodexNativeWebSocketProxy {
 
 class WebSocketInbox {
   readonly #queue: InboxPacket[] = []
+  readonly #socket: WebSocket
+  readonly #maxQueuedMessages: number
+  readonly #maxQueuedBytes: number
+  #queuedBytes = 0
   #waiter: ((packet: InboxPacket) => void) | undefined
 
-  constructor(socket: WebSocket) {
+  constructor(socket: WebSocket, limits: {
+    maxQueuedMessages?: number
+    maxQueuedBytes?: number
+  } = {}) {
+    this.#socket = socket
+    this.#maxQueuedMessages = limits.maxQueuedMessages ?? MAX_UPSTREAM_QUEUED_MESSAGES
+    this.#maxQueuedBytes = limits.maxQueuedBytes ?? MAX_PAYLOAD_BYTES
     socket.on('message', (data, binary) => this.#push({
       kind: 'message',
       data: rawDataToBuffer(data),
@@ -115,7 +126,10 @@ class WebSocketInbox {
 
   next(signal: AbortSignal, timeoutMs: number): Promise<InboxPacket> {
     const queued = this.#queue.shift()
-    if (queued) return Promise.resolve(queued)
+    if (queued) {
+      if (queued.kind === 'message') this.#queuedBytes -= queued.data.length
+      return Promise.resolve(queued)
+    }
     if (signal.aborted) return Promise.reject(signal.reason)
     return new Promise<InboxPacket>((resolve, reject) => {
       const timeout = setTimeout(() => finish(() => reject(new Error('websocket idle timeout'))), timeoutMs)
@@ -134,8 +148,22 @@ class WebSocketInbox {
 
   #push(packet: InboxPacket): void {
     const waiter = this.#waiter
-    if (waiter) waiter(packet)
-    else this.#queue.push(packet)
+    if (waiter) {
+      waiter(packet)
+      return
+    }
+    if (packet.kind === 'message' && (
+      this.#queue.length >= this.#maxQueuedMessages
+      || this.#queuedBytes + packet.data.length > this.#maxQueuedBytes
+    )) {
+      this.#queue.length = 0
+      this.#queuedBytes = 0
+      this.#queue.push({ kind: 'error', error: new Error('websocket receive queue limit exceeded') })
+      closeSocket(this.#socket, 1009, 'websocket receive queue limit exceeded')
+      return
+    }
+    if (packet.kind === 'message') this.#queuedBytes += packet.data.length
+    this.#queue.push(packet)
   }
 }
 
@@ -403,9 +431,10 @@ export function createCodexNativeWebSocketProxy(
   const cooldowns = options.cooldowns ?? new NativeAccountCooldowns()
   const now = options.now ?? Date.now
   let attached = false
+  let closing = false
 
   const serve = async (client: WebSocket, request: IncomingMessage): Promise<void> => {
-    const clientInbox = new WebSocketInbox(client)
+    const clientInbox = new WebSocketInbox(client, { maxQueuedMessages: 1 })
     const abort = new AbortController()
     let active: UpstreamConnection | undefined
     let clientClosed = false
@@ -512,10 +541,11 @@ export function createCodexNativeWebSocketProxy(
             requestHealth = undefined
             return
           }
-          requestHealth?.transportError(now())
-          requestHealth = undefined
           const modelUnsupported = error instanceof NativeRouteUnavailableError
             && error.code === 'model_unsupported'
+          if (modelUnsupported) requestHealth?.discard()
+          else requestHealth?.transportError(now())
+          requestHealth = undefined
           await sendText(client, Buffer.from(JSON.stringify({
             type: 'error',
             status: modelUnsupported ? 422 : 503,
@@ -560,7 +590,15 @@ export function createCodexNativeWebSocketProxy(
           await sendText(client, responsePacket.data)
           if (event?.type && TERMINAL_EVENT_TYPES.has(event.type)) {
             if (event.type === 'error' || event.type === 'response.failed' || event.type === 'response.incomplete') {
-              requestHealth?.streamError(now())
+              const clientError = event.type === 'error'
+                && event.status !== undefined
+                && event.status >= 400
+                && event.status < 500
+                && event.status !== 401
+                && event.status !== 403
+                && event.status !== 429
+              if (clientError) requestHealth?.discard()
+              else requestHealth?.streamError(now())
               terminateConnection(active)
               active = undefined
             } else {
@@ -599,6 +637,10 @@ export function createCodexNativeWebSocketProxy(
           rejectUpgrade(socket, 404, 'baton_proxy_route_not_found', 'Unknown websocket route.')
           return
         }
+        if (closing) {
+          rejectUpgrade(socket, 503, 'baton_restarting', 'Baton is restarting.')
+          return
+        }
         if (!supportsProtocol(request)) {
           rejectUpgrade(
             socket,
@@ -610,6 +652,10 @@ export function createCodexNativeWebSocketProxy(
           return
         }
         void authenticateUpgrade(request, options).then((authenticated) => {
+          if (closing) {
+            rejectUpgrade(socket, 503, 'baton_restarting', 'Baton is restarting.')
+            return
+          }
           if (!authenticated) {
             rejectUpgrade(socket, 401, 'authentication_error', 'Invalid Baton Codex token.')
             return
@@ -626,6 +672,7 @@ export function createCodexNativeWebSocketProxy(
       })
     },
     async close() {
+      closing = true
       const clients = Array.from(websocketServer.clients)
       const gracefulClose = Promise.all(clients.map((client) => new Promise<void>((resolve) => {
         if (client.readyState === WebSocket.CLOSED) {
