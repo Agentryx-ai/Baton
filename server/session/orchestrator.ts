@@ -1774,15 +1774,27 @@ function adapterSnapshot(
   }
 }
 
+/**
+ * Only unresolved calls belonging to a live turn block execution: their
+ * outcome is unknown — most importantly a mutating tool call that must go
+ * through user reconciliation rather than being silently re-run. Turnless
+ * (imported) orphans are tolerated: their results can never arrive, they are
+ * durably repaired on the leaf thread, and appends can never reach into a
+ * fork's inherited parent slice — while providers drop tool items from
+ * portable history entirely, so nothing malformed is ever sent.
+ */
 function assertNoUnresolvedToolCalls(snapshot: ThreadSnapshot): void {
-  const open = new Set<string>()
+  const open = new Map<string, ThreadSnapshot['items'][number]>()
   for (const item of snapshot.items) {
     const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
     if (!callId) continue
-    if (item.kind === 'tool_call') open.add(callId)
+    if (item.kind === 'tool_call') open.set(callId, item)
     if (item.kind === 'tool_result') open.delete(callId)
   }
-  if (open.size > 0) throw new Error(`Provider switch blocked by unresolved tool calls: ${[...open].join(', ')}`)
+  const liveOrphans = [...open.entries()].filter(([, item]) => item.turnId !== null)
+  if (liveOrphans.length > 0) {
+    throw new Error(`Unresolved tool calls require reconciliation before continuing: ${liveOrphans.map(([callId]) => callId).join(', ')}`)
+  }
 }
 
 function isTerminal(status: CanonicalTurn['status']): boolean {
