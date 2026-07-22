@@ -341,6 +341,8 @@ export interface SessionStore extends NativeImportStore {
   listItems(threadId: ThreadId, afterSequence?: number): CanonicalItem[]
   listEvents(threadId: ThreadId, afterSequence?: number): CanonicalStreamEvent[]
   recoverInterruptedTurns(): number
+  /** Persist synthetic error results for imported (turnless) tool calls whose results were never recorded. */
+  repairOrphanImportedToolCalls(threadId: ThreadId): number
 
   getGoal(threadId: ThreadId): CanonicalGoal | null
   getGoalById(goalId: GoalId): CanonicalGoal | null

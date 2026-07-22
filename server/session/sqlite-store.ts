@@ -4110,6 +4110,90 @@ export class SqliteSessionStore implements SessionStore {
     })
   }
 
+  /**
+   * Imported transcripts (turnless items) can carry tool calls whose results
+   * the source app never recorded — the conversation was exported or crashed
+   * mid-call, so the result can never arrive. Persist a synthetic error result
+   * for each so the transcript closes durably: execution, compaction, and
+   * provider views then all observe the same repaired history. Live-turn
+   * orphans are deliberately untouched here — read-only ones are repaired at
+   * recovery, and mutating ones must go through user reconciliation.
+   */
+  repairOrphanImportedToolCalls(threadId: ThreadId): number {
+    return this.#transaction('IMMEDIATE', () => {
+      const rows = this.#all(this.#db.prepare(`
+        SELECT kind,payload_json,provider FROM items
+        WHERE thread_id=? AND turn_id IS NULL AND kind IN ('tool_call','tool_result')
+        ORDER BY sequence
+      `), threadId)
+      const completed = new Set<string>()
+      const calls = new Map<string, {
+        provider: CanonicalProvider | null
+        toolName: string | null
+        providerCallId: string | null
+      }>()
+      for (const row of rows) {
+        const payload = parseObject(row.payload_json)
+        const callId = typeof payload.callId === 'string' ? payload.callId : null
+        if (!callId) continue
+        if (text(row, 'kind') === 'tool_result') {
+          completed.add(callId)
+          continue
+        }
+        calls.set(callId, {
+          provider: (nullableText(row, 'provider') ?? null) as CanonicalProvider | null,
+          toolName: typeof payload.name === 'string' ? payload.name : null,
+          providerCallId: typeof payload.providerCallId === 'string' ? payload.providerCallId : null,
+        })
+      }
+      const unresolved = [...calls].filter(([callId]) => !completed.has(callId))
+      if (unresolved.length === 0) return 0
+
+      const threadRow = this.#optional(this.#db.prepare('SELECT session_id FROM threads WHERE id=?'), threadId)
+      if (!threadRow) throw new Error(`Thread not found for orphan repair: ${threadId}`)
+      const sessionId = text(threadRow, 'session_id')
+      const now = this.#now()
+      const appended: CanonicalItem[] = []
+      for (const [callId, call] of unresolved) {
+        appended.push(...this.#appendItems(
+          sessionId,
+          threadId,
+          null,
+          call.provider,
+          [{
+            kind: 'tool_result' as const,
+            visibility: 'portable' as const,
+            nativeId: call.providerCallId,
+            payload: {
+              callId,
+              ...(call.providerCallId ? { providerCallId: call.providerCallId } : {}),
+              ...(call.toolName ? { toolName: call.toolName } : {}),
+              synthetic: true,
+              result: {
+                success: false,
+                content: null,
+                error: {
+                  code: 'tool_result_missing',
+                  message: 'This tool call has no recorded result; the conversation was imported before it completed.',
+                  retryable: false,
+                },
+              },
+            },
+          }],
+          `baton:repair-orphan-import:${threadId}:${callId}`,
+          now,
+        ))
+      }
+      this.#db.prepare('UPDATE threads SET revision=revision+1,updated_at=? WHERE id=?').run(now, threadId)
+      this.#db.prepare('UPDATE sessions SET updated_at=? WHERE id=?').run(now, sessionId)
+      this.#appendStreamEvent(sessionId, threadId, null, 'items_appended', {
+        itemIds: appended.map((item) => item.id),
+        orphanImportRecovery: true,
+      }, now)
+      return appended.length
+    })
+  }
+
   #repairInterruptedReadOnlyToolCalls(turn: SqlRow, now: string): number {
     const turnId = text(turn, 'id')
     const rows = this.#all(this.#db.prepare(`

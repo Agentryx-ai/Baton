@@ -13,6 +13,7 @@ import type {
   SessionProviderAdapter,
 } from './adapter.ts'
 import type { GoalEvidenceBundle, NewCanonicalItem, ThreadSnapshot } from './domain.ts'
+import type { NativeSessionCandidate } from './native-import/contracts.ts'
 import {
   CanonicalContextRuntime,
   ContextInputTooLargeError,
@@ -1950,7 +1951,7 @@ function orphanToolCallAdapter(): SessionProviderAdapter {
       const event: NativeProviderEvent = {
         eventId: 'orphan-call-1',
         type: 'item/completed',
-        payload: { callId: 'toolu_orphan_1', name: 'Agent', input: {} },
+        payload: { callId: 'toolu_live_orphan', name: 'run_command', sideEffect: 'workspace_command', input: {} },
         durability: 'durable',
       }
       return {
@@ -1968,8 +1969,8 @@ function orphanToolCallAdapter(): SessionProviderAdapter {
   }
 }
 
-test('a transcript with an orphan tool call still executes the next turn', async (t) => {
-  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-orphan-'))
+test('a live-turn orphan tool call still blocks the next turn pending reconciliation', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-live-orphan-'))
   const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
   const registry = new AdapterRegistry()
   registry.register(orphanToolCallAdapter())
@@ -1979,7 +1980,7 @@ test('a transcript with an orphan tool call still executes the next turn', async
     rmSync(directory, { recursive: true, force: true })
   })
 
-  const session = orchestrator.createSession({ title: 'Orphaned import' })
+  const session = orchestrator.createSession({ title: 'Live orphan' })
   const first = await orchestrator.startTurn({
     threadId: session.activeThreadId,
     provider: 'codex',
@@ -1989,14 +1990,7 @@ test('a transcript with an orphan tool call still executes the next turn', async
     input: [{ kind: 'user_message', payload: { text: 'run a tool' } }],
   })
   await waitForTerminal(store, first.turn.id)
-  // History now carries a tool_call whose result was never recorded.
-  assert.equal(
-    store.listItems(session.activeThreadId).some((item) =>
-      item.kind === 'tool_call' && item.payload.callId === 'toolu_orphan_1'), true)
-  assert.equal(
-    store.listItems(session.activeThreadId).some((item) => item.kind === 'tool_result'), false)
 
-  // Previously this threw "Provider switch blocked by unresolved tool calls".
   const second = await orchestrator.startTurn({
     threadId: session.activeThreadId,
     provider: 'codex',
@@ -2006,34 +2000,92 @@ test('a transcript with an orphan tool call still executes the next turn', async
     input: [{ kind: 'user_message', payload: { text: 'continue' } }],
   })
   await waitForTerminal(store, second.turn.id)
-  assert.equal(store.getTurn(second.turn.id)?.status, 'completed')
+  const turn = store.getTurn(second.turn.id)
+  assert.equal(turn?.status, 'failed')
+  assert.match(JSON.stringify(turn?.error ?? {}), /reconciliation/)
 })
 
-test('repairUnresolvedToolCalls synthesizes results for orphans only', async () => {
-  const { repairUnresolvedToolCalls } = await import('./orchestrator.ts')
-  const base = {
-    sessionId: 's', threadId: 't', turnId: null, visibility: 'portable' as const,
-    provider: null, nativeId: null, createdAt: '2026-01-01T00:00:00.000Z',
-  }
-  const snapshot = {
-    items: [
-      { ...base, id: 'i1', sequence: 1, kind: 'tool_call' as const, payload: { callId: 'resolved-1' } },
-      { ...base, id: 'i2', sequence: 2, kind: 'tool_result' as const, payload: { callId: 'resolved-1' } },
-      { ...base, id: 'i3', sequence: 3, kind: 'tool_call' as const, payload: { callId: 'orphan-1' } },
-      { ...base, id: 'i4', sequence: 4, kind: 'assistant_message' as const, payload: { text: 'hi' } },
+test('an imported orphan tool call is durably repaired and the conversation resumes', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'baton-orchestrator-import-orphan-'))
+  const store = new SqliteSessionStore(join(directory, 'sessions.sqlite'))
+  const registry = new AdapterRegistry()
+  const snapshots: ThreadSnapshot[] = []
+  registry.register(safeAdapter(snapshots))
+  const orchestrator = new TurnOrchestrator(store, registry, new ConversationEventHub())
+  t.after(async () => {
+    await orchestrator.close()
+    rmSync(directory, { recursive: true, force: true })
+  })
+
+  const candidate: NativeSessionCandidate = {
+    candidateId: 'candidate-orphan',
+    sourceClient: 'claude_desktop',
+    provider: 'claude',
+    namespaceKey: 'native-test',
+    nativeSessionId: 'native-orphan-1',
+    identityKeys: [],
+    sourceAlias: 'Imported with orphan',
+    aliasSource: 'native',
+    titleSource: 'metadata:user',
+    projectAlias: null,
+    projectGroupKey: null,
+    cwd: null,
+    createdAt: '2026-07-18T00:00:00.000Z',
+    updatedAt: '2026-07-18T00:00:00.000Z',
+    nativeOrigin: 'ide_app',
+    nativeArchived: false,
+    sourceHead: { size: 2, mtimeMs: 2, finalRecordDigest: 'digest-2' },
+    contentDigest: 'content-orphan',
+    prefixDigest: 'prefix-2',
+    portableItemCount: 2,
+    records: [
+      {
+        key: 'record-1',
+        ordinal: 1,
+        digest: 'digest-1',
+        prefixDigest: 'prefix-1',
+        item: { kind: 'user_message', payload: { text: 'please run the agent' } },
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+      {
+        key: 'record-2',
+        ordinal: 2,
+        digest: 'digest-2',
+        prefixDigest: 'prefix-2',
+        item: { kind: 'tool_call', payload: { callId: 'toolu_import_orphan', name: 'Agent', input: {} } },
+        createdAt: '2026-07-18T00:00:01.000Z',
+      },
     ],
-  } as unknown as ThreadSnapshot
-  const repaired = repairUnresolvedToolCalls(snapshot)
-  assert.deepEqual(repaired.items.map((item) => [item.id, item.kind]), [
-    ['i1', 'tool_call'], ['i2', 'tool_result'],
-    ['i3', 'tool_call'], ['i3:orphan-result', 'tool_result'],
-    ['i4', 'assistant_message'],
-  ])
-  const synthetic = repaired.items.find((item) => item.id === 'i3:orphan-result')
+    skippedItemCount: 0,
+    parserVersion: 'test/1',
+    warnings: [],
+    materialized: true,
+  }
+  const imported = store.commitNativeImport({ candidate, previewedState: null })
+  assert.equal(imported.status, 'imported')
+  assert.ok(imported.sessionId)
+  const threadId = store.getSession(imported.sessionId as string)!.activeThreadId
+
+  // Previously this threw "Provider switch blocked by unresolved tool calls".
+  const turn = await orchestrator.startTurn({
+    threadId,
+    provider: 'codex',
+    model: 'gpt-test',
+    clientRequestId: 'request-resume',
+    expectedRevision: store.getThread(threadId)!.revision,
+    input: [{ kind: 'user_message', payload: { text: 'continue' } }],
+  })
+  await waitForTerminal(store, turn.turn.id)
+  assert.equal(store.getTurn(turn.turn.id)?.status, 'completed')
+
+  // The repair is durable: a persisted synthetic result closes the orphan.
+  const items = store.listItems(threadId)
+  const synthetic = items.find((item) => item.kind === 'tool_result'
+    && item.payload.callId === 'toolu_import_orphan')
+  assert.ok(synthetic, 'synthetic tool_result must be persisted')
   assert.equal(synthetic?.payload.synthetic, true)
-  assert.equal(synthetic?.payload.isError, true)
-  assert.equal(synthetic?.payload.callId, 'orphan-1')
-  // No orphans → identical snapshot object, untouched.
-  const clean = { items: snapshot.items.slice(0, 2) } as unknown as ThreadSnapshot
-  assert.equal(repairUnresolvedToolCalls(clean), clean)
+  assert.equal(synthetic?.turnId, null)
+  assert.match(JSON.stringify(synthetic?.payload.result ?? {}), /tool_result_missing/)
+  // Idempotent: a second repair pass appends nothing.
+  assert.equal(store.repairOrphanImportedToolCalls(threadId), 0)
 })

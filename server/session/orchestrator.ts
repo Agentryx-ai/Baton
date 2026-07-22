@@ -850,6 +850,11 @@ export class TurnOrchestrator implements ConversationService {
     }, remainingGoalMs)
     const executionSignal = executionController.signal
     try {
+      // Imported transcripts can carry tool calls whose results were never
+      // recorded; persist synthetic error results so the transcript closes
+      // durably (execution, compaction, and provider views stay consistent).
+      // Live-turn orphans are untouched: mutating ones must be reconciled.
+      this.store.repairOrphanImportedToolCalls(input.threadId)
       const persisted = this.store.getSnapshot(input.threadId)
       if (!persisted) throw new Error(`Thread disappeared after turn start: ${input.threadId}`)
       const materialized = this.contextRuntime
@@ -859,7 +864,8 @@ export class TurnOrchestrator implements ConversationService {
             provider: input.provider,
           })
         : persisted
-      const snapshot = repairUnresolvedToolCalls(adapterSnapshot(materialized, input.provider, turn.id))
+      const snapshot = adapterSnapshot(materialized, input.provider, turn.id)
+      assertNoUnresolvedToolCalls(snapshot)
       const request = {
         turnId: turn.id,
         model: input.model,
@@ -1774,49 +1780,22 @@ function adapterSnapshot(
 }
 
 /**
- * Imported or interrupted transcripts can carry tool calls whose results were
- * never recorded — the source app crashed mid-call, or the conversation was
- * imported before the call finished. Throwing here (the previous behavior)
- * bricked such conversations forever, since the missing result can never
- * arrive. Instead, materialize a synthetic error result for each orphan so
- * every provider sees a consistent transcript. Resolved pairs are never
- * touched, and the synthetic items are execution-scoped only — nothing is
- * persisted.
+ * Turnless (imported) orphans are durably repaired before the snapshot is
+ * taken, so anything still unresolved here belongs to a live turn whose
+ * outcome is unknown — most importantly a mutating tool call that must go
+ * through user reconciliation rather than being silently re-run.
  */
-export function repairUnresolvedToolCalls(snapshot: ThreadSnapshot): ThreadSnapshot {
-  const open = new Map<string, ThreadSnapshot['items'][number]>()
+function assertNoUnresolvedToolCalls(snapshot: ThreadSnapshot): void {
+  const open = new Set<string>()
   for (const item of snapshot.items) {
     const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
     if (!callId) continue
-    if (item.kind === 'tool_call') open.set(callId, item)
+    if (item.kind === 'tool_call') open.add(callId)
     if (item.kind === 'tool_result') open.delete(callId)
   }
-  if (open.size === 0) return snapshot
-  const items: ThreadSnapshot['items'] = []
-  for (const item of snapshot.items) {
-    items.push(item)
-    const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
-    if (callId && item.kind === 'tool_call' && open.get(callId) === item) {
-      items.push({
-        ...item,
-        id: `${item.id}:orphan-result` as typeof item.id,
-        kind: 'tool_result',
-        payload: {
-          callId,
-          isError: true,
-          synthetic: true,
-          output: {
-            error: {
-              code: 'tool_result_missing',
-              message: 'This tool call has no recorded result; the conversation was imported or interrupted before it completed.',
-            },
-          },
-        },
-        nativeId: null,
-      })
-    }
+  if (open.size > 0) {
+    throw new Error(`Unresolved tool calls require reconciliation before continuing: ${[...open].join(', ')}`)
   }
-  return { ...snapshot, items }
 }
 
 function isTerminal(status: CanonicalTurn['status']): boolean {
