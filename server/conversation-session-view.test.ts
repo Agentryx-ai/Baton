@@ -114,6 +114,103 @@ test('project grouping does not merge unrelated paths that share a basename', ()
   assert.deepEqual(groups.map((group) => group.label), ['shared', 'shared'])
 })
 
+test('project grouping merges cwd-only and projectKey-only sessions bridged by one that has both', () => {
+  // Mirrors the real DaeumKkini mixed state: a native session with a cwd but no
+  // projectKey, an older import with a projectKey but no cwd, and a current
+  // import that carries both and bridges them into a single project group.
+  const groups = groupSessions([
+    session('native', '2026-07-20T00:00:00.000Z', { cwd: 'C:\\_projects\\Agentryx-ai\\DaeumKkini' }),
+    session('bridge', '2026-07-19T00:00:00.000Z', {
+      cwd: 'C:\\_projects\\Agentryx-ai\\DaeumKkini',
+      projectKey: 'Fb3G7Z33ZVIeQ_hash',
+      source: {
+        provider: 'codex',
+        sourceClient: 'codex_local',
+        sourceAlias: 'CP-SAT',
+        titleSource: null,
+        projectAlias: 'DaeumKkini',
+      },
+    }),
+    session('legacy-import', '2026-07-18T00:00:00.000Z', {
+      cwd: null,
+      projectKey: 'Fb3G7Z33ZVIeQ_hash',
+      source: {
+        provider: 'codex',
+        sourceClient: 'codex_local',
+        sourceAlias: 'Marketing',
+        titleSource: null,
+        projectAlias: 'DaeumKkini',
+      },
+    }),
+  ], 'project')
+
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0]?.label, 'DaeumKkini')
+  assert.deepEqual(groups[0]?.sessions.map((item) => item.id).sort(), ['bridge', 'legacy-import', 'native'])
+})
+
+test('project grouping keeps every identity-less session in one 프로젝트 없음 group', () => {
+  const groups = groupSessions([
+    session('a', '2026-07-18T00:00:00.000Z'),
+    session('b', '2026-07-17T00:00:00.000Z'),
+  ], 'project')
+
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0]?.label, '프로젝트 없음')
+  assert.deepEqual(groups[0]?.sessions.map((item) => item.id), ['a', 'b'])
+})
+
+test('project group ids are content-stable across activity churn and sort mode', () => {
+  const build = (aUpdatedAt: string, bUpdatedAt: string, sort: 'recent' | 'name') => groupSessions([
+    session('a', aUpdatedAt, { cwd: 'C:\\proj\\Alpha' }),
+    session('b', bUpdatedAt, { cwd: 'C:\\proj\\Beta' }),
+  ], 'project', sort)
+  const idOf = (groups: ReturnType<typeof groupSessions>, sessionId: string) =>
+    groups.find((group) => group.sessions.some((item) => item.id === sessionId))?.id
+
+  const before = build('2026-07-20T00:00:00.000Z', '2026-07-19T00:00:00.000Z', 'recent')
+  const afterChurn = build('2026-07-20T00:00:00.000Z', '2026-07-21T00:00:00.000Z', 'recent')
+  const afterSort = build('2026-07-20T00:00:00.000Z', '2026-07-19T00:00:00.000Z', 'name')
+
+  // The group id must follow the project, not the row's position, so persisted
+  // collapse state never reattaches to a different project.
+  assert.equal(idOf(before, 'a'), idOf(afterChurn, 'a'))
+  assert.equal(idOf(before, 'b'), idOf(afterChurn, 'b'))
+  assert.equal(idOf(before, 'a'), idOf(afterSort, 'a'))
+  assert.notEqual(idOf(before, 'a'), idOf(before, 'b'))
+})
+
+test('a stale projectKey left on a re-pointed folder does not fuse two projects', () => {
+  // `moved` was imported into Alpha (K_A) then re-pointed to Beta; its projectKey
+  // is now stale. It must not drag all of Alpha and all of Beta into one group.
+  const groups = groupSessions([
+    session('a1', '2026-07-20T00:00:00.000Z', { cwd: 'C:\\proj\\Alpha', projectKey: 'K_A' }),
+    session('moved', '2026-07-19T00:00:00.000Z', { cwd: 'C:\\proj\\Beta', projectKey: 'K_A' }),
+    session('b1', '2026-07-18T00:00:00.000Z', { cwd: 'C:\\proj\\Beta' }),
+  ], 'project')
+
+  const groupOf = (id: string) => groups.find((group) => group.sessions.some((item) => item.id === id))
+  assert.notEqual(groupOf('a1')?.id, groupOf('b1')?.id)
+  assert.equal(groupOf('moved')?.id, groupOf('b1')?.id)
+  assert.equal(groupOf('a1')?.sessions.length, 1)
+})
+
+test('project grouping unifies Windows path separators and casing across sources', () => {
+  const groups = groupSessions([
+    session('native', '2026-07-20T00:00:00.000Z', { cwd: 'C:\\_projects\\App' }),
+    session('import', '2026-07-19T00:00:00.000Z', {
+      cwd: null,
+      source: {
+        provider: 'codex', sourceClient: 'codex_local', sourceAlias: 'x', titleSource: null,
+        projectAlias: null, cwd: 'C:/_projects/App',
+      },
+    }),
+  ], 'project')
+
+  assert.equal(groups.length, 1)
+  assert.deepEqual(groups[0]?.sessions.map((item) => item.id).sort(), ['import', 'native'])
+})
+
 test('invalid persisted view preferences fail closed to documented defaults', () => {
   const preferences = loadSessionViewPreferences({ getItem: () => '{bad json' })
 
