@@ -135,7 +135,7 @@ export function useConversationEvents(
     let cursor = threadCursors.get(threadId) ?? 0
     let active = true
     let source: EventSource | null = null
-    let retryTimer: number | undefined
+    let retryTimer: TimerHandle | undefined
     setState({ status: 'connecting', lastSequence: cursor, error: null })
     const batcher = createConversationEventBatcher(threadId, (event, flushedCursor) => {
       cursor = flushedCursor
@@ -181,7 +181,7 @@ export function useConversationEvents(
         // Recreate it from the last flushed cursor so the live view recovers.
         if (next.readyState === EventSource.CLOSED && active) {
           disposeSource()
-          retryTimer = window.setTimeout(connect, 3_000)
+          retryTimer = setTimeout(connect, 3_000)
         }
       }
       for (const type of EVENT_TYPES) next.addEventListener(type, handleEvent)
@@ -190,7 +190,7 @@ export function useConversationEvents(
     connect()
     return () => {
       active = false
-      if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+      if (retryTimer !== undefined) clearTimeout(retryTimer)
       batcher.cancel()
       disposeSource()
     }
