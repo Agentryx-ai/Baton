@@ -75,7 +75,14 @@ server.on('error', (error) => {
 
 let shuttingDown = false
 port.on('message', (message: unknown) => {
-  if (!message || typeof message !== 'object' || (message as { type?: unknown }).type !== 'shutdown') return
+  const type = message && typeof message === 'object' ? (message as { type?: unknown }).type : undefined
+  if (type === 'close-streams') {
+    // End SSE responses so the parent's connection drain is not stuck behind
+    // long-lived streams (mirrors the pre-isolation shutdown order).
+    runtime.closeStreams()
+    return
+  }
+  if (type !== 'shutdown') return
   if (shuttingDown) return
   shuttingDown = true
   void (async () => {

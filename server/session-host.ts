@@ -9,7 +9,7 @@
  * the worker's event loop may stall on the database; the main thread's never
  * does, so inference proxies, health, and the SPA stay responsive.
  */
-import { request as httpRequest } from 'node:http'
+import { Agent, request as httpRequest } from 'node:http'
 import { Worker } from 'node:worker_threads'
 import type { Request, RequestHandler, Response } from 'express'
 
@@ -17,6 +17,16 @@ import { createConversationRuntime } from './session/runtime.ts'
 
 const RESTART_DELAYS_MS = [250, 1_000, 5_000, 15_000, 30_000]
 const HEALTHY_RESET_MS = 60_000
+/**
+ * How long a request may wait for the worker to become ready before failing.
+ * Covers the boot window and the restart-backoff ladder; browsers treat an SSE
+ * HTTP error as a permanent connection failure (no automatic retry), so
+ * holding the request until the worker is back preserves live streams.
+ */
+const READY_WAIT_MS = 20_000
+// A fresh connection per hop: reusing pooled keep-alive sockets races the
+// worker server's idle timeout and surfaces spurious ECONNRESET 502s.
+const hopAgent = new Agent({ keepAlive: false })
 
 /** Hop-by-hop headers never forwarded across the internal hop (RFC 9110 §7.6.1). */
 const HOP_BY_HOP = new Set([
@@ -34,6 +44,8 @@ export interface SessionHostSnapshot {
   mode: 'worker' | 'inline'
   state: 'starting' | 'ready' | 'down' | 'closed' | 'inline'
   restarts: number
+  /** Worker mode, ready only: internal loopback port (token stays private). */
+  port?: number
   lastError?: string
 }
 
@@ -71,6 +83,7 @@ export function forwardToSessionHost(target: SessionHostTarget, req: Request, re
     method: req.method,
     path: req.originalUrl,
     headers,
+    agent: hopAgent,
     // SSE responses idle between events; never time the socket out here.
     timeout: 0,
   })
@@ -132,6 +145,39 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
   let respawnTimer: ReturnType<typeof setTimeout> | null = null
   const closeResolvers: (() => void)[] = []
 
+  interface Waiter {
+    req: Request
+    res: Response
+    timer: ReturnType<typeof setTimeout>
+    onAbort: () => void
+  }
+  const waiters: Waiter[] = []
+
+  const dropWaiter = (waiter: Waiter): void => {
+    clearTimeout(waiter.timer)
+    waiter.res.off('close', waiter.onAbort)
+    const index = waiters.indexOf(waiter)
+    if (index >= 0) waiters.splice(index, 1)
+  }
+
+  const flushWaiters = (): void => {
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.res.off('close', waiter.onAbort)
+      if (waiter.res.writableEnded || waiter.res.destroyed) continue
+      if (target) forwardToSessionHost(target, waiter.req, waiter.res)
+      else unavailable(waiter.res)
+    }
+  }
+
+  const failWaiters = (): void => {
+    for (const waiter of waiters.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.res.off('close', waiter.onAbort)
+      if (!waiter.res.writableEnded && !waiter.res.destroyed) unavailable(waiter.res)
+    }
+  }
+
   const spawn = (): void => {
     state = 'starting'
     target = null
@@ -148,6 +194,7 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
         target = { port: value.port, token: value.token }
         state = 'ready'
         lastError = undefined
+        flushWaiters()
         return
       }
       if (value.type === 'started' && typeof value.recovered === 'number') {
@@ -187,21 +234,49 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
 
   return {
     middleware: (req, res) => {
-      if (state !== 'ready' || !target) {
+      if (state === 'ready' && target) {
+        forwardToSessionHost(target, req, res)
+        return
+      }
+      if (state === 'closed') {
         unavailable(res)
         return
       }
-      forwardToSessionHost(target, req, res)
+      // Boot window or restart backoff: hold the request until the worker is
+      // back. An immediate 503 would permanently fail browser EventSources
+      // (SSE HTTP errors never auto-retry), turning a transient restart into
+      // a dead live view.
+      const waiter: Waiter = {
+        req,
+        res,
+        timer: setTimeout(() => {
+          dropWaiter(waiter)
+          if (!res.writableEnded && !res.destroyed) unavailable(res)
+        }, READY_WAIT_MS),
+        onAbort: () => dropWaiter(waiter),
+      }
+      waiter.timer.unref()
+      res.once('close', waiter.onAbort)
+      waiters.push(waiter)
     },
-    snapshot: () => ({ mode: 'worker', state, restarts, ...(lastError ? { lastError } : {}) }),
+    snapshot: () => ({
+      mode: 'worker',
+      state,
+      restarts,
+      ...(state === 'ready' && target ? { port: target.port } : {}),
+      ...(lastError ? { lastError } : {}),
+    }),
     start: () => null,
     closeStreams: () => {
-      // Streams live in the worker; shutdown message handles them in close().
+      // Mirror the old inline semantics: end worker-held SSE streams now so
+      // the main server's connection drain is not stuck behind them.
+      worker?.postMessage({ type: 'close-streams' })
     },
     close: async () => {
       state = 'closed'
       if (respawnTimer) clearTimeout(respawnTimer)
       respawnTimer = null
+      failWaiters()
       const active = worker
       if (!active) return
       const exited = new Promise<void>((resolve) => closeResolvers.push(resolve))

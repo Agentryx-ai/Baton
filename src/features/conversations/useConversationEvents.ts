@@ -133,24 +133,15 @@ export function useConversationEvents(
     }
 
     let cursor = threadCursors.get(threadId) ?? 0
+    let active = true
+    let source: EventSource | null = null
+    let retryTimer: number | undefined
     setState({ status: 'connecting', lastSequence: cursor, error: null })
-    const source = new EventSource(conversationApi.eventsUrl(threadId, cursor))
     const batcher = createConversationEventBatcher(threadId, (event, flushedCursor) => {
       cursor = flushedCursor
       setState({ status: 'open', lastSequence: cursor, error: null })
       return callbackRef.current(event)
     })
-
-    source.onopen = () => {
-      setState((current) => ({ ...current, status: 'open', error: null }))
-    }
-    source.onerror = () => {
-      setState((current) => ({
-        ...current,
-        status: 'retrying',
-        error: '실시간 연결이 끊겨 재연결 중입니다.',
-      }))
-    }
 
     const handleEvent = (event: Event): void => {
       const message = event as Event & { data: string; lastEventId: string }
@@ -165,11 +156,43 @@ export function useConversationEvents(
       batcher.push(parsed, nextCursor)
     }
 
-    for (const type of EVENT_TYPES) source.addEventListener(type, handleEvent)
-    return () => {
-      batcher.cancel()
+    const disposeSource = (): void => {
+      if (!source) return
       for (const type of EVENT_TYPES) source.removeEventListener(type, handleEvent)
       source.close()
+      source = null
+    }
+
+    const connect = (): void => {
+      if (!active) return
+      const next = new EventSource(conversationApi.eventsUrl(threadId, cursor))
+      source = next
+      next.onopen = () => {
+        setState((current) => ({ ...current, status: 'open', error: null }))
+      }
+      next.onerror = () => {
+        setState((current) => ({
+          ...current,
+          status: 'retrying',
+          error: '실시간 연결이 끊겨 재연결 중입니다.',
+        }))
+        // Browsers retry network drops on their own, but an HTTP error (e.g. a
+        // 503 while the server restarts) fails the EventSource permanently.
+        // Recreate it from the last flushed cursor so the live view recovers.
+        if (next.readyState === EventSource.CLOSED && active) {
+          disposeSource()
+          retryTimer = window.setTimeout(connect, 3_000)
+        }
+      }
+      for (const type of EVENT_TYPES) next.addEventListener(type, handleEvent)
+    }
+
+    connect()
+    return () => {
+      active = false
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer)
+      batcher.cancel()
+      disposeSource()
     }
   }, [threadId])
 

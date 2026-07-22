@@ -151,6 +151,18 @@ test('worker session host serves the real runtime and refuses tokenless direct a
     const sessions = await fetchLocal(frontPort, '/baton/v1/sessions')
     assert.equal(sessions.status, 200)
 
+    // The worker's own port must reject any caller that lacks the per-boot
+    // token — that check is the only barrier against local processes
+    // bypassing the main thread.
+    const workerPort = host.snapshot().port
+    assert.ok(typeof workerPort === 'number')
+    const tokenless = await fetchLocal(workerPort as number, '/baton/v1/sessions')
+    assert.equal(tokenless.status, 403)
+    const wrongToken = await fetchLocal(workerPort as number, '/baton/v1/sessions', {
+      headers: { 'x-baton-session-host': 'wrong-token' },
+    })
+    assert.equal(wrongToken.status, 403)
+
     // CSRF probe proves the Host header survives the hop: the runtime compares
     // the Origin header against the host the client addressed.
     const csrf = await fetchLocal(frontPort, '/baton/v1/native-import/csrf', {
@@ -206,11 +218,13 @@ parentPort.on('message', (m) => { if (m?.type === 'shutdown') process.exit(0) })
 
     await fetchLocal(frontPort, '/baton/v1/crash')
     await waitFor(() => host.snapshot().state !== 'ready')
-    assert.equal((await fetchLocal(frontPort, '/baton/v1/anything')).status, 503)
 
-    // The supervisor relaunches the worker on its backoff ladder.
-    await waitFor(() => host.snapshot().state === 'ready')
-    assert.equal((await fetchLocal(frontPort, '/baton/v1/anything')).status, 200)
+    // A request issued while the worker is down must be HELD, not failed:
+    // an immediate 503 would permanently close browser EventSources. The
+    // supervisor relaunches the worker and then flushes held requests.
+    const heldWhileDown = await fetchLocal(frontPort, '/baton/v1/anything')
+    assert.equal(heldWhileDown.status, 200)
+    assert.equal(host.snapshot().state, 'ready')
     assert.ok(host.snapshot().restarts >= 1)
   } finally {
     front.close()
