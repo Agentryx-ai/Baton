@@ -2046,6 +2046,12 @@ export class SqliteSessionStore implements SessionStore {
       if (thread.status !== 'idle') throw new SessionStoreError('turn_not_running', 'Thread already has an active turn')
       if (!session) throw new Error('Corrupt database: turn session is missing')
       this.#assertPermissionSnapshotCurrent(input.policySnapshot, session)
+      // Close imported (turnless) orphan tool calls now, after the caller's
+      // expectedRevision was honored but before this turn's items exist: the
+      // synthetic results precede every turn item (keeping fresh imports
+      // compactable) and never perturb the native-refresh untouched-root
+      // accounting, because a turn beginning marks the session touched anyway.
+      this.#repairOrphanImportedToolCallsInTxn(input.threadId)
 
       const now = this.#now()
       const goalContext = input.goalContext ?? null
@@ -2156,6 +2162,8 @@ export class SqliteSessionStore implements SessionStore {
       if (!session || session.archivedAt) throw new SessionStoreError('session_archived', 'Follow-up session is archived')
       if (thread.status !== 'idle') throw new SessionStoreError('turn_not_running', 'Thread already has an active turn')
       this.#assertPermissionSnapshotCurrent(input.policySnapshot, session)
+      // Same turnless-orphan closure as beginTurn: before this turn's items.
+      this.#repairOrphanImportedToolCallsInTxn(thread.id)
       const turnSequence = integer(this.#one(this.#db.prepare(
         'SELECT COALESCE(MAX(sequence),0)+1 AS next_sequence FROM turns WHERE thread_id=?',
       ), thread.id), 'next_sequence')
@@ -4379,28 +4387,14 @@ export class SqliteSessionStore implements SessionStore {
       }
       if (existing) {
         const result = this.#appendNativeImport(existing, input)
-        this.#repairOrphanToolCallsForSession(result.sessionId)
         if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
         return result
       }
       if (input.previewedState) throw new Error('native source identity disappeared after preview')
       const result = this.#createNativeImport(input)
-      this.#repairOrphanToolCallsForSession(result.sessionId)
       if (input.commitCheckpoint) this.#recordNativeImportCommitResult(input.commitCheckpoint, result)
       return result
     })
-  }
-
-  /**
-   * Close imported orphans at import time: on a fresh import every item is
-   * still turnless, so the synthetic results land inside the leading turnless
-   * block and the transcript stays compactable from the start.
-   */
-  #repairOrphanToolCallsForSession(sessionId: string | undefined): void {
-    if (!sessionId) return
-    const row = this.#optional(this.#db.prepare('SELECT active_thread_id FROM sessions WHERE id=?'), sessionId)
-    if (!row) return
-    this.#repairOrphanImportedToolCallsInTxn(text(row, 'active_thread_id') as ThreadId)
   }
 
   #createNativeImport(

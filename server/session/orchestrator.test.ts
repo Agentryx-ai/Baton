@@ -2066,19 +2066,13 @@ test('an imported orphan tool call is durably repaired and the conversation resu
   assert.ok(imported.sessionId)
   const threadId = store.getSession(imported.sessionId as string)!.activeThreadId
 
-  // Import-time repair: the synthetic result is persisted while every item is
-  // still turnless, so it lands inside the leading turnless block and the
-  // transcript stays compactable from the start.
-  const items = store.listItems(threadId)
-  const synthetic = items.find((item) => item.kind === 'tool_result'
-    && item.payload.callId === 'toolu_import_orphan')
-  assert.ok(synthetic, 'synthetic tool_result must be persisted at import time')
-  assert.equal(synthetic?.payload.synthetic, true)
-  assert.equal(synthetic?.turnId, null)
-  assert.match(JSON.stringify(synthetic?.payload.result ?? {}), /tool_result_missing/)
-  assert.ok(items.every((item) => item.turnId === null), 'repair happened before any turn')
+  // Import itself never repairs: the source may still deliver the real result
+  // via a refresh, and the untouched-root refresh accounting must stay exact.
+  assert.equal(store.listItems(threadId).some((item) => item.kind === 'tool_result'), false)
 
   // Previously this threw "Provider switch blocked by unresolved tool calls".
+  // The caller's observed revision stays valid: beginTurn repairs internally
+  // after honoring expectedRevision, so no revision_conflict occurs.
   const turn = await orchestrator.startTurn({
     threadId,
     provider: 'codex',
@@ -2089,11 +2083,24 @@ test('an imported orphan tool call is durably repaired and the conversation resu
   })
   await waitForTerminal(store, turn.turn.id)
   assert.equal(store.getTurn(turn.turn.id)?.status, 'completed')
+
+  // The repair ran inside beginTurn, before this turn's items were appended:
+  // the synthetic result stays inside the leading turnless block.
+  const items = store.listItems(threadId)
+  const synthetic = items.find((item) => item.kind === 'tool_result'
+    && item.payload.callId === 'toolu_import_orphan')
+  assert.ok(synthetic, 'synthetic tool_result must be persisted by the first turn')
+  assert.equal(synthetic?.payload.synthetic, true)
+  assert.equal(synthetic?.turnId, null)
+  assert.match(JSON.stringify(synthetic?.payload.result ?? {}), /tool_result_missing/)
+  const firstTurnItem = items.find((item) => item.turnId !== null)!
+  assert.ok((synthetic?.sequence ?? Infinity) < firstTurnItem.sequence,
+    'synthetic result must precede every turn-attached item')
   // Idempotent: a second repair pass appends nothing.
   assert.equal(store.repairOrphanImportedToolCalls(threadId), 0)
 
-  // A fork anchored before the synthetic result inherits the orphan call
-  // without its repair — appends can never reach the parent slice, so the
+  // A fork anchored at the orphan call inherits it without the later
+  // synthetic result — appends can never reach the parent slice, so the
   // executor tolerates turnless orphans instead of bricking the fork.
   const orphanCall = items.find((item) => item.kind === 'tool_call')!
   const fork = store.forkThread({ threadId, forkItemId: orphanCall.id })
@@ -2164,8 +2171,6 @@ test('duplicated imported call records are closed by the order-aware repair', as
   })
   assert.equal(imported.status, 'imported')
   const threadId = store.getSession(imported.sessionId as string)!.activeThreadId
-  const results = store.listItems(threadId).filter((item) => item.kind === 'tool_result')
-  assert.equal(results.length, 2, 'the reopened call gets its own synthetic result')
 
   const turn = await orchestrator.startTurn({
     threadId,
@@ -2177,4 +2182,6 @@ test('duplicated imported call records are closed by the order-aware repair', as
   })
   await waitForTerminal(store, turn.turn.id)
   assert.equal(store.getTurn(turn.turn.id)?.status, 'completed')
+  const results = store.listItems(threadId).filter((item) => item.kind === 'tool_result')
+  assert.equal(results.length, 2, 'the reopened call gets its own synthetic result')
 })

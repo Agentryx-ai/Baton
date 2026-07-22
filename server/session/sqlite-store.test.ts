@@ -3468,3 +3468,72 @@ test('provider bindings reject plaintext opaque state and invalidate incompatibl
   store.finishTurn({ turnId: turn.turn.id, status: 'completed' })
   assert.deepEqual(store.getSnapshot(thread.id)?.bindings, [], 'finished turns invalidate prior bindings')
 })
+
+test('a refresh after importing an orphan still applies and delivers the real result', (t) => {
+  const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
+  t.after(() => store.close())
+  const record = (ordinal: number, item: { kind: string; payload: Record<string, unknown> }) => ({
+    key: `record-${ordinal}`,
+    ordinal,
+    digest: `digest-${ordinal}`,
+    prefixDigest: `prefix-${ordinal}`,
+    item,
+    createdAt: '2026-07-18T00:00:00.000Z',
+  })
+  const candidateWith = (
+    records: ReturnType<typeof record>[],
+    contentDigest: string,
+  ): NativeSessionCandidate => ({
+    candidateId: 'candidate-refresh',
+    sourceClient: 'claude_desktop',
+    provider: 'claude',
+    namespaceKey: 'native-test',
+    nativeSessionId: 'native-refresh-1',
+    identityKeys: [],
+    sourceAlias: 'Mid-call import',
+    aliasSource: 'native',
+    titleSource: 'metadata:user',
+    projectAlias: null,
+    projectGroupKey: null,
+    cwd: null,
+    createdAt: '2026-07-18T00:00:00.000Z',
+    updatedAt: '2026-07-18T00:00:00.000Z',
+    nativeOrigin: 'ide_app',
+    nativeArchived: false,
+    sourceHead: { size: records.length, mtimeMs: records.length, finalRecordDigest: `digest-${records.length}` },
+    contentDigest,
+    prefixDigest: `prefix-${records.length}`,
+    portableItemCount: records.length,
+    records,
+    skippedItemCount: 0,
+    parserVersion: 'test/1',
+    warnings: [],
+    materialized: true,
+  } as NativeSessionCandidate)
+
+  // Imported mid-call: the orphan is present, and import does NOT repair —
+  // the refresh below is the only path that can deliver the genuine result.
+  const call = record(1, { kind: 'tool_call', payload: { callId: 'toolu_refresh', name: 'Read', input: {} } })
+  const first = candidateWith([call], 'content-1')
+  const imported = store.commitNativeImport({ candidate: first, previewedState: null })
+  assert.equal(imported.status, 'imported')
+  assert.ok(imported.sessionId)
+  const threadId = store.getSession(imported.sessionId!)!.activeThreadId
+  assert.equal(store.listItems(threadId).some((item) => item.kind === 'tool_result'), false)
+
+  // The source finished the call: refresh must still apply (untouched root)
+  // and append the real result.
+  const state = store.getNativeImportState(first)
+  assert.ok(state)
+  const refreshed = store.commitNativeImport({
+    candidate: candidateWith([
+      call,
+      record(2, { kind: 'tool_result', payload: { callId: 'toolu_refresh', isError: false } }),
+    ], 'content-2'),
+    previewedState: state,
+  })
+  assert.equal(refreshed.status, 'updated')
+  const results = store.listItems(threadId).filter((item) => item.kind === 'tool_result')
+  assert.equal(results.length, 1, 'the genuine result arrived; no synthetic was fabricated')
+  assert.equal(results[0]?.payload.synthetic, undefined)
+})

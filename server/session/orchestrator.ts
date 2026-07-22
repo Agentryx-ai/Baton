@@ -581,10 +581,6 @@ export class TurnOrchestrator implements ConversationService {
         })
       : null
     if (startSignal?.aborted) throw startSignal.reason ?? new Error('Goal continuation start was cancelled')
-    // Close imported (turnless) orphan tool calls before this turn's items are
-    // appended, so on a freshly imported session the synthetic results stay
-    // inside the leading turnless block and the transcript remains compactable.
-    this.store.repairOrphanImportedToolCalls(input.threadId)
     const result = this.store.beginTurn({
       threadId: input.threadId,
       provider: input.provider,
