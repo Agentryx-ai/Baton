@@ -25,6 +25,7 @@
     "install:bootstrap:dev": "node scripts/build-baton-bootstrap.mjs --install --allow-unsigned-development",
     "verify:bootstrap": "node scripts/verify-baton-bootstrap.mjs",
     "restore:native-goals": "tsx scripts/restore-native-goals.ts",
+    "purge:native-imports": "tsx scripts/purge-native-imports.ts",
     "preview": "vite preview"
   },
   "dependencies": {

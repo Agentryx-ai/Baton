@@ -102,6 +102,15 @@ export function groupSessions(
   })
 }
 
+export function projectGroupWorkspace(group: SessionGroup | undefined): string | null {
+  if (!group) return null
+  const workspaces = new Set(group.sessions.flatMap((session) => {
+    const cwd = session.cwd?.trim() || session.source?.cwd?.trim()
+    return cwd ? [cwd] : []
+  }))
+  return workspaces.size === 1 ? workspaces.values().next().value ?? null : null
+}
+
 function sessionComparator(sort: SessionSortMode): (left: CanonicalSessionDto, right: CanonicalSessionDto) => number {
   if (sort === 'name') {
     return (left, right) => sessionLabel(left).localeCompare(sessionLabel(right))

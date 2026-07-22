@@ -8,6 +8,7 @@ import {
   groupSessions,
   isSelectableNativeCandidate,
   loadSessionViewPreferences,
+  projectGroupWorkspace,
   withNativeCandidateSelection,
 } from '../src/features/conversations/session-view-preferences.ts'
 import type { CanonicalSessionDto, NativeImportCandidateDto } from '../src/features/conversations/types.ts'
@@ -112,6 +113,27 @@ test('project grouping does not merge unrelated paths that share a basename', ()
 
   assert.equal(groups.length, 2)
   assert.deepEqual(groups.map((group) => group.label), ['shared', 'shared'])
+})
+
+test('project group workspace prefers connected folders and accepts an unambiguous imported folder', () => {
+  const connected = groupSessions([
+    session('connected', '2026-07-18T00:00:00.000Z', { projectKey: 'baton', cwd: ' C:\\work\\Baton ' }),
+    session('imported', '2026-07-17T00:00:00.000Z', {
+      projectKey: 'baton',
+      source: {
+        provider: 'codex', sourceClient: 'codex_local', sourceAlias: null, titleSource: null,
+        projectAlias: 'Baton', cwd: 'C:\\work\\Baton',
+      },
+    }),
+  ], 'project')[0]
+  assert.equal(projectGroupWorkspace(connected), 'C:\\work\\Baton')
+
+  const ambiguous = groupSessions([
+    session('one', '2026-07-18T00:00:00.000Z', { projectKey: 'shared', cwd: 'C:\\one' }),
+    session('two', '2026-07-17T00:00:00.000Z', { projectKey: 'shared', cwd: 'C:\\two' }),
+  ], 'project')[0]
+  assert.equal(projectGroupWorkspace(ambiguous), null)
+  assert.equal(projectGroupWorkspace(undefined), null)
 })
 
 test('invalid persisted view preferences fail closed to documented defaults', () => {

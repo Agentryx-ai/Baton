@@ -10,6 +10,7 @@ import {
   Menu,
   MessageSquarePlus,
   Paperclip,
+  Plus,
   RefreshCw,
   Send,
   ShieldCheck,
@@ -63,6 +64,7 @@ import { NativeImportDialog } from './NativeImportDialog'
 import { ProviderAccountDisclosure } from './ProviderAccountDisclosure'
 import {
   groupSessions,
+  projectGroupWorkspace,
   type SessionGroupMode,
   type SessionSortMode,
   type SessionViewPreferences,
@@ -342,7 +344,7 @@ function SessionSidebar({
   scope: 'active' | 'trash'
   preferences: SessionViewPreferences
   onSelect: (sessionId: string) => void
-  onCreate: () => void
+  onCreate: (cwd?: string) => void
   onRefresh: () => void
   onPreferencesChange: (preferences: SessionViewPreferences) => void
   onScopeChange: (scope: 'active' | 'trash') => void
@@ -374,7 +376,7 @@ function SessionSidebar({
           variant="outline"
           className="w-full justify-start bg-background/60"
           disabled={creating}
-          onClick={scope === 'trash' ? () => onScopeChange('active') : onCreate}
+          onClick={scope === 'trash' ? () => onScopeChange('active') : () => onCreate()}
         >
           {scope === 'trash' ? <Undo2 aria-hidden /> : <MessageSquarePlus aria-hidden />}
           {scope === 'trash' ? '대화로 돌아가기' : '새 대화'}
@@ -485,20 +487,39 @@ function SessionSidebar({
               ))
             ) : (
               <section key={group.id}>
-                <button
-                  type="button"
-                  className="sticky top-0 z-10 flex min-h-8 w-full items-center gap-2 rounded-lg border border-transparent bg-sidebar/95 px-2 py-1.5 text-left text-xs font-semibold text-sidebar-foreground backdrop-blur-sm hover:border-sidebar-border hover:bg-sidebar-accent"
-                  aria-expanded={!collapsed.has(group.id)}
-                  onClick={() => toggleGroup(group.id)}
-                  title={group.label}
-                >
-                  {collapsed.has(group.id) ? <ChevronRight className="size-3" aria-hidden /> : <ChevronDown className="size-3" aria-hidden />}
-                  {collapsed.has(group.id) ? <Folder className="size-3.5 text-muted-foreground" aria-hidden /> : <FolderOpen className="size-3.5 text-muted-foreground" aria-hidden />}
-                  <span className="min-w-0 flex-1 truncate">{group.label}</span>
-                  <span className="min-w-5 rounded-full bg-sidebar-accent px-1.5 py-0.5 text-center text-[0.625rem] font-medium tabular-nums text-muted-foreground">
-                    {group.sessions.length}
-                  </span>
-                </button>
+                <div className="sticky top-0 z-10 flex min-h-8 items-center rounded-lg border border-transparent bg-sidebar/95 text-sidebar-foreground backdrop-blur-sm hover:border-sidebar-border hover:bg-sidebar-accent">
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-xs font-semibold"
+                    aria-expanded={!collapsed.has(group.id)}
+                    onClick={() => toggleGroup(group.id)}
+                    title={group.label}
+                  >
+                    {collapsed.has(group.id) ? <ChevronRight className="size-3" aria-hidden /> : <ChevronDown className="size-3" aria-hidden />}
+                    {collapsed.has(group.id) ? <Folder className="size-3.5 text-muted-foreground" aria-hidden /> : <FolderOpen className="size-3.5 text-muted-foreground" aria-hidden />}
+                    <span className="min-w-0 flex-1 truncate">{group.label}</span>
+                    <span className="min-w-5 rounded-full bg-sidebar-accent px-1.5 py-0.5 text-center text-[0.625rem] font-medium tabular-nums text-muted-foreground">
+                      {group.sessions.length}
+                    </span>
+                  </button>
+                  {preferences.groupBy === 'project' && scope === 'active' ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="mr-1 shrink-0"
+                      disabled={creating || projectGroupWorkspace(group) === null}
+                      onClick={() => {
+                        const cwd = projectGroupWorkspace(group)
+                        if (cwd) onCreate(cwd)
+                      }}
+                      aria-label={`${group.label}에서 새 대화`}
+                      title={projectGroupWorkspace(group) ? `${group.label}에서 새 대화` : '연결된 프로젝트 폴더가 필요합니다'}
+                    >
+                      <Plus aria-hidden />
+                    </Button>
+                  ) : null}
+                </div>
                 {!collapsed.has(group.id) ? (
                   <div className="ml-3 mt-1.5 space-y-0.5 border-l border-sidebar-border pl-1.5">
                     {group.sessions.map((session) => (
@@ -938,8 +959,11 @@ export function ConversationWorkspace({
     }
   }, [])
 
-  const beginDraft = () => {
-    const next = draft ?? createConversationDraft({ provider, model, effort })
+  const beginDraft = (cwd?: string) => {
+    const base = draft ?? createConversationDraft({ provider, model, effort, cwd })
+    const next = cwd && draft
+      ? applyDraftFolderSelection(base, base.sessionId, cwd) ?? base
+      : base
     persistDraft(next)
     setDraftOpen(true)
     setSessionScope('active')
@@ -1579,8 +1603,8 @@ export function ConversationWorkspace({
       scope={sessionScope}
       preferences={viewPreferences}
       onSelect={selectSession}
-      onCreate={() => {
-        beginDraft()
+      onCreate={(cwd) => {
+        beginDraft(cwd)
       }}
       onRefresh={() => void refreshSessions()}
       onPreferencesChange={onViewPreferencesChange}

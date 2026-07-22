@@ -396,6 +396,9 @@ test('deferred folder picker completion cannot overwrite a frozen or replaced dr
   assert.equal(applyDraftFolderSelection(replacement, 'draft-a', 'C:\\late'), replacement)
   assert.equal(applyDraftFolderSelection(null, 'draft-a', 'C:\\late'), null)
   assert.equal(applyDraftFolderSelection(draft, 'draft-a', 'C:\\chosen')?.cwd, 'C:\\chosen')
+  assert.equal(createConversationDraft({
+    provider: 'codex', model: 'gpt', effort: 'high', cwd: 'C:\\project', randomId: () => 'draft-with-folder',
+  }).cwd, 'C:\\project')
 })
 
 test('first-turn failure classification preserves uncertain payloads and isolates id conflicts', () => {

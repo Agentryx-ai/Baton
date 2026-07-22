@@ -17,21 +17,30 @@ $dialog = $null
 $owner = $null
 try {
   Add-Type -AssemblyName System.Windows.Forms
-  Add-Type -AssemblyName System.Drawing
+  Add-Type -ReferencedAssemblies ([System.Windows.Forms.Form].Assembly.Location) -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+namespace BatonFolderPicker {
+  public sealed class WindowWrapper : IWin32Window {
+    public WindowWrapper(IntPtr handle) { Handle = handle; }
+    public IntPtr Handle { get; }
+  }
+
+  public static class NativeMethods {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+  }
+}
+'@
   [System.Windows.Forms.Application]::EnableVisualStyles()
-  # A background process cannot steal foreground, so an ownerless dialog opens
-  # behind the browser and looks like a hang. Owning it with an invisible
-  # top-most form forces the dialog above other windows.
-  $owner = New-Object System.Windows.Forms.Form
-  $owner.TopMost = $true
-  $owner.ShowInTaskbar = $false
-  $owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-  $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-  $owner.Size = New-Object System.Drawing.Size(1, 1)
-  $owner.Location = New-Object System.Drawing.Point(-32000, -32000)
-  $owner.Opacity = 0
-  $owner.Show()
-  $owner.Activate()
+  # The request starts from a browser click. Make that foreground browser
+  # window the native owner so the picker stays modal and above it.
+  $ownerHandle = [BatonFolderPicker.NativeMethods]::GetForegroundWindow()
+  if ($ownerHandle -ne [IntPtr]::Zero) {
+    $owner = [BatonFolderPicker.WindowWrapper]::new($ownerHandle)
+  }
   $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
   $dialog.Description = 'Select a folder for Baton'
   $dialog.ShowNewFolderButton = $true
@@ -50,7 +59,7 @@ try {
       }
     } catch { }
   }
-  $result = $dialog.ShowDialog($owner)
+  $result = if ($null -ne $owner) { $dialog.ShowDialog($owner) } else { $dialog.ShowDialog() }
   if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($dialog.SelectedPath)
     $encoded = [System.Convert]::ToBase64String($bytes)
@@ -62,7 +71,6 @@ try {
   [Console]::Out.WriteLine('{"status":"error","code":"picker_unavailable"}')
 } finally {
   if ($null -ne $dialog) { $dialog.Dispose() }
-  if ($null -ne $owner) { $owner.Dispose() }
 }`
 
 const WINDOWS_PICKER_ARGS = Object.freeze([

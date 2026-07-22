@@ -26,6 +26,7 @@ export function createConversationDraft(input: {
   provider: CanonicalProvider
   model: string
   effort: string | null
+  cwd?: string | null
   randomId?: () => string
 }): ConversationDraft {
   const randomId = input.randomId ?? (() => crypto.randomUUID())
@@ -33,7 +34,7 @@ export function createConversationDraft(input: {
     version: 1,
     sessionId: randomId(),
     clientRequestId: randomId(),
-    cwd: null,
+    cwd: input.cwd ?? null,
     provider: input.provider,
     model: input.model,
     effort: input.effort,
