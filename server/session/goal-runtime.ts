@@ -101,6 +101,7 @@ export class GoalRuntime {
   readonly #now: () => Date
   readonly #inFlightGoalIds = new Set<string>()
   readonly #pendingControllers = new Map<string, AbortController>()
+  readonly #inFlightSettlements = new Map<string, Promise<void>>()
   #scanTimer: ReturnType<typeof setInterval> | null = null
   #stopped = true
 
@@ -168,11 +169,16 @@ export class GoalRuntime {
     if (this.#inFlightGoalIds.has(current.id)) return { status: 'busy', goal: current }
 
     this.#inFlightGoalIds.add(current.id)
+    let settleInFlight!: () => void
+    const inFlightSettled = new Promise<void>((resolve) => { settleInFlight = resolve })
+    this.#inFlightSettlements.set(current.id, inFlightSettled)
     try {
       return await this.#claimAndLaunch(current)
     } finally {
       this.#inFlightGoalIds.delete(current.id)
       this.#pendingControllers.delete(current.id)
+      this.#inFlightSettlements.delete(current.id)
+      settleInFlight()
     }
   }
 
@@ -233,10 +239,20 @@ export class GoalRuntime {
       },
     }))
     if (paused.status === 'applied') {
-      this.#pendingControllers.get(input.goalId)?.abort()
-      await input.interrupt()
+      await this.interruptAfterPause(input.goalId, input.interrupt)
     }
     return paused
+  }
+
+  /** Releases pending scheduler ownership after a durable pause has been committed. */
+  async interruptAfterPause(goalId: string, interrupt: () => Promise<void> | void): Promise<void> {
+    const inFlightSettled = this.#inFlightSettlements.get(goalId) ?? Promise.resolve()
+    this.#pendingControllers.get(goalId)?.abort()
+    const [, interrupted] = await Promise.allSettled([
+      inFlightSettled,
+      Promise.resolve().then(interrupt),
+    ])
+    if (interrupted.status === 'rejected') throw interrupted.reason
   }
 
   async #claimAndLaunch(goal: CanonicalGoal): Promise<GoalScheduleResult> {

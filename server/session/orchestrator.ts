@@ -312,7 +312,11 @@ export class TurnOrchestrator implements ConversationService {
       if (result.status === 'applied' && result.goal?.status === 'active') {
         void this.goalRuntime.notifyThreadIdle(threadId)
       } else if (result.status === 'applied' && result.goal?.status === 'paused') {
-        await this.interruptGoalTurns(result.goal.id)
+        const pausedGoalId = result.goal.id
+        await this.goalRuntime.interruptAfterPause(
+          pausedGoalId,
+          () => this.interruptGoalTurns(pausedGoalId),
+        )
       }
     }
     return result
