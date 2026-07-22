@@ -25,9 +25,10 @@ import {
 } from './sqlite-context-compaction.js'
 import { SqliteSessionStore } from './sqlite-store.js'
 
-test('execution manifest treats a matching native compact checkpoint as exact prefix provenance', (t) => {
+test('native compact checkpoint manifest survives store reopen with exact immutable provenance', (t) => {
   const directory = mkdtempSync(path.join(tmpdir(), 'baton-native-checkpoint-manifest-'))
-  const store = new SqliteSessionStore(path.join(directory, 'session.sqlite'))
+  const databasePath = path.join(directory, 'session.sqlite')
+  let store = new SqliteSessionStore(databasePath)
   t.after(() => {
     store.close()
     rmSync(directory, { recursive: true, force: true })
@@ -86,7 +87,8 @@ test('execution manifest treats a matching native compact checkpoint as exact pr
   assert.deepEqual(selected.entries.map((entry) =>
     entry.type === 'canonical_item' ? entry.item.sequence : -1), [2, 3, 4])
   persistExecutionContextManifest(store, resumed.execution, selected)
-  assert.deepEqual(store.getExecutionContextManifest(resumed.execution.id)?.entries.map((entry) =>
+  const manifestBeforeReopen = store.getExecutionContextManifest(resumed.execution.id)
+  assert.deepEqual(manifestBeforeReopen?.entries.map((entry) =>
     entry.kind === 'canonical_item' ? entry.itemId : entry.compactionId),
   selected.entries.map((entry) => entry.type === 'canonical_item' ? entry.item.id : entry.artifact.id))
 
@@ -96,8 +98,16 @@ test('execution manifest treats a matching native compact checkpoint as exact pr
     items: [{ kind: 'assistant_message', payload: { text: 'later canonical item' } }],
   })
   store.finishTurn({ turnId: resumed.turn.id, status: 'completed' })
-  assert.doesNotThrow(() => store.getExecutionContextManifest(resumed.execution.id),
-    'a later canonical suffix must not change the checkpoint frontier of an immutable manifest')
+  const itemIdsBeforeReopen = store.getSnapshot(session.activeThreadId)!.items.map((item) => item.id)
+  store.close()
+  store = new SqliteSessionStore(databasePath)
+
+  const reopenedItemIds = store.getSnapshot(session.activeThreadId)!.items.map((item) => item.id)
+  assert.deepEqual(reopenedItemIds, itemIdsBeforeReopen,
+    'store reopen must preserve the exact canonical sequence without replay duplicates')
+  assert.equal(new Set(reopenedItemIds).size, reopenedItemIds.length)
+  assert.deepEqual(store.getExecutionContextManifest(resumed.execution.id), manifestBeforeReopen,
+    'later canonical growth and store reopen must not change the checkpoint frontier of an immutable manifest')
 
   const switched = store.beginTurn({
     threadId: session.activeThreadId,
