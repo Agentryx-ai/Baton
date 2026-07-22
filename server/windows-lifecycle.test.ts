@@ -21,11 +21,12 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
   const plan = createLifecyclePlan({
     root: 'C:\\Path With Spaces\\Baton',
     executable: 'C:\\Program Files\\nodejs\\node.exe',
+    port: 45123,
     userId: 'DOMAIN\\alice',
     taskName: 'Baton-Test-Plan',
   })
   const script = registrationScript(plan)
-  assert.match(plan.arguments, /^"C:\\Path With Spaces\\Baton\\scripts\\baton-worker-runner\.mjs" --root "C:\\Path With Spaces\\Baton"$/)
+  assert.match(plan.arguments, /^"C:\\Path With Spaces\\Baton\\scripts\\baton-worker-runner\.mjs" --root "C:\\Path With Spaces\\Baton" --port 45123$/)
   assert.match(script, /-LogonType Interactive -RunLevel Limited/)
   assert.match(script, /-AtLogOn -User 'DOMAIN\\alice'/)
   assert.match(script, /-RepetitionInterval \(New-TimeSpan -Minutes 1\)/)
@@ -34,6 +35,38 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
   assert.match(script, /-RestartInterval \(New-TimeSpan -Minutes 1\)/)
   assert.match(script, /-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries/)
   assert.doesNotMatch(script, /SYSTEM|LocalSystem/)
+  assert.equal(plan.port, 45123)
+})
+
+test('lifecycle scripts inspect only the injected test port', async () => {
+  const plan = createLifecyclePlan({
+    root: 'C:\\Baton',
+    userId: 'alice',
+    taskName: 'test',
+    port: 45124,
+  })
+  const calls: string[] = []
+  const run = async (script: string) => { calls.push(script); return '' }
+  await restartWorker(plan, run)
+  const script = calls.join('\n')
+  assert.match(script, /LocalPort 45124/)
+  assert.match(script, /Port 45124/)
+  assert.doesNotMatch(script, /4400/)
+})
+
+test('lifecycle port defaults to BATON_PORT and rejects invalid values', () => {
+  const previous = process.env.BATON_PORT
+  try {
+    process.env.BATON_PORT = '45125'
+    assert.equal(createLifecyclePlan({ taskName: 'test-env-port' }).port, 45125)
+    process.env.BATON_PORT = 'not-a-port'
+    assert.throws(() => createLifecyclePlan({ taskName: 'test-invalid-port' }), /BATON_PORT/)
+    delete process.env.BATON_PORT
+    assert.equal(createLifecyclePlan({ taskName: 'test-default-port' }).port, 4400)
+  } finally {
+    if (previous === undefined) delete process.env.BATON_PORT
+    else process.env.BATON_PORT = previous
+  }
 })
 
 test('standalone bootstrap becomes the task action without changing the Worker checkout identity', () => {
@@ -42,10 +75,10 @@ test('standalone bootstrap becomes the task action without changing the Worker c
   process.env.BATON_BOOTSTRAP_EXECUTABLE = 'C:\\Local App Data\\Baton\\bootstrap\\baton-bootstrap.exe'
   process.env.BATON_WORKER_EXECUTABLE = 'C:\\Program Files\\nodejs\\node.exe'
   try {
-    const plan = createLifecyclePlan({ root: 'C:\\Path With Spaces\\Baton', taskName: 'Baton-Test-Bootstrap' })
+    const plan = createLifecyclePlan({ root: 'C:\\Path With Spaces\\Baton', taskName: 'Baton-Test-Bootstrap', port: 45125 })
     assert.equal(plan.executable, process.env.BATON_BOOTSTRAP_EXECUTABLE)
     assert.equal(plan.workerExecutable, process.env.BATON_WORKER_EXECUTABLE)
-    assert.equal(plan.arguments, 'worker-runner --root "C:\\Path With Spaces\\Baton"')
+    assert.equal(plan.arguments, 'worker-runner --root "C:\\Path With Spaces\\Baton" --port 45125')
     assert.equal(plan.root, 'C:\\Path With Spaces\\Baton')
   } finally {
     if (previousBootstrap === undefined) delete process.env.BATON_BOOTSTRAP_EXECUTABLE
@@ -278,6 +311,31 @@ test('runner startup failure records bounded exhaustion diagnostics without envi
   assert.match(events, /worker-(started|exited|start-failed)/)
   assert.match(events, /worker-restart-exhausted/)
   assert.doesNotMatch(events + result.stderr, /MUST_NOT_LEAK/)
+})
+
+test('task action runner validates and propagates its injected port to the worker', async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-runner-port-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const fixture = path.join(directory, 'fixture.mjs')
+  await writeFile(fixture, `process.stdout.write('worker-port=' + process.env.BATON_PORT + '\\n')\n`)
+  const result = await spawnResult(process.execPath, [
+    'scripts/baton-worker-runner.mjs', '--root', directory, '--port', '45126',
+  ], {
+    ...process.env,
+    NODE_ENV: 'test',
+    BATON_PORT: '4400',
+    BATON_RECOVERY_ROOT: directory,
+    BATON_WORKER_EXECUTABLE: process.execPath,
+    BATON_WORKER_ARGS_JSON: JSON.stringify([fixture]),
+    BATON_WORKER_RESTART_COUNT: '0',
+  })
+  assert.equal(result.code, 0, result.stderr)
+  assert.match(await readFile(path.join(directory, 'lifecycle', 'worker.log'), 'utf8'), /worker-port=45126/)
+
+  const invalid = await spawnResult(process.execPath, [
+    'scripts/baton-worker-runner.mjs', '--root', directory, '--port', 'not-a-port',
+  ], { ...process.env, NODE_ENV: 'test', BATON_RECOVERY_ROOT: directory })
+  assert.notEqual(invalid.code, 0)
 })
 
 test('runner preserves bounded redacted worker output and propagates the worker exit code', async (t) => {

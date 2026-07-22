@@ -216,8 +216,9 @@ function printLifecycle(value) {
   console.log(`Baton lifecycle: ${task.unavailable ? `unavailable${task.error ? ` (${terminalText(task.error)})` : ''}` : task.exists ? `${task.enabled ? 'enabled' : 'stopped'} (${task.state ?? 'unknown'})` : 'not registered'}`)
   if (task.lastRunTime) console.log(`  Last run: ${terminalText(task.lastRunTime)} · result ${task.lastTaskResult ?? 'unknown'}`)
   if (value.lastWorkerEvent) console.log(`  Last worker event: ${terminalText(value.lastWorkerEvent.event ?? 'unknown')} at ${terminalText(value.lastWorkerEvent.at ?? 'unknown')}`)
-  if (value.port4400?.occupied) console.log(`  Port 4400: occupied by PID ${value.port4400.pid ?? '?'} (${terminalText(value.port4400.processName ?? 'unknown')}); no process was stopped`)
-  else if (value.port4400) console.log('  Port 4400: available')
+  const port = value.plan?.port ?? Number(process.env.BATON_PORT ?? 4400)
+  if (value.port4400?.occupied) console.log(`  Port ${port}: occupied by PID ${value.port4400.pid ?? '?'} (${terminalText(value.port4400.processName ?? 'unknown')}); no process was stopped`)
+  else if (value.port4400) console.log(`  Port ${port}: available`)
 }
 
 function parseTargets(argv) {

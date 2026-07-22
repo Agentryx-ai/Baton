@@ -9,6 +9,8 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
+import { reserveTemporaryPort } from './temporary-port-reservation.mjs'
+
 const root = path.resolve(fileURLToPath(new URL('..', import.meta.url)))
 const fixture = path.join(tmpdir(), `Baton P2 verify ${randomUUID()}`)
 const localAppData = path.join(fixture, 'Local App Data')
@@ -18,9 +20,12 @@ const recoveryRoot = path.join(localAppData, 'Baton', 'integration-recovery')
 const fakeWorker = path.join(fixture, 'baton-test-worker.exe')
 const tsx = path.join('node_modules', 'tsx', 'dist', 'cli.mjs')
 const taskName = `Baton-P2-Isolated-${randomUUID()}`
+const portReservation = await reserveTemporaryPort('bootstrap verification port')
+const port = portReservation.port
 const baseEnv = {
-  ...process.env,
+  ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith('BATON_'))),
   LOCALAPPDATA: localAppData,
+  APPDATA: path.join(fixture, 'App Data'),
   USERPROFILE: home,
   HOME: home,
   BATON_OFFLINE_HOME: home,
@@ -28,6 +33,10 @@ const baseEnv = {
   BATON_RECOVERY_ROOT: recoveryRoot,
   BATON_BOOTSTRAP_ROOT: bootstrapRoot,
   BATON_TASK_NAME: taskName,
+  BATON_DISABLE_ENV_FILE: '1',
+  BATON_DATA_DIR: path.join(fixture, 'data'),
+  BATON_PORT: String(port),
+  BATON_URL: `http://127.0.0.1:${port}`,
   BATON_WORKER_NODE: fakeWorker,
   BATON_ALLOW_UNSIGNED_BOOTSTRAP: '1',
 }
@@ -104,6 +113,7 @@ try {
   assert.equal(repaired.task.definitionMatches, true)
   assert.equal((await realpath(repaired.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
   assert.equal((await realpath(repaired.plan.workerExecutable)).toLowerCase(), (await realpath(fakeWorker)).toLowerCase())
+  assert.match(repaired.plan.arguments, new RegExp(`--port ${port}$`))
   taskExecutable = repaired.plan.executable
   const validPublicDoctor = await captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', 'doctor', '--json'], baseEnv, root)
   assert.equal(validPublicDoctor.code, 0, validPublicDoctor.stderr.toString('utf8'))
@@ -139,6 +149,7 @@ try {
   const publicStatusValue = JSON.parse(publicStatus.stdout.toString('utf8'))
   assert.equal((await realpath(publicStatusValue.plan.executable)).toLowerCase(), (await realpath(stable)).toLowerCase())
   assert.equal((await realpath(publicStatusValue.plan.workerExecutable)).toLowerCase(), (await realpath(fakeWorker)).toLowerCase())
+  assert.match(publicStatusValue.plan.arguments, new RegExp(`--port ${port}$`))
   const offlineRuntimeStatus = await captureFailureAllowed(process.execPath, ['scripts/baton-cli.mjs', 'status', '--json'], {
     ...baseEnv, BATON_URL: 'http://127.0.0.1:1',
   }, root)
@@ -153,12 +164,12 @@ try {
     const result = await publicCli(args)
     assert.equal(result.code, 0, `public CLI ${args.join(' ')} failed: ${result.stderr}`)
   }
-  // A real Baton/foreign listener may already own :4400 on the developer
-  // machine. Public start/restart must then fail before mutating the isolated
-  // Task; when the port is free the harmless exit-zero worker is exercised.
+  // Start/restart may inspect and exercise only this run's temporary port and
+  // UUID Task. The harmless exit-zero worker cannot touch the live listener.
+  await portReservation.release()
   for (const command of ['start', 'restart']) {
     const result = await publicCli([command, '--json'])
-    if (result.code !== 0) assert.match(result.stderr.toString('utf8'), /Port 4400 is (?:already occupied|owned by a foreign process)/)
+    assert.equal(result.code, 0, `${command} failed: ${result.stderr}`)
   }
   for (const args of [['stop', '--json'], ['autostart', 'uninstall', '--json']]) {
     const result = await publicCli(args)
@@ -256,6 +267,7 @@ try {
 
   console.log('Standalone bootstrap adversarial verification passed.')
 } finally {
+  await portReservation.release()
   if (holdingStable) {
     holdingStable.kill()
     await onceClosed(holdingStable)
