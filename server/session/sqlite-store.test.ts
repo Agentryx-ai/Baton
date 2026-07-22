@@ -1651,7 +1651,7 @@ test('workspace mutation uses thread CAS, invalidates bindings, and blocks activ
   assert.equal(store.getThread(session.activeThreadId)?.revision, 2)
 })
 
-test('native cwd remains a suggestion and refresh never overwrites the authorized workspace', (t) => {
+test('native cwd seeds the new session workspace and refresh never overwrites the authorized one', (t) => {
   const store = new SqliteSessionStore(databasePath(t), deterministicOptions())
   t.after(() => store.close())
   const first = nativeCandidate(['one'], 'C:\\source-old', 'content-1')
@@ -1659,7 +1659,10 @@ test('native cwd remains a suggestion and refresh never overwrites the authorize
   assert.equal(imported.status, 'imported')
   assert.ok(imported.sessionId)
   const importedSession = store.getSession(imported.sessionId)
-  assert.equal(importedSession?.cwd, null)
+  // A fresh import arrives already connected to the folder it was recorded
+  // in; only the initial value comes from the source — later refreshes must
+  // never touch the user-authorized workspace below.
+  assert.equal(importedSession?.cwd, 'C:\\source-old')
   assert.equal(importedSession?.source?.cwd, 'C:\\source-old')
 
   store.updateWorkspace({

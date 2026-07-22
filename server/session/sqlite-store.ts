@@ -4311,7 +4311,14 @@ export class SqliteSessionStore implements SessionStore {
     this.#db.prepare(`
       INSERT INTO sessions(id,title,preview,active_thread_id,project_key,cwd,schema_version,next_item_sequence,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,1,?,?)
-    `).run(sessionId, candidate.sourceAlias, null, threadId, candidate.projectGroupKey, null, SCHEMA_VERSION, now, now)
+    `).run(
+      sessionId, candidate.sourceAlias, null, threadId, candidate.projectGroupKey,
+      // The native source records its working directory; carry it onto the
+      // session so an imported conversation arrives already connected to its
+      // project folder instead of requiring a manual workspace hookup.
+      candidate.cwd ?? null,
+      SCHEMA_VERSION, now, now,
+    )
     this.#db.prepare(`
       INSERT INTO threads(id,session_id,parent_thread_id,fork_turn_id,fork_item_id,revision,status,instruction_snapshot_json,created_at,updated_at)
       VALUES (?,?,NULL,NULL,NULL,0,'idle',?,?,?)

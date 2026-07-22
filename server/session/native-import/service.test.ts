@@ -233,7 +233,8 @@ test('preview and commit are idempotent and append only a valid native delta', a
   assert.equal(first.results[0]?.status, 'imported')
   assert.equal(store.listSessions()[0]?.source?.sourceAlias, 'Imported alias')
   assert.equal(store.listSessions()[0]?.projectKey, 'project-key')
-  assert.equal(store.listSessions()[0]?.cwd, null)
+  // Imports arrive connected to the folder the native session was recorded in.
+  assert.equal(store.listSessions()[0]?.cwd, 'C:\\project')
   assert.equal('cwd' in (store.getSnapshot(store.listSessions()[0]!.activeThreadId)?.thread.instructionSnapshot ?? {}), false)
 
   const replay = await service.commit({ token: firstPreview.token, candidateIds: [firstPreview.candidates[0]!.candidateId] })
