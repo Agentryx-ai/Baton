@@ -30,6 +30,7 @@ import { createInlineSessionHost, createWorkerSessionHost } from './session-host
 import { ModelFallbackRuntime, modelFallbackStatePath } from './model-fallback-runtime.ts'
 import { createModelFallbackRouter } from './model-fallback-routes.ts'
 import { NativeProxyHealthTracker } from './native-proxy-health.ts'
+import { classifyPortConflict } from './port-guard.ts'
 import { NativeAccountCooldowns } from './native-account-router.ts'
 import { CodexPluginReferenceStore, codexPluginReferenceStatePath } from './codex-plugin-reference-store.ts'
 import { CodexPluginReferenceService } from './codex-plugin-reference-service.ts'
@@ -147,6 +148,26 @@ const server = createServer(app)
 const websocketUpgradeDispatcher = createWebSocketUpgradeDispatcher()
 websocketUpgradeDispatcher.register(createCodexResponsesWebSocketRoute(codexNativeProxyOptions))
 websocketUpgradeDispatcher.attach(server)
+// A duplicate supervisor (Task Scheduler self-heal trigger firing while a
+// healthy worker already holds the port) must not crash-loop on EADDRINUSE.
+// Probe the incumbent: if it is a healthy Baton, stand down cleanly (exit 0 so
+// baton-worker-runner stops retrying); otherwise surface the real conflict.
+server.on('error', (error: NodeJS.ErrnoException) => {
+  if (error.code !== 'EADDRINUSE') {
+    console.error('[baton] fatal server error:', error)
+    process.exit(1)
+    return
+  }
+  void classifyPortConflict(config.port).then(async (verdict) => {
+    if (verdict === 'yield') {
+      console.warn(`[baton] http://127.0.0.1:${config.port} already served by a healthy Baton; duplicate worker standing down`)
+    } else {
+      console.error(`[baton] port ${config.port} is held by a non-Baton process; refusing to start`)
+    }
+    await sessionHost.close().catch(() => { /* best-effort before exit */ })
+    process.exit(verdict === 'yield' ? 0 : 1)
+  })
+})
 server.listen(config.port, '127.0.0.1', () => {
   console.log(`[baton] Native runtime on http://127.0.0.1:${config.port}`)
   // Worker mode starts (and reports recovery) on its own thread; inline mode
