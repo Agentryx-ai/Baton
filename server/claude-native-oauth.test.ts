@@ -93,6 +93,84 @@ test('native Claude OAuth exchanges once, enriches identity, stores protected cr
   assert.equal(tokenExchanges().length, 1)
 })
 
+test('native OAuth stable-identity upsert replaces a Claude Code placeholder with OAuth ownership', async () => {
+  const vault = await createVault()
+  await vault.put({
+    nickname: 'Claude Code',
+    accountId: 'acct-uuid',
+    source: 'claude-code',
+    secret: { accessToken: 'old-access', refreshToken: 'old-refresh', scopes: [] },
+  })
+  const manager = new ClaudeNativeOAuthManager({
+    vault,
+    random: (size) => Buffer.alloc(size, 8),
+    fetchImpl: async (input) => String(input).includes('/api/oauth/profile')
+      ? Response.json({ account: { uuid: 'acct-uuid', email: 'user@example.com' } })
+      : Response.json({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3_600 }),
+  })
+  const { state } = manager.start()
+  const result = await manager.submit(`http://localhost:54545/callback?code=new-code&state=${state}`)
+
+  assert.equal(result.status, 'success')
+  assert.deepEqual((await vault.list()).map(({ id, source, email }) => ({ id, source, email })), [{
+    id: 'account-1', source: 'oauth', email: 'user@example.com',
+  }])
+  assert.equal((await vault.getSecret('account-1')).refreshToken, 'new-refresh')
+})
+
+test('native OAuth claims a production-shaped identity-less Claude Code placeholder only after verifying its credential', async () => {
+  const vault = await createVault()
+  await vault.importClaudeCodeOnce(async () => ({
+    nickname: 'Claude Code',
+    secret: { accessToken: 'imported-access', refreshToken: 'imported-refresh', scopes: [] },
+  }))
+  const manager = new ClaudeNativeOAuthManager({
+    vault,
+    random: (size) => Buffer.alloc(size, 9),
+    fetchImpl: async (input, init) => {
+      const url = String(input)
+      if (!url.includes('/api/oauth/profile')) {
+        return Response.json({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3_600 })
+      }
+      const authorization = new Headers(init?.headers).get('authorization')
+      return Response.json({
+        account: authorization === 'Bearer imported-access'
+          ? { uuid: 'acct-uuid', email: 'imported@example.com' }
+          : { uuid: 'acct-uuid', email: 'user@example.com' },
+      })
+    },
+  })
+  const { state } = manager.start()
+  const result = await manager.submit(`http://localhost:54545/callback?code=new-code&state=${state}`)
+
+  assert.equal(result.status, 'success')
+  assert.deepEqual((await vault.list()).map(({ id, accountId, source }) => ({ id, accountId, source })), [{
+    id: 'account-1', accountId: 'acct-uuid', source: 'oauth',
+  }])
+  assert.equal((await vault.getSecret('account-1')).refreshToken, 'new-refresh')
+})
+
+test('repeated OAuth profile failures fail closed without creating identity-less accounts', async () => {
+  const vault = await createVault()
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const manager = new ClaudeNativeOAuthManager({
+      vault,
+      random: (size) => Buffer.alloc(size, attempt + 10),
+      fetchImpl: async (input) => String(input).includes('/api/oauth/profile')
+        ? new Response('{}', { status: 503 })
+        : Response.json({
+            access_token: `access-${attempt}`,
+            refresh_token: `refresh-${attempt}`,
+            expires_in: 3_600,
+          }),
+    })
+    const { state } = manager.start()
+    const result = await manager.submit(`http://localhost:54545/callback?code=code-${attempt}&state=${state}`)
+    assert.equal(result.status, 'error')
+  }
+  assert.deepEqual(await vault.list(), [])
+})
+
 test('native Claude OAuth rejects foreign callbacks and mismatched state without token exchange', async () => {
   let requests = 0
   const manager = new ClaudeNativeOAuthManager({

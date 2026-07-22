@@ -6,19 +6,19 @@
  * second so the UI's "n초 전 기준" freshness label ticks smoothly between polls.
  */
 import { useCallback, useEffect, useState } from 'react'
-import type { AccountQuota, Provider } from '@/api/types'
-import { client } from '@/api/client'
+import type { AccountQuota, AccountQuotaError, Provider } from '@/api/types'
+import { ApiError, client } from '@/api/client'
 import { usePolling } from '@/hooks/usePolling'
 
 export function useQuota(
   provider: Provider,
   accountId: string,
-): { quota: AccountQuota | null; ageSec: number | null } {
+): { quota: AccountQuota | null; quotaError: AccountQuotaError | null; ageSec: number | null } {
   const fetchQuota = useCallback(
     () => client.getQuota(provider, accountId),
     [provider, accountId],
   )
-  const { data } = usePolling(fetchQuota, 60_000)
+  const { data, error } = usePolling(fetchQuota, 60_000)
 
   const [ageSec, setAgeSec] = useState<number | null>(null)
   useEffect(() => {
@@ -33,5 +33,12 @@ export function useQuota(
     return () => window.clearInterval(timer)
   }, [data])
 
-  return { quota: data, ageSec }
+  return {
+    quota: data,
+    quotaError: error ? {
+      code: error instanceof ApiError ? error.code : null,
+      message: error.message,
+    } : null,
+    ageSec,
+  }
 }

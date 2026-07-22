@@ -32,10 +32,12 @@ import type {
 /** Thrown on any non-2xx API response. `status` is the HTTP status code. */
 export class ApiError extends Error {
   status: number
-  constructor(status: number, message: string) {
+  code: string | null
+  constructor(status: number, message: string, code: string | null = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -131,7 +133,10 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    throw new ApiError(res.status, extractMessage(res.status, raw, parsed))
+    const code = parsed && typeof parsed === 'object' && typeof (parsed as Record<string, unknown>).code === 'string'
+      ? (parsed as Record<string, string>).code
+      : null
+    throw new ApiError(res.status, extractMessage(res.status, raw, parsed), code)
   }
   return parsed as T
 }

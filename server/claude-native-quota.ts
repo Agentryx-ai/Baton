@@ -1,4 +1,7 @@
-import type { ClaudeNativeCredential } from './claude-native-credentials.ts'
+import {
+  ClaudeNativeCredentialError,
+  type ClaudeNativeCredential,
+} from './claude-native-credentials.ts'
 
 const USAGE_ENDPOINT = 'https://api.anthropic.com/api/oauth/usage'
 const USAGE_CACHE_MS = 60_000
@@ -161,6 +164,12 @@ export class ClaudeQuotaPreflight {
       },
       signal: AbortSignal.timeout(10_000),
     })
+    if (response.status === 401 || response.status === 403) {
+      throw new ClaudeNativeCredentialError(
+        'expired',
+        `Claude usage 인증이 HTTP ${response.status}로 거부되었습니다. 계정을 다시 인증하세요.`,
+      )
+    }
     if (!response.ok) throw new Error(`Claude usage endpoint returned HTTP ${response.status}`)
     const body = await response.json() as UsageResponse
     const limits = Array.isArray(body.limits)

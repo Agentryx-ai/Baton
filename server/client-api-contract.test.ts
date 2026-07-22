@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { client } from '../src/api/client.ts'
+import { ApiError, client } from '../src/api/client.ts'
 
 test('client integration API preserves explicit repair eligibility', async () => {
   const originalFetch = globalThis.fetch
@@ -59,6 +59,24 @@ test('Baton status uses the Baton-owned diagnostic endpoint', async () => {
   }
 
   assert.deepEqual(urls, ['/baton/status'])
+})
+
+test('quota API preserves the structured reauth_required code for account UI state', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => Response.json({
+    error: 'Claude 계정을 다시 인증하세요.',
+    code: 'reauth_required',
+  }, { status: 401 })) as typeof fetch
+  try {
+    await assert.rejects(
+      client.getQuota('claude', 'expired-account'),
+      (error: unknown) => error instanceof ApiError
+        && error.status === 401
+        && error.code === 'reauth_required',
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
 })
 
 test('Claude and Codex account operations always use Baton Native routes', async () => {

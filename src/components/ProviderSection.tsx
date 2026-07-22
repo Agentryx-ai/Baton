@@ -1,6 +1,6 @@
 import { Plus } from 'lucide-react'
 
-import type { Account, AccountQuota, PolicyProviderState, Provider } from '@/api/types'
+import type { Account, AccountQuota, AccountQuotaError, PolicyProviderState, Provider } from '@/api/types'
 import { Button } from '@/components/ui/button'
 import { AccountCard, type AccountStatus } from '@/components/AccountCard'
 
@@ -40,6 +40,8 @@ export interface ProviderSectionProps {
   accounts: Account[]
   /** Keyed by account id; value null = quota still loading for that account. */
   quotas: Record<string, AccountQuota | null>
+  /** Per-account failures are distinct from loading so cards never stall on a skeleton. */
+  quotaErrors?: Record<string, AccountQuotaError | null>
   /** Smart-rotation engine on? Gates manual controls in the cards. */
   engineEnabled: boolean
   /** This provider's policy ordering and legacy pause-recovery snapshot, or null. */
@@ -58,6 +60,7 @@ export function ProviderSection({
   provider,
   accounts,
   quotas,
+  quotaErrors = {},
   engineEnabled,
   providerState,
   onPause,
@@ -103,6 +106,7 @@ export function ProviderSection({
                 key={account.id}
                 account={account}
                 quota={quotas[account.id] ?? null}
+                quotaError={quotaErrors[account.id] ?? null}
                 status={status}
                 engineEnabled={engineEnabled}
                 canSolo={canSolo}

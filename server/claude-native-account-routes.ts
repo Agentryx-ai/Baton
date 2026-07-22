@@ -9,6 +9,7 @@ import {
   ClaudeNativeOAuthManager,
 } from './claude-native-oauth.ts'
 import type { ClaudeAccountQuota } from './claude-native-quota.ts'
+import { ClaudeNativeCredentialError } from './claude-native-credentials.ts'
 
 export interface ClaudeNativeAccountRoutesOptions {
   vault: ClaudeNativeAccountVault
@@ -31,7 +32,7 @@ export function createClaudeNativeAccountRouter(options: ClaudeNativeAccountRout
           id: account.id,
           provider: 'claude',
           isDefault: account.id === defaultId,
-          email: account.email ?? '',
+          email: account.email ?? account.accountId ?? account.id,
           nickname: account.nickname,
           paused: !account.enabled,
           priority: account.priority,
@@ -152,6 +153,10 @@ function parseBody(req: Request): Record<string, unknown> {
 }
 
 function sendError(res: Response, error: unknown): void {
+  if (error instanceof ClaudeNativeCredentialError) {
+    res.status(401).json({ error: error.message, code: 'reauth_required' })
+    return
+  }
   if (error instanceof ClaudeNativeAccountVaultError) {
     const status = error.code === 'not_found' ? 404 : error.code === 'invalid' ? 400 : 503
     res.status(status).json({ error: error.message, code: error.code })

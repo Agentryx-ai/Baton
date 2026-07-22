@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 
 import { claudeNativeAccountVault } from '../server/claude-native-runtime.ts'
-import type { ClaudeNativeAccountSecret } from '../server/claude-native-account-vault.ts'
+import { migrateLegacyClaudeAccount } from '../server/claude-native-migration.ts'
 import { codexNativeRuntime } from '../server/codex-native-runtime.ts'
 import type { CodexCredentialsFile } from '../server/codex-native-credentials.ts'
 
@@ -11,14 +11,6 @@ const ROOTS = [
   '/root/.ccs/cliproxy/auth',
   '/root/.ccs/cliproxy/auth-paused',
 ] as const
-const CLAUDE_DEFAULT_SCOPES = [
-  'user:profile',
-  'user:inference',
-  'user:sessions:claude_code',
-  'user:mcp_servers',
-  'user:file_upload',
-]
-
 type LegacyCredential = Record<string, unknown>
 type MigrationResult = { provider: 'claude' | 'codex'; alias: string; status: 'imported' | 'matched'; enabled: boolean }
 
@@ -66,12 +58,6 @@ function fingerprint(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
-function expiration(value: unknown): number | undefined {
-  if (typeof value !== 'string') return undefined
-  const parsed = Date.parse(value)
-  return Number.isFinite(parsed) ? parsed : undefined
-}
-
 async function migrateCodex(file: string, legacy: LegacyCredential, priority: number): Promise<MigrationResult> {
   const alias = email(legacy)
   const enabled = !file.includes('/auth-paused/') && legacy.disabled !== true
@@ -100,39 +86,10 @@ async function migrateCodex(file: string, legacy: LegacyCredential, priority: nu
 }
 
 async function migrateClaude(file: string, legacy: LegacyCredential, priority: number): Promise<MigrationResult> {
-  const alias = email(legacy)
-  const enabled = !file.includes('/auth-paused/') && legacy.disabled !== true
-  const refreshToken = required(legacy.refresh_token, 'refresh_token')
-  const accounts = await claudeNativeAccountVault.list()
-  for (const account of accounts) {
-    const secret = await claudeNativeAccountVault.getSecret(account.id)
-    if (fingerprint(secret.refreshToken) !== fingerprint(refreshToken)) continue
-    await claudeNativeAccountVault.put({
-      id: account.id,
-      nickname: alias.split('@')[0] || alias,
-      email: alias,
-      priority: account.priority,
-      enabled: account.enabled,
-      source: account.source,
-      secret,
-    })
-    return { provider: 'claude', alias, status: 'matched', enabled: account.enabled }
+  return {
+    provider: 'claude',
+    ...await migrateLegacyClaudeAccount({ vault: claudeNativeAccountVault, sourcePath: file, legacy, priority }),
   }
-  const secret: ClaudeNativeAccountSecret = {
-    accessToken: required(legacy.access_token, 'access_token'),
-    refreshToken,
-    ...(expiration(legacy.expired) === undefined ? {} : { expiresAt: expiration(legacy.expired) }),
-    scopes: CLAUDE_DEFAULT_SCOPES,
-  }
-  await claudeNativeAccountVault.put({
-    nickname: alias.split('@')[0] || alias,
-    email: alias,
-    priority,
-    enabled,
-    source: 'oauth',
-    secret,
-  })
-  return { provider: 'claude', alias, status: 'imported', enabled }
 }
 
 async function main(): Promise<void> {

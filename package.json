@@ -20,6 +20,7 @@
     "smoke:claude-native": "tsx scripts/claude-native-canary.ts",
     "smoke:codex-plugins": "tsx scripts/codex-plugin-account-canary.ts",
     "migrate:legacy-accounts": "tsx scripts/migrate-legacy-cliproxy-accounts.ts",
+    "repair:claude-accounts": "tsx scripts/repair-claude-native-accounts.ts",
     "build:bootstrap": "node scripts/build-baton-bootstrap.mjs",
     "install:bootstrap:dev": "node scripts/build-baton-bootstrap.mjs --install --allow-unsigned-development",
     "verify:bootstrap": "node scripts/verify-baton-bootstrap.mjs",
