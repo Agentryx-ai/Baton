@@ -21,6 +21,7 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
   const plan = createLifecyclePlan({
     root: 'C:\\Path With Spaces\\Baton',
     executable: 'C:\\Program Files\\nodejs\\node.exe',
+    port: 45123,
     userId: 'DOMAIN\\alice',
     taskName: 'Baton-Test-Plan',
   })
@@ -32,6 +33,38 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
   assert.match(script, /-RestartInterval \(New-TimeSpan -Minutes 1\)/)
   assert.match(script, /-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries/)
   assert.doesNotMatch(script, /SYSTEM|LocalSystem/)
+  assert.equal(plan.port, 45123)
+})
+
+test('lifecycle scripts inspect only the injected test port', async () => {
+  const plan = createLifecyclePlan({
+    root: 'C:\\Baton',
+    userId: 'alice',
+    taskName: 'test',
+    port: 45124,
+  })
+  const calls: string[] = []
+  const run = async (script: string) => { calls.push(script); return '' }
+  await restartWorker(plan, run)
+  const script = calls.join('\n')
+  assert.match(script, /LocalPort 45124/)
+  assert.match(script, /Port 45124/)
+  assert.doesNotMatch(script, /4400/)
+})
+
+test('lifecycle port defaults to BATON_PORT and rejects invalid values', () => {
+  const previous = process.env.BATON_PORT
+  try {
+    process.env.BATON_PORT = '45125'
+    assert.equal(createLifecyclePlan({ taskName: 'test-env-port' }).port, 45125)
+    process.env.BATON_PORT = 'not-a-port'
+    assert.throws(() => createLifecyclePlan({ taskName: 'test-invalid-port' }), /BATON_PORT/)
+    delete process.env.BATON_PORT
+    assert.equal(createLifecyclePlan({ taskName: 'test-default-port' }).port, 4400)
+  } finally {
+    if (previous === undefined) delete process.env.BATON_PORT
+    else process.env.BATON_PORT = previous
+  }
 })
 
 test('standalone bootstrap becomes the task action without changing the Worker checkout identity', () => {

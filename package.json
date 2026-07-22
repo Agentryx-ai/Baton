@@ -13,7 +13,7 @@
     "build": "tsc -b && vite build",
     "start": "tsx server/index.ts",
     "status": "node scripts/baton-cli.mjs status",
-    "test": "tsx --test \"server/**/*.test.ts\"",
+    "test": "node scripts/run-isolated-tests.mjs",
     "typecheck": "tsc -b --noEmit",
     "lint": "oxlint",
     "smoke:codex-adapter": "tsx scripts/codex-adapter-smoke.ts",

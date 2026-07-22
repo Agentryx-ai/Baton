@@ -28,6 +28,7 @@ export interface LifecyclePlan {
   arguments: string
   workingDirectory: string
   userId: string
+  port: number
   restartCount: number
   restartIntervalMinutes: number
   ownershipMarker: string
@@ -76,6 +77,7 @@ export function createLifecyclePlan(options: {
   useBootstrap?: boolean
   userId?: string
   taskName?: string
+  port?: number
 } = {}): LifecyclePlan {
   const moduleRoot = process.env.BATON_RELEASE_ROOT
     ?? fileURLToPath(new URL('..', import.meta.url))
@@ -100,6 +102,7 @@ export function createLifecyclePlan(options: {
     userId: options.userId ?? (process.env.USERDOMAIN
       ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
       : userInfo().username),
+    port: lifecyclePort(options.port),
     restartCount: RESTART_COUNT,
     restartIntervalMinutes: RESTART_INTERVAL_MINUTES,
     ownershipMarker: `Baton CurrentUser worker lifecycle (${root})`,
@@ -109,6 +112,7 @@ export function createLifecyclePlan(options: {
 export async function resolveLifecyclePlan(options: {
   userId?: string
   taskName?: string
+  port?: number
 } = {}): Promise<LifecyclePlan> {
   return withBootstrapLock(async () => {
     if (!(await hasBootstrapLifecycleMetadata())) {
@@ -302,7 +306,7 @@ export async function restartWorker(plan = createLifecyclePlan(), run: PowerShel
 
 function portInspectionScript(plan: LifecyclePlan): string[] {
   return [
-    `$connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 4400 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1`,
+    `$connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort ${plan.port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1`,
     `$portOccupied = $null -ne $connection`,
     `$portProcess = if ($portOccupied) { Get-CimInstance Win32_Process -Filter ("ProcessId=" + $connection.OwningProcess) -ErrorAction SilentlyContinue } else { $null }`,
     `$expectedCommand = ($null -ne $portProcess) -and ($null -ne $portProcess.CommandLine) -and ($portProcess.CommandLine.IndexOf(${psLiteral(plan.root)}, [StringComparison]::OrdinalIgnoreCase) -ge 0) -and ($portProcess.CommandLine.IndexOf('server/index.ts', [StringComparison]::OrdinalIgnoreCase) -ge 0)`,
@@ -333,13 +337,13 @@ function lifecycleMutationScript(plan: LifecyclePlan, operation: 'start' | 'stop
     if (operation === 'start') {
       lines.push(
         `if ($task.State -eq 'Running') {`,
-        `  if ($portOccupied -and $portOwnerKind -ne 'expected-baton-worker') { throw 'Port 4400 is owned by a foreign process; no process was stopped' }`,
+        `  if ($portOccupied -and $portOwnerKind -ne 'expected-baton-worker') { throw 'Port ${plan.port} is owned by a foreign process; no process was stopped' }`,
         `  exit 0`,
         `}`,
-        `if ($portOccupied) { throw 'Port 4400 is already occupied; no process was stopped' }`,
+        `if ($portOccupied) { throw 'Port ${plan.port} is already occupied; no process was stopped' }`,
       )
     } else {
-      lines.push(`if ($portOccupied -and $portOwnerKind -ne 'expected-baton-worker') { throw 'Port 4400 is owned by a foreign process; no process was stopped' }`)
+      lines.push(`if ($portOccupied -and $portOwnerKind -ne 'expected-baton-worker') { throw 'Port ${plan.port} is owned by a foreign process; no process was stopped' }`)
     }
   }
   if (operation === 'stop' || operation === 'restart') {
@@ -352,11 +356,11 @@ function lifecycleMutationScript(plan: LifecyclePlan, operation: 'start' | 'stop
   if (operation === 'restart') {
     lines.push(
       `for ($attempt = 0; $attempt -lt 20; $attempt++) {`,
-      `  $connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort 4400 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1`,
+      `  $connection = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort ${plan.port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1`,
       `  if ($null -eq $connection) { break }`,
       `  Start-Sleep -Milliseconds 250`,
       `}`,
-      `if ($null -ne $connection) { throw 'Port 4400 did not become available after stopping the owned task' }`,
+      `if ($null -ne $connection) { throw 'Port ${plan.port} did not become available after stopping the owned task' }`,
     )
   }
   if (operation === 'start' || operation === 'restart') {
@@ -366,6 +370,13 @@ function lifecycleMutationScript(plan: LifecyclePlan, operation: 'start' | 'stop
     )
   }
   return lines.join('\n')
+}
+
+function lifecyclePort(value = Number(process.env.BATON_PORT ?? 4400)): number {
+  if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+    throw new Error('BATON_PORT must be an integer between 1 and 65535')
+  }
+  return value
 }
 
 async function portStatus(plan: LifecyclePlan, run: PowerShellRunner): Promise<NonNullable<LifecycleStatus['port4400']>> {
