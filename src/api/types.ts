@@ -50,6 +50,11 @@ export interface AccountQuota {
   accountId: string
 }
 
+export interface AccountQuotaError {
+  code: string | null
+  message: string
+}
+
 export interface ProxyStatus {
   running: boolean
   port: number

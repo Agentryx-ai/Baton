@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { ClaudeQuotaPreflight } from './claude-native-quota.ts'
+import { ClaudeNativeCredentialError } from './claude-native-credentials.ts'
 
 const credential = { accountId: 'account-a', accessToken: 'secret', scopes: [] }
 
@@ -82,4 +83,14 @@ test('maps native Claude usage limits to the existing account quota UI contract'
       },
     ],
   })
+})
+
+test('usage authentication rejection becomes a reauthentication credential error', async () => {
+  const preflight = new ClaudeQuotaPreflight({
+    fetchImpl: async () => Response.json({ error: 'invalid token' }, { status: 401 }),
+  })
+  await assert.rejects(
+    preflight.accountQuota(credential),
+    (error: unknown) => error instanceof ClaudeNativeCredentialError && error.code === 'expired',
+  )
 })

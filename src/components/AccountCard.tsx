@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Target, Shield, Moon, Pause, Play, Crosshair, RefreshCw, Star, Trash2 } from 'lucide-react'
 
-import type { Account, AccountQuota } from '@/api/types'
+import type { Account, AccountQuota, AccountQuotaError } from '@/api/types'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -36,6 +36,7 @@ export type AccountStatus = 'target' | 'reserve' | 'engine-paused' | 'user-pause
 export interface AccountCardProps {
   account: Account
   quota: AccountQuota | null
+  quotaError?: AccountQuotaError | null
   status: AccountStatus
   /** Smart-rotation engine on? Gates which manual controls appear. */
   engineEnabled: boolean
@@ -94,9 +95,22 @@ function NoQuotaState() {
   )
 }
 
+function QuotaErrorState({ error }: { error: AccountQuotaError }) {
+  const reauthRequired = error.code === 'reauth_required'
+  return (
+    <div className="rounded-md border border-danger/40 bg-danger/5 px-3 py-3" role="alert">
+      <p className="text-sm font-medium text-danger">
+        {reauthRequired ? '재로그인 필요' : '한도 조회 실패'}
+      </p>
+      <p className="mt-1 text-xs text-muted-foreground">{error.message}</p>
+    </div>
+  )
+}
+
 export function AccountCard({
   account,
   quota,
+  quotaError = null,
   status,
   engineEnabled,
   canSolo,
@@ -181,7 +195,9 @@ export function AccountCard({
 
         {/* Quota */}
         <div className="space-y-3">
-          {quota === null ? (
+          {quotaError ? (
+            <QuotaErrorState error={quotaError} />
+          ) : quota === null ? (
             <QuotaSkeleton />
           ) : quota.windows.length === 0 ? (
             <NoQuotaState />

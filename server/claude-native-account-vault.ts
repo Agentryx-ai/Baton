@@ -1,6 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { chmod, copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 
 export interface ClaudeNativeAccountSecret {
@@ -56,6 +57,18 @@ export interface ClaudeNativeAccountVaultOptions {
   createId?: () => string
 }
 
+export interface ClaudeStableIdentityDuplicate {
+  accountId: string
+  accountIds: string[]
+}
+
+export interface ClaudeStableIdentityRepairResult {
+  applied: boolean
+  duplicates: ClaudeStableIdentityDuplicate[]
+  removedAccountIds: string[]
+  backupPath: string | null
+}
+
 export class ClaudeNativeAccountVaultError extends Error {
   readonly code: 'invalid' | 'not_found' | 'unavailable'
 
@@ -107,16 +120,35 @@ export class ClaudeNativeAccountVault {
     validateInput(input)
     return this.mutate(async (file) => {
       const now = new Date(this.now()).toISOString()
-      const existing = input.id ? file.accounts.find((account) => account.id === input.id) : undefined
-      if (input.id && !existing) {
+      const explicit = input.id ? file.accounts.find((account) => account.id === input.id) : undefined
+      if (input.id && !explicit) {
         throw new ClaudeNativeAccountVaultError('not_found', '수정할 Claude 계정을 찾지 못했습니다.')
       }
+      const stableIdentity = input.accountId?.trim()
+      const stableMatches = stableIdentity
+        ? file.accounts.filter((account) => account.accountId === stableIdentity)
+        : []
+      if (stableMatches.length > 1) {
+        throw new ClaudeNativeAccountVaultError(
+          'invalid',
+          `Claude stable identity ${stableIdentity}가 여러 vault 계정에 연결되어 있습니다. 명시적으로 복구하세요.`,
+        )
+      }
+      if (explicit && stableMatches[0] && stableMatches[0].id !== explicit.id) {
+        throw new ClaudeNativeAccountVaultError(
+          'invalid',
+          `Claude 불변 계정 식별자 ${stableIdentity}는 다른 vault 계정이 소유합니다.`,
+        )
+      }
+      const existing = explicit ?? stableMatches[0]
       const protectedSecret = await this.protector.protect(JSON.stringify(input.secret))
+      const accountId = stableIdentity ?? existing?.accountId
+      const email = input.email === undefined ? existing?.email : input.email.trim()
       const account: StoredAccount = {
         id: existing?.id ?? this.createId(),
         nickname: input.nickname.trim(),
-        ...(input.accountId ? { accountId: input.accountId } : {}),
-        ...(input.email ? { email: input.email } : {}),
+        ...(accountId ? { accountId } : {}),
+        ...(email ? { email } : {}),
         priority: input.priority ?? existing?.priority ?? nextPriority(file.accounts),
         enabled: input.enabled ?? existing?.enabled ?? true,
         createdAt: existing?.createdAt ?? now,
@@ -129,6 +161,65 @@ export class ClaudeNativeAccountVault {
       const { protectedSecret: _protectedSecret, ...publicAccount } = account
       return publicAccount
     })
+  }
+
+  async repairStableIdentityDuplicates(input: {
+    apply?: boolean
+    keepByAccountId?: Record<string, string>
+  } = {}): Promise<ClaudeStableIdentityRepairResult> {
+    const previous = this.pendingMutation
+    let release!: () => void
+    this.pendingMutation = new Promise<void>((resolve) => { release = resolve })
+    await previous
+    try {
+      const file = await this.read()
+      const grouped = new Map<string, StoredAccount[]>()
+      for (const account of file.accounts) {
+        if (!account.accountId) continue
+        const group = grouped.get(account.accountId) ?? []
+        group.push(account)
+        grouped.set(account.accountId, group)
+      }
+      const duplicates = [...grouped.entries()]
+        .filter(([, accounts]) => accounts.length > 1)
+        .map(([accountId, accounts]) => ({ accountId, accountIds: accounts.map((account) => account.id) }))
+        .sort((left, right) => left.accountId.localeCompare(right.accountId))
+      if (input.apply !== true) {
+        return { applied: false, duplicates, removedAccountIds: [], backupPath: null }
+      }
+
+      const keepByAccountId = input.keepByAccountId ?? {}
+      const keepIds = new Set<string>()
+      for (const duplicate of duplicates) {
+        const keepId = keepByAccountId[duplicate.accountId]
+        if (!keepId || !duplicate.accountIds.includes(keepId)) {
+          throw new ClaudeNativeAccountVaultError(
+            'invalid',
+            `중복 stable identity ${duplicate.accountId}에서 유지할 계정 id를 명시하세요 (explicit keep id required).`,
+          )
+        }
+        keepIds.add(keepId)
+      }
+      if (duplicates.length === 0) {
+        return { applied: true, duplicates, removedAccountIds: [], backupPath: null }
+      }
+
+      const duplicateIds = new Set(duplicates.flatMap((duplicate) => duplicate.accountIds))
+      const removedAccountIds = file.accounts
+        .filter((account) => duplicateIds.has(account.id) && !keepIds.has(account.id))
+        .map((account) => account.id)
+      const backupPath = `${this.filePath}.backup-${this.now()}`
+      try {
+        await copyFile(this.filePath, backupPath, constants.COPYFILE_EXCL)
+      } catch {
+        throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault 백업을 만들지 못해 복구를 중단했습니다.')
+      }
+      file.accounts = file.accounts.filter((account) => !removedAccountIds.includes(account.id))
+      await this.write(file)
+      return { applied: true, duplicates, removedAccountIds, backupPath }
+    } finally {
+      release()
+    }
   }
 
   async setEnabled(id: string, enabled: boolean): Promise<ClaudeNativeAccount> {
@@ -274,6 +365,9 @@ export function nativeClaudeAccountVaultPath(dataDir: string): string {
 
 function validateInput(input: ClaudeNativeAccountInput): void {
   if (!input.nickname.trim()) throw new ClaudeNativeAccountVaultError('invalid', 'Claude 계정 별칭이 비어 있습니다.')
+  if (input.accountId !== undefined && !input.accountId.trim()) {
+    throw new ClaudeNativeAccountVaultError('invalid', 'Claude 불변 계정 식별자가 비어 있습니다.')
+  }
   if (!Number.isInteger(input.priority ?? 0) || (input.priority ?? 0) < 0) {
     throw new ClaudeNativeAccountVaultError('invalid', 'Claude 계정 우선순위가 올바르지 않습니다.')
   }

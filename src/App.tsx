@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import type {
   AccountQuota,
+  AccountQuotaError,
   ClientIntegrationApplyResult,
   ClientIntegrationTarget,
   ClaudeProxyMode,
@@ -9,7 +10,7 @@ import type {
   Provider,
 } from '@/api/types'
 import { UI_PROVIDERS } from '@/api/types'
-import { client } from '@/api/client'
+import { ApiError, client } from '@/api/client'
 import { useAccounts } from '@/hooks/useAccounts'
 import { useProxyStatus } from '@/hooks/useProxyStatus'
 import { usePolling } from '@/hooks/usePolling'
@@ -27,8 +28,14 @@ import {
   type SessionViewPreferences,
 } from '@/features/conversations/session-view-preferences'
 
-/** Nested quota map: provider → accountId → quota (null = loading/failed). */
+/** Nested quota map: provider → accountId → quota (null = still loading). */
 type QuotaMap = Record<string, Record<string, AccountQuota | null>>
+type QuotaErrorMap = Record<string, Record<string, AccountQuotaError | null>>
+
+interface QuotaSnapshot {
+  quotas: QuotaMap
+  errors: QuotaErrorMap
+}
 
 function viewFromHash(): AppView {
   const value = window.location.hash.replace(/^#\/?/, '')
@@ -61,20 +68,26 @@ function App() {
   // Quotas: one call per account. Can't loop a per-account hook, so poll them
   // together here (60s, DESIGN §6) and refresh whenever the account set changes.
   const {
-    data: quotaMap,
+    data: quotaSnapshot,
     refresh: refreshQuotas,
-  } = usePolling<QuotaMap>(
+  } = usePolling<QuotaSnapshot>(
     useCallback(async () => {
-      const result: QuotaMap = {}
+      const result: QuotaSnapshot = { quotas: {}, errors: {} }
       if (!accounts) return result
       await Promise.all(
         UI_PROVIDERS.flatMap((prov) =>
           (accounts[prov] ?? []).map(async (acc) => {
-            ;(result[prov] ??= {})
+            ;(result.quotas[prov] ??= {})
+            ;(result.errors[prov] ??= {})
             try {
-              result[prov][acc.id] = await client.getQuota(prov, acc.id)
-            } catch {
-              result[prov][acc.id] = null
+              result.quotas[prov][acc.id] = await client.getQuota(prov, acc.id)
+              result.errors[prov][acc.id] = null
+            } catch (error) {
+              result.quotas[prov][acc.id] = null
+              result.errors[prov][acc.id] = {
+                code: error instanceof ApiError ? error.code : null,
+                message: error instanceof Error ? error.message : String(error),
+              }
             }
           }),
         ),
@@ -83,6 +96,8 @@ function App() {
     }, [accounts]),
     60_000,
   )
+  const quotaMap = quotaSnapshot?.quotas ?? null
+  const quotaErrors = quotaSnapshot?.errors ?? null
 
   // When the account set first loads / changes, pull quotas immediately.
   const accountsKey = accounts
@@ -227,6 +242,7 @@ function App() {
                 provider={prov}
                 accounts={accounts?.[prov] ?? []}
                 quotas={quotaMap?.[prov] ?? {}}
+                quotaErrors={quotaErrors?.[prov] ?? {}}
                 engineEnabled={false}
                 providerState={null}
                 onPause={onPause}

@@ -179,6 +179,7 @@ export class ClaudeNativeOAuthManager {
         nickname,
         ...(profile.email ? { email: profile.email } : {}),
         ...(profile.accountUuid ? { accountId: profile.accountUuid } : {}),
+        source: 'oauth',
         secret,
       })
     } catch {
