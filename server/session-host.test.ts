@@ -185,6 +185,25 @@ test('worker session host serves the real runtime and refuses tokenless direct a
   }
 })
 
+test('close during the worker boot window resolves and never respawns', async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'baton-session-host-close-'))
+  try {
+    const host = createWorkerSessionHost({ dataDir })
+    // The worker is still booting (tsx register + runtime import + DB open):
+    // close() must settle, not wait on a listening message that will be
+    // ignored, and the graceful worker exit must not take the restart branch.
+    await host.close()
+    assert.equal(host.snapshot().state, 'closed')
+    // Outlive the first restart-backoff slot: a zombie respawn would flip the
+    // state away from closed and bump the restart counter.
+    await new Promise((resolve) => setTimeout(resolve, 700))
+    assert.equal(host.snapshot().state, 'closed')
+    assert.equal(host.snapshot().restarts, 0)
+  } finally {
+    await rm(dataDir, { recursive: true, force: true })
+  }
+})
+
 test('worker session host restarts after an unexpected worker death', async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'baton-session-host-crash-'))
   const fixture = path.join(dataDir, 'crashy-worker.mjs')

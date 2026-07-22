@@ -142,6 +142,11 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
   let attempt = 0
   let lastError: string | undefined
   let startedAt = 0
+  // Closure is tracked separately from `state`: worker messages (`listening`)
+  // arrive asynchronously and must never be able to overwrite a closed host
+  // back to ready — that would flush requests into a dying worker and make the
+  // exit handler respawn a zombie nothing will ever stop.
+  let closed = false
   let respawnTimer: ReturnType<typeof setTimeout> | null = null
   const closeResolvers: (() => void)[] = []
 
@@ -179,6 +184,7 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
   }
 
   const spawn = (): void => {
+    if (closed) return
     state = 'starting'
     target = null
     const spawned = new Worker(workerUrl, {
@@ -190,6 +196,7 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
     spawned.on('message', (message: unknown) => {
       if (!message || typeof message !== 'object') return
       const value = message as { type?: unknown; port?: unknown; token?: unknown; recovered?: unknown; message?: unknown }
+      if (closed) return
       if (value.type === 'listening' && typeof value.port === 'number' && typeof value.token === 'string') {
         target = { port: value.port, token: value.token }
         state = 'ready'
@@ -213,7 +220,8 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
     spawned.once('exit', (code) => {
       if (worker === spawned) worker = null
       target = null
-      if (state === 'closed') {
+      if (closed) {
+        state = 'closed'
         for (const resolve of closeResolvers.splice(0)) resolve()
         return
       }
@@ -269,10 +277,14 @@ export function createWorkerSessionHost(options: WorkerSessionHostOptions): Sess
     start: () => null,
     closeStreams: () => {
       // Mirror the old inline semantics: end worker-held SSE streams now so
-      // the main server's connection drain is not stuck behind them.
+      // the main server's connection drain is not stuck behind them — and
+      // release parked requests too, or their headerless responses would pin
+      // the drain for its full timeout.
+      failWaiters()
       worker?.postMessage({ type: 'close-streams' })
     },
     close: async () => {
+      closed = true
       state = 'closed'
       if (respawnTimer) clearTimeout(respawnTimer)
       respawnTimer = null
