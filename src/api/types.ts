@@ -143,6 +143,7 @@ export interface ClientIntegrationTargetStatus {
   running: ClientProcess[]
   configuration: ClientIntegrationConfigurationState
   configurationDetail?: string
+  repairable?: boolean
   codexMode?: CodexIntegrationMode
   claudeProxyMode?: ClaudeProxyMode
 }

@@ -57,6 +57,7 @@ export interface ClientIntegrationTargetStatus {
   running: ClientProcess[]
   configuration: ClientIntegrationConfigurationState
   configurationDetail?: string
+  repairable?: boolean
   codexMode?: CodexIntegrationMode
   claudeProxyMode?: ClaudeProxyMode
 }
@@ -470,14 +471,18 @@ async function requireTargetsStopped(targets: ClientIntegrationTarget[]): Promis
 
 type ConfigurationInspection = Pick<
   ClientIntegrationTargetStatus,
-  'configuration' | 'configurationDetail' | 'codexMode' | 'claudeProxyMode'
+  'configuration' | 'configurationDetail' | 'repairable' | 'codexMode' | 'claudeProxyMode'
 >
 
-/** Existing or ambiguous integration fields always fail closed. */
+/** Only absent settings and explicitly classified Baton-owned repairs are applyable. */
 export function canApplyConfiguration(
-  state: ClientIntegrationConfigurationState,
+  target: ClientIntegrationTarget,
+  inspection: Pick<ClientIntegrationTargetStatus, 'configuration' | 'repairable'>,
 ): boolean {
-  return state === 'not-applied'
+  return inspection.configuration === 'not-applied'
+    || (target === 'codex'
+      && inspection.configuration === 'conflict'
+      && inspection.repairable === true)
 }
 
 async function requireConfigurationState(
@@ -488,9 +493,9 @@ async function requireConfigurationState(
   const inspections = await inspectTargetConfigurations(claudeConnection)
   const invalid = targets
     .map((target) => ({ target, inspection: inspections.get(target)! }))
-    .filter(({ inspection }) => expected === 'applied'
+    .filter(({ target, inspection }) => expected === 'applied'
       ? inspection.configuration !== 'applied'
-      : !canApplyConfiguration(inspection.configuration))
+      : !canApplyConfiguration(target, inspection))
   if (invalid.length === 0) return
 
   const expectedLabel = expected === 'applied' ? '적용된' : '미적용'
@@ -681,10 +686,12 @@ export function inspectCodexNativeConfig(
   const configuredBaseUrl = parsed.openai_base_url
   const provider = parsed.model_provider
   const batonProvider = codexProvider(parsed, 'baton')
+  const managedCompat = isManagedBatonCompatProvider(batonProvider, baseUrl)
+  const migratesLegacyBaton = isMigratableLegacyBatonProvider(batonProvider, baseUrl)
   if (
     configuredBaseUrl === baseUrl
     && (provider === undefined || provider === 'openai')
-    && isManagedBatonCompatProvider(batonProvider, baseUrl)
+    && managedCompat
   ) {
     return {
       configuration: 'applied',
@@ -693,11 +700,26 @@ export function inspectCodexNativeConfig(
     }
   }
   if (configuredBaseUrl === baseUrl) {
+    const repairable = isRepairableCodexNativeConfig(content, baseUrl)
     return {
       configuration: 'conflict',
       configurationDetail: provider !== undefined && provider !== 'openai'
         ? 'Baton openai_base_url이 있으나 model_provider가 openai가 아닙니다.'
         : 'Baton openai_base_url이 있으나 기존 Baton 세션 resume 호환 provider가 없습니다.',
+      ...(repairable ? { repairable: true } : {}),
+      codexMode: 'native-openai',
+    }
+  }
+  if (
+    configuredBaseUrl === undefined
+    && provider === 'baton'
+    && migratesLegacyBaton
+  ) {
+    const repairable = isRepairableCodexNativeConfig(content, baseUrl)
+    return {
+      configuration: 'conflict',
+      configurationDetail: '기존 Baton provider를 Native resume 호환 설정으로 복구해야 합니다.',
+      ...(repairable ? { repairable: true } : {}),
       codexMode: 'native-openai',
     }
   }
@@ -923,9 +945,7 @@ export function patchCodexNativeConfig(content: string, baseUrl: string): string
 
   const batonProvider = codexProvider(parsed, 'baton')
   const managedCompat = isManagedBatonCompatProvider(batonProvider, baseUrl)
-  const migratesLegacyBaton = batonProvider?.env_key === 'BATON_PROXY_TOKEN'
-    && batonProvider?.wire_api === 'responses'
-    && typeof batonProvider?.base_url === 'string'
+  const migratesLegacyBaton = isMigratableLegacyBatonProvider(batonProvider, baseUrl)
   if (batonProvider !== undefined && !managedCompat && !migratesLegacyBaton) {
     throw new ClientIntegrationError(409, '사용자가 정의한 model_providers.baton이 있어 Baton Native 설정을 적용하지 않았습니다.')
   }
@@ -1069,13 +1089,44 @@ function isManagedBatonCompatProvider(
   provider: Record<string, unknown> | undefined,
   baseUrl: string,
 ): boolean {
-  return provider?.name === 'Baton Native (resume compatibility)'
+  return hasExactKeys(provider, [
+    'name', 'base_url', 'wire_api', 'request_max_retries', 'stream_max_retries',
+  ])
+    && provider?.name === 'Baton Native (resume compatibility)'
     && provider.base_url === baseUrl
     && provider.wire_api === 'responses'
     && provider.request_max_retries === 0
     && provider.stream_max_retries === 0
-    && provider.env_key === undefined
-    && provider.requires_openai_auth === undefined
+}
+
+function isMigratableLegacyBatonProvider(
+  provider: Record<string, unknown> | undefined,
+  baseUrl: string,
+): boolean {
+  if (!hasExactKeys(provider, ['name', 'base_url', 'env_key', 'wire_api'])) return false
+  return (provider?.name === 'Baton CLIProxy'
+      || (provider?.name === 'Baton Native' && provider.base_url === baseUrl))
+    && provider.env_key === 'BATON_PROXY_TOKEN'
+    && provider.wire_api === 'responses'
+    && typeof provider.base_url === 'string'
+}
+
+function hasExactKeys(
+  value: Record<string, unknown> | undefined,
+  expected: readonly string[],
+): boolean {
+  if (!value) return false
+  const keys = Object.keys(value).sort()
+  return keys.length === expected.length
+    && [...expected].sort().every((key, index) => keys[index] === key)
+}
+
+function isRepairableCodexNativeConfig(content: string, baseUrl: string): boolean {
+  try {
+    return patchCodexNativeConfig(content, baseUrl) !== content
+  } catch {
+    return false
+  }
 }
 
 function managedBatonCompatProviderLines(baseUrl: string): string[] {

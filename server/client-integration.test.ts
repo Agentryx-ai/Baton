@@ -24,10 +24,12 @@ import {
 } from './client-integration.ts'
 
 test('configuration conflicts fail closed and only absent settings are applyable', () => {
-  assert.equal(canApplyConfiguration('not-applied'), true)
-  assert.equal(canApplyConfiguration('conflict'), false)
-  assert.equal(canApplyConfiguration('applied'), false)
-  assert.equal(canApplyConfiguration('unknown'), false)
+  assert.equal(canApplyConfiguration('codex', { configuration: 'not-applied' }), true)
+  assert.equal(canApplyConfiguration('codex', { configuration: 'conflict' }), false)
+  assert.equal(canApplyConfiguration('codex', { configuration: 'conflict', repairable: true }), true)
+  assert.equal(canApplyConfiguration('claude-cli', { configuration: 'conflict', repairable: true }), false)
+  assert.equal(canApplyConfiguration('codex', { configuration: 'applied' }), false)
+  assert.equal(canApplyConfiguration('codex', { configuration: 'unknown' }), false)
 })
 
 test('native Codex mode keeps openai identity plus a legacy resume alias and round-trips safely', () => {
@@ -83,14 +85,17 @@ test('native Codex mode migrates the exact Baton-owned legacy provider to an una
     'example = true',
     '',
     '[model_providers.baton]',
-    'name = "Baton Legacy"',
+    'name = "Baton CLIProxy"',
     'base_url = "http://127.0.0.1:8317/v1"',
     'env_key = "BATON_PROXY_TOKEN"',
     'wire_api = "responses"',
     '',
   ].join('\n')
   const migrated = patchCodexNativeConfig(source, baseUrl)
-  assert.equal(inspectCodexNativeConfig(source, baseUrl).configuration, 'conflict')
+  const legacy = inspectCodexNativeConfig(source, baseUrl)
+  assert.equal(legacy.configuration, 'conflict')
+  assert.equal(legacy.repairable, true)
+  assert.equal(canApplyConfiguration('codex', legacy), true)
   const parsed = parseToml(migrated) as Record<string, unknown>
   assert.equal(parsed.model_provider, undefined)
   assert.equal(parsed.openai_base_url, baseUrl)
@@ -108,8 +113,25 @@ test('native Codex mode migrates the exact Baton-owned legacy provider to an una
 
 test('native Codex mode repairs a removed resume alias and rejects a user-owned baton provider', () => {
   const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  const missingAlias = inspectCodexNativeConfig(`openai_base_url = "${baseUrl}"\n`, baseUrl)
+  assert.equal(missingAlias.configuration, 'conflict')
+  assert.equal(missingAlias.repairable, true)
+  assert.equal(canApplyConfiguration('codex', missingAlias), true)
+
   const repaired = patchCodexNativeConfig(`openai_base_url = "${baseUrl}"\n`, baseUrl)
   assert.equal(inspectCodexNativeConfig(repaired, baseUrl).configuration, 'applied')
+
+  const userOwned = inspectCodexNativeConfig([
+    `openai_base_url = "${baseUrl}"`,
+    '[model_providers.baton]',
+    'name = "My provider"',
+    `base_url = "${baseUrl}"`,
+    'wire_api = "responses"',
+    '',
+  ].join('\n'), baseUrl)
+  assert.equal(userOwned.configuration, 'conflict')
+  assert.equal(userOwned.repairable, undefined)
+  assert.equal(canApplyConfiguration('codex', userOwned), false)
   assert.throws(
     () => patchCodexNativeConfig([
       '[model_providers.baton]',
@@ -120,6 +142,86 @@ test('native Codex mode repairs a removed resume alias and rejects a user-owned 
     ].join('\n'), baseUrl),
     /사용자가 정의한 model_providers\.baton/,
   )
+})
+
+test('native Codex mode normalizes the exact manual resume workaround idempotently', () => {
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  const manual = [
+    `openai_base_url = "${baseUrl}"`,
+    '',
+    '[model_providers.baton]',
+    'name = "Baton Native"',
+    `base_url = "${baseUrl}"`,
+    'wire_api = "responses"',
+    'env_key = "BATON_PROXY_TOKEN"',
+    '',
+  ].join('\n')
+
+  const inspection = inspectCodexNativeConfig(manual, baseUrl)
+  assert.equal(inspection.configuration, 'conflict')
+  assert.equal(inspection.repairable, true)
+  const normalized = patchCodexNativeConfig(manual, baseUrl)
+  assert.equal(inspectCodexNativeConfig(normalized, baseUrl).configuration, 'applied')
+  assert.equal(patchCodexNativeConfig(normalized, baseUrl), normalized)
+  assert.deepEqual(
+    ((parseToml(normalized) as Record<string, unknown>).model_providers as Record<string, unknown>).baton,
+    {
+      name: 'Baton Native (resume compatibility)',
+      base_url: baseUrl,
+      wire_api: 'responses',
+      request_max_retries: 0,
+      stream_max_retries: 0,
+    },
+  )
+})
+
+test('Codex repair inspection fails closed for custom, extended, and noncanonical configs', () => {
+  const baseUrl = 'http://127.0.0.1:4400/baton/inference/openai/v1'
+  const foreign = [
+    'model_provider = "baton"',
+    '[model_providers.baton]',
+    'name = "My Baton-compatible provider"',
+    'base_url = "http://127.0.0.1:8317/v1"',
+    'env_key = "BATON_PROXY_TOKEN"',
+    'wire_api = "responses"',
+    '',
+  ].join('\n')
+  const extendedManaged = [
+    `openai_base_url = "${baseUrl}"`,
+    '[model_providers.baton]',
+    'name = "Baton Native (resume compatibility)"',
+    `base_url = "${baseUrl}"`,
+    'wire_api = "responses"',
+    'request_max_retries = 0',
+    'stream_max_retries = 0',
+    'custom = true',
+    '',
+  ].join('\n')
+  const noncanonical = `"openai_base_url" = "${baseUrl}"\n`
+  const noncanonicalLegacy = [
+    '"model_provider" = "baton"',
+    '[model_providers."baton"]',
+    'name = "Baton CLIProxy"',
+    'base_url = "http://127.0.0.1:8317/v1"',
+    'env_key = "BATON_PROXY_TOKEN"',
+    'wire_api = "responses"',
+    '',
+  ].join('\n')
+
+  for (const content of [foreign, extendedManaged, noncanonical, noncanonicalLegacy]) {
+    const inspection = inspectCodexNativeConfig(content, baseUrl)
+    assert.notEqual(inspection.configuration, 'applied')
+    assert.equal(inspection.repairable, undefined)
+    assert.equal(canApplyConfiguration('codex', inspection), false)
+    assert.throws(() => patchCodexNativeConfig(content, baseUrl))
+  }
+})
+
+test('malformed Codex config remains unknown and cannot reach apply', () => {
+  const inspection = inspectCodexNativeConfig('bad = "unterminated\n', 'http://127.0.0.1:4400/v1')
+  assert.equal(inspection.configuration, 'unknown')
+  assert.equal(inspection.repairable, undefined)
+  assert.equal(canApplyConfiguration('codex', inspection), false)
 })
 
 test('configuration inspection distinguishes applied, absent, and conflicting values', () => {
