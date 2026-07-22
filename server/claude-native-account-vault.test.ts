@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, stat, unlink, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rmdir, stat, unlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -168,6 +168,170 @@ test('separate Claude vault instances preserve an account add racing a token ref
     'Added concurrently', 'Existing',
   ])
   assert.equal((await createVault().getSecret(existing.id)).accessToken, 'rotated-access')
+})
+
+test('a paused lock candidate cannot remove another contender lock after resuming', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-candidate-race-'))
+  const filePath = path.join(directory, 'accounts.json')
+  let candidatePath = ''
+  let candidateReady!: () => void
+  let resumeCandidate!: () => void
+  const candidatePaused = new Promise<void>((resolve) => { candidateReady = resolve })
+  const candidateResume = new Promise<void>((resolve) => { resumeCandidate = resolve })
+  let blockContender = true
+  let contenderStarted!: () => void
+  let releaseContender!: () => void
+  const contenderPaused = new Promise<void>((resolve) => { contenderStarted = resolve })
+  class ContenderProtector extends TestProtector {
+    override async protect(value: string): Promise<string> {
+      if (blockContender) {
+        blockContender = false
+        contenderStarted()
+        await new Promise<void>((resolve) => { releaseContender = resolve })
+      }
+      return super.protect(value)
+    }
+  }
+  let firstCandidate = true
+  const pausedVault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    createId: () => 'paused-account',
+    lockHooks: {
+      candidateReady: async (createdPath) => {
+        if (!firstCandidate) return
+        firstCandidate = false
+        candidatePath = createdPath
+        candidateReady()
+        await candidateResume
+      },
+    },
+  })
+  const contenderVault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new ContenderProtector(),
+    createId: () => 'contender-account',
+  })
+
+  const pausedPut = pausedVault.put({ nickname: 'Paused initializer', secret })
+  await candidatePaused
+  const contenderPut = contenderVault.put({
+    nickname: 'Published contender',
+    secret: { ...secret, refreshToken: 'contender-refresh' },
+  })
+  await contenderPaused
+  const canonicalOwnerBefore = await readFile(`${filePath}.lock/owner.json`, 'utf8')
+  resumeCandidate()
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await stat(candidatePath)
+      await new Promise((resolve) => setTimeout(resolve, 2))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') break
+      throw error
+    }
+  }
+  await assert.rejects(stat(candidatePath), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT')
+  assert.equal(await readFile(`${filePath}.lock/owner.json`, 'utf8'), canonicalOwnerBefore)
+  releaseContender()
+  await Promise.all([pausedPut, contenderPut])
+  assert.deepEqual((await pausedVault.list()).map((account) => account.id).sort(), [
+    'contender-account', 'paused-account',
+  ])
+})
+
+test('lock acquisition retries when the incumbent releases during collision cleanup', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-cleared-contention-'))
+  const filePath = path.join(directory, 'accounts.json')
+  let incumbentStarted!: () => void
+  let releaseIncumbent!: () => void
+  const incumbentPaused = new Promise<void>((resolve) => { incumbentStarted = resolve })
+  let blockIncumbent = true
+  class IncumbentProtector extends TestProtector {
+    override async protect(value: string): Promise<string> {
+      if (blockIncumbent) {
+        blockIncumbent = false
+        incumbentStarted()
+        await new Promise<void>((resolve) => { releaseIncumbent = resolve })
+      }
+      return super.protect(value)
+    }
+  }
+  const incumbentVault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new IncumbentProtector(),
+    createId: () => 'incumbent-account',
+  })
+  let incumbentPut!: Promise<unknown>
+  let collisionHandled = false
+  const contenderVault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    createId: () => 'contender-after-release',
+    lockHooks: {
+      publishCollision: async () => {
+        if (collisionHandled) return
+        collisionHandled = true
+        releaseIncumbent()
+        await incumbentPut
+      },
+    },
+  })
+
+  incumbentPut = incumbentVault.put({ nickname: 'Incumbent', secret })
+  await incumbentPaused
+  const contender = await contenderVault.put({
+    nickname: 'Contender',
+    secret: { ...secret, refreshToken: 'contender-after-release' },
+  })
+  await incumbentPut
+
+  assert.equal(contender.id, 'contender-after-release')
+  assert.deepEqual((await contenderVault.list()).map((account) => account.id).sort(), [
+    'contender-after-release', 'incumbent-account',
+  ])
+})
+
+test('vault commit fails its final fence after canonical lock ownership changes', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-commit-fence-'))
+  const filePath = path.join(directory, 'accounts.json')
+  const lockPath = `${filePath}.lock`
+  const displacedPath = `${lockPath}.displaced`
+  let commitReady!: () => void
+  let resumeCommit!: () => void
+  const commitPaused = new Promise<void>((resolve) => { commitReady = resolve })
+  const commitResume = new Promise<void>((resolve) => { resumeCommit = resolve })
+  const vault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    lockHooks: {
+      beforeCommit: async () => {
+        commitReady()
+        await commitResume
+      },
+    },
+  })
+  const put = vault.put({ nickname: 'Must not commit', secret })
+  await commitPaused
+  const originalOwner = JSON.parse(await readFile(path.join(lockPath, 'owner.json'), 'utf8')) as Record<string, unknown>
+  await rename(lockPath, displacedPath)
+  await mkdir(lockPath)
+  const replacementNonce = 'c'.repeat(32)
+  await writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({
+    ...originalOwner,
+    nonce: replacementNonce,
+  }))
+  await writeFile(path.join(lockPath, 'lease.json'), JSON.stringify({
+    version: 1, nonce: replacementNonce, leaseUntil: Date.now() + 30_000,
+  }))
+  resumeCommit()
+  await assert.rejects(put, /vault lock|ownership/i)
+  await assert.rejects(stat(filePath), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT')
+  for (const target of [lockPath, displacedPath]) {
+    await unlink(path.join(target, 'lease.json'))
+    await unlink(path.join(target, 'owner.json'))
+    await rmdir(target)
+  }
 })
 
 test('Claude vault recovers an owned lock left by a crashed process', async () => {
@@ -443,6 +607,10 @@ test('repair surfaces identity-less refresh credential duplicates and requires a
     vault.repairStableIdentityDuplicates({ apply: true }),
     /refresh credential|explicit keep id/i,
   )
+  await assert.rejects(
+    vault.repairStableIdentityDuplicates({ apply: true, dropRefreshFingerprints: [fingerprint] }),
+    /완전히 제거될 때만 drop/i,
+  )
   const applied = await vault.repairStableIdentityDuplicates({
     apply: true,
     keepByRefreshFingerprint: { [fingerprint]: identified.id },
@@ -472,10 +640,18 @@ test('repair allows an overlapping refresh group to disappear under an explicit 
   await writeFile(filePath, `${JSON.stringify(seeded, null, 2)}\n`)
   const fingerprint = createHash('sha256').update(secret.refreshToken).digest('hex')
 
+  await assert.rejects(
+    vault.repairStableIdentityDuplicates({
+      apply: true,
+      keepByAccountId: { 'stable-overlap': keeper.id },
+      keepByRefreshFingerprint: { [fingerprint]: first.id },
+    }),
+    /keeper.*충돌/i,
+  )
   const applied = await vault.repairStableIdentityDuplicates({
     apply: true,
     keepByAccountId: { 'stable-overlap': keeper.id },
-    keepByRefreshFingerprint: { [fingerprint]: first.id },
+    dropRefreshFingerprints: [fingerprint],
   })
 
   assert.deepEqual(applied.removedAccountIds, [first.id, second.id])

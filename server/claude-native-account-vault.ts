@@ -56,6 +56,16 @@ export interface ClaudeNativeAccountVaultOptions {
   protector: ClaudeNativeSecretProtector
   now?: () => number
   createId?: () => string
+  /** @internal Deterministic race injection for vault lock tests. */
+  lockHooks?: {
+    candidateReady?: (candidatePath: string, lockPath: string) => Promise<void>
+    publishCollision?: (lockPath: string) => Promise<void>
+    beforeCommit?: (temporaryPath: string) => Promise<void>
+  }
+}
+
+interface VaultMutationContext {
+  assertOwned(): Promise<void>
 }
 
 export interface ClaudeStableIdentityDuplicate {
@@ -95,7 +105,8 @@ export class ClaudeNativeAccountVault {
   private readonly protector: ClaudeNativeSecretProtector
   private readonly now: () => number
   private readonly createId: () => string
-  private readonly mutationContext = new AsyncLocalStorage<boolean>()
+  private readonly lockHooks: ClaudeNativeAccountVaultOptions['lockHooks']
+  private readonly mutationContext = new AsyncLocalStorage<VaultMutationContext>()
   private pendingMutation: Promise<void> = Promise.resolve()
 
   constructor(options: ClaudeNativeAccountVaultOptions) {
@@ -103,6 +114,7 @@ export class ClaudeNativeAccountVault {
     this.protector = options.protector
     this.now = options.now ?? Date.now
     this.createId = options.createId ?? randomUUID
+    this.lockHooks = options.lockHooks
   }
 
   async list(): Promise<ClaudeNativeAccount[]> {
@@ -176,6 +188,7 @@ export class ClaudeNativeAccountVault {
     apply?: boolean
     keepByAccountId?: Record<string, string>
     keepByRefreshFingerprint?: Record<string, string>
+    dropRefreshFingerprints?: string[]
   } = {}): Promise<ClaudeStableIdentityRepairResult> {
     return this.withExclusiveMutation(async () => {
       const file = await this.read()
@@ -211,6 +224,18 @@ export class ClaudeNativeAccountVault {
 
       const keepByAccountId = input.keepByAccountId ?? {}
       const keepByRefreshFingerprint = input.keepByRefreshFingerprint ?? {}
+      const dropRefreshFingerprints = new Set(input.dropRefreshFingerprints ?? [])
+      if (dropRefreshFingerprints.size !== (input.dropRefreshFingerprints?.length ?? 0)) {
+        throw new ClaudeNativeAccountVaultError('invalid', '중복 refresh credential drop acknowledgement가 반복되었습니다.')
+      }
+      const knownRefreshFingerprints = new Set(
+        refreshCredentialDuplicates.map((duplicate) => duplicate.refreshFingerprint),
+      )
+      for (const fingerprint of dropRefreshFingerprints) {
+        if (!knownRefreshFingerprints.has(fingerprint)) {
+          throw new ClaudeNativeAccountVaultError('invalid', `알 수 없는 refresh credential drop acknowledgement: ${fingerprint}`)
+        }
+      }
       const decisions = new Map<string, 'keep' | 'remove'>()
       const requireKeeper = (accountIds: string[], keepId: string | undefined, description: string): string => {
         if (!keepId || !accountIds.includes(keepId)) {
@@ -240,17 +265,30 @@ export class ClaudeNativeAccountVault {
         applyKeeper(duplicate.accountIds, keepId)
       }
       for (const duplicate of refreshCredentialDuplicates) {
-        const keepId = requireKeeper(
+        const survivors = duplicate.accountIds.filter((accountId) => decisions.get(accountId) !== 'remove')
+        const keepId = keepByRefreshFingerprint[duplicate.refreshFingerprint]
+        const dropAcknowledged = dropRefreshFingerprints.has(duplicate.refreshFingerprint)
+        if (keepId && dropAcknowledged) {
+          throw new ClaudeNativeAccountVaultError('invalid', 'refresh credential 그룹에 keeper와 drop을 동시에 지정할 수 없습니다.')
+        }
+        if (dropAcknowledged) {
+          if (survivors.length > 0) {
+            throw new ClaudeNativeAccountVaultError(
+              'invalid',
+              'refresh credential 그룹은 다른 explicit keeper 결정으로 완전히 제거될 때만 drop할 수 있습니다.',
+            )
+          }
+          continue
+        }
+        const selectedKeeper = requireKeeper(
           duplicate.accountIds,
-          keepByRefreshFingerprint[duplicate.refreshFingerprint],
+          keepId,
           `중복 refresh credential ${duplicate.refreshFingerprint}`,
         )
-        const survivors = duplicate.accountIds.filter((accountId) => decisions.get(accountId) !== 'remove')
-        if (survivors.length === 0) continue
-        if (!survivors.includes(keepId)) {
+        if (!survivors.includes(selectedKeeper)) {
           throw new ClaudeNativeAccountVaultError('invalid', '중복 그룹의 keeper 선택이 서로 충돌합니다.')
         }
-        applyKeeper(survivors, keepId)
+        applyKeeper(survivors, selectedKeeper)
       }
       if (duplicates.length === 0 && refreshCredentialDuplicates.length === 0) {
         return { applied: true, duplicates, refreshCredentialDuplicates, removedAccountIds: [], backupPath: null }
@@ -261,6 +299,7 @@ export class ClaudeNativeAccountVault {
         .map((account) => account.id)
       const backupPath = `${this.filePath}.backup-${this.now()}`
       try {
+        await this.requireMutationContext().assertOwned()
         await copyFile(this.filePath, backupPath, constants.COPYFILE_EXCL)
       } catch {
         throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault 백업을 만들지 못해 복구를 중단했습니다.')
@@ -413,7 +452,9 @@ export class ClaudeNativeAccountVault {
     this.pendingMutation = new Promise<void>((resolve) => { release = resolve })
     await previous
     try {
-      return await withVaultFileLock(this.filePath, () => this.mutationContext.run(true, operation))
+      return await withVaultFileLock(this.filePath, this.lockHooks, (assertOwned) => (
+        this.mutationContext.run({ assertOwned }, operation)
+      ))
     } finally {
       release()
     }
@@ -451,9 +492,28 @@ export class ClaudeNativeAccountVault {
   private async write(file: VaultFile): Promise<void> {
     await mkdir(path.dirname(this.filePath), { recursive: true })
     const temporary = `${this.filePath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
-    await writeFile(temporary, `${JSON.stringify(file, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-    await rename(temporary, this.filePath)
+    try {
+      await writeFile(temporary, `${JSON.stringify(file, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+      await this.lockHooks?.beforeCommit?.(temporary)
+      await this.requireMutationContext().assertOwned()
+      await rename(temporary, this.filePath)
+    } catch (error) {
+      try {
+        await unlink(temporary)
+      } catch (cleanupError) {
+        if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw new AggregateError([error, cleanupError], 'Claude 계정 vault 임시 파일을 정리하지 못했습니다.')
+        }
+      }
+      throw error
+    }
     await chmod(this.filePath, 0o600).catch(() => undefined)
+  }
+
+  private requireMutationContext(): VaultMutationContext {
+    const context = this.mutationContext.getStore()
+    if (!context) throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault mutation lock이 없습니다.')
+    return context
   }
 }
 
@@ -481,15 +541,18 @@ const FALLBACK_PROCESS_IDENTITY = `fallback:${process.pid}:${randomBytes(16).toS
 const activeVaultLockNonces = new Set<string>()
 let currentProcessIdentityPromise: Promise<string> | undefined
 
-async function withVaultFileLock<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+async function withVaultFileLock<T>(
+  filePath: string,
+  hooks: ClaudeNativeAccountVaultOptions['lockHooks'],
+  operation: (assertOwned: () => Promise<void>) => Promise<T>,
+): Promise<T> {
   const lockPath = `${filePath}.lock`
-  const owner = await acquireVaultFileLock(lockPath)
-  const leasePath = path.join(lockPath, VAULT_LOCK_LEASE_FILE)
+  const owner = await acquireVaultFileLock(lockPath, hooks)
   let heartbeatError: unknown
   let heartbeat = Promise.resolve()
   const heartbeatTimer = setInterval(() => {
     heartbeat = heartbeat
-      .then(() => writeVaultLockLease(leasePath, owner.nonce))
+      .then(() => refreshVaultLockLease(lockPath, owner))
       .catch((error: unknown) => { heartbeatError ??= error })
   }, VAULT_LOCK_HEARTBEAT_MS)
   heartbeatTimer.unref()
@@ -498,7 +561,7 @@ async function withVaultFileLock<T>(filePath: string, operation: () => Promise<T
   let operationError: unknown
   let operationFailed = false
   try {
-    result = await operation()
+    result = await operation(() => assertVaultFileLockOwned(lockPath, owner))
   } catch (error) {
     operationFailed = true
     operationError = error
@@ -528,7 +591,10 @@ async function withVaultFileLock<T>(filePath: string, operation: () => Promise<T
   return result
 }
 
-async function acquireVaultFileLock(lockPath: string): Promise<VaultLockOwner> {
+async function acquireVaultFileLock(
+  lockPath: string,
+  hooks: ClaudeNativeAccountVaultOptions['lockHooks'],
+): Promise<VaultLockOwner> {
   await mkdir(path.dirname(lockPath), { recursive: true })
   const deadline = Date.now() + VAULT_LOCK_TIMEOUT_MS
   const processIdentity = await currentProcessIdentity()
@@ -540,29 +606,45 @@ async function acquireVaultFileLock(lockPath: string): Promise<VaultLockOwner> {
       createdAt: Date.now(),
       processIdentity,
     }
+    const candidatePath = `${lockPath}.candidate-${owner.nonce}`
     try {
-      await mkdir(lockPath)
-      try {
-        await writeFile(path.join(lockPath, VAULT_LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`, {
-          encoding: 'utf8',
-          flag: 'wx',
-          mode: 0o600,
-        })
-        await writeVaultLockLease(path.join(lockPath, VAULT_LOCK_LEASE_FILE), owner.nonce)
-        activeVaultLockNonces.add(owner.nonce)
-        return owner
-      } catch (error) {
-        try {
-          await removeKnownLockDirectory(lockPath)
-        } catch (cleanupError) {
-          throw new AggregateError([error, cleanupError], 'Claude 계정 vault lock 초기화를 정리하지 못했습니다.')
-        }
-        throw error
-      }
+      await mkdir(candidatePath)
+      await writeFile(path.join(candidatePath, VAULT_LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`, {
+        encoding: 'utf8',
+        flag: 'wx',
+        mode: 0o600,
+      })
+      await writeVaultLockLease(path.join(candidatePath, VAULT_LOCK_LEASE_FILE), owner.nonce)
+      await hooks?.candidateReady?.(candidatePath, lockPath)
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        if (error instanceof AggregateError) throw error
-        throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock을 획득하지 못했습니다.')
+      try {
+        await removeKnownLockDirectory(candidatePath)
+      } catch (cleanupError) {
+        if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw new AggregateError([error, cleanupError], 'Claude 계정 vault lock 후보를 정리하지 못했습니다.')
+        }
+      }
+      if (error instanceof AggregateError) throw error
+      throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock 후보를 초기화하지 못했습니다.')
+    }
+    try {
+      await rename(candidatePath, lockPath)
+      activeVaultLockNonces.add(owner.nonce)
+      return owner
+    } catch (error) {
+      try {
+        await removeKnownLockDirectory(candidatePath)
+      } catch (cleanupError) {
+        if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw new AggregateError([error, cleanupError], 'Claude 계정 vault lock 후보를 정리하지 못했습니다.')
+        }
+      }
+      await hooks?.publishCollision?.(lockPath)
+      if (!await pathExists(lockPath)) {
+        if (Date.now() >= deadline) {
+          throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock을 게시하지 못했습니다.')
+        }
+        continue
       }
       if (await recoverAbandonedVaultFileLock(lockPath)) continue
       if (Date.now() >= deadline) {
@@ -637,6 +719,31 @@ async function recoverAbandonedVaultFileLock(lockPath: string): Promise<boolean>
   return true
 }
 
+async function assertVaultFileLockOwned(lockPath: string, expectedOwner: VaultLockOwner): Promise<void> {
+  const owner = parseVaultLockOwner(await readFile(path.join(lockPath, VAULT_LOCK_OWNER_FILE), 'utf8'))
+  const lease = parseVaultLockLease(await readFile(path.join(lockPath, VAULT_LOCK_LEASE_FILE), 'utf8'))
+  if (
+    !owner
+    || owner.nonce !== expectedOwner.nonce
+    || owner.processIdentity !== expectedOwner.processIdentity
+    || !lease
+    || lease.nonce !== expectedOwner.nonce
+    || lease.leaseUntil < Date.now()
+    || !activeVaultLockNonces.has(expectedOwner.nonce)
+  ) {
+    throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock ownership을 잃었습니다.')
+  }
+}
+
+async function refreshVaultLockLease(lockPath: string, expectedOwner: VaultLockOwner): Promise<void> {
+  await assertVaultFileLockOwned(lockPath, expectedOwner)
+  await writeVaultLockLease(path.join(lockPath, VAULT_LOCK_LEASE_FILE), expectedOwner.nonce)
+  const owner = parseVaultLockOwner(await readFile(path.join(lockPath, VAULT_LOCK_OWNER_FILE), 'utf8'))
+  if (!owner || owner.nonce !== expectedOwner.nonce) {
+    throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock ownership을 잃었습니다.')
+  }
+}
+
 async function releaseVaultFileLock(lockPath: string, expectedOwner: VaultLockOwner): Promise<void> {
   const owner = parseVaultLockOwner(await readFile(path.join(lockPath, VAULT_LOCK_OWNER_FILE), 'utf8'))
   const lease = parseVaultLockLease(await readFile(path.join(lockPath, VAULT_LOCK_LEASE_FILE), 'utf8'))
@@ -653,6 +760,16 @@ async function removeKnownLockDirectory(lockPath: string): Promise<void> {
   ))) throw new Error('Claude account vault lock contains unexpected entries.')
   for (const entry of entries) await unlink(path.join(lockPath, entry.name))
   await rmdir(lockPath)
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await stat(targetPath)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
 }
 
 async function writeVaultLockLease(leasePath: string, nonce: string): Promise<void> {
