@@ -361,6 +361,66 @@ test('pause releases pending continuation ownership before an immediate resume c
   ])
 })
 
+test('pause waits for continuation settlement before propagating an interrupt failure', async () => {
+  const store = new FakeGoalStore(goal())
+  let releaseLauncher!: () => void
+  const launcherRelease = new Promise<void>((resolve) => { releaseLauncher = resolve })
+  let reportLaunched!: () => void
+  const launched = new Promise<void>((resolve) => { reportLaunched = resolve })
+  let launcherSettled = false
+  const order: string[] = []
+  const runtime = new GoalRuntime(store, {
+    ownerId: 'runtime-1',
+    scanIntervalMs: 60_000,
+    launchContinuation: ({ signal }) => {
+      reportLaunched()
+      return new Promise((resolve) => signal.addEventListener('abort', () => {
+        void launcherRelease.then(() => {
+          launcherSettled = true
+          order.push('settled')
+          resolve({ status: 'not_started', reason: 'cancelled' })
+        })
+      }, { once: true }))
+    },
+  })
+
+  const firstLaunch = runtime.start()
+  await launched
+  const interruptionFailure = new Error('interrupt failed')
+  let reportInterrupt!: () => void
+  const interruptCalled = new Promise<void>((resolve) => { reportInterrupt = resolve })
+  const observedPause = runtime.pauseBeforeInterrupt({
+    goalId: 'goal-1',
+    goalRevision: 4,
+    interrupt() {
+      reportInterrupt()
+      throw interruptionFailure
+    },
+  }).then(
+    () => {
+      order.push('resolved')
+      return null
+    },
+    (error: unknown) => {
+      order.push('rejected')
+      return error
+    },
+  )
+
+  await interruptCalled
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  const rejectedBeforeSettlement = order.includes('rejected')
+  releaseLauncher()
+  const observedFailure = await observedPause
+  await firstLaunch
+  runtime.stop()
+
+  assert.equal(rejectedBeforeSettlement, false)
+  assert.equal(launcherSettled, true)
+  assert.deepEqual(order, ['settled', 'rejected'])
+  assert.equal(observedFailure, interruptionFailure)
+})
+
 test('stale candidates and provider failures cannot overwrite a newer Goal revision', async () => {
   const store = new FakeGoalStore(goal({ revision: 5 }))
   const runtime = new GoalRuntime(store, {

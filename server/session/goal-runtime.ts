@@ -248,10 +248,11 @@ export class GoalRuntime {
   async interruptAfterPause(goalId: string, interrupt: () => Promise<void> | void): Promise<void> {
     const inFlightSettled = this.#inFlightSettlements.get(goalId) ?? Promise.resolve()
     this.#pendingControllers.get(goalId)?.abort()
-    await Promise.all([
+    const [, interrupted] = await Promise.allSettled([
       inFlightSettled,
       Promise.resolve().then(interrupt),
     ])
+    if (interrupted.status === 'rejected') throw interrupted.reason
   }
 
   async #claimAndLaunch(goal: CanonicalGoal): Promise<GoalScheduleResult> {
