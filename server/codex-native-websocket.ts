@@ -1,10 +1,5 @@
 import { timingSafeEqual } from 'node:crypto'
-import { STATUS_CODES } from 'node:http'
-import type { IncomingMessage, Server } from 'node:http'
-import type { Duplex } from 'node:stream'
-
-import { WebSocket, WebSocketServer } from 'ws'
-import type { RawData } from 'ws'
+import type { IncomingMessage } from 'node:http'
 
 import type { CodexNativeCredential } from './codex-native-credentials.ts'
 import {
@@ -24,13 +19,24 @@ import type {
   NativeRouteFailure,
 } from './native-account-router.ts'
 import type { NativeProxyRequestHealth } from './native-proxy-health.ts'
+import type {
+  WebSocketUpgradeContext,
+  WebSocketUpgradeRoute,
+} from './websocket-upgrade-dispatcher.ts'
+import {
+  connectWebSocket,
+  DEFAULT_WEBSOCKET_MAX_PAYLOAD_BYTES,
+  WebSocketHandshakeError,
+  WebSocketTransport,
+} from './websocket-transport.ts'
+import type { WebSocketFrame } from './websocket-transport.ts'
 
 export const CODEX_RESPONSES_WEBSOCKET_VERSION = 'responses_websockets=2026-02-06'
+export const CODEX_RESPONSES_WEBSOCKET_PATH = '/baton/inference/openai/v1/responses'
 
-const MAX_PAYLOAD_BYTES = 128 * 1024 * 1024
-const MAX_UPSTREAM_QUEUED_MESSAGES = 4_096
 const DEFAULT_REQUEST_TIMEOUT_MS = 10 * 60_000
 const DEFAULT_RETRY_DEADLINE_MS = 30_000
+const MAX_CONTINUATION_AFFINITIES = 256
 const TERMINAL_EVENT_TYPES = new Set([
   'error',
   'response.completed',
@@ -38,51 +44,19 @@ const TERMINAL_EVENT_TYPES = new Set([
   'response.failed',
   'response.incomplete',
 ])
-const REQUEST_HEADER_BLOCKLIST = new Set([
-  'authorization',
-  'connection',
-  'content-length',
-  'cookie',
-  'host',
-  'proxy-authorization',
-  'sec-websocket-accept',
-  'sec-websocket-extensions',
-  'sec-websocket-key',
-  'sec-websocket-protocol',
-  'sec-websocket-version',
-  'transfer-encoding',
-  'upgrade',
-  'x-api-key',
+const SAFE_FORWARDED_HEADERS = new Set([
+  'accept-language',
+  'user-agent',
 ])
-
-interface MessagePacket {
-  kind: 'message'
-  data: Buffer
-  binary: boolean
-}
-
-interface ClosePacket {
-  kind: 'close'
-  code: number
-  reason: Buffer
-}
-
-interface ErrorPacket {
-  kind: 'error'
-  error: Error
-}
-
-type InboxPacket = MessagePacket | ClosePacket | ErrorPacket
 
 interface UpstreamConnection {
   account: CodexNativeProxyAccount
-  socket: WebSocket
-  inbox: WebSocketInbox
+  transport: WebSocketTransport
 }
 
 interface UpstreamAttemptValue {
   connection?: UpstreamConnection
-  first?: MessagePacket
+  first?: WebSocketFrame
   status?: number
   responseHeaders?: Record<string, string>
   error?: Error
@@ -93,99 +67,7 @@ interface ParsedEvent {
   status?: number
   headers?: Record<string, string>
   token?: string
-}
-
-export interface CodexNativeWebSocketProxy {
-  attach(server: Server): void
-  close(): Promise<void>
-}
-
-class WebSocketInbox {
-  readonly #queue: InboxPacket[] = []
-  readonly #socket: WebSocket
-  readonly #maxQueuedMessages: number
-  readonly #maxQueuedBytes: number
-  #queuedBytes = 0
-  #waiter: ((packet: InboxPacket) => void) | undefined
-
-  constructor(socket: WebSocket, limits: {
-    maxQueuedMessages?: number
-    maxQueuedBytes?: number
-  } = {}) {
-    this.#socket = socket
-    this.#maxQueuedMessages = limits.maxQueuedMessages ?? MAX_UPSTREAM_QUEUED_MESSAGES
-    this.#maxQueuedBytes = limits.maxQueuedBytes ?? MAX_PAYLOAD_BYTES
-    socket.on('message', (data, binary) => this.#push({
-      kind: 'message',
-      data: rawDataToBuffer(data),
-      binary,
-    }))
-    socket.once('close', (code, reason) => this.#push({ kind: 'close', code, reason }))
-    socket.once('error', (error) => this.#push({ kind: 'error', error }))
-  }
-
-  next(signal: AbortSignal, timeoutMs: number): Promise<InboxPacket> {
-    const queued = this.#queue.shift()
-    if (queued) {
-      if (queued.kind === 'message') this.#queuedBytes -= queued.data.length
-      return Promise.resolve(queued)
-    }
-    if (signal.aborted) return Promise.reject(signal.reason)
-    return new Promise<InboxPacket>((resolve, reject) => {
-      const timeout = setTimeout(() => finish(() => reject(new Error('websocket idle timeout'))), timeoutMs)
-      timeout.unref()
-      const abort = () => finish(() => reject(signal.reason))
-      const finish = (complete: () => void) => {
-        clearTimeout(timeout)
-        signal.removeEventListener('abort', abort)
-        this.#waiter = undefined
-        complete()
-      }
-      this.#waiter = (packet) => finish(() => resolve(packet))
-      signal.addEventListener('abort', abort, { once: true })
-    })
-  }
-
-  #push(packet: InboxPacket): void {
-    const waiter = this.#waiter
-    if (waiter) {
-      waiter(packet)
-      return
-    }
-    if (packet.kind === 'message' && (
-      this.#queue.length >= this.#maxQueuedMessages
-      || this.#queuedBytes + packet.data.length > this.#maxQueuedBytes
-    )) {
-      this.#queue.length = 0
-      this.#queuedBytes = 0
-      this.#queue.push({ kind: 'error', error: new Error('websocket receive queue limit exceeded') })
-      closeSocket(this.#socket, 1009, 'websocket receive queue limit exceeded')
-      return
-    }
-    if (packet.kind === 'message') this.#queuedBytes += packet.data.length
-    this.#queue.push(packet)
-  }
-}
-
-class UpstreamHandshakeError extends Error {
-  readonly status: number
-  readonly responseHeaders: Record<string, string>
-
-  constructor(
-    status: number,
-    responseHeaders: Record<string, string>,
-  ) {
-    super(`upstream websocket handshake returned ${status}`)
-    this.name = 'UpstreamHandshakeError'
-    this.status = status
-    this.responseHeaders = responseHeaders
-  }
-}
-
-function rawDataToBuffer(data: RawData): Buffer {
-  if (Array.isArray(data)) return Buffer.concat(data)
-  if (data instanceof ArrayBuffer) return Buffer.from(data)
-  return Buffer.from(data)
+  responseId?: string
 }
 
 function secureEquals(left: string, right: string): boolean {
@@ -213,27 +95,6 @@ function supportsProtocol(req: IncomingMessage): boolean {
   ))
 }
 
-function rejectUpgrade(
-  socket: Duplex,
-  status: number,
-  type: string,
-  message: string,
-  headers: Record<string, string> = {},
-): void {
-  if (socket.destroyed) return
-  const body = Buffer.from(JSON.stringify({ error: { type, message } }))
-  const lines = [
-    `HTTP/1.1 ${status} ${STATUS_CODES[status] ?? 'Error'}`,
-    'Connection: close',
-    'Content-Type: application/json',
-    `Content-Length: ${body.length}`,
-    ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
-    '',
-    '',
-  ]
-  socket.end(Buffer.concat([Buffer.from(lines.join('\r\n')), body]))
-}
-
 function upstreamUrl(baseUrl: string): string {
   const url = new URL(baseUrl.replace(/\/$/, '') + '/responses')
   if (url.protocol === 'http:') url.protocol = 'ws:'
@@ -248,21 +109,14 @@ function upstreamHeaders(
 ): Record<string, string> {
   const headers: Record<string, string> = {}
   for (const [name, raw] of Object.entries(req.headers)) {
-    if (REQUEST_HEADER_BLOCKLIST.has(name.toLowerCase()) || raw === undefined) continue
+    if (!SAFE_FORWARDED_HEADERS.has(name.toLowerCase()) || raw === undefined) continue
     headers[name] = Array.isArray(raw) ? raw.join(', ') : raw
   }
   headers.authorization = `Bearer ${credential.accessToken}`
   if (credential.chatgptAccountId) headers['chatgpt-account-id'] = credential.chatgptAccountId
+  headers['openai-beta'] = CODEX_RESPONSES_WEBSOCKET_VERSION
   headers.originator = 'baton'
   return headers
-}
-
-function recordHeaders(headers: IncomingMessage['headers']): Record<string, string> {
-  const result: Record<string, string> = {}
-  for (const [name, value] of Object.entries(headers)) {
-    if (value !== undefined) result[name] = Array.isArray(value) ? value.join(', ') : value
-  }
-  return result
 }
 
 function resetAt(headers: Record<string, string>, now: number): number {
@@ -291,7 +145,7 @@ function classifyStatus(
   return { kind: 'fatal', retryable: false }
 }
 
-function parseEvent(packet: MessagePacket): ParsedEvent | null {
+function parseEvent(packet: WebSocketFrame): ParsedEvent | null {
   if (packet.binary) return null
   try {
     const payload = JSON.parse(packet.data.toString('utf8')) as Record<string, unknown>
@@ -303,6 +157,9 @@ function parseEvent(packet: MessagePacket): ParsedEvent | null {
         .map(([name, value]) => [name.toLowerCase(), String(value)]))
       : undefined
     const delta = payload.delta
+    const response = payload.response && typeof payload.response === 'object'
+      ? payload.response as Record<string, unknown>
+      : undefined
     const token = typeof delta === 'string'
       ? delta
       : delta && typeof delta === 'object'
@@ -313,37 +170,30 @@ function parseEvent(packet: MessagePacket): ParsedEvent | null {
       status: typeof payload.status === 'number' ? payload.status : undefined,
       headers,
       token: typeof token === 'string' ? token : undefined,
+      responseId: typeof response?.id === 'string' && response.id ? response.id : undefined,
     }
   } catch {
     return null
   }
 }
 
-function parseRequest(packet: MessagePacket): { model: string } | null {
+function parseRequest(packet: WebSocketFrame): { model: string; previousResponseId?: string } | null {
   if (packet.binary) return null
   try {
     const payload = JSON.parse(packet.data.toString('utf8')) as Record<string, unknown>
     if (payload.type !== 'response.create' || typeof payload.model !== 'string' || !payload.model) return null
-    return { model: payload.model }
+    const previousResponseId = typeof payload.previous_response_id === 'string'
+      && payload.previous_response_id
+      ? payload.previous_response_id
+      : undefined
+    return { model: payload.model, ...(previousResponseId ? { previousResponseId } : {}) }
   } catch {
     return null
   }
 }
 
-function sendText(socket: WebSocket, data: Buffer): Promise<void> {
-  return new Promise((resolve, reject) => {
-    socket.send(data, { binary: false }, (error) => error ? reject(error) : resolve())
-  })
-}
-
-function closeSocket(socket: WebSocket, code = 1000, reason = ''): void {
-  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-    try { socket.close(code, reason) } catch { socket.terminate() }
-  }
-}
-
 function terminateConnection(connection: UpstreamConnection | undefined): void {
-  if (connection && connection.socket.readyState !== WebSocket.CLOSED) connection.socket.terminate()
+  connection?.transport.terminate()
 }
 
 function openUpstream(
@@ -353,47 +203,13 @@ function openUpstream(
   signal: AbortSignal,
   handshakeTimeout: number,
 ): Promise<UpstreamConnection> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url, {
-      headers,
-      handshakeTimeout,
-      maxPayload: MAX_PAYLOAD_BYTES,
-      perMessageDeflate: true,
-    })
-    let settled = false
-    const finish = (complete: () => void) => {
-      if (settled) return
-      settled = true
-      signal.removeEventListener('abort', onAbort)
-      socket.off('error', onError)
-      socket.off('unexpected-response', onUnexpectedResponse)
-      complete()
-    }
-    const onAbort = () => finish(() => {
-      socket.once('error', () => undefined)
-      socket.terminate()
-      reject(signal.reason)
-    })
-    const onError = (error: Error) => finish(() => reject(error))
-    const onUnexpectedResponse = (_request: unknown, response: IncomingMessage) => {
-      const status = response.statusCode ?? 502
-      const responseHeaders = recordHeaders(response.headers)
-      response.resume()
-      finish(() => {
-        socket.once('error', () => undefined)
-        socket.terminate()
-        reject(new UpstreamHandshakeError(status, responseHeaders))
-      })
-    }
-    socket.once('open', () => finish(() => resolve({
-      account,
-      socket,
-      inbox: new WebSocketInbox(socket),
-    })))
-    socket.once('error', onError)
-    socket.once('unexpected-response', onUnexpectedResponse)
-    signal.addEventListener('abort', onAbort, { once: true })
-  })
+  return connectWebSocket(url, {
+    headers,
+    handshakeTimeout,
+    maxPayload: DEFAULT_WEBSOCKET_MAX_PAYLOAD_BYTES,
+    perMessageDeflate: true,
+    signal,
+  }).then((transport) => ({ account, transport }))
 }
 
 async function authenticateUpgrade(
@@ -416,43 +232,61 @@ async function authenticateUpgrade(
   )
 }
 
-export function createCodexNativeWebSocketProxy(
+function touchAffinity(affinities: Map<string, string>, responseId: string, accountId: string): void {
+  affinities.delete(responseId)
+  affinities.set(responseId, accountId)
+  while (affinities.size > MAX_CONTINUATION_AFFINITIES) {
+    const oldest = affinities.keys().next().value as string | undefined
+    if (!oldest) break
+    affinities.delete(oldest)
+  }
+}
+
+function affinityFor(affinities: Map<string, string>, responseId: string | undefined): string | undefined {
+  if (!responseId) return undefined
+  const accountId = affinities.get(responseId)
+  if (!accountId) return undefined
+  touchAffinity(affinities, responseId, accountId)
+  return accountId
+}
+
+function errorFrame(status: number, type: string, message: string): WebSocketFrame {
+  return {
+    binary: false,
+    data: Buffer.from(JSON.stringify({ type: 'error', status, error: { type, message } })),
+  }
+}
+
+export function createCodexResponsesWebSocketRoute(
   options: CodexNativeProxyOptions,
-): CodexNativeWebSocketProxy {
-  const websocketServer = new WebSocketServer({
-    noServer: true,
-    maxPayload: MAX_PAYLOAD_BYTES,
-    perMessageDeflate: true,
-  })
+): WebSocketUpgradeRoute {
   const baseUrl = options.upstreamBaseUrl ?? CODEX_NATIVE_UPSTREAM_BASE_URL
   const targetUrl = upstreamUrl(baseUrl)
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   const retryDeadlineMs = options.retryDeadlineMs ?? DEFAULT_RETRY_DEADLINE_MS
   const cooldowns = options.cooldowns ?? new NativeAccountCooldowns()
   const now = options.now ?? Date.now
-  let attached = false
-  let closing = false
 
-  const serve = async (client: WebSocket, request: IncomingMessage): Promise<void> => {
-    const clientInbox = new WebSocketInbox(client, { maxQueuedMessages: 1 })
+  const serve = async (client: WebSocketTransport, request: IncomingMessage): Promise<void> => {
     const abort = new AbortController()
+    const affinities = new Map<string, string>()
     let active: UpstreamConnection | undefined
     let clientClosed = false
     let requestHealth: NativeProxyRequestHealth | undefined
-    client.once('close', () => {
+    client.onceClose(() => {
       clientClosed = true
       abort.abort(new Error('client disconnected'))
       terminateConnection(active)
     })
 
     try {
-      while (!abort.signal.aborted && client.readyState === WebSocket.OPEN) {
-        const packet = await clientInbox.next(abort.signal, requestTimeoutMs)
+      while (!abort.signal.aborted && client.isOpen) {
+        const packet = await client.inbox.next(abort.signal, requestTimeoutMs)
         if (packet.kind === 'close') break
         if (packet.kind === 'error') throw packet.error
-        const parsed = parseRequest(packet)
+        const parsed = parseRequest(packet.frame)
         if (!parsed) {
-          closeSocket(client, packet.binary ? 1003 : 1007, 'expected a response.create JSON text frame')
+          client.close(packet.frame.binary ? 1003 : 1007, 'expected a response.create JSON text frame')
           return
         }
 
@@ -463,20 +297,24 @@ export function createCodexNativeWebSocketProxy(
         } catch {
           requestHealth?.transportError(now())
           requestHealth = undefined
-          await sendText(client, Buffer.from(JSON.stringify({
-            type: 'error',
-            status: 503,
-            error: { type: 'baton_codex_accounts_unavailable', message: 'Codex accounts are unavailable.' },
-          })))
-          closeSocket(client, 1011, 'Codex accounts unavailable')
+          await client.send(errorFrame(
+            503,
+            'baton_codex_accounts_unavailable',
+            'Codex accounts are unavailable.',
+          ), abort.signal)
+          client.close(1011, 'Codex accounts unavailable')
           return
         }
         const byId = new Map(accounts.map((account) => [account.id, account]))
+        const affinityAccountId = affinityFor(affinities, parsed.previousResponseId)
+        const routingAccounts = affinityAccountId
+          ? accounts.filter((account) => account.id === affinityAccountId)
+          : accounts
 
         let routed
         try {
           routed = await routeNativeRequest<UpstreamAttemptValue>({
-            accounts,
+            accounts: routingAccounts,
             model: parsed.model,
             supportsModel: (account, model) => byId.get(account.id)?.models.includes(model) ?? false,
             attempt: async (account, signal): Promise<NativeRouteAttempt<UpstreamAttemptValue>> => {
@@ -484,7 +322,7 @@ export function createCodexNativeWebSocketProxy(
               if (!selected) throw new Error('selected Codex account disappeared')
               let connection: UpstreamConnection | undefined
               try {
-                connection = active?.account.id === selected.id && active.socket.readyState === WebSocket.OPEN
+                connection = active?.account.id === selected.id && active.transport.isOpen
                   ? active
                   : await openUpstream(
                     targetUrl,
@@ -493,8 +331,8 @@ export function createCodexNativeWebSocketProxy(
                     signal,
                     retryDeadlineMs,
                   )
-                await sendText(connection.socket, packet.data)
-                const first = await connection.inbox.next(signal, requestTimeoutMs)
+                await connection.transport.send(packet.frame, signal)
+                const first = await connection.transport.inbox.next(signal, requestTimeoutMs)
                 if (first.kind === 'close') {
                   return {
                     value: { connection, error: new Error(`upstream closed before first frame (${first.code})`) },
@@ -507,13 +345,13 @@ export function createCodexNativeWebSocketProxy(
                     failure: { kind: 'transient', retryable: true },
                   }
                 }
-                const event = parseEvent(first)
+                const event = parseEvent(first.frame)
                 const failure = event?.type === 'error' && event.status !== undefined
                   ? classifyStatus(event.status, event.headers ?? {}, now())
                   : undefined
-                return { value: { connection, first }, ...(failure ? { failure } : {}) }
+                return { value: { connection, first: first.frame }, ...(failure ? { failure } : {}) }
               } catch (error) {
-                if (error instanceof UpstreamHandshakeError) {
+                if (error instanceof WebSocketHandshakeError) {
                   return {
                     value: {
                       status: error.status,
@@ -546,15 +384,12 @@ export function createCodexNativeWebSocketProxy(
           if (modelUnsupported) requestHealth?.discard()
           else requestHealth?.transportError(now())
           requestHealth = undefined
-          await sendText(client, Buffer.from(JSON.stringify({
-            type: 'error',
-            status: modelUnsupported ? 422 : 503,
-            error: {
-              type: modelUnsupported ? 'baton_codex_model_unsupported' : 'baton_codex_upstream_unavailable',
-              message: error instanceof Error ? error.message : 'Codex upstream is unavailable.',
-            },
-          })))
-          closeSocket(client, 1011, 'Codex upstream unavailable')
+          await client.send(errorFrame(
+            modelUnsupported ? 422 : 503,
+            modelUnsupported ? 'baton_codex_model_unsupported' : 'baton_codex_upstream_unavailable',
+            error instanceof Error ? error.message : 'Codex upstream is unavailable.',
+          ), abort.signal)
+          client.close(1011, 'Codex upstream unavailable')
           return
         }
 
@@ -562,16 +397,13 @@ export function createCodexNativeWebSocketProxy(
         if (!value.connection || !value.first) {
           requestHealth?.transportError(now())
           requestHealth = undefined
-          await sendText(client, Buffer.from(JSON.stringify({
-            type: 'error',
-            status: value.status ?? 502,
-            error: {
-              type: 'baton_codex_upstream_unavailable',
-              message: value.error?.message ?? 'Codex upstream websocket is unavailable.',
-            },
-          })))
+          await client.send(errorFrame(
+            value.status ?? 502,
+            'baton_codex_upstream_unavailable',
+            value.error?.message ?? 'Codex upstream websocket is unavailable.',
+          ), abort.signal)
           terminateConnection(value.connection)
-          closeSocket(client, 1011, 'Codex upstream unavailable')
+          client.close(1011, 'Codex upstream unavailable')
           return
         }
 
@@ -579,15 +411,13 @@ export function createCodexNativeWebSocketProxy(
         active = value.connection
         requestHealth?.headers(true)
 
-        let responsePacket: InboxPacket = value.first
+        let responseFrame = value.first
         while (true) {
-          if (responsePacket.kind === 'close') throw new Error(`upstream closed during response (${responsePacket.code})`)
-          if (responsePacket.kind === 'error') throw responsePacket.error
-          if (responsePacket.binary) throw new Error('upstream sent an unsupported binary frame')
-          const event = parseEvent(responsePacket)
+          const event = parseEvent(responseFrame)
           requestHealth?.firstByte(now())
           if (event?.token) requestHealth?.firstToken(now())
-          await sendText(client, responsePacket.data)
+          if (event?.responseId) touchAffinity(affinities, event.responseId, active.account.id)
+          await client.send(responseFrame, abort.signal)
           if (event?.type && TERMINAL_EVENT_TYPES.has(event.type)) {
             if (event.type === 'error' || event.type === 'response.failed' || event.type === 'response.incomplete') {
               const clientError = event.type === 'error'
@@ -607,92 +437,59 @@ export function createCodexNativeWebSocketProxy(
             requestHealth = undefined
             break
           }
-          responsePacket = await active.inbox.next(abort.signal, requestTimeoutMs)
+          const next = await active.transport.inbox.next(abort.signal, requestTimeoutMs)
+          if (next.kind === 'close') throw new Error(`upstream closed during response (${next.code})`)
+          if (next.kind === 'error') throw next.error
+          responseFrame = next.frame
         }
       }
     } catch {
       if (clientClosed || abort.signal.aborted) requestHealth?.cancelled(now())
       else {
         requestHealth?.streamError(now())
-        closeSocket(client, 1011, 'Codex websocket proxy failure')
+        client.close(1011, 'Codex websocket proxy failure')
       }
     } finally {
+      affinities.clear()
       terminateConnection(active)
     }
   }
 
   return {
-    attach(server) {
-      if (attached) throw new Error('Codex websocket proxy is already attached')
-      attached = true
-      server.on('upgrade', (request, socket, head) => {
-        let pathname: string
-        try {
-          pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
-        } catch {
-          rejectUpgrade(socket, 400, 'invalid_request_error', 'Invalid websocket request URL.')
-          return
-        }
-        if (pathname !== '/baton/inference/openai/v1/responses') {
-          rejectUpgrade(socket, 404, 'baton_proxy_route_not_found', 'Unknown websocket route.')
-          return
-        }
-        if (closing) {
-          rejectUpgrade(socket, 503, 'baton_restarting', 'Baton is restarting.')
-          return
-        }
-        if (!supportsProtocol(request)) {
-          rejectUpgrade(
-            socket,
-            426,
-            'baton_websocket_version_required',
-            `Expected OpenAI-Beta: ${CODEX_RESPONSES_WEBSOCKET_VERSION}`,
-            { 'OpenAI-Beta': CODEX_RESPONSES_WEBSOCKET_VERSION },
-          )
-          return
-        }
-        void authenticateUpgrade(request, options).then((authenticated) => {
-          if (closing) {
-            rejectUpgrade(socket, 503, 'baton_restarting', 'Baton is restarting.')
-            return
-          }
-          if (!authenticated) {
-            rejectUpgrade(socket, 401, 'authentication_error', 'Invalid Baton Codex token.')
-            return
-          }
-          websocketServer.handleUpgrade(request, socket, head, (client) => {
-            websocketServer.emit('connection', client, request)
-          })
-        }).catch(() => {
-          rejectUpgrade(socket, 503, 'baton_codex_accounts_unavailable', 'Codex accounts are unavailable.')
-        })
-      })
-      websocketServer.on('connection', (client, request) => {
-        void serve(client, request)
-      })
-    },
-    async close() {
-      closing = true
-      const clients = Array.from(websocketServer.clients)
-      const gracefulClose = Promise.all(clients.map((client) => new Promise<void>((resolve) => {
-        if (client.readyState === WebSocket.CLOSED) {
-          resolve()
-          return
-        }
-        client.once('close', () => resolve())
-        closeSocket(client, 1001, 'Baton restarting')
-      })))
-      if (clients.length > 0) await Promise.race([
-        gracefulClose,
-        new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, 500)
-          timer.unref()
-        }),
-      ])
-      for (const client of clients) {
-        if (client.readyState !== WebSocket.CLOSED) client.terminate()
+    path: CODEX_RESPONSES_WEBSOCKET_PATH,
+    async upgrade(context: WebSocketUpgradeContext) {
+      if (!supportsProtocol(context.request)) {
+        context.reject(
+          426,
+          'baton_websocket_version_required',
+          `Expected OpenAI-Beta: ${CODEX_RESPONSES_WEBSOCKET_VERSION}`,
+          { 'OpenAI-Beta': CODEX_RESPONSES_WEBSOCKET_VERSION },
+        )
+        return
       }
-      await new Promise<void>((resolve) => websocketServer.close(() => resolve()))
+      let authenticated: boolean
+      try {
+        authenticated = await authenticateUpgrade(context.request, options)
+      } catch {
+        context.reject(
+          503,
+          'baton_codex_accounts_unavailable',
+          'Codex accounts are unavailable.',
+        )
+        return
+      }
+      if (context.signal.aborted || context.isClosing()) return
+      if (!authenticated) {
+        context.reject(401, 'authentication_error', 'Invalid Baton Codex token.')
+        return
+      }
+      let client: WebSocketTransport
+      try {
+        client = await context.accept({ inbox: { maxQueuedMessages: 1 } })
+      } catch {
+        return
+      }
+      await serve(client, context.request)
     },
   }
 }

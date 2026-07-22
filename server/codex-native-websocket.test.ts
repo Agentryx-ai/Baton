@@ -9,10 +9,19 @@ import { WebSocket, WebSocketServer } from 'ws'
 import type { CodexNativeProxyAccount } from './codex-native-proxy.ts'
 import {
   CODEX_RESPONSES_WEBSOCKET_VERSION,
-  createCodexNativeWebSocketProxy,
+  createCodexResponsesWebSocketRoute,
 } from './codex-native-websocket.ts'
 import { NativeAccountCooldowns } from './native-account-router.ts'
 import { NativeProxyHealthTracker } from './native-proxy-health.ts'
+import { createWebSocketUpgradeDispatcher } from './websocket-upgrade-dispatcher.ts'
+
+function createCodexNativeWebSocketProxy(
+  options: Parameters<typeof createCodexResponsesWebSocketRoute>[0],
+) {
+  const dispatcher = createWebSocketUpgradeDispatcher()
+  dispatcher.register(createCodexResponsesWebSocketRoute(options))
+  return dispatcher
+}
 
 async function listen(server: ReturnType<typeof createServer>): Promise<number> {
   server.listen(0, '127.0.0.1')
@@ -64,6 +73,7 @@ function receiveUntil(socket: WebSocket, terminalType: string): Promise<string[]
 }
 
 test('Codex websocket proxy negotiates v2, fails over handshake 429, and reuses the selected upstream', async (t) => {
+  let clock = Date.now()
   const authorizations: string[] = []
   const workspaces: string[] = []
   const requests: string[] = []
@@ -116,6 +126,7 @@ test('Codex websocket proxy negotiates v2, fails over handshake 429, and reuses 
     upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
     cooldowns: new NativeAccountCooldowns(),
     health,
+    now: () => clock,
   })
   websocketProxy.attach(proxyServer)
   const proxyPort = await listen(proxyServer)
@@ -147,6 +158,7 @@ test('Codex websocket proxy negotiates v2, fails over handshake 429, and reuses 
     previous_response_id: 'resp-1',
     input: 'two',
   })
+  clock += 61_000
   const secondEvents = receiveUntil(client, 'response.completed')
   client.send(secondRequest)
   await secondEvents
@@ -157,6 +169,68 @@ test('Codex websocket proxy negotiates v2, fails over handshake 429, and reuses 
   assert.deepEqual(requests, [firstRequest, secondRequest])
   assert.equal(health.snapshot().sampleCount, 2)
   assert.equal(health.snapshot().errorRate, 0)
+  client.close()
+})
+
+test('Codex websocket proxy owns upstream identity and capability headers', async (t) => {
+  let observedHeaders: Record<string, string | string[] | undefined> | undefined
+  const upstreamServer = createServer()
+  const upstreamWebSockets = new WebSocketServer({ noServer: true })
+  upstreamServer.on('upgrade', (request, socket, head) => {
+    observedHeaders = request.headers
+    upstreamWebSockets.handleUpgrade(request, socket, head, (websocket) => {
+      upstreamWebSockets.emit('connection', websocket)
+    })
+  })
+  upstreamWebSockets.on('connection', (socket) => {
+    socket.on('message', () => {
+      socket.send(JSON.stringify({ type: 'response.created', response: { id: 'resp-header' } }))
+      socket.send(JSON.stringify({ type: 'response.completed', response: { id: 'resp-header' } }))
+    })
+  })
+  const upstreamPort = await listen(upstreamServer)
+  const selected = account('selected', 10, 'server-access')
+  selected.credential.chatgptAccountId = undefined
+
+  const proxyServer = createServer(express())
+  const websocketProxy = createCodexNativeWebSocketProxy({
+    loadAccounts: async () => [selected],
+    trustLoopbackClient: true,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
+  })
+  websocketProxy.attach(proxyServer)
+  const proxyPort = await listen(proxyServer)
+  t.after(async () => {
+    await websocketProxy.close()
+    upstreamWebSockets.close()
+    proxyServer.close()
+    upstreamServer.close()
+  })
+
+  const client = new WebSocket(
+    `ws://127.0.0.1:${proxyPort}/baton/inference/openai/v1/responses`,
+    {
+      headers: {
+        'OpenAI-Beta': `${CODEX_RESPONSES_WEBSOCKET_VERSION}, ignored-client-feature`,
+        Authorization: 'Bearer client-access',
+        'X-Api-Key': 'client-api-key',
+        'ChatGPT-Account-Id': 'client-workspace',
+        Originator: 'client-originator',
+        'Accept-Language': 'ko-KR',
+      },
+    },
+  )
+  await once(client, 'open')
+  const events = receiveUntil(client, 'response.completed')
+  client.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.6-sol', input: 'headers' }))
+  await events
+
+  assert.equal(observedHeaders?.authorization, 'Bearer server-access')
+  assert.equal(observedHeaders?.['chatgpt-account-id'], undefined)
+  assert.equal(observedHeaders?.originator, 'baton')
+  assert.equal(observedHeaders?.['openai-beta'], CODEX_RESPONSES_WEBSOCKET_VERSION)
+  assert.equal(observedHeaders?.['x-api-key'], undefined)
+  assert.equal(observedHeaders?.['accept-language'], 'ko-KR')
   client.close()
 })
 

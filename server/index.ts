@@ -9,7 +9,8 @@ import { batonRouter } from './baton-routes.ts'
 import { createHostRouter } from './host-routes.ts'
 import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
 import { createCodexNativeProxy } from './codex-native-proxy.ts'
-import { createCodexNativeWebSocketProxy } from './codex-native-websocket.ts'
+import { createCodexResponsesWebSocketRoute } from './codex-native-websocket.ts'
+import { createWebSocketUpgradeDispatcher } from './websocket-upgrade-dispatcher.ts'
 import { createRawPassthroughBody } from './raw-passthrough-body.ts'
 import { codexNativeRuntime, loadNativeCodexProxyConnection } from './codex-native-runtime.ts'
 import { CodexNativeOAuthManager } from './codex-native-oauth.ts'
@@ -143,8 +144,9 @@ if (existsSync(distDir)) {
 
 // Bind to loopback only — local single-user tool (DESIGN.md §7).
 const server = createServer(app)
-const codexNativeWebSocketProxy = createCodexNativeWebSocketProxy(codexNativeProxyOptions)
-codexNativeWebSocketProxy.attach(server)
+const websocketUpgradeDispatcher = createWebSocketUpgradeDispatcher()
+websocketUpgradeDispatcher.register(createCodexResponsesWebSocketRoute(codexNativeProxyOptions))
+websocketUpgradeDispatcher.attach(server)
 server.listen(config.port, '127.0.0.1', () => {
   console.log(`[baton] Native runtime on http://127.0.0.1:${config.port}`)
   // Worker mode starts (and reports recovery) on its own thread; inline mode
@@ -160,7 +162,7 @@ async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   console.log(`[baton] ${signal}: shutting down`)
-  await codexNativeWebSocketProxy.close()
+  await websocketUpgradeDispatcher.close()
   const closed = new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()))
   })
