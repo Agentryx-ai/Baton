@@ -240,3 +240,83 @@ test('Codex websocket proxy rejects an unsupported protocol version with 426 bef
   })
   assert.equal(status, 426)
 })
+
+test('Codex websocket proxy rejects upgrades that race with shutdown and closes cleanly', async (t) => {
+  const proxyServer = createServer(express())
+  const websocketProxy = createCodexNativeWebSocketProxy({
+    loadAccounts: async () => [account('a', 10, 'access-a')],
+    trustLoopbackClient: true,
+  })
+  websocketProxy.attach(proxyServer)
+  const proxyPort = await listen(proxyServer)
+  t.after(() => proxyServer.close())
+
+  const existing = new WebSocket(
+    `ws://127.0.0.1:${proxyPort}/baton/inference/openai/v1/responses`,
+    { headers: { 'OpenAI-Beta': CODEX_RESPONSES_WEBSOCKET_VERSION } },
+  )
+  await once(existing, 'open')
+  const closing = websocketProxy.close()
+
+  const status = await new Promise<number>((resolve, reject) => {
+    const racing = new WebSocket(
+      `ws://127.0.0.1:${proxyPort}/baton/inference/openai/v1/responses`,
+      { headers: { 'OpenAI-Beta': CODEX_RESPONSES_WEBSOCKET_VERSION } },
+    )
+    racing.once('open', () => reject(new Error('shutdown race unexpectedly upgraded')))
+    racing.once('error', () => undefined)
+    racing.once('unexpected-response', (_request, response) => {
+      response.resume()
+      resolve(response.statusCode ?? 0)
+    })
+  })
+
+  assert.equal(status, 503)
+  await closing
+})
+
+test('Codex websocket proxy bounds queued client requests while a response is in flight', async (t) => {
+  let firstRequestReceived: (() => void) | undefined
+  const receivedFirstRequest = new Promise<void>((resolve) => { firstRequestReceived = resolve })
+  const upstreamServer = createServer()
+  const upstreamWebSockets = new WebSocketServer({ noServer: true })
+  upstreamServer.on('upgrade', (request, socket, head) => {
+    upstreamWebSockets.handleUpgrade(request, socket, head, (websocket) => {
+      upstreamWebSockets.emit('connection', websocket, request)
+    })
+  })
+  upstreamWebSockets.on('connection', (socket) => {
+    socket.once('message', () => firstRequestReceived?.())
+  })
+  const upstreamPort = await listen(upstreamServer)
+
+  const proxyServer = createServer(express())
+  const websocketProxy = createCodexNativeWebSocketProxy({
+    loadAccounts: async () => [account('a', 10, 'access-a')],
+    trustLoopbackClient: true,
+    upstreamBaseUrl: `http://127.0.0.1:${upstreamPort}`,
+  })
+  websocketProxy.attach(proxyServer)
+  const proxyPort = await listen(proxyServer)
+  t.after(async () => {
+    await websocketProxy.close()
+    upstreamWebSockets.close()
+    proxyServer.close()
+    upstreamServer.close()
+  })
+
+  const client = new WebSocket(
+    `ws://127.0.0.1:${proxyPort}/baton/inference/openai/v1/responses`,
+    { headers: { 'OpenAI-Beta': CODEX_RESPONSES_WEBSOCKET_VERSION } },
+  )
+  await once(client, 'open')
+  const request = JSON.stringify({ type: 'response.create', model: 'gpt-5.6-sol', input: 'one' })
+  client.send(request)
+  await receivedFirstRequest
+  const closed = once(client, 'close') as Promise<[number, Buffer]>
+  client.send(request)
+  client.send(request)
+  const [code] = await closed
+
+  assert.equal(code, 1009)
+})
