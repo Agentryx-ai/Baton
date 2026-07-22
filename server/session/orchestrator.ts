@@ -859,8 +859,7 @@ export class TurnOrchestrator implements ConversationService {
             provider: input.provider,
           })
         : persisted
-      const snapshot = adapterSnapshot(materialized, input.provider, turn.id)
-      assertNoUnresolvedToolCalls(snapshot)
+      const snapshot = repairUnresolvedToolCalls(adapterSnapshot(materialized, input.provider, turn.id))
       const request = {
         turnId: turn.id,
         model: input.model,
@@ -1774,15 +1773,50 @@ function adapterSnapshot(
   }
 }
 
-function assertNoUnresolvedToolCalls(snapshot: ThreadSnapshot): void {
-  const open = new Set<string>()
+/**
+ * Imported or interrupted transcripts can carry tool calls whose results were
+ * never recorded — the source app crashed mid-call, or the conversation was
+ * imported before the call finished. Throwing here (the previous behavior)
+ * bricked such conversations forever, since the missing result can never
+ * arrive. Instead, materialize a synthetic error result for each orphan so
+ * every provider sees a consistent transcript. Resolved pairs are never
+ * touched, and the synthetic items are execution-scoped only — nothing is
+ * persisted.
+ */
+export function repairUnresolvedToolCalls(snapshot: ThreadSnapshot): ThreadSnapshot {
+  const open = new Map<string, ThreadSnapshot['items'][number]>()
   for (const item of snapshot.items) {
     const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
     if (!callId) continue
-    if (item.kind === 'tool_call') open.add(callId)
+    if (item.kind === 'tool_call') open.set(callId, item)
     if (item.kind === 'tool_result') open.delete(callId)
   }
-  if (open.size > 0) throw new Error(`Provider switch blocked by unresolved tool calls: ${[...open].join(', ')}`)
+  if (open.size === 0) return snapshot
+  const items: ThreadSnapshot['items'] = []
+  for (const item of snapshot.items) {
+    items.push(item)
+    const callId = typeof item.payload.callId === 'string' ? item.payload.callId : null
+    if (callId && item.kind === 'tool_call' && open.get(callId) === item) {
+      items.push({
+        ...item,
+        id: `${item.id}:orphan-result` as typeof item.id,
+        kind: 'tool_result',
+        payload: {
+          callId,
+          isError: true,
+          synthetic: true,
+          output: {
+            error: {
+              code: 'tool_result_missing',
+              message: 'This tool call has no recorded result; the conversation was imported or interrupted before it completed.',
+            },
+          },
+        },
+        nativeId: null,
+      })
+    }
+  }
+  return { ...snapshot, items }
 }
 
 function isTerminal(status: CanonicalTurn['status']): boolean {
