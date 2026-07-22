@@ -37,4 +37,3 @@ invalid_tool_input: evidence requires kind, claim, and a reference for tool_resu
 - tool 설명에 reference가 실제 transcript의 어떤 식별자를 사용해야 하는지 예시를 제공한다.
 - 스키마와 런타임 검증의 일치성을 검사하는 단위 테스트가 추가된다.
 - Codex와 Claude 양쪽에서 첫 유효 호출이 `invalid_tool_input` 없이 수락된다.
-

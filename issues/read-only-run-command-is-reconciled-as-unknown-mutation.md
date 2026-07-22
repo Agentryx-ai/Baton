@@ -49,4 +49,3 @@ if (Test-Path -LiteralPath 'D:\ChangZhi\LDPlayer9\dnconsole.exe') { ... }
 - 진짜 command/mutation은 기존처럼 unknown outcome 수동 확인을 유지한다.
 - UI가 실제 side effect 분류에 맞춰 “변경 작업”과 “읽기 작업”을 구분한다.
 - `Test-Path`/상태 조회와 실제 파일 변경 명령의 중단 회귀 테스트가 각각 기대 경로를 통과한다.
-
