@@ -286,6 +286,136 @@ test('Claude adapter captures native title provenance, tools, file summaries, hi
   assert.notEqual(otherProfile[0]?.namespaceKey, candidate?.namespaceKey)
 })
 
+test('Claude adapter excludes nested subagent transcripts from the root session inventory', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'baton-claude-mainline-'))
+  const project = path.join(root, 'projects', 'project')
+  const subagents = path.join(project, 'main-session', 'subagents')
+  await mkdir(subagents, { recursive: true })
+  await writeFile(path.join(project, 'main-session.jsonl'), JSON.stringify({
+    type: 'user', uuid: 'main-user', cwd: 'C:\\work\\main', timestamp: '2026-07-18T00:00:00Z',
+    message: { content: 'Main request' },
+  }))
+  await writeFile(path.join(subagents, 'child-session.jsonl'), JSON.stringify({
+    type: 'user', uuid: 'child-user', cwd: 'C:\\work\\main', timestamp: '2026-07-18T00:00:01Z',
+    message: { content: 'Internal child request' }, isSidechain: true,
+  }))
+
+  const reader = new ClaudeLocalSourceReader({
+    desktopRoot: path.join(root, 'missing-desktop'), projectsRoot: path.join(root, 'projects'),
+    namespaceSecret: NAMESPACE_SECRET,
+  })
+  const candidates = await reader.scan({ sources: ['claude_code'] })
+
+  assert.deepEqual(candidates.map((candidate) => candidate.nativeSessionId), ['main-session'])
+})
+
+test('Claude adapter excludes meta and sidechain messages and preserves MCP attribution privately', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'baton-claude-filtered-records-'))
+  const project = path.join(root, 'projects', 'project')
+  await mkdir(project, { recursive: true })
+  await writeFile(path.join(project, 'filtered.jsonl'), [
+    JSON.stringify({
+      type: 'user', uuid: 'main-user', cwd: 'C:\\work\\main', timestamp: '2026-07-18T00:00:00Z',
+      attributionMcpServer: 'remote-docs', message: { content: 'Visible request' },
+    }),
+    JSON.stringify({
+      type: 'user', uuid: 'meta-user', timestamp: '2026-07-18T00:00:01Z', isMeta: true,
+      attributionMcpServer: 'remote-docs', message: { content: 'Internal metadata prompt' },
+    }),
+    JSON.stringify({
+      type: 'assistant', uuid: 'sidechain-assistant', timestamp: '2026-07-18T00:00:02Z', isSidechain: true,
+      message: { content: [{ type: 'text', text: 'Internal sidechain response' }] },
+    }),
+  ].join('\n'))
+
+  const [candidate] = await new ClaudeLocalSourceReader({
+    desktopRoot: path.join(root, 'missing-desktop'), projectsRoot: path.join(root, 'projects'),
+    namespaceSecret: NAMESPACE_SECRET,
+  }).scan({ sources: ['claude_code'] })
+
+  assert.ok(candidate)
+  assert.deepEqual(candidate.records.map((record) => record.item.kind), ['provider_event', 'user_message'])
+  const attribution = candidate.records[0]
+  assert.equal(attribution?.item.visibility, 'provider_private')
+  assert.deepEqual(attribution?.item.payload, {
+    event: 'external_mcp_connector_attribution', serverId: 'remote-docs',
+    nativeSourceClient: 'claude_code', nativeTimestamp: '2026-07-18T00:00:00Z',
+  })
+  assert.equal(JSON.stringify(candidate.records).includes('Internal metadata prompt'), false)
+  assert.equal(JSON.stringify(candidate.records).includes('Internal sidechain response'), false)
+  assert.equal(candidate.skippedItemCount, 2)
+})
+
+test('Codex adapter preserves current collaboration and tool-search metadata without importing private bodies', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'baton-codex-current-rollout-'))
+  const sessions = path.join(home, 'sessions')
+  await mkdir(sessions)
+  const rollout = path.join(sessions, 'current.jsonl')
+  await writeFile(rollout, [
+    JSON.stringify({ timestamp: '2026-07-18T00:00:00Z', type: 'session_meta', payload: { id: 'current' } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:01Z', type: 'inter_agent_communication', payload: {
+      id: 'message-1', author: '/root/audit', recipient: '/root', other_recipients: [],
+      content: 'Audit completed', trigger_turn: false,
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:02Z', type: 'inter_agent_communication', payload: {
+      id: 'message-2', author: '/root/private', recipient: '/root', other_recipients: [],
+      content: '', encrypted_content: 'never-import', trigger_turn: true,
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:02Z', type: 'response_item', payload: {
+      id: 'agent-message-1', type: 'agent_message', author: '/root/reviewer', recipient: '/root',
+      content: [{ type: 'input_text', text: 'Review completed' }],
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:02Z', type: 'response_item', payload: {
+      id: 'agent-message-2', type: 'agent_message', author: '/root/private', recipient: '/root',
+      content: [
+        { type: 'input_text', text: 'never-import mixed plaintext' },
+        { type: 'encrypted_content', encrypted_content: 'never-import encrypted body' },
+      ],
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:03Z', type: 'response_item', payload: {
+      id: 'search-1', type: 'tool_search_call', call_id: 'search-call', status: 'completed',
+      execution: 'search', arguments: { query: 'private query', mode: 'semantic' },
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:04Z', type: 'response_item', payload: {
+      id: 'search-output-1', type: 'tool_search_output', call_id: 'search-call', status: 'completed',
+      execution: 'search', tools: [{ name: 'docs', description: 'private tool description' }],
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:05Z', type: 'response_item', payload: {
+      id: 'web-1', type: 'web_search_call', status: 'completed', action: { type: 'search', query: 'private web query' },
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:06Z', type: 'response_item', payload: {
+      id: 'shell-1', type: 'local_shell_call', call_id: 'shell-call', status: 'completed',
+      action: { type: 'exec', command: 'echo never-import', working_directory: 'C:\\work\\alpha' },
+    } }),
+    JSON.stringify({ timestamp: '2026-07-18T00:00:07Z', type: 'response_item', payload: {
+      id: 'image-1', type: 'image_generation_call', status: 'completed',
+      revised_prompt: 'private revised prompt', result: 'private-image-body',
+    } }),
+  ].join('\n'))
+  const db = createCodexDatabase(home)
+  db.prepare('INSERT INTO threads VALUES (?,?,?,?,?,?,?)').run('current', rollout, 1, 2, 'C:\\work\\alpha', 'Current rollout', null)
+  db.close()
+
+  const [candidate] = await new CodexLocalSourceReader({ codexHome: home, namespaceSecret: NAMESPACE_SECRET }).scan()
+
+  assert.ok(candidate)
+  assert.deepEqual(candidate.records.map((record) => record.item.kind), [
+    'provider_event', 'provider_event', 'tool_call', 'tool_result', 'tool_call', 'tool_call', 'provider_event',
+  ])
+  const collaboration = candidate.records[0]
+  assert.equal(collaboration?.item.visibility, 'provider_private')
+  assert.equal(collaboration?.item.payload.event, 'provider_native_collaboration_message')
+  assert.equal(collaboration?.item.payload.content, 'Audit completed')
+  assert.equal(candidate.records[1]?.item.payload.content, 'Review completed')
+  const serialized = JSON.stringify(candidate.records)
+  assert.equal(serialized.includes('never-import'), false)
+  assert.equal(serialized.includes('private query'), false)
+  assert.equal(serialized.includes('private web query'), false)
+  assert.equal(serialized.includes('private tool description'), false)
+  assert.equal(serialized.includes('private revised prompt'), false)
+  assert.equal(serialized.includes('private-image-body'), false)
+})
+
 test('Claude adapter reconstructs a confirmed Goal and ignores ordinary Stop-hook prose as lifecycle', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'baton-claude-goal-'))
   const projects = path.join(root, 'projects', 'project')
