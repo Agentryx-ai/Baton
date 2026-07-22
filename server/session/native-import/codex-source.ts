@@ -43,9 +43,9 @@ const CODEX_TOP_LEVEL_TYPES = new Set([
   'session_meta', 'response_item', 'event_msg', 'turn_context',
   // Current Codex bookkeeping records. Valid replacement history is retained only as a
   // provider-private execution checkpoint; other private bookkeeping remains loss.
-  'world_state', 'compacted', 'inter_agent_communication_metadata',
+  'world_state', 'compacted', 'inter_agent_communication', 'inter_agent_communication_metadata',
 ])
-const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v5`
+const CODEX_PARSER_VERSION = `${PARSER_VERSION}-codex-native-compact-v6`
 
 export class CodexLocalSourceReader implements NativeSourceReader {
   readonly sourceClient = 'codex_local' as const
@@ -273,6 +273,11 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
     if (!eventType || !CODEX_TOP_LEVEL_TYPES.has(eventType)) throw new Error('codex_top_level_type_unsupported')
     const payload = object(event.payload)
     if (!payload) throw new Error('codex_record_framing_invalid')
+    const timestamp = string(event.timestamp)
+    if (eventType === 'inter_agent_communication') {
+      skipped += addCodexCollaborationRecord(records, `${sessionId}:${lineIndex + 1}:collaboration`, payload, timestamp)
+      continue
+    }
     if (eventType === 'turn_context') {
       currentModel = string(payload.model)
       currentEffort = string(payload.effort)
@@ -285,7 +290,6 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
         skipped += 1
         continue
       }
-      const timestamp = string(event.timestamp)
       addRecord(records, `${sessionId}:${lineIndex + 1}:compact`, 'provider_event', nativeContextCheckpointPayload({
         version: 1,
         provider: 'codex',
@@ -298,19 +302,22 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
     if (eventType !== 'response_item') { skipped += 1; continue }
     const payloadType = string(payload.type)
     if (!payloadType) throw new Error('codex_response_item_framing_invalid')
-    const timestamp = string(event.timestamp)
     const baseId = string(payload.id) ?? `${sessionId}:${lineIndex + 1}`
 
     if (payloadType === 'agent_message') {
+      if (codexCollaborationHasEncryptedContent(payload)) { skipped += 1; continue }
       const textValue = messageText(payload.content)
       const taskNotification = textValue ? parseCodexTaskNotification(textValue) : null
-      if (!taskNotification) { skipped += 1; continue }
-      addRecord(records, `${baseId}:task-notification`, 'user_message', {
-        ...taskNotificationPayload(taskNotification),
-        nativeSourceClient: 'codex_local',
-        nativeRecordType: 'agent_message',
-        nativeTimestamp: timestamp,
-      }, timestamp)
+      if (taskNotification) {
+        addRecord(records, `${baseId}:task-notification`, 'user_message', {
+          ...taskNotificationPayload(taskNotification),
+          nativeSourceClient: 'codex_local',
+          nativeRecordType: 'agent_message',
+          nativeTimestamp: timestamp,
+        }, timestamp)
+      } else {
+        skipped += addCodexCollaborationRecord(records, `${baseId}:collaboration`, payload, timestamp)
+      }
       continue
     }
     if (payloadType === 'message') {
@@ -373,6 +380,47 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
       }, timestamp)
       continue
     }
+    if (payloadType === 'tool_search_call') {
+      const callId = safeAlias(string(payload.call_id) ?? baseId, baseId)
+      const sanitized = sanitizeToolInput(payload.arguments ?? payload.input ?? payload.query)
+      skipped += sanitized.lossCount
+      addRecord(records, `${baseId}:call`, 'tool_call', {
+        callId, name: 'tool_search', execution: safeAlias(payload.execution, 'search'),
+        status: string(payload.status), input: sanitized.value,
+        nativeSourceClient: 'codex_local', nativeTimestamp: timestamp,
+      }, timestamp)
+      continue
+    }
+    if (payloadType === 'tool_search_output') {
+      const callId = safeAlias(string(payload.call_id) ?? baseId, baseId)
+      const sanitized = sanitizeToolResult(payload.tools ?? payload.output)
+      skipped += sanitized.lossCount
+      addRecord(records, `${baseId}:result`, 'tool_result', {
+        callId, toolName: 'tool_search', status: string(payload.status), output: sanitized.value,
+        nativeSourceClient: 'codex_local', nativeTimestamp: timestamp,
+      }, timestamp)
+      continue
+    }
+    if (payloadType === 'web_search_call' || payloadType === 'local_shell_call') {
+      const callId = safeAlias(string(payload.call_id) ?? baseId, baseId)
+      const name = payloadType === 'web_search_call' ? 'web_search' : 'local_shell'
+      const sanitized = sanitizeToolInput(payload.action ?? payload.input)
+      skipped += sanitized.lossCount
+      addRecord(records, `${baseId}:call`, 'tool_call', {
+        callId, name, status: string(payload.status), input: sanitized.value,
+        nativeSourceClient: 'codex_local', nativeTimestamp: timestamp,
+      }, timestamp)
+      continue
+    }
+    if (payloadType === 'image_generation_call') {
+      if (payload.revised_prompt != null) skipped += 1
+      if (payload.result != null) skipped += 1
+      addRecord(records, `${baseId}:image-generation`, 'provider_event', {
+        event: 'image_generation', status: string(payload.status),
+        nativeSourceClient: 'codex_local', nativeTimestamp: timestamp,
+      }, timestamp, 'provider_private')
+      continue
+    }
     if (payloadType === 'reasoning') {
       const summary = messageText(payload.summary)
       const sanitized = summary?.trim() ? sanitizeReasoningSummary(summary) : { value: null, lossCount: 0 }
@@ -391,6 +439,37 @@ function parseCodexRecords(text: string, sessionId: string, includeRecords: bool
     warnings: skipped ? [`${skipped} known non-portable or hidden Codex records were not imported`] : [],
     goal: goal.snapshot('codex', currentModel, currentEffort),
   }
+}
+
+function addCodexCollaborationRecord(
+  records: NativeRecordAccumulator, key: string, payload: Record<string, unknown>, timestamp: string | null,
+): number {
+  if (codexCollaborationHasEncryptedContent(payload)) return 1
+  const content = string(payload.content) ?? messageText(payload.content)
+  if (!content?.trim()) return 1
+  const sanitized = sanitizeReasoningSummary(content)
+  if (!sanitized.value) return Math.max(1, sanitized.lossCount)
+  const otherRecipients = Array.isArray(payload.other_recipients)
+    ? payload.other_recipients.map((recipient) => safeAlias(recipient, '')).filter(Boolean)
+    : []
+  addRecord(records, key, 'provider_event', {
+    event: 'provider_native_collaboration_message',
+    author: safeAlias(payload.author, 'unknown'),
+    recipient: safeAlias(payload.recipient, 'unknown'),
+    otherRecipients,
+    content: sanitized.value,
+    triggerTurn: payload.trigger_turn === true,
+    nativeSourceClient: 'codex_local',
+    nativeTimestamp: timestamp,
+  }, timestamp, 'provider_private')
+  return sanitized.lossCount
+}
+
+function codexCollaborationHasEncryptedContent(payload: Record<string, unknown>): boolean {
+  const blocks = Array.isArray(payload.content) ? payload.content : []
+  return payload.encrypted_content != null || blocks.some((block) => {
+    return string(object(block)?.type) === 'encrypted_content'
+  })
 }
 
 function addRecord(

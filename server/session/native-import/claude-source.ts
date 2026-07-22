@@ -62,7 +62,7 @@ const CLAUDE_BLOCK_TYPES = new Set([
   'text', 'thinking', 'redacted_thinking', 'tool_use', 'tool_result', 'fallback', 'image', 'document',
   'server_tool_use', 'web_search_tool_result',
 ])
-const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v5`
+const CLAUDE_PARSER_VERSION = `${PARSER_VERSION}-claude-native-compact-v6`
 
 export interface ClaudeSourceReaderOptions {
   desktopRoot?: string
@@ -119,7 +119,7 @@ export class ClaudeLocalSourceReader implements NativeSourceReader {
     }
 
     let transcriptWalk: WalkResult
-    try { transcriptWalk = await walk(projectsRoot, '.jsonl', MAX_NATIVE_CANDIDATES + 1) }
+    try { transcriptWalk = await walkClaudeProjectSessions(projectsRoot, MAX_NATIVE_CANDIDATES + 1) }
     catch (error) {
       const code = errorCode(error, 'claude_transcript_scan_failed')
       this.#warn('unavailable', code, 'Claude transcript store could not be scanned safely', 1, 'claude_code')
@@ -367,6 +367,7 @@ function parseClaudeRecords(
 ): ParsedClaudeRecords {
   const records = new NativeRecordAccumulator(includeRecords)
   const toolNames = new Map<string, string>()
+  const attributedMcpServers = new Set<string>()
   const goal = new NativeGoalReconstructor()
   let currentModel: string | null = null
   let currentEffort: string | null = null
@@ -394,6 +395,13 @@ function parseClaudeRecords(
     const timestamp = string(event.timestamp)
     createdAt ??= timestamp
     updatedAt = timestamp ?? updatedAt
+    const attributedMcpServer = safeAlias(event.attributionMcpServer, '')
+    if (attributedMcpServer && !attributedMcpServers.has(attributedMcpServer)) {
+      attributedMcpServers.add(attributedMcpServer)
+      addClaudeRecord(records, `${sessionId}:mcp:${sha256(attributedMcpServer).slice(0, 16)}`, 'provider_event', {
+        event: 'external_mcp_connector_attribution', serverId: attributedMcpServer,
+      }, timestamp, sourceClient, 'provider_private')
+    }
     if (eventType === 'queue-operation') {
       applyGoalCommand(goal, parseExplicitGoalCommand(string(event.content) ?? ''), timestamp, 'slash_command')
       skipped += 1
@@ -444,6 +452,7 @@ function parseClaudeRecords(
       continue
     }
     if (eventType !== 'user' && eventType !== 'assistant') { skipped += 1; continue }
+    if (event.isMeta === true || event.isSidechain === true) { skipped += 1; continue }
     const message = object(event.message)
     if (!message || !('content' in message)) throw new Error('claude_message_framing_invalid')
     const content = message.content
@@ -574,6 +583,37 @@ function fileChangeSummary(name: string, value: unknown): Record<string, unknown
 }
 
 interface WalkResult { files: string[], truncated: boolean, blockedLinks: number }
+async function walkClaudeProjectSessions(root: string, limit = 10_000): Promise<WalkResult> {
+  const files: string[] = []
+  let blockedLinks = 0
+  let visitedEntries = 0
+  const entryLimit = limit * 20
+  let projects
+  try { projects = await readdir(root, { withFileTypes: true }) }
+  catch { throw new Error('native_source_directory_unreadable') }
+  for (const project of projects) {
+    visitedEntries += 1
+    if (project.isSymbolicLink()) { blockedLinks += 1; continue }
+    if (!project.isDirectory()) continue
+    const projectRoot = await containedRealPath(root, path.join(root, project.name))
+    let entries
+    try { entries = await readdir(projectRoot, { withFileTypes: true }) }
+    catch { throw new Error('native_source_directory_unreadable') }
+    for (const entry of entries) {
+      visitedEntries += 1
+      if (entry.isSymbolicLink()) { blockedLinks += 1; continue }
+      if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        files.push(await containedRealPath(root, path.join(projectRoot, entry.name)))
+      }
+      if (files.length >= limit || visitedEntries >= entryLimit) {
+        return { files, truncated: true, blockedLinks }
+      }
+    }
+    if (visitedEntries >= entryLimit) return { files, truncated: true, blockedLinks }
+  }
+  return { files, truncated: false, blockedLinks }
+}
+
 async function walk(root: string, extension: string, limit = 10_000): Promise<WalkResult> {
   const files: string[] = []
   const pending = [root]
