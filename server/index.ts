@@ -1,6 +1,7 @@
 /** Baton Native local control plane, inference proxies, and SPA host. */
 import express from 'express'
 import { existsSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { config } from './config.ts'
@@ -8,6 +9,7 @@ import { batonRouter } from './baton-routes.ts'
 import { createHostRouter } from './host-routes.ts'
 import { CODEX_NATIVE_PROXY_PATH } from './client-integration.ts'
 import { createCodexNativeProxy } from './codex-native-proxy.ts'
+import { createCodexNativeWebSocketProxy } from './codex-native-websocket.ts'
 import { createRawPassthroughBody } from './raw-passthrough-body.ts'
 import { codexNativeRuntime, loadNativeCodexProxyConnection } from './codex-native-runtime.ts'
 import { CodexNativeOAuthManager } from './codex-native-oauth.ts'
@@ -27,6 +29,7 @@ import { createConversationRuntime } from './session/runtime.ts'
 import { ModelFallbackRuntime, modelFallbackStatePath } from './model-fallback-runtime.ts'
 import { createModelFallbackRouter } from './model-fallback-routes.ts'
 import { NativeProxyHealthTracker } from './native-proxy-health.ts'
+import { NativeAccountCooldowns } from './native-account-router.ts'
 import { CodexPluginReferenceStore, codexPluginReferenceStatePath } from './codex-plugin-reference-store.ts'
 import { CodexPluginReferenceService } from './codex-plugin-reference-service.ts'
 import { createCodexPluginRouter } from './codex-plugin-routes.ts'
@@ -40,6 +43,7 @@ const modelFallbackRuntime = new ModelFallbackRuntime({
 })
 const claudeNativeHealth = new NativeProxyHealthTracker({ provider: 'claude' })
 const codexNativeHealth = new NativeProxyHealthTracker({ provider: 'codex' })
+const codexNativeCooldowns = new NativeAccountCooldowns()
 const codexPluginReference = new CodexPluginReferenceService({
   runtime: codexNativeRuntime,
   store: new CodexPluginReferenceStore({
@@ -52,12 +56,16 @@ app.use('/baton/v1', conversationRuntime.router)
 
 // Codex can zstd-compress large prompts. Capture those bytes before Express's
 // raw parser attempts (and fails) to decode an unsupported content encoding.
-app.use(CODEX_NATIVE_PROXY_PATH, createRawPassthroughBody(), createCodexNativeProxy({
+const codexNativeProxyOptions = {
   loadAccounts: () => codexNativeRuntime.loadProxyAccounts(),
   loadClientToken: async () => (await loadNativeCodexProxyConnection(false)).token,
   trustLoopbackClient: true,
   health: codexNativeHealth,
-}))
+  cooldowns: codexNativeCooldowns,
+}
+app.use(CODEX_NATIVE_PROXY_PATH, createRawPassthroughBody(), createCodexNativeProxy(
+  codexNativeProxyOptions,
+))
 
 // Remaining control-plane bodies are ordinary uncompressed JSON.
 app.use(express.raw({ type: () => true, limit: '10mb' }))
@@ -122,7 +130,10 @@ if (existsSync(distDir)) {
 }
 
 // Bind to loopback only — local single-user tool (DESIGN.md §7).
-const server = app.listen(config.port, '127.0.0.1', () => {
+const server = createServer(app)
+const codexNativeWebSocketProxy = createCodexNativeWebSocketProxy(codexNativeProxyOptions)
+codexNativeWebSocketProxy.attach(server)
+server.listen(config.port, '127.0.0.1', () => {
   console.log(`[baton] Native runtime on http://127.0.0.1:${config.port}`)
   const recovered = conversationRuntime.start()
   if (recovered > 0) console.warn(`[baton] recovered ${recovered} interrupted canonical turns`)
@@ -133,6 +144,7 @@ async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
   console.log(`[baton] ${signal}: shutting down`)
+  await codexNativeWebSocketProxy.close()
   const closed = new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()))
   })
