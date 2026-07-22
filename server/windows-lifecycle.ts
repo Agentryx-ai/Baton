@@ -16,6 +16,14 @@ const execFileAsync = promisify(execFile)
 
 export const RESTART_COUNT = 3
 export const RESTART_INTERVAL_MINUTES = 1
+/**
+ * The task also fires on this cadence via a repeating time trigger. With
+ * MultipleInstances=IgnoreNew it is a no-op while the supervisor is alive and
+ * relaunches it only once it (or its whole process tree) is dead — closing the
+ * "supervisor killed → stays down until next logon" gap without a second
+ * watchdog process (Task Scheduler is the always-running OS root).
+ */
+export const HEAL_INTERVAL_MINUTES = 1
 
 export interface LifecyclePlan {
   taskName: string
@@ -146,25 +154,34 @@ export function registrationScript(plan: LifecyclePlan): string {
   return [
     "$ErrorActionPreference = 'Stop'",
     `$action = New-ScheduledTaskAction -Execute ${psLiteral(plan.executable)} -Argument ${psLiteral(plan.arguments)} -WorkingDirectory ${psLiteral(plan.workingDirectory)}`,
-    `$trigger = New-ScheduledTaskTrigger -AtLogOn -User ${psLiteral(plan.userId)}`,
+    `$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User ${psLiteral(plan.userId)}`,
+    // Self-heal: a repeating time trigger lets Task Scheduler (the always-running
+    // OS root) relaunch a dead supervisor; MultipleInstances=IgnoreNew keeps it a
+    // no-op while one is alive. A past -StartBoundary -Once trigger is NOT auto-run
+    // immediately by StartWhenAvailable (verified on Win11) — it fires on the
+    // ~1-min repetition cadence — so repair's brief register→disable window never
+    // leaves a worker running under a disabled task. On an enabled task it does
+    // bring the worker up within ~1 min (the intended autostart behavior).
+    `$healTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes ${HEAL_INTERVAL_MINUTES})`,
     `$principal = New-ScheduledTaskPrincipal -UserId ${psLiteral(plan.userId)} -LogonType Interactive -RunLevel Limited`,
     `$settings = New-ScheduledTaskSettingsSet -RestartCount ${plan.restartCount} -RestartInterval (New-TimeSpan -Minutes ${plan.restartIntervalMinutes}) -MultipleInstances IgnoreNew -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)`,
-    `Register-ScheduledTask -TaskPath ${psLiteral(plan.taskPath)} -TaskName ${psLiteral(plan.taskName)} -Description ${psLiteral(plan.ownershipMarker)} -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null`,
+    `Register-ScheduledTask -TaskPath ${psLiteral(plan.taskPath)} -TaskName ${psLiteral(plan.taskName)} -Description ${psLiteral(plan.ownershipMarker)} -Action $action -Trigger @($logonTrigger, $healTrigger) -Principal $principal -Settings $settings | Out-Null`,
   ].join('\n')
 }
 
 function validationScript(plan: LifecyclePlan): string[] {
   return [
     `$action = @($task.Actions)[0]`,
-    `$trigger = @($task.Triggers)[0]`,
+    `$logonTrigger = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' })`,
+    `$healTrigger = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' })`,
     `function Resolve-Sid([string]$name) { try { return ([System.Security.Principal.NTAccount]$name).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { return $null } }`,
     `$expectedSid = Resolve-Sid ${psLiteral(plan.userId)}`,
     `$actualSid = Resolve-Sid $task.Principal.UserId`,
-    `$triggerSid = Resolve-Sid $trigger.UserId`,
+    `$triggerSid = if ($logonTrigger.Count -eq 1) { Resolve-Sid $logonTrigger[0].UserId } else { $null }`,
     `$userMatches = ($null -ne $expectedSid) -and ($null -ne $actualSid) -and ($expectedSid -eq $actualSid)`,
     `$forbiddenSid = @('S-1-5-18','S-1-5-19','S-1-5-20') -contains $actualSid`,
     `$ownershipMatches = ($task.TaskPath -eq ${psLiteral(plan.taskPath)}) -and ($task.Description -eq ${psLiteral(plan.ownershipMarker)}) -and $userMatches -and (-not $forbiddenSid)`,
-    `$triggerMatches = (@($task.Triggers).Count -eq 1) -and ($trigger.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger') -and ($null -ne $triggerSid) -and ($triggerSid -eq $expectedSid)`,
+    `$triggerMatches = (@($task.Triggers).Count -eq 2) -and ($logonTrigger.Count -eq 1) -and ($healTrigger.Count -eq 1) -and ($null -ne $triggerSid) -and ($triggerSid -eq $expectedSid) -and ([string]$healTrigger[0].Repetition.Interval -eq 'PT${HEAL_INTERVAL_MINUTES}M')`,
     `$matches = $ownershipMatches -and (@($task.Actions).Count -eq 1) -and ($action.Execute -eq ${psLiteral(plan.executable)}) -and ($action.Arguments -eq ${psLiteral(plan.arguments)}) -and ($action.WorkingDirectory -eq ${psLiteral(plan.workingDirectory)}) -and $triggerMatches -and ($task.Principal.LogonType -eq 'Interactive') -and ($task.Principal.RunLevel -eq 'Limited') -and ([string]$task.Settings.MultipleInstances -eq 'IgnoreNew') -and $task.Settings.StartWhenAvailable -and ([string]$task.Settings.ExecutionTimeLimit -eq 'PT0S') -and ($task.Settings.RestartCount -eq ${plan.restartCount}) -and ([string]$task.Settings.RestartInterval -eq 'PT${plan.restartIntervalMinutes}M') -and (-not $task.Settings.DisallowStartIfOnBatteries) -and (-not $task.Settings.StopIfGoingOnBatteries)`,
   ]
 }

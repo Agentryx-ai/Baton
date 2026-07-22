@@ -28,6 +28,8 @@ test('scheduled task plan preserves spaces and uses CurrentUser limited interact
   assert.match(plan.arguments, /^"C:\\Path With Spaces\\Baton\\scripts\\baton-worker-runner\.mjs" --root "C:\\Path With Spaces\\Baton"$/)
   assert.match(script, /-LogonType Interactive -RunLevel Limited/)
   assert.match(script, /-AtLogOn -User 'DOMAIN\\alice'/)
+  assert.match(script, /-RepetitionInterval \(New-TimeSpan -Minutes 1\)/)
+  assert.match(script, /-Trigger @\(\$logonTrigger, \$healTrigger\)/)
   assert.match(script, /-RestartCount 3/)
   assert.match(script, /-RestartInterval \(New-TimeSpan -Minutes 1\)/)
   assert.match(script, /-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries/)

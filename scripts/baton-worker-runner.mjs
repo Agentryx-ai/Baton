@@ -3,7 +3,7 @@
 import { execFileSync } from 'node:child_process'
 import { spawn } from 'node:child_process'
 import {
-  chmodSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, renameSync, rmSync, writeSync,
+  chmodSync, closeSync, existsSync, fstatSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, writeSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -28,10 +28,25 @@ if (process.platform === 'win32') {
     ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
     : process.env.USERNAME
   if (!account) throw new Error('Unable to determine CurrentUser for lifecycle log ACL')
-  execFileSync('icacls.exe', [lifecycleDir, '/inheritance:r', '/grant:r', `${account}:(OI)(CI)F`, '/t'], {
+  // (OI)(CI) inheritance flags are valid only on the directory. Applying them to
+  // files (as the old `/t` did) leaves each file with an empty DACL, denying all
+  // access — including the owner — so the log open fails with EPERM and the whole
+  // worker crashes. Grant the directory inheritable full control (new logs then
+  // inherit access), then heal any existing files with a concrete, flag-free ACE.
+  execFileSync('icacls.exe', [lifecycleDir, '/inheritance:r', '/grant:r', `${account}:(OI)(CI)F`], {
     windowsHide: true,
     stdio: 'ignore',
   })
+  for (const entry of readdirSync(lifecycleDir)) {
+    // Best-effort: a single icacls hiccup on one file must not crash the
+    // supervisor and block startup.
+    try {
+      execFileSync('icacls.exe', [path.join(lifecycleDir, entry), '/grant:r', `${account}:F`], {
+        windowsHide: true,
+        stdio: 'ignore',
+      })
+    } catch { /* leave this file to inherit / be recreated */ }
+  }
 }
 
 let writes = 0
@@ -202,7 +217,10 @@ try {
     if (attempt === restartCount) {
       record({ event: 'worker-restart-exhausted', attempts: attempt + 1, lastCode: outcome.code })
       // Worker failures were handled and diagnosed by this bounded runner.
-      // Exit success so Task Scheduler does not multiply these four attempts.
+      // Exit success so Task Scheduler does not treat these four attempts as a
+      // task failure. The task's periodic self-heal trigger (windows-lifecycle.ts)
+      // intentionally relaunches the supervisor on its own cadence afterward, so a
+      // persistently-failing worker keeps being retried at that interval by design.
       finalCode = 0
       break
     }
