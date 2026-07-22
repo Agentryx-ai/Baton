@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, stat, unlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { once } from 'node:events'
 import test from 'node:test'
 
 import {
@@ -168,6 +170,95 @@ test('separate Claude vault instances preserve an account add racing a token ref
   assert.equal((await createVault().getSecret(existing.id)).accessToken, 'rotated-access')
 })
 
+test('Claude vault recovers an owned lock left by a crashed process', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-crashed-lock-'))
+  const filePath = path.join(directory, 'accounts.json')
+  const lockPath = `${filePath}.lock`
+  const child = spawn(process.execPath, ['-e', ''], { windowsHide: true })
+  const deadPid = child.pid
+  assert.ok(deadPid)
+  await once(child, 'close')
+  const nonce = 'a'.repeat(32)
+  await mkdir(lockPath)
+  await writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({
+    version: 1, pid: deadPid, nonce, createdAt: Date.now() - 60_000, processIdentity: 'crashed:test-process',
+  }))
+  await writeFile(path.join(lockPath, 'lease.json'), JSON.stringify({
+    version: 1, nonce, leaseUntil: Date.now() - 30_000,
+  }))
+  const vault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    createId: () => 'recovered-account',
+  })
+
+  assert.equal((await vault.put({ nickname: 'Recovered', secret })).id, 'recovered-account')
+  await assert.rejects(stat(lockPath), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT')
+})
+
+test('Claude vault recovers an expired lock after its PID is reused by another process instance', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-reused-pid-lock-'))
+  const filePath = path.join(directory, 'accounts.json')
+  const lockPath = `${filePath}.lock`
+  const nonce = 'b'.repeat(32)
+  await mkdir(lockPath)
+  await writeFile(path.join(lockPath, 'owner.json'), JSON.stringify({
+    version: 1,
+    pid: process.pid,
+    nonce,
+    createdAt: Date.now() - 60_000,
+    processIdentity: 'stale-process-instance',
+  }))
+  await writeFile(path.join(lockPath, 'lease.json'), JSON.stringify({
+    version: 1, nonce, leaseUntil: Date.now() - 30_000,
+  }))
+  const vault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    createId: () => 'pid-reuse-recovery',
+  })
+
+  assert.equal((await vault.put({ nickname: 'Recovered', secret })).id, 'pid-reuse-recovery')
+  await assert.rejects(stat(lockPath), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT')
+})
+
+test('Claude vault recovers a stale anonymous lock left before owner initialization', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-anonymous-lock-'))
+  const filePath = path.join(directory, 'accounts.json')
+  const lockPath = `${filePath}.lock`
+  await mkdir(lockPath)
+  const stale = new Date(Date.now() - 60_000)
+  await utimes(lockPath, stale, stale)
+  const vault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    createId: () => 'anonymous-recovery',
+  })
+
+  assert.equal((await vault.put({ nickname: 'Recovered', secret })).id, 'anonymous-recovery')
+  await assert.rejects(stat(lockPath), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT')
+})
+
+test('Claude vault reports lock cleanup failure instead of silently succeeding', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-claude-vault-cleanup-failure-'))
+  const filePath = path.join(directory, 'accounts.json')
+  const lockPath = `${filePath}.lock`
+  const unexpectedPath = path.join(lockPath, 'unexpected')
+  const vault = new ClaudeNativeAccountVault({ filePath, protector: new TestProtector() })
+
+  await assert.rejects(
+    vault.withExclusiveMutation(async () => { await writeFile(unexpectedPath, 'force cleanup failure') }),
+    /vault lock.*정리/i,
+  )
+  await unlink(unexpectedPath)
+  const owner = JSON.parse(await readFile(path.join(lockPath, 'owner.json'), 'utf8')) as { nonce: string }
+  await writeFile(path.join(lockPath, 'lease.json'), JSON.stringify({
+    version: 1, nonce: owner.nonce, leaseUntil: Date.now() - 1,
+  }))
+  assert.equal((await vault.put({ nickname: 'Recovered after cleanup failure', secret })).nickname, 'Recovered after cleanup failure')
+  await assert.rejects(stat(lockPath), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT')
+})
+
 test('vault put preserves omitted identity metadata and upserts one stable account identity', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'baton-vault-stable-identity-'))
   let nextId = 0
@@ -273,7 +364,7 @@ test('duplicate identity repair is dry-run by default and requires an explicit k
   const second = await vault.put({
     nickname: 'Real account',
     email: 'user@example.com',
-    secret: { ...secret, accessToken: 'current-access', refreshToken: 'current-refresh' },
+    secret: { ...secret, accessToken: 'current-access' },
   })
   const seeded = JSON.parse(await readFile(filePath, 'utf8')) as { accounts: Array<Record<string, unknown>> }
   seeded.accounts[0]!.accountId = 'stable-duplicate'
@@ -287,25 +378,41 @@ test('duplicate identity repair is dry-run by default and requires an explicit k
     /several vault accounts|여러 vault 계정/i,
   )
   const preview = await repairVault.repairStableIdentityDuplicates()
+  const fingerprint = createHash('sha256').update(secret.refreshToken).digest('hex')
   assert.equal(preview.applied, false)
   assert.deepEqual(preview.duplicates, [{ accountId: 'stable-duplicate', accountIds: [first.id, second.id] }])
+  assert.deepEqual(preview.refreshCredentialDuplicates, [{
+    refreshFingerprint: fingerprint,
+    accountIds: [first.id, second.id],
+    identitylessAccountIds: [],
+  }])
   assert.equal(await readFile(filePath, 'utf8'), before)
   await assert.rejects(
     repairVault.repairStableIdentityDuplicates({ apply: true }),
     /explicit keep id|유지할 계정/i,
   )
   assert.equal(await readFile(filePath, 'utf8'), before)
+  await assert.rejects(
+    repairVault.repairStableIdentityDuplicates({
+      apply: true,
+      keepByAccountId: { 'stable-duplicate': second.id },
+      keepByRefreshFingerprint: { [fingerprint]: first.id },
+    }),
+    /keeper.*충돌/i,
+  )
+  assert.equal(await readFile(filePath, 'utf8'), before)
 
   const applied = await repairVault.repairStableIdentityDuplicates({
     apply: true,
     keepByAccountId: { 'stable-duplicate': second.id },
+    keepByRefreshFingerprint: { [fingerprint]: second.id },
   })
   assert.equal(applied.applied, true)
   assert.deepEqual(applied.removedAccountIds, [first.id])
   assert.ok(applied.backupPath)
   assert.equal(await readFile(applied.backupPath!, 'utf8'), before)
   assert.deepEqual((await repairVault.list()).map((account) => account.id), [second.id])
-  assert.equal((await repairVault.getSecret(second.id)).refreshToken, 'current-refresh')
+  assert.equal((await repairVault.getSecret(second.id)).refreshToken, secret.refreshToken)
 })
 
 test('repair surfaces identity-less refresh credential duplicates and requires an explicit keeper', async () => {
@@ -342,6 +449,37 @@ test('repair surfaces identity-less refresh credential duplicates and requires a
   })
   assert.deepEqual(applied.removedAccountIds, [placeholder!.id])
   assert.deepEqual((await vault.list()).map((account) => account.id), [identified.id])
+})
+
+test('repair allows an overlapping refresh group to disappear under an explicit stable-identity keeper', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'baton-vault-overlapping-duplicate-repair-'))
+  const filePath = path.join(directory, 'accounts.json')
+  let nextId = 0
+  const vault = new ClaudeNativeAccountVault({
+    filePath,
+    protector: new TestProtector(),
+    createId: () => `account-${++nextId}`,
+    now: () => 10_000,
+  })
+  const first = await vault.put({ nickname: 'Old first', secret })
+  const second = await vault.put({ nickname: 'Old second', secret: { ...secret, accessToken: 'second' } })
+  const keeper = await vault.put({
+    nickname: 'Current keeper',
+    secret: { ...secret, accessToken: 'keeper', refreshToken: 'current-refresh' },
+  })
+  const seeded = JSON.parse(await readFile(filePath, 'utf8')) as { accounts: Array<Record<string, unknown>> }
+  for (const account of seeded.accounts) account.accountId = 'stable-overlap'
+  await writeFile(filePath, `${JSON.stringify(seeded, null, 2)}\n`)
+  const fingerprint = createHash('sha256').update(secret.refreshToken).digest('hex')
+
+  const applied = await vault.repairStableIdentityDuplicates({
+    apply: true,
+    keepByAccountId: { 'stable-overlap': keeper.id },
+    keepByRefreshFingerprint: { [fingerprint]: first.id },
+  })
+
+  assert.deepEqual(applied.removedAccountIds, [first.id, second.id])
+  assert.deepEqual((await vault.list()).map((account) => account.id), [keeper.id])
 })
 
 test('Windows DPAPI protector round-trips without exposing plaintext as ciphertext', {

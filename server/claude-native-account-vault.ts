@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { constants } from 'node:fs'
-import { chmod, copyFile, mkdir, readFile, rename, rmdir, writeFile } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, readFile, readdir, rename, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import path from 'node:path'
 
@@ -198,7 +198,7 @@ export class ClaudeNativeAccountVault {
         refreshGrouped.set(fingerprint, group)
       }
       const refreshCredentialDuplicates = [...refreshGrouped.entries()]
-        .filter(([, accounts]) => accounts.length > 1 && accounts.some((account) => !account.accountId))
+        .filter(([, accounts]) => accounts.length > 1)
         .map(([refreshFingerprint, accounts]) => ({
           refreshFingerprint,
           accountIds: accounts.map((account) => account.id),
@@ -212,13 +212,16 @@ export class ClaudeNativeAccountVault {
       const keepByAccountId = input.keepByAccountId ?? {}
       const keepByRefreshFingerprint = input.keepByRefreshFingerprint ?? {}
       const decisions = new Map<string, 'keep' | 'remove'>()
-      const selectKeeper = (accountIds: string[], keepId: string | undefined, description: string): void => {
+      const requireKeeper = (accountIds: string[], keepId: string | undefined, description: string): string => {
         if (!keepId || !accountIds.includes(keepId)) {
           throw new ClaudeNativeAccountVaultError(
             'invalid',
             `${description}에서 유지할 계정 id를 명시하세요 (explicit keep id required).`,
           )
         }
+        return keepId
+      }
+      const applyKeeper = (accountIds: string[], keepId: string): void => {
         for (const accountId of accountIds) {
           const decision = accountId === keepId ? 'keep' : 'remove'
           const previous = decisions.get(accountId)
@@ -229,14 +232,25 @@ export class ClaudeNativeAccountVault {
         }
       }
       for (const duplicate of duplicates) {
-        selectKeeper(duplicate.accountIds, keepByAccountId[duplicate.accountId], `중복 stable identity ${duplicate.accountId}`)
+        const keepId = requireKeeper(
+          duplicate.accountIds,
+          keepByAccountId[duplicate.accountId],
+          `중복 stable identity ${duplicate.accountId}`,
+        )
+        applyKeeper(duplicate.accountIds, keepId)
       }
       for (const duplicate of refreshCredentialDuplicates) {
-        selectKeeper(
+        const keepId = requireKeeper(
           duplicate.accountIds,
           keepByRefreshFingerprint[duplicate.refreshFingerprint],
           `중복 refresh credential ${duplicate.refreshFingerprint}`,
         )
+        const survivors = duplicate.accountIds.filter((accountId) => decisions.get(accountId) !== 'remove')
+        if (survivors.length === 0) continue
+        if (!survivors.includes(keepId)) {
+          throw new ClaudeNativeAccountVaultError('invalid', '중복 그룹의 keeper 선택이 서로 충돌합니다.')
+        }
+        applyKeeper(survivors, keepId)
       }
       if (duplicates.length === 0 && refreshCredentialDuplicates.length === 0) {
         return { applied: true, duplicates, refreshCredentialDuplicates, removedAccountIds: [], backupPath: null }
@@ -443,29 +457,298 @@ export class ClaudeNativeAccountVault {
   }
 }
 
+interface VaultLockOwner {
+  version: 1
+  pid: number
+  nonce: string
+  createdAt: number
+  processIdentity: string
+}
+
+interface VaultLockLease {
+  version: 1
+  nonce: string
+  leaseUntil: number
+}
+
+const VAULT_LOCK_TIMEOUT_MS = 10_000
+const VAULT_LOCK_INITIALIZATION_GRACE_MS = 30_000
+const VAULT_LOCK_LEASE_MS = 30_000
+const VAULT_LOCK_HEARTBEAT_MS = 5_000
+const VAULT_LOCK_OWNER_FILE = 'owner.json'
+const VAULT_LOCK_LEASE_FILE = 'lease.json'
+const FALLBACK_PROCESS_IDENTITY = `fallback:${process.pid}:${randomBytes(16).toString('hex')}`
+const activeVaultLockNonces = new Set<string>()
+let currentProcessIdentityPromise: Promise<string> | undefined
+
 async function withVaultFileLock<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
   const lockPath = `${filePath}.lock`
-  await mkdir(path.dirname(filePath), { recursive: true })
-  const deadline = Date.now() + 10_000
+  const owner = await acquireVaultFileLock(lockPath)
+  const leasePath = path.join(lockPath, VAULT_LOCK_LEASE_FILE)
+  let heartbeatError: unknown
+  let heartbeat = Promise.resolve()
+  const heartbeatTimer = setInterval(() => {
+    heartbeat = heartbeat
+      .then(() => writeVaultLockLease(leasePath, owner.nonce))
+      .catch((error: unknown) => { heartbeatError ??= error })
+  }, VAULT_LOCK_HEARTBEAT_MS)
+  heartbeatTimer.unref()
+
+  let result!: T
+  let operationError: unknown
+  let operationFailed = false
+  try {
+    result = await operation()
+  } catch (error) {
+    operationFailed = true
+    operationError = error
+  }
+  clearInterval(heartbeatTimer)
+  await heartbeat
+
+  let cleanupError: unknown
+  try {
+    await releaseVaultFileLock(lockPath, owner)
+  } catch (error) {
+    cleanupError = error
+  } finally {
+    activeVaultLockNonces.delete(owner.nonce)
+  }
+  if (heartbeatError || cleanupError) {
+    const lockError = new ClaudeNativeAccountVaultError(
+      'unavailable',
+      'Claude 계정 vault lock을 안전하게 정리하지 못했습니다.',
+    )
+    if (operationFailed) {
+      throw new AggregateError([operationError, heartbeatError, cleanupError].filter(Boolean), lockError.message)
+    }
+    throw lockError
+  }
+  if (operationFailed) throw operationError
+  return result
+}
+
+async function acquireVaultFileLock(lockPath: string): Promise<VaultLockOwner> {
+  await mkdir(path.dirname(lockPath), { recursive: true })
+  const deadline = Date.now() + VAULT_LOCK_TIMEOUT_MS
+  const processIdentity = await currentProcessIdentity()
   while (true) {
+    const owner: VaultLockOwner = {
+      version: 1,
+      pid: process.pid,
+      nonce: randomBytes(16).toString('hex'),
+      createdAt: Date.now(),
+      processIdentity,
+    }
     try {
       await mkdir(lockPath)
-      break
+      try {
+        await writeFile(path.join(lockPath, VAULT_LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`, {
+          encoding: 'utf8',
+          flag: 'wx',
+          mode: 0o600,
+        })
+        await writeVaultLockLease(path.join(lockPath, VAULT_LOCK_LEASE_FILE), owner.nonce)
+        activeVaultLockNonces.add(owner.nonce)
+        return owner
+      } catch (error) {
+        try {
+          await removeKnownLockDirectory(lockPath)
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], 'Claude 계정 vault lock 초기화를 정리하지 못했습니다.')
+        }
+        throw error
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        if (error instanceof AggregateError) throw error
         throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock을 획득하지 못했습니다.')
       }
+      if (await recoverAbandonedVaultFileLock(lockPath)) continue
       if (Date.now() >= deadline) {
         throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault가 다른 프로세스에서 변경 중입니다.')
       }
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
   }
+}
+
+async function recoverAbandonedVaultFileLock(lockPath: string): Promise<boolean> {
+  let entries
   try {
-    return await operation()
-  } finally {
-    await rmdir(lockPath).catch(() => undefined)
+    entries = await readdir(lockPath, { withFileTypes: true })
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
+    throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock을 검사하지 못했습니다.')
   }
+  if (entries.some((entry) => (
+    !entry.isFile() || (entry.name !== VAULT_LOCK_OWNER_FILE && entry.name !== VAULT_LOCK_LEASE_FILE)
+  ))) return false
+
+  const ownerPath = path.join(lockPath, VAULT_LOCK_OWNER_FILE)
+  let owner: VaultLockOwner | null = null
+  try {
+    owner = parseVaultLockOwner(await readFile(ownerPath, 'utf8'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock owner를 읽지 못했습니다.')
+    }
+  }
+  let lease: VaultLockLease | null = null
+  try {
+    lease = parseVaultLockLease(await readFile(path.join(lockPath, VAULT_LOCK_LEASE_FILE), 'utf8'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock lease를 읽지 못했습니다.')
+    }
+  }
+  if (owner && isProcessAlive(owner.pid)) {
+    if (!lease || lease.nonce !== owner.nonce || lease.leaseUntil >= Date.now()) return false
+    const liveIdentity = await processStartIdentity(owner.pid)
+    if (liveIdentity === undefined) return false
+    if (liveIdentity === owner.processIdentity) {
+      if (owner.pid !== process.pid || activeVaultLockNonces.has(owner.nonce)) return false
+    }
+  }
+  if (!owner) {
+    const target = entries.some((entry) => entry.name === VAULT_LOCK_OWNER_FILE) ? ownerPath : lockPath
+    let age: number
+    try {
+      age = Date.now() - (await stat(target)).mtimeMs
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
+      throw new ClaudeNativeAccountVaultError('unavailable', 'Claude 계정 vault lock을 검사하지 못했습니다.')
+    }
+    if (age < VAULT_LOCK_INITIALIZATION_GRACE_MS) return false
+  }
+
+  const quarantinePath = `${lockPath}.abandoned-${randomBytes(12).toString('hex')}`
+  try {
+    await rename(lockPath, quarantinePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
+    return false
+  }
+  try {
+    await removeKnownLockDirectory(quarantinePath)
+  } catch {
+    throw new ClaudeNativeAccountVaultError('unavailable', '폐기된 Claude 계정 vault lock을 정리하지 못했습니다.')
+  }
+  return true
+}
+
+async function releaseVaultFileLock(lockPath: string, expectedOwner: VaultLockOwner): Promise<void> {
+  const owner = parseVaultLockOwner(await readFile(path.join(lockPath, VAULT_LOCK_OWNER_FILE), 'utf8'))
+  const lease = parseVaultLockLease(await readFile(path.join(lockPath, VAULT_LOCK_LEASE_FILE), 'utf8'))
+  if (!owner || owner.nonce !== expectedOwner.nonce || !lease || lease.nonce !== expectedOwner.nonce) {
+    throw new Error('Claude account vault lock ownership changed before cleanup.')
+  }
+  await removeKnownLockDirectory(lockPath)
+}
+
+async function removeKnownLockDirectory(lockPath: string): Promise<void> {
+  const entries = await readdir(lockPath, { withFileTypes: true })
+  if (entries.some((entry) => (
+    !entry.isFile() || (entry.name !== VAULT_LOCK_OWNER_FILE && entry.name !== VAULT_LOCK_LEASE_FILE)
+  ))) throw new Error('Claude account vault lock contains unexpected entries.')
+  for (const entry of entries) await unlink(path.join(lockPath, entry.name))
+  await rmdir(lockPath)
+}
+
+async function writeVaultLockLease(leasePath: string, nonce: string): Promise<void> {
+  const lease: VaultLockLease = { version: 1, nonce, leaseUntil: Date.now() + VAULT_LOCK_LEASE_MS }
+  await writeFile(leasePath, `${JSON.stringify(lease)}\n`, { encoding: 'utf8', mode: 0o600 })
+}
+
+function parseVaultLockOwner(raw: string): VaultLockOwner | null {
+  try {
+    const value = JSON.parse(raw) as Partial<VaultLockOwner>
+    return value.version === 1
+      && Number.isSafeInteger(value.pid) && Number(value.pid) > 0
+      && typeof value.nonce === 'string' && /^[a-f0-9]{32}$/.test(value.nonce)
+      && typeof value.createdAt === 'number' && Number.isFinite(value.createdAt)
+      && typeof value.processIdentity === 'string' && value.processIdentity.length > 0 && value.processIdentity.length <= 200
+      ? value as VaultLockOwner
+      : null
+  } catch {
+    return null
+  }
+}
+
+function parseVaultLockLease(raw: string): VaultLockLease | null {
+  try {
+    const value = JSON.parse(raw) as Partial<VaultLockLease>
+    return value.version === 1
+      && typeof value.nonce === 'string' && /^[a-f0-9]{32}$/.test(value.nonce)
+      && typeof value.leaseUntil === 'number' && Number.isFinite(value.leaseUntil)
+      ? value as VaultLockLease
+      : null
+  } catch {
+    return null
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (pid === process.pid) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ESRCH') return false
+    return true
+  }
+}
+
+function currentProcessIdentity(): Promise<string> {
+  currentProcessIdentityPromise ??= processStartIdentity(process.pid).then((identity) => {
+    if (identity === null) throw new ClaudeNativeAccountVaultError('unavailable', '현재 vault lock process identity를 확인하지 못했습니다.')
+    return identity ?? FALLBACK_PROCESS_IDENTITY
+  })
+  return currentProcessIdentityPromise
+}
+
+async function processStartIdentity(pid: number): Promise<string | null | undefined> {
+  if (process.platform === 'win32') return windowsProcessStartIdentity(pid)
+  if (process.platform === 'linux') {
+    try {
+      const raw = await readFile(`/proc/${pid}/stat`, 'utf8')
+      const closing = raw.lastIndexOf(')')
+      const fields = closing >= 0 ? raw.slice(closing + 1).trim().split(/\s+/) : []
+      return fields[19] ? `linux:${fields[19]}` : undefined
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      return undefined
+    }
+  }
+  return pid === process.pid ? FALLBACK_PROCESS_IDENTITY : undefined
+}
+
+async function windowsProcessStartIdentity(pid: number): Promise<string | null | undefined> {
+  return new Promise((resolve) => {
+    const script = `$p=Get-Process -Id ${pid} -ErrorAction SilentlyContinue;if($null -eq $p){exit 3};[Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks)`
+    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+    let stdout = ''
+    const timeout = setTimeout(() => child.kill(), 5_000)
+    timeout.unref()
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk: string) => {
+      if (stdout.length + chunk.length <= 200) stdout += chunk
+    })
+    child.once('error', () => {
+      clearTimeout(timeout)
+      resolve(undefined)
+    })
+    child.once('close', (code) => {
+      clearTimeout(timeout)
+      if (code === 3) resolve(null)
+      else if (code === 0 && /^\d+$/.test(stdout.trim())) resolve(`windows:${stdout.trim()}`)
+      else resolve(undefined)
+    })
+  })
 }
 
 export class WindowsDpapiSecretProtector implements ClaudeNativeSecretProtector {
