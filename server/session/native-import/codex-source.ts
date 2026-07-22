@@ -145,7 +145,7 @@ export class CodexLocalSourceReader implements NativeSourceReader {
         return []
       }
       const candidates = await mapWithConcurrency(rows, scanConcurrency, async (row) => {
-        try { return await this.#candidate(row, canonicalHomePath, namespaceKey, includeRecords) }
+        try { return await this.#candidate(row, canonicalHomePath, namespaceKey, includeRecords, filter.includeArchived) }
         catch (error) {
           this.#warn(warningStatus(error), errorCode(error, 'codex_candidate_corrupt'), 'A Codex task was skipped because its source was corrupt, unsupported, or escaped the configured home')
           return null
@@ -157,12 +157,17 @@ export class CodexLocalSourceReader implements NativeSourceReader {
 
   async #candidate(
     row: Record<string, unknown>, canonicalHomePath: string, namespaceKey: string, includeRecords: boolean,
-  ): Promise<NativeSessionCandidate> {
+    includeArchived: boolean,
+  ): Promise<NativeSessionCandidate | null> {
     const nativeSessionId = string(row.id)
     const rolloutPath = string(row.rollout_path)
     if (!nativeSessionId || !rolloutPath) throw new Error('codex_thread_framing_invalid')
     const requestedRolloutPath = path.isAbsolute(rolloutPath) ? rolloutPath : path.resolve(canonicalHomePath, rolloutPath)
-    const canonicalRolloutPath = await containedRealPath(canonicalHomePath, requestedRolloutPath)
+    const location = await resolveCodexRolloutPath(
+      canonicalHomePath, this.#home, requestedRolloutPath, nativeSessionId,
+    )
+    if (location.archivedFallback && !includeArchived) return null
+    const canonicalRolloutPath = location.path
     const source = includeRecords ? await readStableFile(canonicalRolloutPath) : null
     const sourceHead = source?.head ?? await inspectStableFile(canonicalRolloutPath)
     const parsed = source ? parseCodexRecords(source.text, nativeSessionId, true) : null
@@ -187,7 +192,7 @@ export class CodexLocalSourceReader implements NativeSourceReader {
       createdAt: asIso(row.created_at),
       updatedAt: asIso(row.updated_at),
       nativeOrigin: codexOrigin(row.source),
-      nativeArchived: row.archived === 1 || row.archived === true,
+      nativeArchived: row.archived === 1 || row.archived === true || location.archivedFallback,
       sourceHead,
       contentDigest: parsed?.contentDigest ?? sha256(''),
       prefixDigest: parsed?.contentDigest ?? sha256(''),
@@ -246,6 +251,33 @@ function normalizeCodexFilter(options: NativeSourceScanOptions): {
   const origins = options.codex?.origins ?? ['cli', 'ide_app']
   return { origins: new Set(origins), includeSubagents: options.codex?.includeSubagents === true,
     includeArchived: options.codex?.includeArchived === true }
+}
+
+async function resolveCodexRolloutPath(
+  canonicalHomePath: string, configuredHomePath: string, requestedRolloutPath: string, nativeSessionId: string,
+): Promise<{ path: string, archivedFallback: boolean }> {
+  try {
+    return { path: await containedRealPath(canonicalHomePath, requestedRolloutPath), archivedFallback: false }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') throw error
+  }
+
+  const lexicalRolloutPath = normalizeNativeCwd(requestedRolloutPath) ?? requestedRolloutPath
+  if (!isContainedPath(canonicalHomePath, lexicalRolloutPath)
+    && !isContainedPath(configuredHomePath, lexicalRolloutPath)) {
+    throw new Error('native_source_path_escape')
+  }
+  const filename = path.basename(lexicalRolloutPath)
+  if (!filename.startsWith('rollout-') || !filename.endsWith(`-${nativeSessionId}.jsonl`)) {
+    throw new Error('codex_archived_rollout_identity_mismatch')
+  }
+  const archivedPath = path.join(canonicalHomePath, 'archived_sessions', filename)
+  return { path: await containedRealPath(canonicalHomePath, archivedPath), archivedFallback: true }
+}
+
+function isContainedPath(root: string, child: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(child))
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
 }
 
 function codexOrigin(value: unknown): CodexNativeOrigin {
