@@ -102,7 +102,6 @@ test('session lists retain only an explicit valid selection and never auto-open 
   const {
     retainExplicitSessionSelection,
     isConversationSelectionPending,
-    shouldApplyThreadSnapshot,
     shouldResetThreadSnapshot,
   } = await import(workspaceModulePath) as {
     retainExplicitSessionSelection: (
@@ -112,10 +111,6 @@ test('session lists retain only an explicit valid selection and never auto-open 
     isConversationSelectionPending: (
       selectedSessionId: string | null,
       snapshotSessionId: string | null,
-    ) => boolean
-    shouldApplyThreadSnapshot: (
-      selectedSessionId: string | null,
-      snapshotSessionId: string,
     ) => boolean
     shouldResetThreadSnapshot: (
       selectedSessionId: string | null,
@@ -131,9 +126,6 @@ test('session lists retain only an explicit valid selection and never auto-open 
   assert.equal(isConversationSelectionPending('explicit', null), true)
   assert.equal(isConversationSelectionPending('explicit', 'previous'), true)
   assert.equal(isConversationSelectionPending('explicit', 'explicit'), false)
-  assert.equal(shouldApplyThreadSnapshot('explicit', 'explicit'), true)
-  assert.equal(shouldApplyThreadSnapshot('other', 'explicit'), false)
-  assert.equal(shouldApplyThreadSnapshot(null, 'explicit'), false)
   assert.equal(shouldResetThreadSnapshot('explicit', 'explicit'), false)
   assert.equal(shouldResetThreadSnapshot('other', 'explicit'), true)
   assert.equal(shouldResetThreadSnapshot(null, 'explicit'), true)

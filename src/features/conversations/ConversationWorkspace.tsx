@@ -277,13 +277,6 @@ export function isConversationSelectionPending(
   return selectedSessionId !== null && snapshotSessionId !== selectedSessionId
 }
 
-export function shouldApplyThreadSnapshot(
-  selectedSessionId: string | null,
-  snapshotSessionId: string,
-): boolean {
-  return selectedSessionId === snapshotSessionId
-}
-
 export function shouldResetThreadSnapshot(
   selectedSessionId: string | null,
   routeSessionId: string,
@@ -749,6 +742,17 @@ export function ConversationWorkspace({
   draftRef.current = draft
   draftOpenRef.current = draftOpen
   const threadId = selectedSession?.activeThreadId ?? null
+  // refreshThread reads the current thread from this ref rather than closing over
+  // threadId, so async continuations (mutation flows, stream refreshes) that run
+  // after the user has navigated always target the thread on screen now — never a
+  // stale one. The write is in render, which is correct because every state
+  // update that changes threadId commits synchronously and re-fires the primary
+  // effect: any fetch aimed at a superseded thread loses the generation race, and
+  // a change to null re-runs the effect's clear path. (This relies on navigation
+  // committing synchronously; it holds because nothing here schedules threadId
+  // updates through startTransition/useDeferredValue.)
+  const threadIdRef = useRef<string | null>(threadId)
+  threadIdRef.current = threadId
   const currentCatalog = catalogs[provider]
   const models = currentCatalog?.models ?? null
   const selectedModel = models?.find((option) => option.id === model) ?? null
@@ -844,19 +848,27 @@ export function ConversationWorkspace({
 
   const refreshThread = useCallback(async (fullHistory = false): Promise<boolean> => {
     const requestId = ++threadRequest.current
-    if (!threadId) {
+    const activeThreadId = threadIdRef.current
+    if (!activeThreadId) {
       setSnapshot(null)
       setLoadingThread(false)
       return true
     }
     setLoadingThread(true)
     try {
-      if (fullHistory) fullHistoryThreadId.current = threadId
-      const itemLimit = fullHistory || fullHistoryThreadId.current === threadId
+      if (fullHistory) fullHistoryThreadId.current = activeThreadId
+      const itemLimit = fullHistory || fullHistoryThreadId.current === activeThreadId
         ? undefined
         : TRANSCRIPT_PAGE_SIZE
-      const result = await conversationApi.getThread(threadId, itemLimit)
-      if (shouldApplyThreadSnapshot(selectedSessionIdRef.current, result.session.id)) {
+      const result = await conversationApi.getThread(activeThreadId, itemLimit)
+      // Apply only the newest in-flight request. Every navigation that matters —
+      // a thread switch, a selection null-out, a stream-driven refresh — issues a
+      // fresh refreshThread and bumps threadRequest, so a superseded response is
+      // dropped while the current one always applies. Combined with reading the
+      // live threadIdRef above, a stale closure or a transient selection wobble
+      // can neither fetch nor apply the wrong thread, so the view cannot strand on
+      // "대화를 불러오는 중…" nor render a previous thread after navigation.
+      if (requestId === threadRequest.current) {
         setSnapshot(result)
         setSessions((current) => replaceSessionProjection(current, result.session))
         setError(null)
@@ -869,7 +881,7 @@ export function ConversationWorkspace({
     } finally {
       if (requestId === threadRequest.current) setLoadingThread(false)
     }
-  }, [threadId])
+  }, [])
 
   useEffect(() => {
     void refreshSessions()
@@ -941,11 +953,12 @@ export function ConversationWorkspace({
   }, [])
 
   useEffect(() => {
-    // refreshThread increments its own generation, so the next thread request
-    // already invalidates the previous one. Cleanup must not invalidate the
-    // only request issued by a StrictMode remount (home -> conversation).
+    // Load whenever the selected thread changes. refreshThread is stable and
+    // reads the live threadIdRef, so it always fetches the current thread; its
+    // generation counter invalidates any request the previous thread left in
+    // flight, including a StrictMode remount's duplicate.
     void refreshThread()
-  }, [refreshThread])
+  }, [threadId, refreshThread])
 
   const onStreamEvent = useCallback(() => refreshThread(), [refreshThread])
   useConversationEvents(threadId, onStreamEvent)
