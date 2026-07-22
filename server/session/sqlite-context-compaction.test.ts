@@ -83,6 +83,7 @@ test('native compact checkpoint manifest survives store reopen with exact immuta
     },
   })
   const current = store.getSnapshot(session.activeThreadId)!
+  const itemsBeforeAppend = [...current.items]
   const selected = materializeContext(current, [], 'codex')
   assert.deepEqual(selected.entries.map((entry) =>
     entry.type === 'canonical_item' ? entry.item.sequence : -1), [2, 3, 4])
@@ -98,16 +99,30 @@ test('native compact checkpoint manifest survives store reopen with exact immuta
     items: [{ kind: 'assistant_message', payload: { text: 'later canonical item' } }],
   })
   store.finishTurn({ turnId: resumed.turn.id, status: 'completed' })
-  const itemIdsBeforeReopen = store.getSnapshot(session.activeThreadId)!.items.map((item) => item.id)
+  const grown = store.getSnapshot(session.activeThreadId)!
+  const appendedItems = grown.items.filter((item) =>
+    !itemsBeforeAppend.some((previous) => previous.id === item.id))
+  assert.equal(appendedItems.length, 1)
+  assert.equal(appendedItems[0]?.sequence, 5)
+  assert.equal(appendedItems[0]?.kind, 'assistant_message')
+  const itemIdsBeforeReopen = grown.items.map((item) => item.id)
   store.close()
   store = new SqliteSessionStore(databasePath)
 
-  const reopenedItemIds = store.getSnapshot(session.activeThreadId)!.items.map((item) => item.id)
+  const reopened = store.getSnapshot(session.activeThreadId)!
+  const reopenedItemIds = reopened.items.map((item) => item.id)
   assert.deepEqual(reopenedItemIds, itemIdsBeforeReopen,
     'store reopen must preserve the exact canonical sequence without replay duplicates')
   assert.equal(new Set(reopenedItemIds).size, reopenedItemIds.length)
-  assert.deepEqual(store.getExecutionContextManifest(resumed.execution.id), manifestBeforeReopen,
+  const reopenedSelection = materializeContext(reopened, [], 'codex')
+  assert.deepEqual(reopenedSelection.entries.map((entry) =>
+    entry.type === 'canonical_item' ? entry.item.sequence : -1), [2, 3, 4, 5])
+  const persistedManifest = store.getExecutionContextManifest(resumed.execution.id)
+  assert.deepEqual(persistedManifest, manifestBeforeReopen,
     'later canonical growth and store reopen must not change the checkpoint frontier of an immutable manifest')
+  const sequenceByItemId = new Map(reopened.items.map((item) => [item.id, item.sequence]))
+  assert.deepEqual(persistedManifest?.entries.map((entry) =>
+    entry.kind === 'canonical_item' ? sequenceByItemId.get(entry.itemId) : -1), [2, 3, 4])
 
   const switched = store.beginTurn({
     threadId: session.activeThreadId,
