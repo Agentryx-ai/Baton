@@ -25,7 +25,7 @@ import {
   loadNativeClaudeCredentialCandidates,
   loadNativeClaudeProxyConnection,
 } from './claude-native-runtime.ts'
-import { createConversationRuntime } from './session/runtime.ts'
+import { createInlineSessionHost, createWorkerSessionHost } from './session-host.ts'
 import { ModelFallbackRuntime, modelFallbackStatePath } from './model-fallback-runtime.ts'
 import { createModelFallbackRouter } from './model-fallback-routes.ts'
 import { NativeProxyHealthTracker } from './native-proxy-health.ts'
@@ -35,7 +35,17 @@ import { CodexPluginReferenceService } from './codex-plugin-reference-service.ts
 import { createCodexPluginRouter } from './codex-plugin-routes.ts'
 
 const app = express()
-const conversationRuntime = createConversationRuntime({ dataDir: config.dataDir })
+// The conversation runtime owns every synchronous SQLite call. By default it
+// runs on a dedicated worker thread so a database stall (lock contention, WAL
+// checkpoint) can never freeze the inference proxies or health endpoint.
+const sessionHost = process.env.BATON_SESSION_HOST === 'inline'
+  ? createInlineSessionHost({ dataDir: config.dataDir })
+  : createWorkerSessionHost({
+    dataDir: config.dataDir,
+    onStarted: (recovered) => {
+      if (recovered > 0) console.warn(`[baton] recovered ${recovered} interrupted canonical turns`)
+    },
+  })
 const startedAt = new Date().toISOString()
 const codexNativeOAuthManager = new CodexNativeOAuthManager({ vault: codexNativeRuntime.vault })
 const modelFallbackRuntime = new ModelFallbackRuntime({
@@ -51,8 +61,9 @@ const codexPluginReference = new CodexPluginReferenceService({
   }),
 })
 
-// Canonical JSON routes must consume their body before the raw gateway proxy middleware.
-app.use('/baton/v1', conversationRuntime.router)
+// Canonical JSON routes must consume their body before the raw gateway proxy
+// middleware. In worker mode this streams bodies verbatim to the session host.
+app.use('/baton/v1', sessionHost.middleware)
 
 // Codex can zstd-compress large prompts. Capture those bytes before Express's
 // raw parser attempts (and fails) to decode an unsupported content encoding.
@@ -73,6 +84,7 @@ app.use(express.raw({ type: () => true, limit: '10mb' }))
 app.get('/baton/health', (_req, res) => {
   res.json({
     ok: true,
+    sessionHost: sessionHost.snapshot(),
     nativeProxy: {
       claude: claudeNativeHealth.snapshot(),
       codex: codexNativeHealth.snapshot(),
@@ -135,8 +147,12 @@ const codexNativeWebSocketProxy = createCodexNativeWebSocketProxy(codexNativePro
 codexNativeWebSocketProxy.attach(server)
 server.listen(config.port, '127.0.0.1', () => {
   console.log(`[baton] Native runtime on http://127.0.0.1:${config.port}`)
-  const recovered = conversationRuntime.start()
-  if (recovered > 0) console.warn(`[baton] recovered ${recovered} interrupted canonical turns`)
+  // Worker mode starts (and reports recovery) on its own thread; inline mode
+  // runs the same recovery here.
+  const recovered = sessionHost.start()
+  if (recovered !== null && recovered > 0) {
+    console.warn(`[baton] recovered ${recovered} interrupted canonical turns`)
+  }
 })
 
 let shuttingDown = false
@@ -148,7 +164,7 @@ async function shutdown(signal: string): Promise<void> {
   const closed = new Promise<void>((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()))
   })
-  conversationRuntime.closeStreams()
+  sessionHost.closeStreams()
   const drained = await Promise.race([
     closed.then(() => true),
     new Promise<false>((resolve) => {
@@ -160,7 +176,7 @@ async function shutdown(signal: string): Promise<void> {
     server.closeAllConnections()
     await closed
   }
-  await conversationRuntime.close()
+  await sessionHost.close()
 }
 
 process.once('SIGINT', () => { void shutdown('SIGINT') })
