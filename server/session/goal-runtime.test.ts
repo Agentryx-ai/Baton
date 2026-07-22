@@ -49,6 +49,7 @@ function goal(overrides: Partial<CanonicalGoal> = {}): CanonicalGoal {
 class FakeGoalStore implements GoalRuntimeStore {
   current: CanonicalGoal | null
   lease: GoalSchedulerLease | null = null
+  leaseCount = 0
   heartbeatCount = 0
   refuseHeartbeat = false
   statusUpdates: UpdateGoalStatusInput[] = []
@@ -68,8 +69,9 @@ class FakeGoalStore implements GoalRuntimeStore {
   claimGoalLease(input: ClaimGoalLeaseInput): GoalSchedulerLease | null {
     if (this.lease || this.current?.id !== input.goalId
       || this.current.revision !== input.goalRevision || this.current.status !== 'active') return null
+    this.leaseCount += 1
     this.lease = {
-      leaseId: 'lease-1',
+      leaseId: `lease-${this.leaseCount}`,
       goalId: input.goalId,
       goalRevision: input.goalRevision,
       ownerId: input.ownerId,
@@ -312,6 +314,51 @@ test('pause is committed before interrupt and stale pause does not interrupt', a
   })
   assert.equal(stale.status, 'stale')
   assert.equal(staleInterrupted, false)
+})
+
+test('pause releases pending continuation ownership before an immediate resume claims a fresh lease', async () => {
+  const store = new FakeGoalStore(goal())
+  const requests: Array<{ id: string; lease: string }> = []
+  const runtime = new GoalRuntime(store, {
+    ownerId: 'runtime-1',
+    scanIntervalMs: 60_000,
+    launchContinuation: ({ clientRequestId, goalContext, signal }) => {
+      requests.push({ id: clientRequestId, lease: goalContext.leaseId })
+      if (requests.length > 1) return { status: 'started', turnId: 'turn-after-resume' }
+      return new Promise((resolve) => signal.addEventListener('abort', () => {
+        setTimeout(() => resolve({ status: 'not_started', reason: 'cancelled' }), 10)
+      }, { once: true }))
+    },
+  })
+
+  const firstLaunch = runtime.start()
+  while (requests.length === 0) await new Promise((resolve) => setTimeout(resolve, 1))
+  const paused = await Promise.race([
+    runtime.pauseBeforeInterrupt({
+      goalId: 'goal-1',
+      goalRevision: 4,
+      interrupt() {},
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Goal pause timed out')), 100)),
+  ])
+  assert.equal(paused.status, 'applied')
+
+  const resumed = store.updateGoalStatus({
+    goalId: 'goal-1',
+    expectedRevision: 5,
+    status: 'active',
+  })
+  assert.equal(resumed.status, 'applied')
+  assert.ok(resumed.goal)
+  const secondLaunch = await runtime.schedule(resumed.goal)
+  assert.equal((await firstLaunch)[0]?.status, 'lease_unavailable')
+  runtime.stop()
+
+  assert.equal(secondLaunch.status, 'started')
+  assert.deepEqual(requests, [
+    { id: 'goal-continuation:goal-1:r4:a1', lease: 'lease-1' },
+    { id: 'goal-continuation:goal-1:r6:a1', lease: 'lease-2' },
+  ])
 })
 
 test('stale candidates and provider failures cannot overwrite a newer Goal revision', async () => {
