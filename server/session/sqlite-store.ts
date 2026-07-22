@@ -110,7 +110,7 @@ import type {
   NativeSourceIdentity,
 } from './native-import/contracts.ts'
 
-const SCHEMA_VERSION = 19
+const SCHEMA_VERSION = 21
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace'
 const DEFAULT_GOAL_TURNS = 24
 const DEFAULT_GOAL_ACTIVE_SECONDS = 2 * 60 * 60
@@ -1419,6 +1419,48 @@ export class SqliteSessionStore implements SessionStore {
           .run(19, 'independent-goal-verification', this.#now())
         this.#db.exec('PRAGMA user_version = 19')
         appliedVersion = 19
+      }
+      if (appliedVersion < 20) {
+        // native_imported_records holds one row per imported transcript record
+        // (hundreds of thousands of rows) but had no index on its owning
+        // source. Purging or looking up by source therefore full-scanned the
+        // table inside a write transaction — the observed 75-minute
+        // lock-everything purge. The index turns those deletes into range
+        // scans. Guarded: hand-built legacy fixtures migrate minimal schemas
+        // that may omit the native-import tables entirely.
+        const hasImportedRecords = this.#optional(this.#db.prepare(
+          "SELECT name AS name FROM sqlite_master WHERE type='table' AND name='native_imported_records'",
+        )) !== null
+        if (hasImportedRecords) {
+          // item_id backs the FK from items: without it, deleting each item
+          // FK-scans the whole record table (quadratic across a purge).
+          this.#db.exec(`
+            CREATE INDEX IF NOT EXISTS native_imported_records_source ON native_imported_records(source_id);
+            CREATE INDEX IF NOT EXISTS native_imported_records_item ON native_imported_records(item_id);
+          `)
+        }
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(20, 'native-imported-records-source-index', this.#now())
+        this.#db.exec('PRAGMA user_version = 20')
+        appliedVersion = 20
+      }
+      if (appliedVersion < 21) {
+        // Heal databases that recorded v20 while the migration only created the
+        // source_id index: without the item_id index a purge's items delete
+        // FK-scans the 700K-row record table per item (observed: 28 minutes per
+        // 25-session batch; 2.4 s with the index).
+        const hasImportedRecords = this.#optional(this.#db.prepare(
+          "SELECT name AS name FROM sqlite_master WHERE type='table' AND name='native_imported_records'",
+        )) !== null
+        if (hasImportedRecords) {
+          this.#db.exec(`
+            CREATE INDEX IF NOT EXISTS native_imported_records_item ON native_imported_records(item_id);
+          `)
+        }
+        this.#db.prepare('INSERT INTO schema_migrations(version,name,applied_at) VALUES (?,?,?)')
+          .run(21, 'native-imported-records-item-index-heal', this.#now())
+        this.#db.exec('PRAGMA user_version = 21')
+        appliedVersion = 21
       }
       const userVersion = integer(this.#one(this.#db.prepare('PRAGMA user_version')), 'user_version')
       if (versions.length > 0 && userVersion !== SCHEMA_VERSION) {
@@ -5408,7 +5450,7 @@ export class SqliteSessionStore implements SessionStore {
       createdAt: text(row, 'created_at'),
       updatedAt: text(row, 'updated_at'),
       archivedAt: nullableText(row, 'archived_at'),
-      workStatus: visibleWorkStatus(row, sourceProvider !== null),
+      workStatus: visibleWorkStatus(row),
       source: sourceProvider ? {
         provider: sourceProvider as CanonicalProvider,
         sourceClient: publicSourceClient(text(row, 'source_client')),
@@ -6029,7 +6071,10 @@ function parseNullablePermissionProfile(value: SqlRow[string]): PermissionProfil
   return parsePermissionProfile(value)
 }
 
-function visibleWorkStatus(row: SqlRow, imported: boolean): CanonicalSession['workStatus'] {
+// Imported sessions carry no special status: provenance is not a work state,
+// so they surface whatever their content implies (usually idle), exactly like
+// a native Baton conversation.
+function visibleWorkStatus(row: SqlRow): CanonicalSession['workStatus'] {
   if (nullableText(row, 'archived_at') !== null) return 'archived'
   const turn = nullableText(row, 'latest_turn_status')
   if (turn === 'waiting_tool' || turn === 'running' || turn === 'queued') return turn
@@ -6040,6 +6085,5 @@ function visibleWorkStatus(row: SqlRow, imported: boolean): CanonicalSession['wo
   if (turn === 'failed' || turn === 'interrupted' || turn === 'cancelled') return turn
   if (goal === 'complete') return 'complete'
   if (turn === 'completed') return 'completed'
-  if (imported) return 'imported'
   return 'idle'
 }

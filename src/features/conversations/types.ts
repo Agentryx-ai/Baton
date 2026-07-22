@@ -34,7 +34,6 @@ export type VisibleWorkStatus =
   | 'cancelled'
   | 'complete'
   | 'completed'
-  | 'imported'
   | 'idle'
 
 export type CanonicalItemKind =

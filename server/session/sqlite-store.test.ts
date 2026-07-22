@@ -114,7 +114,9 @@ function removeGoalV2Schema(database: DatabaseSync): void {
     ALTER TABLE goals DROP COLUMN latest_completion_receipt_id;
     ALTER TABLE goals DROP COLUMN latest_stop_receipt_id;
     ALTER TABLE goals DROP COLUMN verification_proposal_id;
-    DELETE FROM schema_migrations WHERE version=19;
+    DROP INDEX IF EXISTS native_imported_records_source;
+    DROP INDEX IF EXISTS native_imported_records_item;
+    DELETE FROM schema_migrations WHERE version>=19;
   `)
 }
 
@@ -201,7 +203,7 @@ test('initial session materialization is atomic, idempotent, and keeps schema v1
     const row = database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
     assert.equal(row.count, expected, table)
   }
-  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
   store.close()
 
   const reopened = new SqliteSessionStore(path, deterministicOptions())
@@ -340,10 +342,10 @@ test('schema v1 migrates through v19 with Goal verification storage', (t) => {
   assert.equal(store.getTurn('turn-1')?.effort, null)
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
   const migrations = inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>
   const sourceColumns = inspected.prepare('PRAGMA table_info(native_session_sources)').all() as Array<{ name: string }>
-  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+  assert.deepEqual(migrations.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21])
   assert.equal(sourceColumns.some((column) => column.name === 'title_source'), true)
   const indexes = inspected.prepare("SELECT name FROM sqlite_schema WHERE type='index'").all() as Array<{ name: string }>
   assert.equal(indexes.some((index) => index.name === 'sessions_archived_expiry'), true)
@@ -463,11 +465,11 @@ test('schema v6 migrates to v19 in place and reopens without replaying migration
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations ORDER BY version').all() as Array<{ version: number }>)
       .map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
   )
   assert.equal((inspected.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version=7")
     .get() as { count: number }).count, 1)
@@ -513,7 +515,7 @@ test('schema v10 rebuilds follow-up constraints through v19 with foreign keys an
   t.after(() => reopened.close())
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
   assert.deepEqual(inspected.prepare('PRAGMA foreign_key_check').all(), [])
   assert.equal((inspected.prepare('SELECT status FROM follow_ups WHERE id=?').get('f') as { status: string }).status, 'queued')
 })
@@ -550,11 +552,11 @@ test('schema v12 migrates once to immutable derived context tables and preserves
 
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
   assert.deepEqual(
     (inspected.prepare('SELECT version FROM schema_migrations WHERE version>=13 ORDER BY version')
       .all() as Array<{ version: number }>).map((row) => row.version),
-    [13, 14, 15, 16, 17, 18, 19],
+    [13, 14, 15, 16, 17, 18, 19, 20, 21],
   )
   const tables = (inspected.prepare(`
     SELECT name FROM sqlite_schema WHERE type='table'
@@ -614,7 +616,7 @@ test('an empty released v13 database migrates through v19 and gains the authorit
   migrated.close()
   const inspected = new DatabaseSync(path, { readOnly: true })
   t.after(() => inspected.close())
-  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 19)
+  assert.equal((inspected.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 21)
   assert.ok((inspected.prepare(`
     SELECT 1 FROM pragma_table_info('context_compaction_jobs')
     WHERE name='expected_previous_artifact_id'

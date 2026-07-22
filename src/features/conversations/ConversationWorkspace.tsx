@@ -600,7 +600,6 @@ export const SESSION_STATUS: Record<CanonicalSessionDto['workStatus'], { label: 
   cancelled: { label: '취소됨', dot: 'bg-muted-foreground' },
   complete: { label: '목표 완료', dot: 'bg-ok' },
   completed: { label: '완료', dot: 'bg-ok' },
-  imported: { label: '가져옴', dot: 'bg-muted-foreground' },
   idle: { label: '준비됨', dot: 'bg-muted-foreground' },
 }
 
