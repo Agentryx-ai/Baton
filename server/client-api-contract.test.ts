@@ -3,6 +3,31 @@ import test from 'node:test'
 
 import { client } from '../src/api/client.ts'
 
+test('client integration API preserves explicit repair eligibility', async () => {
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async () => Response.json({
+    supported: true,
+    certainlyStopped: true,
+    checkedAt: '2026-07-22T00:00:00.000Z',
+    running: [],
+    targets: [{
+      target: 'codex',
+      label: 'Codex CLI/Desktop',
+      certainlyStopped: true,
+      running: [],
+      configuration: 'conflict',
+      repairable: true,
+      codexMode: 'native-openai',
+    }],
+  })) as typeof fetch
+  try {
+    const status = await client.getClientIntegrationStatus()
+    assert.equal(status.targets[0]?.repairable, true)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
 test('Baton status uses the Baton-owned diagnostic endpoint', async () => {
   const originalFetch = globalThis.fetch
   const urls: string[] = []

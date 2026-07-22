@@ -17,6 +17,7 @@ import { client } from '@/api/client'
 import { pendingModelFallbackOffers } from '@/api/model-fallback'
 import { Button } from '@/components/ui/button'
 import { BatonStatusCard } from '@/components/BatonStatusCard'
+import { clientIntegrationAction } from '@/components/client-integration-action'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Separator } from '@/components/ui/separator'
@@ -437,11 +438,8 @@ export function SettingsSection({
                   (item) => item.target === option.target,
                 )
                 const isApplied = status?.configuration === 'applied'
-                const isNotApplied = status?.configuration === 'not-applied'
                 const isConflict = status?.configuration === 'conflict'
-                const actionable = Boolean(
-                  status?.certainlyStopped && (isApplied || isNotApplied || isConflict),
-                )
+                const action = clientIntegrationAction(status)
                 const changingThisTarget = changingIntegrationTarget === option.target
                 return (
                   <div
@@ -511,7 +509,7 @@ export function SettingsSection({
                       disabled={
                         clientIntegrationLoading
                         || changingIntegrationTarget !== null
-                        || !actionable
+                        || !action.actionable
                       }
                       onClick={() => void (
                         isApplied
@@ -521,14 +519,8 @@ export function SettingsSection({
                     >
                       {isApplied ? <ShieldOff /> : <ShieldCheck />}
                       {changingThisTarget
-                        ? isApplied ? '해제 중…' : '적용 중…'
-                        : isApplied
-                          ? status?.certainlyStopped ? '설정 해제' : '종료 후 해제'
-                          : isNotApplied
-                            ? status?.certainlyStopped ? '설정 적용' : '종료 후 적용'
-                            : isConflict
-                              ? status?.certainlyStopped ? '설정 복구' : '종료 후 복구'
-                            : !status ? '확인 중…' : '조치 불가'}
+                        ? isApplied ? '해제 중…' : isConflict ? '복구 중…' : '적용 중…'
+                        : action.label}
                     </Button>
                   </div>
                 )
